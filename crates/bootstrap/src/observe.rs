@@ -1,7 +1,3 @@
-//! Observability — tracing init and a minimal Prometheus-text `/metrics`
-//! endpoint: a tiny hand-rolled HTTP/1.1 responder (no axum/hyper/metrics
-//! dep) serving a base set (`pie_build_info`, `pie_uptime_seconds`).
-
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -10,28 +6,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
 
-/// Initialise the global tracing subscriber: logs to stderr (stdout stays clean
-/// for piping), level from `RUST_LOG` if set, else `log_level`.
 pub(crate) fn init_tracing(log_level: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-    // `try_init` so a second init (e.g. in tests) is a no-op rather than a panic.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
 }
 
-/// Bind the `/metrics` listener (synchronously, so a bad/in-use address fails
-/// fast in `init`) and spawn its accept loop onto the ambient runtime. `start`
-/// anchors the uptime gauge. Must be called from within a tokio runtime context.
 pub(crate) fn spawn_metrics(
     addr: SocketAddr,
     start: Instant,
     component: &'static str,
     version: &'static str,
 ) -> Result<()> {
-    // Sync bind → propagate the error out of `init`; then hand the socket to
-    // tokio for the async accept loop.
     let std_listener =
         std::net::TcpListener::bind(addr).with_context(|| format!("bind /metrics on {addr}"))?;
     std_listener
@@ -51,9 +39,7 @@ pub(crate) fn spawn_metrics(
     Ok(())
 }
 
-/// Answer one scrape: `GET /metrics` → 200 Prometheus text, anything else → 404.
 async fn handle_scrape(mut sock: TcpStream, start: Instant, component: &str, version: &str) {
-    // The request line is first, so a single read is enough to route.
     let mut buf = [0u8; 1024];
     let n = sock.read(&mut buf).await.unwrap_or(0);
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -70,7 +56,6 @@ async fn handle_scrape(mut sock: TcpStream, start: Instant, component: &str, ver
     let _ = sock.write_all(resp.as_bytes()).await;
 }
 
-/// The base Prometheus-text body.
 fn render(start: Instant, component: &str, version: &str) -> String {
     let uptime = start.elapsed().as_secs_f64();
     format!(

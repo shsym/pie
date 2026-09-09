@@ -1,14 +1,3 @@
-//! `pie model { list | info | import | remove }` — the models pie serves.
-//!
-//! `list` and `info` read the artifact store ([`crate::local::store`]) with the
-//! HF snapshot cache beside it, because "what do I have" and "where did it come
-//! from" are one question. [`import`] is big enough to own a file: it fetches a
-//! checkpoint and normalizes it into a `.zt`.
-//!
-//! There is no offline build step: the engine produces its weights from the
-//! checkpoint through the SKU's own import table at load, so there is nothing
-//! to precompute and no artifact shape to precompute it into.
-
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,23 +15,14 @@ pub mod import;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
-    /// List the artifacts pie can serve, and any raw snapshots beside them.
     List,
 
-    /// Show what pie knows about one stored artifact.
     Info {
-        /// The store name, as `pie model list` prints it.
         name: String,
     },
-    /// Make a model servable: fetch it if it is remote, convert it to a
-    /// `.zt` artifact, and put it in the store.
     Import(import::ImportArgs),
-    /// Remove a stored artifact by name. Prompts for confirmation;
-    /// `--yes` skips the prompt.
     Remove {
-        /// The store name, as `pie model list` prints it.
         name: String,
-        /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -52,21 +32,15 @@ pub fn run(cmd: ModelCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
-        // `import` is the one verb for "make this servable", and it fetches
-        // when the source is remote. The only arm that takes the globals: it
-        // reads the serving config to prepare the weight tiers of what it
-        // just imported.
         ModelCmd::Import(args) => import::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
     }
 }
 
-/// HF cache root for model snapshots: `<HF_HOME or ~/.cache/huggingface>/hub/`.
 fn hub_dir() -> std::path::PathBuf {
     crate::local::hf::resolve_cache_dir()
 }
 
-/// Convert `models--org--name` ↔ `org/name`.
 fn dirname_to_repo_id(dir: &str) -> Option<String> {
     let stripped = dir.strip_prefix("models--")?;
     let parts: Vec<&str> = stripped.split("--").collect();
@@ -77,30 +51,6 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Pie-compatibility check
-// -----------------------------------------------------------------------------
-
-/// Does the snapshot beside this repo hold a checkpoint some catalog SKU can
-/// be built from?
-///
-/// # It asks the TENSORS, through the door serving asks it through
-///
-/// The catalog never asks a config what a model is. The runtime's
-/// [`identify`](runtime::engine::load::identify) does not match tensor NAMES
-/// either: it compiles each candidate's load contract against the checkpoint's
-/// own metadata and answers with the SKU whose params the checkpoint actually
-/// holds. A name match cannot tell a 3B Qwen from a 0.8B one — every SKU of a
-/// family spells its tensors the same way. This asks the same question an
-/// engine settles at load, one step earlier.
-///
-/// Cost is unchanged: that door opens the container's index and runs the
-/// contract's arithmetic, so listing a cache of twenty repos still reads
-/// twenty headers and no payload.
-///
-/// Returns `(true, sku)` for a checkpoint that matches a row, and
-/// `(false, why)` for one that does not, carrying the refusal's own account —
-/// which names what each candidate did wrong.
 fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let snapshots = repo_dir.join("snapshots");
     let snapshot = match std::fs::read_dir(&snapshots) {
@@ -113,16 +63,6 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let Some(snap) = snapshot else {
         return (false, "no snapshot".to_string());
     };
-    // "A snapshot with no weights in it" and "a checkpoint no SKU claims" are
-    // different operator actions, and the door below answers both with one
-    // refusal. `Snapshot::at` used to draw the line by returning `None`; this
-    // draws it by looking, which is the same read the door would do first
-    // anyway.
-    // **A DIFFUSERS PIPELINE KEEPS ITS WEIGHTS ONE LEVEL DOWN.** Z-Image and
-    // Wan 2.2 have nothing but JSON and subfolders at the top of the
-    // snapshot, so the flat listing below says "no safetensors" about a
-    // 20 GiB checkpoint. `model_index.json` is the statement that the
-    // components are the checkpoint; `checkpoint::file::diffusers` reads it.
     let pipeline = checkpoint::file::diffusers::is_pipeline(&snap);
     let weights = pipeline
         || std::fs::read_dir(&snap).is_ok_and(|entries| {
@@ -135,70 +75,26 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     if !weights {
         return (false, "no safetensors".to_string());
     }
-    // The plane picks an alignment and a tile budget, neither of which can
-    // change whether a tensor's SHAPE is the one a contract declares — which
-    // is the only question a listing asks.
-    //
-    // **BUT ONE PLATFORM IS NO LONGER AS GOOD AS ANY**, and the paragraph
-    // that said so stood here while `Platform::Cuda` was written in (§J4c). A
-    // family's text may declare a `Dtype` PLACEMENT, and a contract read for a
-    // shell that does not serve the arrangement states a `Repack` no device
-    // target carries — so this cell came back "no SKU" for every 4-bit MLX
-    // qwen_3 snapshot on a Metal box, which is a fact about the reading and
-    // not about the file. `this_box` is the setup this binary would serve,
-    // which is the only setup a listing on this machine is about.
-    // **AND A BINARY WITH NO ENGINE SAYS SO** rather than identifying against
-    // a setup it does not have. `this_box` used to answer `Cuda` for such a
-    // build, so this cell printed a SKU that no boot of this binary could
-    // reach — a listing that reads as an inventory of what can be served.
     let Some(platform) = runtime::engine::load::this_box() else {
         return (false, "no engine".to_string());
     };
     match runtime::engine::load::identify(&snap, platform) {
         Ok(sku) => (true, sku.to_string()),
-        // **A PIPELINE THIS BUILD SHIPS NO ROW FOR IS STILL A CHECKPOINT.**
-        // Identification is "the first catalog row whose contract builds",
-        // and the generative families are not in the catalog yet, so every
-        // pipeline answers no row at all. That is a fact about this build,
-        // not about the snapshot, and it is worth a different cell than the
-        // language-model "no SKU" — the operator has the weights, and what
-        // is missing is a family text.
         Err(_) if pipeline => (false, "(no row)".to_string()),
-        // One line, because this is a table cell. The full per-candidate
-        // account is what `pie model import` prints when the load is
-        // actually attempted.
         Err(_) => (false, "no SKU".to_string()),
     }
 }
 
-// -----------------------------------------------------------------------------
-// list
-// -----------------------------------------------------------------------------
-
-/// The artifacts pie can serve, and the raw snapshots beside them.
 #[derive(serde::Serialize)]
 pub struct ModelList {
     store: std::path::PathBuf,
     artifacts: Vec<Artifact>,
-    /// Where `import` reads from. Not what serving reads: the HF cache demotes
-    /// to a staging area once an artifact exists.
     snapshots_dir: std::path::PathBuf,
     snapshots: Vec<Snapshot>,
     snapshot_bytes: u64,
-    /// **THE DEAD WEIGHT-CACHE FILES**, if this box has any of them.
-    ///
-    /// A boot reads its planes out of the model's own `.zt`, so the weight
-    /// cache's `<key>.tiers` and `<key>.weights` are never opened. They are
-    /// not stale, not corrupt, and not a cache: nothing will read them again.
-    ///
-    /// Reported because nobody would otherwise find out. These are the largest
-    /// files pie writes — a copy of the model apiece — and an operator who
-    /// upgraded into this layout has them sitting on the disk with no line
-    /// anywhere saying what they are.
     dead: Option<DeadWeight>,
 }
 
-/// The weight-cache files nothing reads any more, and what they cost.
 #[derive(serde::Serialize)]
 struct DeadWeight {
     dir: std::path::PathBuf,
@@ -209,12 +105,7 @@ struct DeadWeight {
 #[derive(serde::Serialize)]
 struct Artifact {
     name: String,
-    /// What to type at this artifact: `name` when the model directory holds
-    /// only it, and the whole `<slug>.<sku>.<backend>` when it has siblings.
-    /// A listing whose rows cannot be typed back at `pie model info` is a
-    /// listing of names that resolve to nothing.
     address: String,
-    /// The catalog row and the shell, from the artifact's serving stamp.
     sku: Option<String>,
     backend: Option<String>,
     root: std::path::PathBuf,
@@ -223,15 +114,7 @@ struct Artifact {
     tensors: usize,
     written_by: Option<String>,
     source: Option<String>,
-    /// Per-target builds derived from this archive. Reported so that the store
-    /// size a listing shows is the store size on disk: a runtime artifact is
-    /// as large as the archive it came from, and a model with three of them
-    /// occupies four times what the archive line alone would suggest.
     runtimes: Vec<RuntimeBuild>,
-    /// **WHAT THIS ROW CAN DO**, when the row it was stamped with is a
-    /// generative one (design D12): its readings, its latent space and its
-    /// schedule. A text row reports `None`, which is the same absence as a
-    /// `.zt` with no stamp on it.
     generative: Option<facts::GenerativeFacts>,
 }
 
@@ -245,18 +128,13 @@ struct RuntimeBuild {
 #[derive(serde::Serialize)]
 struct Snapshot {
     repo_id: String,
-    /// Whether any linked engine knows this family.
     servable: bool,
-    /// The pie arch name when servable, the reason when not.
     detail: String,
     bytes: u64,
 }
 
 impl crate::ui::Report for ModelList {
     fn render(&self, palette: &Palette) {
-        // What pie can serve. This is the store, and it comes first because it
-        // is the answer to "what models do I have" — the HF cache below it is
-        // where these came *from*.
         println!("Artifacts ({}):", self.store.display());
         if self.artifacts.is_empty() {
             println!(
@@ -264,12 +142,6 @@ impl crate::ui::Report for ModelList {
                 palette.dim("(none — `pie model import <org>/<name>`)")
             );
         }
-        // Four columns, not three. Folding the tensor count in with the
-        // provenance put all three facts in the column `Table` cuts to fit, so
-        // an 80-column terminal lost the tensor count *and* the source. Only
-        // the last column is ever cut, so only the least load-bearing fact --
-        // where it came from, which `pie model info` prints in full -- is at
-        // risk.
         let mut table = Table::new(
             [
                 Align::Left,
@@ -285,15 +157,9 @@ impl crate::ui::Report for ModelList {
                 0 => String::new(),
                 n => format!(" +{n}"),
             };
-            // **WHAT IT IS FOR**, which is the column that tells two rows of
-            // one model apart: a store holding the same model landed for
-            // cuda and for vulkan shows both, and the difference between
-            // them is here rather than only in the filename.
             let landing = match (&artifact.sku, &artifact.backend) {
                 (Some(sku), Some(backend)) => format!("{sku} · {backend}"),
                 (Some(sku), None) => sku.clone(),
-                // A `.zt` carrying no serving stamp is a checkpoint, which
-                // is a thing to know rather than a blank.
                 _ => "unstamped".to_string(),
             };
             let from = artifact
@@ -307,8 +173,6 @@ impl crate::ui::Report for ModelList {
                 .map(|v| format!("pie {v}"))
                 .unwrap_or_else(|| "provenance missing".to_string());
             table.push(Row::new(
-                // `●` here and `○`/`×` below were this command's private glyph
-                // vocabulary, three spellings of what `Mark` already names.
                 Mark::Plain,
                 [
                     artifact.address.clone(),
@@ -318,11 +182,6 @@ impl crate::ui::Report for ModelList {
                     format!("{from}{by}"),
                 ],
             ));
-            // **WHAT IT CAN DO**, under what it is. Indented for the same
-            // reason the runtime builds below are: it is a fact ABOUT the row
-            // on the line above, not a second row. Only generative rows get
-            // it -- a text row's readings are one implicit arm and saying so
-            // on every line would be noise on every line.
             if let Some(generative) = &artifact.generative {
                 table.push(Row::new(
                     Mark::Plain,
@@ -339,9 +198,6 @@ impl crate::ui::Report for ModelList {
                     ],
                 ));
             }
-            // Indented under the archive they came from, because that is the
-            // relationship: a build is derived and deleting it costs a
-            // rebuild, where deleting the archive costs a re-import.
             for runtime in &artifact.runtimes {
                 let quant = runtime
                     .runtime_quant
@@ -365,8 +221,6 @@ impl crate::ui::Report for ModelList {
         if self.snapshots.is_empty() {
             return;
         }
-        // Raw snapshots, marked as what they now are: staging for conversion,
-        // and disk that `pie cache clear snapshots` reclaims.
         println!(
             "\nRaw snapshots ({}, {}):",
             self.snapshots_dir.display(),
@@ -375,8 +229,6 @@ impl crate::ui::Report for ModelList {
         let mut table = Table::new([Align::Left, Align::Right, Align::Left], 1);
         for snapshot in &self.snapshots {
             table.push(Row::new(
-                // "pie cannot serve this family" is the same answer as every
-                // other absence, and gets the same glyph.
                 if snapshot.servable {
                     Mark::Plain
                 } else {
@@ -390,12 +242,6 @@ impl crate::ui::Report for ModelList {
             ));
         }
         table.print(palette);
-        // **THE ROW IN THAT LAST COLUMN IS A CHOICE, NOT A PROPERTY.** It is
-        // the first row whose contract fits, and a snapshot commonly fits
-        // several — a family's text row is asked before its vision row, and
-        // both read the same files. So the cell is what an import picks by
-        // itself, and this line is where an operator finds out that another
-        // row can be asked for and how to see the names.
         if self.snapshots.iter().any(|snapshot| snapshot.servable) {
             println!(
                 "  {}",
@@ -407,11 +253,6 @@ impl crate::ui::Report for ModelList {
             );
         }
 
-        // **AND WHAT NOTHING WILL READ AGAIN.** Last, because it is not a
-        // thing to act on so much as a thing to know: the command names the
-        // directory and the number, and says plainly that deleting it takes
-        // nothing away. It does NOT delete — a hundred gigabytes is not
-        // something a listing removes on its owner's behalf.
         if let Some(dead) = &self.dead {
             println!(
                 "\nDead weight ({}, {}):",
@@ -429,12 +270,6 @@ impl crate::ui::Report for ModelList {
     }
 }
 
-/// The retired weight-cache files on this box, if the directory has any.
-///
-/// `~/.pie/cache/weights` is the default and the only one a listing can know
-/// without a serving config; a deployment that pointed `[model]
-/// weight_cache_dir` somewhere else keeps its own files and this says nothing
-/// about them, which is the honest limit of a command that reads no config.
 fn dead_weight() -> Option<DeadWeight> {
     let dir = bootstrap::paths::pie_home().join("cache").join("weights");
     let mut files = 0usize;
@@ -509,20 +344,6 @@ fn list() -> Result<Answer> {
     }))
 }
 
-/// `pie model info <name>` — one artifact, in detail.
-///
-/// About a STORE ENTRY, not a HuggingFace repo. The earlier version of this
-/// opened `models--org--name/snapshots/*/config.json` and reported an
-/// architecture, which stopped being the right question when the artifact
-/// became the thing pie serves: a repo is one way an artifact got here, and
-/// `source` below is where that is recorded.
-/// The one artifact `name` names, or a refusal that says why it names none.
-///
-/// **AN AMBIGUOUS NAME IS ANSWERED WITH THE CANDIDATES, NOT WITH A PICK.**
-/// A model directory holds one artifact per shell and per row, so a bare
-/// model name can name three files; showing an operator the three names and
-/// letting them say which is the only answer that cannot be the wrong one —
-/// `pie model remove` runs through here too.
 fn one(name: &str) -> Result<crate::local::store::Entry> {
     match crate::local::store::find(name)? {
         crate::local::store::Resolved::One(entry) => Ok(*entry),
@@ -547,10 +368,6 @@ fn one(name: &str) -> Result<crate::local::store::Entry> {
 fn info(name: String) -> Result<Answer> {
     let entry = one(&name)?;
     Ok(Answer::report(ModelInfo {
-        // The row this artifact was imported as, from its own serving stamp
-        // — the same string `pie model import --sku <NAME>` takes, and the
-        // one in the middle of the filename. `None` for a `.zt` that carries
-        // no stamp, which is a checkpoint rather than an artifact.
         sku: entry.sku.clone(),
         backend: entry.backend.clone(),
         address: entry.address().to_string(),
@@ -575,16 +392,11 @@ fn info(name: String) -> Result<Answer> {
     }))
 }
 
-/// One store entry, in detail.
 #[derive(serde::Serialize)]
 pub struct ModelInfo {
     name: String,
-    /// The name that resolves to this artifact and no other — the same one
-    /// `pie model list` prints, and what `[model] model` should say.
     address: String,
-    /// The catalog row the artifact's serving stamp names.
     sku: Option<String>,
-    /// The shell its bytes are landed for, from the same stamp.
     backend: Option<String>,
     root: std::path::PathBuf,
     files: Vec<std::path::PathBuf>,
@@ -594,8 +406,6 @@ pub struct ModelInfo {
     written_by: Option<String>,
     source: Option<String>,
     runtimes: Vec<RuntimeBuild>,
-    /// The generative facts of the stamped row (design D12); `None` for a
-    /// text row or an unstamped `.zt`.
     generative: Option<facts::GenerativeFacts>,
 }
 
@@ -604,9 +414,6 @@ impl crate::ui::Report for ModelInfo {
         println!("{}", palette.bold(&self.address));
         let mut table = Table::new([Align::Left, Align::Left], 1);
         let mut row = |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
-        // The model this is an artifact of, when the address above is the
-        // longer name: the two differ exactly when the directory holds
-        // siblings, and that is the case where saying so is worth a line.
         if self.address != self.name {
             row("model", self.name.clone());
         }
@@ -632,9 +439,6 @@ impl crate::ui::Report for ModelInfo {
             row("written by", format!("pie {written_by}"));
         }
         row("path", crate::ui::short_path(&self.root));
-        // What has been built from it, and for what. `pie model build` is the
-        // only thing that writes these, and `pie model rm` takes them with the
-        // archive because they are derived from it.
         for runtime in &self.runtimes {
             let quant = runtime
                 .runtime_quant
@@ -652,10 +456,6 @@ impl crate::ui::Report for ModelInfo {
         }
         table.print(palette);
 
-        // **THE GENERATIVE BLOCK.** After the storage facts, because it is
-        // about what the row does rather than about the file, and before the
-        // `[model]` snippet, because a person reading down the page decides
-        // here whether this is the artifact they want to paste.
         if let Some(generative) = &self.generative {
             println!("\n{}", palette.bold("Generative"));
             let mut table = Table::new([Align::Left, Align::Left], 1);
@@ -671,9 +471,6 @@ impl crate::ui::Report for ModelInfo {
             if let Some(schedule) = &generative.schedule {
                 row("schedule", schedule.line());
                 if !schedule.pinned_sigmas.is_empty() {
-                    // Printed in full: a distilled row's step count is not a
-                    // preference, and these are the numbers a guest will use
-                    // whatever `--steps` says.
                     row(
                         "sigmas",
                         schedule
@@ -689,11 +486,6 @@ impl crate::ui::Report for ModelInfo {
             row("max latent rows", generative.max_latent_rows.to_string());
             table.print(palette);
 
-            // Plain lines, not a `Table`: the ports of one reading run to
-            // five entries and `Table` cuts its last column to the terminal,
-            // so the half that says what a guest has to bind was the half
-            // that disappeared. A long line a terminal wraps is worth more
-            // here than a short line pie truncated.
             println!("\n{}", palette.bold("Readings"));
             let name_width = generative
                 .readings
@@ -702,12 +494,6 @@ impl crate::ui::Report for ModelInfo {
                 .max()
                 .unwrap_or(0);
             let binds_of = |reading: &facts::Reading| {
-                // The two booleans a guest finds a reading BY:
-                // `takes_tokens` says "this one can be told something in
-                // words", `has_kv` says "this one is an attention pass with
-                // a cache". Spelled out rather than shown as flags, because
-                // the point of this screen is that nobody should have to
-                // look them up.
                 let mut binds = Vec::new();
                 if reading.tokens {
                     binds.push("tokens");
@@ -757,9 +543,6 @@ impl crate::ui::Report for ModelInfo {
             }
         }
 
-        // The `sku` row above is a name the import takes back: a snapshot
-        // that fits several rows was converted for one of them, and this is
-        // the string that asks for a different one.
         if let Some(sku) = &self.sku {
             println!(
                 "  {}",
@@ -772,41 +555,19 @@ impl crate::ui::Report for ModelInfo {
         }
         println!(
             "\n{}",
-            // The ADDRESS, not the model name: this block is meant to be
-            // pasted into a config, and a name that names three artifacts
-            // would make that config refuse to boot on the box holding all
-            // three.
             palette.dim(format!("[model]\nmodel = \"{}\"", self.address))
         );
     }
 }
 
-// -----------------------------------------------------------------------------
-// download
-// -----------------------------------------------------------------------------
-
-/// Fetch a HuggingFace snapshot into the local cache.
-///
-/// The runtime-artifact filter is not a flag any more: an import converts what
-/// it fetches, and the formats the old `--all` added are ones the conversion
-/// drops anyway. They were only useful with the `--raw` that has gone with it
-/// -- and "get files from HuggingFace without converting them" is
-/// `huggingface-cli`'s job, not a mode of a pie command.
 pub(crate) fn fetch_snapshot(repo_id: &str) -> Result<std::path::PathBuf> {
-    // Checked here rather than at the hub: `owner/name` is the shape every
-    // downstream path assumes, and a 404 is a worse way to learn it.
     parse_repo_id(repo_id)?;
     println!("Fetching {repo_id}");
 
-    // Multi-thread, because the downloader fans out across files: on a
-    // current-thread runtime the eight tasks would take turns on one core and
-    // the transfer would run at one connection's pace.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let label = repo_id.to_string();
-    // Built out here so the result line can report what the transfer cost --
-    // the bar erases itself when it finishes.
     let progress = ProgressBar::new();
     let sink = progress.sink();
     let snapshot_path = runtime.block_on(async move {
@@ -833,9 +594,6 @@ fn parse_repo_id(s: &str) -> Result<(String, String)> {
     Ok((owner.to_string(), name.to_string()))
 }
 
-/// Inline ANSI progress bar for a snapshot fetch, driven by the downloader's
-/// [`crate::local::hf::Progress`] callbacks. Redraws at most every ~100 ms so
-/// a hundred-shard transfer does not spend its time writing escape codes.
 #[derive(Clone)]
 struct ProgressBar {
     inner: std::sync::Arc<ProgressBarInner>,
@@ -848,9 +606,6 @@ struct ProgressBarInner {
     started: Instant,
     last_draw: Mutex<Instant>,
     finished: AtomicBool,
-    /// Skip drawing entirely when stderr isn't a TTY (e.g. piped to a
-    /// file or running under CI). The download still completes; we
-    /// just don't emit ANSI escapes.
     is_tty: bool,
 }
 
@@ -880,9 +635,6 @@ impl ProgressBarInner {
         let bar_width = 30usize;
         let filled = (pct * bar_width as f64).round() as usize;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-        // An ETA only once there is a rate worth extrapolating from. Guessing
-        // from the first hundred milliseconds swings by minutes, which teaches
-        // a reader to ignore the field.
         let eta = if total > done && rate > 1.0 && elapsed > 2.0 {
             let remaining = std::time::Duration::from_secs_f64((total - done) as f64 / rate);
             format!(" {} left", crate::ui::duration(remaining))
@@ -896,9 +648,6 @@ impl ProgressBarInner {
             total = crate::ui::bytes(total),
             rate = crate::ui::rate(rate),
         );
-        // Cut to the terminal: a line that wraps puts the cursor on a second
-        // screen row, and the `\r` that starts the next redraw returns to the
-        // start of THAT row, leaving the first behind as debris.
         eprint!("\r\x1b[K{}", crate::ui::clip(&body, crate::ui::width()));
         let _ = std::io::stderr().flush();
     }
@@ -932,8 +681,6 @@ impl ProgressBar {
         }
     }
 
-    /// The handle the downloader reports into. Shares this bar's state, so the
-    /// result line can still read the byte count after the fetch returns.
     fn sink(&self) -> std::sync::Arc<dyn crate::local::hf::Progress> {
         self.inner.clone()
     }
@@ -941,17 +688,11 @@ impl ProgressBar {
     fn finish(&self) {
         self.inner.finished.store(true, Ordering::Relaxed);
         if self.inner.is_tty {
-            // Replace the bar line with a clean blank so the result line lands
-            // on a fresh row.
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
         }
     }
 
-    /// What the transfer actually cost, for the result line.
-    ///
-    /// The bar erases itself when it finishes, so without this the only record
-    /// of a twenty-minute fetch was that it had ended.
     fn summary(&self) -> String {
         let moved = self.inner.bytes_done.load(Ordering::Relaxed);
         if moved == 0 {
@@ -965,27 +706,9 @@ impl ProgressBar {
     }
 }
 
-// -----------------------------------------------------------------------------
-// remove
-// -----------------------------------------------------------------------------
-
-/// Delete one artifact from the store.
-///
-/// Only the artifact. Reclaiming the HuggingFace snapshot it was converted
-/// from is `pie cache clear snapshots`, which knows about every snapshot
-/// rather than the one beside this artifact, asks before deleting, and reports
-/// what it got back. A command that removes a model has no business deciding
-/// what else its origin is worth keeping.
 fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
-    // Through the same resolution `pie model info` uses, so that a name
-    // naming three artifacts is refused with their names rather than
-    // deleting whichever the scan reached first.
     let entry = one(&name)?;
 
-    // The archive AND the builds derived from it, because that is what the
-    // removal takes. Reporting the archive alone understated a three-artifact
-    // model as one file, in a confirmation prompt whose whole job is to say
-    // what is about to be lost.
     let files = entry.files.len() + entry.runtimes.iter().map(|r| r.files.len()).sum::<usize>();
     let derived = match entry.runtimes.len() {
         0 => String::new(),

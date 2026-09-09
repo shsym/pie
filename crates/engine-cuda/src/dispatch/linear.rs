@@ -1,6 +1,3 @@
-//! `Linear`: the gemm anchor, the mlp activations, the moe router, bank and
-//! combine arms, and the LoRA correction over a routed adapter bank.
-
 use kernels_cuda::linear;
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::moe::GroupSeat;
@@ -10,11 +7,6 @@ use model_ir::{Dtype, Linear, ValueId};
 
 use crate::run::Run;
 
-// Row count where a quantized projection switches from the fused (folding)
-// kernel to its `_via_dense` twin. The fused kernel re-reads the whole
-// weight per activation row: cheap at decode sizes, far slower at prefill
-// sizes. Kept above 6 so a 6-token first-light prompt stays on the fused arm
-// (the two arms don't agree bit-for-bit, only to bf16 rounding).
 const PREFILL_ROWS: u32 = 16;
 
 impl DispatchLinear for Run<'_> {
@@ -24,30 +16,8 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
-    // Arms are in `kernels-cuda`'s error vocabulary, not the contract's, so
-    // each is a plain tail call with `?`; `kernel()` lifts the error family.
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
-            // ---- gemm (anchor) ----
-            //
-            // Weight seating picks the arm: a repacked plane (m16n8k16
-            // fragment order, written by `pie model import`) takes the tiled
-            // road first, since the row-major arms below can't read it. An
-            // MLX affine triplet (`WeightRow::Planes`) takes the quant
-            // point; a stored super-block row (ggml, no companion plane)
-            // takes the kquant path, which discriminates the k-quant scheme
-            // by the row's byte width; anything else takes the dense gemm.
-            // Nothing is chosen here beyond that: the trace declares which
-            // rows seat which way.
-            //
-            // `PREFILL_ROWS` picks fused vs. `_via_dense`/gemv within a
-            // seating: the fused kernel reads the weight once per row (cheap
-            // at decode sizes, far slower at prefill), the alternate decodes
-            // the weight once into scratch. A STREAMED seat always takes the
-            // fused arm since its planes have no fixed rectangle.
-            // A LANE chain's projection (an f32 activation: the timestep
-            // embedding into its modulation, design D6) takes the lane-axis
-            // kernel; the tensor-core arms below read bf16 activations.
             Linear::Matmul { act, w, y } if self.tensor(*act).dtype == Dtype::F32 => {
                 let weight = self.dense_or_decoded(
                     "linear.matmul",
@@ -103,11 +73,6 @@ impl Run<'_> {
                     }
                 None => self.row_major_lm_head(act, w, y),
             },
-            // ---- the epilogue-fused projections (`model_ir::fuse::gemm_epilogues`) ----
-            //
-            // A dense bf16 weight at decode width takes the skinny kernel,
-            // which lands the epilogue off the accumulator and never writes
-            // the packed/raw value; anything else is the two traced launches.
             Linear::MatmulGeglu {
                 act,
                 w,
@@ -153,8 +118,6 @@ impl Run<'_> {
                 y,
                 y_out: _,
             } => {
-                // A quantized head is a split-plane bank with no dense handle
-                // to take: it goes straight to the head's own arms below.
                 if self.dense_weight(*w) {
                     let a = self.tensor(*act);
                     let weight = self.tensor(*w);
@@ -181,15 +144,11 @@ impl Run<'_> {
                 })?;
                 kernels_cuda::attn::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
             }
-            // ---- mlp ----
             Linear::MlpSwiglu {
                 packed,
                 intermediate,
                 y,
             } => {
-                // Fan-out the staged seat is scaled by (`Run::plane_fan`):
-                // 1 for a dense MLP, or the routed fan-out for a leg whose
-                // packed input is a select's output.
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::swiglu(
                     self.ctx(),
@@ -205,9 +164,6 @@ impl Run<'_> {
                 limit,
                 y,
             } => {
-                // Fan-out the staged seat is scaled by (`Run::plane_fan`):
-                // 1 for a dense MLP, or the routed fan-out for a leg whose
-                // packed input is a select's output.
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::swiglu_clamp(
                     self.ctx(),
@@ -225,9 +181,6 @@ impl Run<'_> {
                 alpha,
                 y,
             } => {
-                // Fan-out the staged seat is scaled by (`Run::plane_fan`):
-                // 1 for a dense MLP, or the routed fan-out for a leg whose
-                // packed input is a select's output.
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::swiglu_clamp_alpha(
                     self.ctx(),
@@ -239,10 +192,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // Unfused swiglu-clamp pair: the 2-bit MLX expert path's combine.
-            // This plane serves no MLX affine bank; the arm exists because
-            // the match is exhaustive, and the kernel itself refuses rather
-            // than compute a shape it has no unit for.
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
                 linear::mlp::swiglu_clamp_split(
                     self.ctx(),
@@ -262,8 +211,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // Ungated GELU: the towers' MLP and merger, `fc2(act(fc1(x)))`
-            // with nothing to multiply.
             Linear::MlpGeluTanh { x, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
@@ -273,9 +220,6 @@ impl Run<'_> {
                 intermediate,
                 y,
             } => {
-                // Fan-out the staged seat is scaled by (`Run::plane_fan`):
-                // 1 for a dense MLP, or the routed fan-out for a leg whose
-                // packed input is a select's output.
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::geglu_tanh_packed(
                     self.ctx(),
@@ -292,9 +236,6 @@ impl Run<'_> {
                 up_cap,
                 y,
             } => {
-                // Fan-out the staged seat is scaled by (`Run::plane_fan`):
-                // 1 for a dense MLP, or the routed fan-out for a leg whose
-                // packed input is a select's output.
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::situ(
                     self.ctx(),
@@ -306,7 +247,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // ---- moe ----
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,
@@ -396,8 +336,6 @@ impl Run<'_> {
                 *extent,
                 &mut self.tensor(*y),
             ),
-            // The prediction ranks like the router and cuts nothing on this
-            // arm either (its op is not one `exports::writer_classes` names).
             Linear::MoePredictRoute {
                 logits,
                 bias,
@@ -437,12 +375,6 @@ impl Run<'_> {
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
             ),
-            // Lookup router: no logits are read. `tid2eid` is the
-            // `[vocab, top_k]` I64 table, `ids` the fire's own token stream;
-            // the pair landed is the same pair the ranked routers above
-            // land, so the selects behind it need no arm of their own.
-            // `experts` is only used by host-side passes dividing a band by
-            // it, not a kernel argument.
             Linear::MoeHashRoute {
                 ids,
                 tid2eid,
@@ -469,17 +401,6 @@ impl Run<'_> {
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe_route::group_routes(self.ctx(), *groups, &mut self.tensor(*routes))
             }
-            // **THE BLOCK-DIAGONAL PROJECTION, AS THE ROUTED SELECT OVER A
-            // RESTATED RECTANGLE.** `[tokens, G·K]` is `[tokens·G, K]` byte for
-            // byte, `[G·N, K]` is a `G`-expert bank, `[tokens, G·N]` is
-            // `[tokens·G, N]`; with `group_routes`' `g` in slot `g`, the
-            // by-route dense select computes exactly the grouped product.
-            //
-            // **THE DENSE PLANE ONLY, ON THIS ARM.** A quantized o-projection
-            // plane lands in this shell's TILED layout, which the split-plane
-            // routed select does not read; it is refused by name here rather
-            // than read wrong. (The Metal arm reads both; this arm was
-            // mirrored without a device to run it on.)
             Linear::MatmulGrouped {
                 x,
                 w,
@@ -521,11 +442,6 @@ impl Run<'_> {
                     experts,
                 )
             }
-            // `Run::expert_bank` answers the same rectangle `Run::tensor`
-            // would, plus the two device addresses a STREAMED bank needs
-            // (indirection table, routing counters). A resident bank
-            // answers `ExpertTable::RESIDENT` (two nulls), unchanged from
-            // before the tier existed.
             Linear::MoeMatmulSelect { x, bank, routes, y } => {
                 let (bank, experts) = self.expert_bank(*bank);
                 linear::moe::matmul_select(
@@ -537,9 +453,6 @@ impl Run<'_> {
                     experts,
                 )
             }
-            // The IR's one `bank` id is two device planes: the (codes,
-            // scales) pair the entry reads, resolved through `Run::planes`
-            // (`WeightRow::Planes`).
             Linear::MoeMatmulSelectBias {
                 x,
                 bank,
@@ -564,9 +477,6 @@ impl Run<'_> {
                     seat,
                 )
             }
-            // The same two-plane bank as the biased twin above, with nothing
-            // added inside the fold: the down leg's routed bias lands after
-            // the reduce, through `MoeBiasSum`.
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 let (codes, scales, biases, seat) = self.planes(*bank);
                 let routes = self.tensor(*routes);
@@ -608,16 +518,6 @@ impl Run<'_> {
                 self.tensor(*weights),
                 &mut self.tensor(*y),
             ),
-            // ---- the correction class ----
-            //
-            // `y` and `y_out` are one arena column (compiler folded the
-            // in-place pair), so the arm resolves `y_out` and writes
-            // through it — the same address `y` names.
-            //
-            // Both banks resolve through `Run::tensor`: they're
-            // `Def::Weight` rows whose bytes came from `register_adapter`
-            // (`ParamSource::Registered`), with the runtime index riding in
-            // `routes`.
             Linear::LoraCorrect {
                 x,
                 bank_a,
@@ -625,10 +525,6 @@ impl Run<'_> {
                 routes,
                 y: _,
                 y_out,
-            // `Run::segments` is `None` for a window the compiler seated
-            // whole (every row is a row of the correction) and `Some` for a
-            // `Fallback::Grouped`
-            // window; this is the only arm that may take a grouped window.
             } => linear::lora::correct(
                 self.ctx(),
                 self.tensor(*x),
@@ -653,11 +549,6 @@ impl Run<'_> {
         }
     }
 
-    /// The row-major roads: a projection whose planes the checkpoint landed
-    /// in declared order, a weight seated as one stored quantization block,
-    /// and the dense bf16 rectangle beside them.
-    /// A plain bf16 weight: no affine planes, no stored block, no tiled
-    /// repack — the dense GEMM road.
     fn dense_weight(&mut self, w: ValueId) -> bool {
         self.maybe_tiled_planes(w).is_none()
             && self.maybe_planes(w).is_none()
@@ -707,8 +598,6 @@ impl Run<'_> {
         }
     }
 
-    /// [`Run::row_major_matmul`] under the head's own entries, and the same
-    /// lift.
     fn row_major_lm_head(
         &mut self,
         act: &ValueId,
@@ -735,9 +624,6 @@ impl Run<'_> {
                     seat,
                 )
             }
-            // The head's own stored-block arm, and not a courtesy
-            // pairing: a Q4_K_M mix stores `output.weight` at q6_k, so
-            // the head is the busiest consumer the entry has.
             None => match self.maybe_stored(*w) {
                 Some(block) => linear::kquant::lm_head(
                     self.ctx(),
@@ -756,15 +642,9 @@ impl Run<'_> {
     }
 }
 
-/// The most expert bytes one select stages into device scratch; a wider
-/// routing (a long prefill) stays on the bound planes.
 const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
 
 impl Run<'_> {
-    /// A routed bank held on the host (T1) read at device speed: the experts
-    /// this fire routes to are copied into scratch and the routes renumbered
-    /// onto those slots. `None` keeps the bound planes — a device-resident
-    /// bank, a routing too wide to stage, or a copy the runtime refused.
     fn staged_experts(
         &self,
         codes: Tensor,
@@ -781,8 +661,6 @@ impl Run<'_> {
         }
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        // Ordered behind the routing on the same stream; a pageable
-        // destination makes the copy synchronous, so `picked` is whole after it.
         if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4).is_err() {
             return None;
         }
@@ -830,9 +708,6 @@ impl Run<'_> {
     }
 }
 
-/// One device buffer per staging plane for the whole process, grown when a
-/// wider routing needs it — not fire scratch, whose per-region slabs would
-/// multiply a gigabyte of experts by the walk's regions.
 fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     use std::collections::HashMap;
     use std::sync::Mutex;

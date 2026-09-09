@@ -1,23 +1,3 @@
-//! **ONE ATTENTION GROUP OF FOUR LANES — a text lane, an image lane and TWO
-//! reference lanes — FIRED THROUGH THE `Engine` API UNDER
-//! `RaggedMask::ReferenceSelfOnly` LANDS WHAT THE HOST COMPUTES: the text
-//! and image rows attend the whole group, references included, and each
-//! reference lane attends itself alone (FLUX.2's KV layout, HunyuanImage 3's
-//! several references).**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_group_with_two_reference_lanes_keeps_each_to_itself
-//! ```
-//!
-//! The double-block miniature with the reference mask: reference lanes land
-//! in the image class (their word clears the text bit) and run the image
-//! weights, feeding the image latents port; the packed order puts them last
-//! in the group (stream code 5), and the two `ReferenceTag` tables the plan
-//! reads carry each reference lane's fire index on its rows. Loads under
-//! the default knobs (bodies armed and golden-checked). Skips when no
-//! device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -35,7 +15,6 @@ use model_dsl::{
 
 const FREQ: u32 = 16;
 
-/// The double block, joint attention under the reference mask.
 struct ReferenceBlock;
 
 impl ForwardHybrid for ReferenceBlock {
@@ -126,8 +105,6 @@ fn plan() -> Trace {
     trace_hybrid(NAME, &ReferenceBlock, Platform::Cuda)
 }
 
-/// One lane of the group on the host: its rows, its positions, and whether
-/// it is a reference (attending itself alone).
 struct HostLane {
     rows: Vec<f32>,
     count: usize,
@@ -136,15 +113,11 @@ struct HostLane {
     text: bool,
 }
 
-/// The group's velocity rows per lane, in the order given: text and image
-/// queries see every key of the group; a reference lane's queries see its
-/// own keys alone.
 fn reference(weights: &Weights, timestep: f32, lanes: &[HostLane]) -> Vec<Vec<f32>> {
     let w = WIDTH as usize;
     let hd = HEAD_DIM as usize;
     let emb = silu(&sinusoid(timestep));
     let m = matmul_f32(&emb, 1, FREQ as usize, weights.get("ada"), 2 * w);
-    // Per lane: q/k/v under its own stream's weights, rotated.
     let mut q_all = Vec::new();
     let mut k_all = Vec::new();
     let mut v_all = Vec::new();
@@ -224,8 +197,6 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
     let w = WIDTH as usize;
     let mut rng = Lcg::seeded(47);
     let timestep = 0.6;
-    // Text, image, and two references — the packed order (text, image,
-    // ref, ref) is the group's, whatever the submission order.
     let counts = [3usize, 5, 4, 6];
     let kinds = [(true, false), (false, false), (false, true), (false, true)];
     let mut host: Vec<HostLane> = Vec::new();
@@ -244,7 +215,6 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
     }
     let want = reference(&weights, timestep, &host);
 
-    // Submitted reference-first, so the packed order is not the submission's.
     let order = [2usize, 0, 3, 1];
     let mut lanes = Vec::new();
     let mut attachments = Vec::new();
@@ -270,8 +240,6 @@ fn each_reference_lane_attends_itself_and_the_rest_see_everything() {
             (false, false) => LaneStream::Image,
         };
         let mut submitted = lane(slot as u32, &handles, stream, 0);
-        // A reference lane's word is the image class's: it feeds the image
-        // latents port, as `lane` wires every non-text stream.
         submitted.word = common_dit::classify(
             &model_dsl::Request::new(lane_host.count as u32, false).on_stream(match stream {
                 LaneStream::Text => Stream::Text,

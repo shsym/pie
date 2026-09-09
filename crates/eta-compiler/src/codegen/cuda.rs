@@ -1,9 +1,3 @@
-//! CUDA kernel emitters: the only producer of Pie's generated CUDA. Emission
-//! is a pure function of the plan, so the same stage emits the same bytes
-//! every time and `compiler/tests/golden-cuda/` pins them. [`runtime`] is
-//! the embedded runtime template, [`validate`] the region ABI checks,
-//! [`singleton`]/[`fused`]/[`order`]/[`scan`] the kernel shapes.
-
 pub mod fused;
 pub mod order;
 pub mod region_analysis;
@@ -25,25 +19,8 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-/// `kCudaGeneratedEmitterVersion` — bumped whenever emitted CUDA changes, so
-/// the engine's compile cache keys on it. Also keys the negative tier
-/// (cached `Deterministic` compile failures), so a bump is how a stale
-/// refusal is forgotten.
 pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 39;
 
-/// The kernel this backend compiles for one region of a stage: the single
-/// place that decides which emitter a region goes through.
-///
-/// A `RegionKind::Library` region is not automatically refused: the plan
-/// recognising a library dataflow doesn't mean this backend has a kernel for
-/// it. `top_k`, `sort_desc` and `cumsum`/`cumprod` have one; `matmul` does
-/// not and falls through to [`emit_fused_region`]. A `SecondParty` region
-/// falls through too and is refused there, since it names a kernel the
-/// shell launches itself.
-///
-/// # Errors
-///
-/// Whatever the chosen emitter refuses; see [`EmitError`].
 pub fn emit_region(
     entry_name: &str,
     stage: &CompiledStage,

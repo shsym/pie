@@ -1,28 +1,8 @@
-//! **THE REAL Z-IMAGE-TURBO SNAPSHOT OPENS AS ONE SOURCE WHOSE `dit.`, `te.`
-//! AND `vae.` TENSORS HAVE THE SHAPES THE CHECKPOINT DECLARES.**
-//!
-//! The synthetic sibling
-//! (`a_diffusers_pipeline_reads_as_one_prefixed_name_space`) proves the rule;
-//! this one proves the rule was written against the real thing — three
-//! components of three different shapes (a three-shard fp32 diffusers
-//! transformer with an index beside it, a three-shard bf16 `transformers`
-//! encoder, a lone-file bf16 VAE) under one `model_index.json`.
-//!
-//! The named tensors and shapes below were read off the snapshot's own
-//! safetensors headers and its `diffusion_pytorch_model.safetensors.index.json`.
-//!
-//! Skipped by name when the snapshot is not in the HuggingFace cache: this is
-//! a 30 GiB checkpoint, and a machine without it has not failed anything.
-//!
-//!     cargo test -p checkpoint --test the_z_image_snapshot_opens_as_one_prefixed_source
-
 use std::path::PathBuf;
 
 use checkpoint::file::diffusers;
 use checkpoint::file::read::parse_metadata;
 
-/// The repo directory in the HuggingFace cache, honoring the same precedence
-/// `huggingface_hub` uses.
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -33,8 +13,6 @@ fn hub() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
 }
 
-/// The one snapshot directory of `models--Tongyi-MAI--Z-Image-Turbo`, or
-/// `None` when this machine has not pulled it.
 pub fn snapshot() -> Option<PathBuf> {
     let snapshots = hub().join("models--Tongyi-MAI--Z-Image-Turbo/snapshots");
     std::fs::read_dir(snapshots)
@@ -68,9 +46,6 @@ fn the_z_image_snapshot_opens_as_one_prefixed_source() {
 
     let source = diffusers::open(&root).unwrap();
 
-    // Every name is under exactly one of the three prefixes, and the three
-    // are all non-empty: a component that contributed nothing would be a
-    // discovery that silently dropped a third of the checkpoint.
     let mut counts = [0usize; 3];
     for name in source.names() {
         match name {
@@ -83,9 +58,6 @@ fn the_z_image_snapshot_opens_as_one_prefixed_source() {
     assert_eq!(counts[0], 521, "the transformer's index names 521 tensors");
     assert!(counts[1] > 0 && counts[2] > 0);
 
-    // Tensors read off the snapshot's own headers: the DiT's patch embedder
-    // and final layer (fp32, as Z-Image ships them), the Qwen3-4B encoder's
-    // embedding table, the FLUX 16-channel VAE's first decoder convolution.
     for (name, shape) in [
         ("dit.all_x_embedder.2-1.weight", vec![3840u64, 64]),
         ("dit.all_x_embedder.2-1.bias", vec![3840]),
@@ -99,11 +71,9 @@ fn the_z_image_snapshot_opens_as_one_prefixed_source() {
         assert_eq!(tensor.shape().to_vec(), shape, "{name}");
     }
 
-    // The unprefixed spellings are the checkpoint's, not this source's.
     assert!(source.get("all_x_embedder.2-1.weight").is_none());
     assert!(source.get("model.embed_tokens.weight").is_none());
 
-    // And the loader's table agrees with the source it was described from.
     let metadata = parse_metadata(&root).unwrap();
     assert_eq!(metadata.tensors.len(), source.len());
     assert_eq!(

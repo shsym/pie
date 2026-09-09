@@ -1,10 +1,3 @@
-//! Memory accounting: recompute the plan's persistent / temporary / scratch
-//! peaks and its checkpoint-read and device-write totals.
-//!
-//! `live_peak` is a running total, not a liveness analysis: buffers enter
-//! `live` at `Allocate` and never leave, since nothing frees one today. It is
-//! written as a max so it stays correct if a free is ever added.
-
 use std::collections::HashSet;
 
 use crate::error::{OrOverflow, Result};
@@ -47,8 +40,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
         match instr {
             StorageInstr::Allocate { buffer, .. } => {
                 let decl = program.buffer(*buffer)?;
-                // A staging buffer is arena memory, counted in
-                // `scratch_bytes`, not `live`.
                 if decl.scratch_offset.is_some() {
                     continue;
                 }
@@ -60,7 +51,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     live_peak = live_peak.max(live_bytes);
                 }
             }
-            // A fill moves no checkpoint bytes and allocates nothing.
             StorageInstr::Fill { .. } => {}
             StorageInstr::ExtentWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
@@ -78,8 +68,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     .checked_add(source.span_bytes)
                     .or_overflow("write byte overflow")?;
             }
-            // A gather reads its source once and writes its destination once,
-            // and the two are the same byte count in a different order.
             StorageInstr::GatherWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(source.span_bytes)
@@ -122,8 +110,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
     }
 
     program.memory.persistent_bytes = persistent_bytes;
-    // Scratch sits behind the resident tensors, so its offsets already
-    // include them; the caller only adds the difference.
     program.memory.scratch_bytes = scratch_end.saturating_sub(persistent_bytes);
     program.memory.temporary_peak_bytes = live_peak.saturating_sub(persistent_bytes);
     program.memory.transform_scratch_peak_bytes = transform_scratch_peak_bytes;

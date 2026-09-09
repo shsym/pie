@@ -1,29 +1,3 @@
-//! **STREAMS** — a row block's elementwise ops fused into one loop.
-//!
-//! A row-parallel region runs one block per row, and until now every op in
-//! it was its own loop over the row: `exp` read the row and wrote it, the
-//! `div` after it read that and wrote again, the `reduce_sum` read it once
-//! more. Over a `[256, 262144]` epilogue that is a 268 MB round trip per op,
-//! and a sampler has a dozen of them — the epilogue's whole cost was that
-//! traffic, not its arithmetic.
-//!
-//! A stream is a maximal run of consecutive region ops that can be evaluated
-//! in ONE pass over the row's elements: the elementwise ops (`exp`, `div`,
-//! `gt`, `select`, a scalar's `broadcast`, `rng`, ...) and the reductions
-//! that read them (`reduce_sum/max/min/argmax`). Inside the pass each
-//! intermediate lives in a register; it is stored to its scratch slot only
-//! if something outside the stream reads it (a later op, another region, a
-//! channel). A reduction's result is complete only after the pass, so an op
-//! that reads one starts the next stream.
-//!
-//! The arithmetic is the runtime helpers' own, mirrored expression for
-//! expression (`ptir_parallel_elementwise`, `ptir_parallel_reduce_f32`,
-//! `ptir_fast_argmax` in `fused_block0.cuh`): the same loaders and
-//! conversions, the same NaN-canonical max and min, the same argmax
-//! candidate combine. What differs is the order a sum's terms meet — each
-//! thread folds its strided elements first — so a fused `reduce_sum` may
-//! round a last bit differently from the two-launch path.
-
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -36,62 +10,39 @@ use eta_ir::op::{intrinsic_tags, tags};
 use crate::codegen::op_view::OpView;
 use crate::plan::{CompiledStage, Dimension, Region};
 
-/// A value's shape as a row block sees it.
 #[derive(Clone, PartialEq, Eq)]
 enum RowClass {
-    /// The block's row of a value of the region's geometry: `width` elements.
     Full(Dimension),
-    /// One element: a per-row vector's element, or a whole scalar.
     Scalar,
-    /// Anything a stream does not index by element.
     Other,
 }
 
-/// What a stream does with one op.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
-    /// Elementwise: a register per element.
     Map,
-    /// A scalar spread over the row: the register IS the scalar.
     Broadcast,
-    /// A draw per element from a seed fixed before the pass.
     Rng,
-    /// `reduce_sum/max/min`: an accumulator folded after the pass.
     Reduce,
-    /// `reduce_argmax`: a candidate folded after the pass.
     Argmax,
-    /// An intrinsic (the logits) read straight off its plane, element by
-    /// element — no copy into scratch unless something outside reads it.
     Intrinsic,
 }
 
-/// One op of a stream.
 struct Member {
     node: usize,
     role: Role,
 }
 
-/// The stage facts a stream is planned and emitted against.
 pub(super) struct Streams<'a> {
     pub stage: &'a CompiledStage,
     pub region: &'a Region,
     pub ops: &'a [OpView],
     pub bases: &'a [u32],
-    /// Per value: 1 = of the geometry, 2 = a per-row vector, 0 = whole.
     pub kinds: &'a [u8],
-    /// `direct_intrinsic[node] != u16::MAX` marks an argmax the emitter
-    /// answers straight off the intrinsic; a stream leaves it alone.
     pub direct_intrinsic: &'a [u16],
-    /// Nodes the emitter skips outright.
     pub skipped: &'a [u8],
-    /// Per value, every stage node that reads it.
     pub readers: Vec<Vec<usize>>,
-    /// Per value, the stage node that defines it (`u32::MAX` for none).
     pub producers: Vec<u32>,
-    /// Per node, a `top_k` that reads the intrinsic plane straight
-    /// (`fused::analyze_direct_topk`): its operand need not be stored for it.
     pub direct_topk: &'a [Option<super::fused::TopKDirect>],
-    /// The region's nodes in the order they are emitted (`emission_order`).
     pub order: Vec<usize>,
 }
 
@@ -136,11 +87,6 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// Whether a full-row `value` can be recomputed inside a later pass
-    /// instead of stored and re-read: it is the intrinsic itself, or a
-    /// stream `Map`/`Broadcast` of this region over values that can be
-    /// (scalars aside), no more than a few ops deep. Recomputing a divide
-    /// costs nothing against a 268 MB round trip through scratch.
     fn rematerializable(&self, value: u32) -> bool {
         self.remat_depth(value, 0)
     }
@@ -177,15 +123,12 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// Whether `node` is a stream member somewhere in this region — a reader
-    /// that will recompute a rematerializable value rather than load it.
     fn stream_reader(&self, node: usize) -> bool {
         self.region.nodes.iter().any(|n| n.index() == node)
             && self.skipped[node] == 0
             && self.role(node, &mut None).is_some()
     }
 
-    /// Whether `node` is a `top_k` that reads the intrinsic plane for `value`.
     fn topk_reads_direct(&self, node: usize, value: u32) -> bool {
         self.direct_topk.get(node).copied().flatten().is_some()
             && self.ops[node].args.first() == Some(&value)
@@ -214,9 +157,6 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// The role an op takes in a stream of `width`, or `None` when it ends
-    /// one. `width` is fixed by the stream's first op; `None` there means
-    /// the op sets it.
     fn role(&self, node: usize, width: &mut Option<Dimension>) -> Option<Role> {
         if self.skipped[node] != 0 {
             return None;
@@ -352,8 +292,6 @@ impl<'a> Streams<'a> {
                 Some(Role::Rng)
             }
             tags::INTRINSIC_VAL => {
-                // The fallback intrinsics (`layer`, `mtp_drafts`) stay with
-                // the helper; a float plane of the row geometry streams.
                 if op.intr == intrinsic_tags::LAYER || op.intr == intrinsic_tags::MTP_DRAFTS {
                     return None;
                 }
@@ -388,16 +326,12 @@ impl<'a> Streams<'a> {
         }
     }
 
-    /// The stream starting at position `at` of the region's node list:
-    /// its members in order, or `None` when that op is not a stream's.
     fn plan(&self, at: usize) -> Option<Vec<Member>> {
         let mut width: Option<Dimension> = None;
         let mut members: Vec<Member> = Vec::new();
         let mut reduced: Vec<u32> = Vec::new();
         for &node in &self.order[at..] {
             let op = &self.ops[node];
-            // An op that reads a reduction of this stream needs the pass
-            // finished first.
             if op.args.iter().any(|a| reduced.contains(a)) {
                 break;
             }
@@ -412,9 +346,6 @@ impl<'a> Streams<'a> {
         if members.is_empty() { None } else { Some(members) }
     }
 
-    /// Whether a value a stream's op defines must also land in scratch: some
-    /// reader outside this pass will load it — one that is not a later
-    /// pass able to recompute it, nor a `top_k` reading the intrinsic.
     fn escapes(&self, value: u32, members: &[Member]) -> bool {
         let outside: Vec<usize> = self
             .readers
@@ -431,25 +362,10 @@ impl<'a> Streams<'a> {
         if outside.iter().any(|node| !served(node)) {
             return true;
         }
-        // A region output with no reader this stage names: something else
-        // reads it; keep it.
         self.region.outputs.contains(&value) && outside.is_empty()
     }
 }
 
-/// The order a row-parallel region's nodes are emitted in.
-///
-/// A stream ends where an op reads a reduction of the same stream, so the
-/// passes a region takes over its rows are set by how many reductions each
-/// op waits on, not by where the program wrote it: a Gumbel-max sample and
-/// an argmax of the scaled logits wait on none and belong in the first pass
-/// beside the row max, however late the guest spelled them. Nodes are
-/// scheduled by `(reductions waited on, kind, program order)` over the
-/// region's own dataflow — channel takes and reads first, then constants
-/// and reshapes (a reshape between two passes costs nothing; inside one it
-/// would end it), then the elementwise run, then a gather (which reads a
-/// row whole and would split a pass), then channel puts. Channel ops keep
-/// their program order among themselves; every op follows its operands.
 fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> {
     use eta_ir::op::tags;
     let nodes: Vec<usize> = region.nodes.iter().map(|n| n.index()).collect();
@@ -501,7 +417,6 @@ fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> 
             .filter(|&i| !placed[i] && deps[i].iter().all(|&d| placed[d]))
             .min_by_key(|&i| (depth[i], kind(ops[nodes[i]].tag), i));
         let Some(i) = next else {
-            // Unreachable in SSA; program order is always a valid answer.
             return nodes;
         };
         placed[i] = true;
@@ -510,7 +425,6 @@ fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> 
     out
 }
 
-/// C spelling of a register of `dtype`.
 fn c_type(dtype: Dtype) -> &'static str {
     match dtype {
         Dtype::F32 => "float",
@@ -520,7 +434,6 @@ fn c_type(dtype: Dtype) -> &'static str {
     }
 }
 
-/// The loader letter for `dtype`: `m1_load_f/i/u/b`.
 fn letter(dtype: Dtype) -> char {
     match dtype {
         Dtype::F32 => 'f',
@@ -530,7 +443,6 @@ fn letter(dtype: Dtype) -> char {
     }
 }
 
-/// The wire code of `dtype`, what a descriptor's `dtype` field holds.
 fn code(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::F32 => 0,
@@ -540,8 +452,6 @@ fn code(dtype: Dtype) -> u32 {
     }
 }
 
-/// `expr` (a register of `from`) read as `to` — exactly what the typed
-/// loader `m1_load_<to>` makes of a slot of `from`.
 fn convert(expr: &str, from: Dtype, to: Dtype) -> String {
     if from == to {
         return expr.into();
@@ -561,29 +471,17 @@ fn convert(expr: &str, from: Dtype, to: Dtype) -> String {
     }
 }
 
-/// The pass body in its two spellings. The scalar loop (`s`) is the one
-/// every stream had; the vector loop (`v`) takes four consecutive elements
-/// a thread per iteration, loading and storing each full-row value as one
-/// 16-byte access (`pre` before the four, `post` after) and picking the
-/// element out of the register quad inside. The arithmetic between is the
-/// same text in both. The kernel chooses the vector loop per block when the
-/// row's width is a multiple of four and every pointer it touches is
-/// 16-byte aligned (`ptrs`, `conds`), and falls back to the scalar loop
-/// otherwise.
 #[derive(Default)]
 struct Bodies {
     s: String,
     v: String,
     pre: String,
     post: String,
-    /// Pointer expressions the vector loop reads or writes 16 bytes at.
     ptrs: Vec<String>,
-    /// Further block-uniform conditions of the vector loop.
     conds: Vec<String>,
 }
 
 impl Bodies {
-    /// A line of arithmetic, the same in both loops.
     fn both(&mut self, line: &str) {
         self.s.push_str(line);
         self.s.push('\n');
@@ -597,8 +495,6 @@ impl Bodies {
         }
     }
 
-    /// A full-row element load into `name`: scalar in one loop, a quad
-    /// picked in the other.
     fn load(&mut self, name: &str, want: Dtype, ptr: &str, from: u32) {
         let l = letter(want);
         let _ = writeln!(self.s, "      const {} {name} = m1_load_{l}({ptr}, i, {from}u);", c_type(want));
@@ -607,8 +503,6 @@ impl Bodies {
         self.touch(ptr);
     }
 
-    /// A full-row element store of register `reg`: scalar in one loop,
-    /// gathered into a quad and stored after the four in the other.
     fn store(&mut self, dtype: Dtype, ptr: &str, reg: &str) {
         let l = letter(dtype);
         let _ = writeln!(self.s, "      m1_store_{l}({ptr}, i, {reg});");
@@ -619,7 +513,6 @@ impl Bodies {
     }
 }
 
-/// C spelling of a quad of `dtype`.
 fn vec_type(dtype: Dtype) -> &'static str {
     match dtype {
         Dtype::F32 => "float4",
@@ -629,9 +522,6 @@ fn vec_type(dtype: Dtype) -> &'static str {
     }
 }
 
-/// The pass's emission state: the registers the pass defines, the scalar
-/// loads hoisted before it, the element loads already spelled, the
-/// intrinsics whose preamble is written, and the text.
 struct Pass<'p> {
     registers: Vec<(u32, Dtype)>,
     hoisted: Vec<(u32, Dtype)>,
@@ -642,10 +532,6 @@ struct Pass<'p> {
     pointer: &'p mut dyn FnMut(u32) -> String,
 }
 
-/// A read of `value` as `want` inside the pass: a register's conversion, a
-/// hoisted scalar (`s<value>_<t>`, loaded once before the pass), a
-/// recomputation of a rematerializable value, or the element's load
-/// (`l<value>_<t>`, once per pass).
 fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> String {
     if let Some((_, from)) = pass.registers.iter().find(|(v, _)| *v == value) {
         return convert(&format!("r{value}"), *from, want);
@@ -683,8 +569,6 @@ fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> 
     }
 }
 
-/// Recompute a rematerializable `value` in this pass: its intrinsic read,
-/// or its `Map` over recomputed operands. Answers the register's name.
 fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> String {
     let node = streams.producers[value as usize] as usize;
     let op = &streams.ops[node];
@@ -700,8 +584,6 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
     format!("r{out}")
 }
 
-/// The intrinsic op's preamble (once per pass) and its per-element read
-/// into `r<out>`: the scalar loop's row arithmetic, the vector loop's quad.
 fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
     let _ = streams;
     if !pass.intrinsics.contains(&node) {
@@ -726,8 +608,6 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
             "    const m1_u32 istride{node} = p{node}.intrinsic_row_stride == 0u ? iwidth{node} : p{node}.intrinsic_row_stride;"
         );
         let _ = writeln!(p, "    const m1_u64 ifirst{node} = (m1_u64)p{node}.intrinsic_row_offset + (m1_u64)p{node}.imm2;");
-        // The quad stays inside one intrinsic row: the row's width a
-        // multiple of four and the pass never wider than a row.
         pass.body.conds.push(format!(
             "(iwidth{node} & 3u) == 0u && stream_width <= iwidth{node} && m1_intrinsic_row_vectorable(ibase{node}, ifirst{node}, istride{node}, p{node}.intrinsic_dtype)"
         ));
@@ -744,9 +624,6 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     pass.registers.push((out, Dtype::F32));
 }
 
-/// The C expression of a `Map`/`Broadcast` op's element, its operands read
-/// through [`read`] — the runtime helpers' arithmetic, expression for
-/// expression.
 fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pass<'_>) -> String {
     let op = &streams.ops[node];
     let tag = op.tag;
@@ -799,8 +676,6 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         let b = read(streams, op.args[1], Dtype::Bool, pass);
         if tag == tags::AND { format!("({a} && {b})") } else { format!("({a} || {b})") }
     } else {
-        // Binary arithmetic and compares: the left operand's dtype picks
-        // the path, as the helper's `d0.dtype` does.
         let path = streams.dtype(op.args[0]);
         let a = read(streams, op.args[0], path, pass);
         let b = read(streams, op.args[1], path, pass);
@@ -836,10 +711,6 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
     }
 }
 
-/// Emit the stream at `at` — when there is one — into `source`, returning
-/// how many of the region's nodes it covered. `pointer(value)` spells a
-/// value's scratch pointer (aliases resolved); `tail` is the per-op
-/// barrier-and-status block the caller appends after every op.
 pub(super) fn emit_stream(
     source: &mut String,
     streams: &Streams<'_>,
@@ -851,7 +722,6 @@ pub(super) fn emit_stream(
     let ops = streams.ops;
     let bases = streams.bases;
 
-    // The row's width: any member's full value (all agree by planning).
     let witness = members
         .iter()
         .find_map(|m| {
@@ -927,9 +797,6 @@ pub(super) fn emit_stream(
                     );
                 }
                 if op.kind == eta_ir::types::RngKind::Normal as u8 {
-                    // Box-Muller reads two uniform lanes an element, so the
-                    // draw is the runtime's own function rather than a
-                    // transform of one `u{node}`.
                     pass.body.both(&format!("      const float r{out} = ptir_rng_hash_normal(seed{node}, i + p{node}.imm3);"));
                 } else {
                     pass.body.both(&format!("      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"));
@@ -996,8 +863,6 @@ pub(super) fn emit_stream(
                 let _ = writeln!(epilogue, "    }}");
             }
         }
-        // The next member's fold reuses the work slots and the candidate
-        // array: a barrier between folds, the stream's tail after the last.
         if matches!(member.role, Role::Reduce | Role::Argmax) {
             epilogue.push_str("    __syncthreads();\n");
         }
@@ -1008,7 +873,6 @@ pub(super) fn emit_stream(
     }
     let Pass { prologue, body, .. } = pass;
     s.push_str(&prologue);
-    // The vector loop when the block can take it, else the scalar one.
     let mut conds: Vec<String> = vec!["(stream_width & 3u) == 0u".into()];
     conds.extend(body.ptrs.iter().map(|p| format!("m1_aligned16({p})")));
     conds.extend(body.conds.iter().cloned());
@@ -1035,10 +899,6 @@ pub(super) fn emit_stream(
     Some(members.len())
 }
 
-/// The values the CUDA emitter's streams keep in registers for `region`
-/// and never store: what `emit_fused_region` plans, without emitting. Empty
-/// for a region that is not row-parallel, not generated, or that the
-/// emitter declines.
 #[must_use]
 pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if region.kind != crate::plan::RegionKind::Generated {

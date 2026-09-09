@@ -1,295 +1,164 @@
-//! The shell's error vocabulary: [`KernelError`] is about the backend,
-//! [`Fault`] is about the shell.
-
 use std::fmt;
 
 use model_exec::KernelError;
 
-/// Every way this shell answers "no".
 #[derive(Debug)]
 pub enum Fault {
-    /// No Metal in this build — a non-Apple target.
     Deviceless,
 
-    /// A Metal call refused, and this is what it said.
     Device {
-        /// The Objective-C selector, as the shell spells it.
         call: &'static str,
-        /// The `NSError`'s own description, or a stated reason when the call
-        /// returned `nil` without one.
         why: String,
     },
 
-    /// A shader source or entrypoint this crate does not ship.
     Shader {
-        /// The `.metal` path a `Fire` named.
         file: &'static str,
-        /// The entrypoint a `Fire` named.
         entrypoint: &'static str,
-        /// What went missing.
         why: String,
     },
 
-    /// A count past a ceiling reserved at load.
     Ceiling {
-        /// What was counted.
         what: &'static str,
-        /// What the fire asked for.
         need: u64,
-        /// What the reservation holds.
         have: u64,
     },
 
-    /// A lane's media geometry and media payload disagree — a check
-    /// `engine::fire::StepMedia::validate` cannot make since it needs shell-
-    /// only numbers (patch row width, position-table tap count).
     PatchPayload {
-        /// Which lane of the submission.
         lane: u32,
-        /// Which of its vectors.
         what: &'static str,
-        /// What that vector carries.
         have: u64,
-        /// What its own geometry owes.
         want: u64,
     },
 
-    /// The compiler refused to bake the plan against these budgets.
     Bake(model_compiler::Error),
 
-    /// The loader refused to land the checkpoint against this plan.
     Load(checkpoint::error::Error),
 
-    /// The fire substrate refused the batch, or a dispatch refused the op.
     Fire(model_exec::Error),
 
-    /// A param the plan names that the checkpoint never published, or
-    /// published at another shape.
     Param {
-        /// The param's canonical name.
         name: String,
-        /// Why it could not land.
         why: &'static str,
     },
 
-    /// A region's classes are not one run and the artifact owes it no
-    /// fallback: the bake and the fire disagree about the compiler's
-    /// consecutiveness promise.
     Fragmented {
-        /// The template region.
         region: u32,
-        /// How many runs its class mask fell into in this fire.
         runs: usize,
-        /// How many the compiler wrote down, or `None` when it wrote nothing at all —
-        /// which is the promise being broken rather than exceeded.
         promised: Option<u32>,
     },
 
-    /// A schedule value built over one class mask and read under another.
     Straddled {
-        /// The plan value holding the schedule.
         value: u32,
-        /// The node that reads it.
         node: u32,
-        /// The classes the schedule was planned for.
         planned: String,
-        /// The classes that consume it.
         consumed: String,
     },
 
-    /// A lane's stated mask does not reach the extent it will read (a longer
-    /// mask is fine and gets clipped).
     Mask {
-        /// The lane, in submission order.
         lane: u32,
-        /// The mask's stated total.
         stated: u64,
-        /// The extent the fire will read.
         extent: u64,
     },
 
-    /// A lane carries a mask and this artifact bakes no masked class.
     Maskless {
-        /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane's per-row mask (`Masking::Rows`) states a different number of
-    /// rows than the lane feeds.
     MaskRows {
-        /// The lane, in submission order.
         lane: u32,
-        /// How many rows the masking states.
         stated: u64,
-        /// How many rows the lane feeds.
         rows: u32,
     },
 
-    /// A lane states its own token positions and a different number of them
-    /// than it feeds tokens. Monotonicity is deliberately not checked here —
-    /// a non-monotone run is a caller's rotation, not a geometry error.
     Positions {
-        /// The lane, in submission order.
         lane: u32,
-        /// How many positions it states.
         stated: u64,
-        /// How many token rows it feeds.
         rows: u64,
     },
 
-    /// A lane's word and its mask disagree, in either direction.
     MaskWord {
-        /// The lane, in submission order.
         lane: u32,
-        /// The word the caller stamped.
         word: u64,
-        /// Whether the word's class runs the masked arm.
         runs_masked_arm: bool,
     },
 
-    /// An adapted lane in a fire whose loaded artifact bakes no correction
-    /// arm, so it would get the base model's answer under an adapter's name.
     Adapterless {
-        /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane whose fact word and whose adapter disagree: the word's class
-    /// decides whether the lane's rows fall inside the correction's window.
     AdapterWord {
-        /// The lane, in submission order.
         lane: u32,
-        /// The word the caller stamped.
         word: u64,
-        /// Whether the word's class runs the correction.
         runs_correction: bool,
     },
 
-    /// A guest program this device would not compile: `eta_exec::Failure`'s
-    /// `Deterministic` vs `Retryable` split.
     Compile(eta_exec::Failure),
 
-    /// The guest-program plane refused a call, and this is where and why.
     Program {
-        /// Which entry refused, as the plane spells it.
         at: &'static str,
-        /// The sentence.
         why: String,
     },
 
-    /// The ETA substrate refused a launch program, distinct from
-    /// [`Fault::Program`] (this crate's own guest-program refusals). Both
-    /// sort to `Error::Program` at the contract.
     Interpret(eta_exec::Error),
 
-    /// An adapter registration this load's banks cannot seat: an undeclared
-    /// bank name, an id past capacity, or a plane that is not one whole slot.
     Adapter {
-        /// The bank, as the plan's param names it.
         bank: String,
-        /// Why the planes do not fit it.
         why: String,
     },
 
-    /// A shared adapter the mount, manifest or model text refuses — missing
-    /// file, directory, or plane mismatch.
     Blob {
-        /// The adapter, as the bind spelled it.
         path: String,
-        /// What is wrong with it.
         why: String,
     },
 
-    /// Every adapter slot this load's banks seat is pinned by a live bind.
-    /// A refusal, not an eviction: a slot in flight is never taken back.
     AdapterSlots {
-        /// How many slots the banks seat.
         seats: u32,
     },
 
-    /// A quantity the ICB would rewrite per fire, and no affine law
-    /// (`v = base + sum(slope*axis)`) predicts it.
     Unaffine {
-        /// The slot, in walk order — which is dispatch order and ICB index.
         slot: u32,
-        /// The shader point standing in that slot.
         point: String,
-        /// Which component of it: a grid axis, a threadgroup axis, or an
-        /// argument index.
         at: String,
-        /// What the fit saw.
         why: String,
     },
 
-    /// Two synthetic descriptors did not walk the same template (slots,
-    /// order, argument indices), so no single ICB can serve both.
     Unstructured {
-        /// Where the two recordings first disagree.
         slot: u32,
-        /// How.
         why: String,
     },
 
-    /// The plan names something this shell bound no seat for.
     Unbound {
-        /// What went unbound.
         what: String,
     },
 
-    /// A residency this shell cannot arrange (`crate::experts`). A
-    /// sentence, not fields — the shapes share no arithmetic. Lifts to
-    /// `Error::Impossible`, never `Exhausted` (freeing memory doesn't help).
     Residency(String),
 
-    /// A capturing lane in a fire whose loaded artifact declares no capture
-    /// arm.
     Scoreless {
-        /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane whose fact word and whose capture ask disagree: the word's
-    /// class decides whether the lane's rows fall inside the capture window.
     ScoreWord {
-        /// The lane, in submission order.
         lane: u32,
-        /// The word the caller stamped.
         word: u64,
-        /// Whether the word's class runs the capture arm.
         runs_capture_arm: bool,
     },
 
-    /// A streamed load whose backing temp-file mapping failed. Named
-    /// separately from [`Fault::Load`]: the checkpoint is innocent here.
     Backing {
-        /// Which call refused: `open`, `size` or `map`.
         step: &'static str,
-        /// How many bytes of streamed source the plan asked to back.
         bytes: u64,
-        /// The OS's own sentence.
         why: String,
     },
 
-    /// An artifact this shell could not map, could not bind zero-copy, or
-    /// was asked to write through — a mapped reservation is `PROT_READ`.
     Mapped {
-        /// Which call refused — `open`, `stat`, `size`, `map`, `bind` — or
-        /// the method a read-only reservation refused: `write`, `zero_span`.
         step: &'static str,
-        /// The artifact, as the caller named it.
         what: String,
-        /// The OS's, Metal's, or this shell's own sentence.
         why: String,
     },
 
-    /// A serving artifact this deployment is not the one for — the
-    /// `pie.serving/1` stamp gate, refused before any device byte is
-    /// reserved. A sentence, not fields; shared wording with the CUDA shell.
     Recipe(String),
 }
 
 impl Fault {
-    /// One guest-program refusal, named where it happened.
     #[must_use]
     pub(crate) fn program(at: &'static str, why: impl Into<String>) -> Fault {
         Fault::Program {
@@ -471,7 +340,6 @@ impl fmt::Display for Fault {
                 "the artifact `{what}` is served from its own mapped pages and does not \
                  `{step}`: {why}"
             ),
-            // Forwarded whole: the string already names its own subject.
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
@@ -550,25 +418,14 @@ impl From<eta_exec::Error> for Fault {
     }
 }
 
-
-/// What every fallible entry in this shell answers.
 pub type Result<T> = std::result::Result<T, Fault>;
 
-/// A kernel entry's refusal, reaching a shell path that answers [`Fault`]
-/// directly (weight staging, control launches, scratch work) rather than
-/// through the dispatch contract.
 impl From<kernels_metal::Error> for Fault {
     fn from(error: kernels_metal::Error) -> Self {
         Fault::from(kernel(error))
     }
 }
 
-// The seam: this backend's refusal, said in the contract's words.
-
-/// Say a [`kernels_metal::Error`] in the dispatch contract's words. A
-/// function, not a `From` impl, since both types are foreign here (orphan
-/// rule). The match is deliberately total so a new variant fails to compile
-/// rather than being silently dropped.
 pub fn kernel(error: kernels_metal::Error) -> KernelError {
     match error {
         kernels_metal::Error::Unsupported { op } => KernelError::Unsupported { op },

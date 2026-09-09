@@ -1,6 +1,3 @@
-//! Recurrent-state mixers — causal conv, gated delta nets, KDA. Chunked
-//! forms are the prefill path: one scan per request instead of per token.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -11,19 +8,12 @@ const CONV_GROUP: u32 = 256;
 
 const SCAN_WIDTH: u32 = 128;
 
-/// Metal file holding the register scan stamped by `gdn_scan_points!`.
 const GDN_SCAN_FILE: &str = "attn/ssm_gdn_scan.metal";
 
-/// The only lane count `ssm_gdn_scan.metal` is stamped at: one simdgroup, so
-/// the shuffle tree needs no barrier. Any other tuned value falls back to
-/// [`gated_delta_chunked`]'s untemplated kernel.
 const GDN_SCAN_LANES: u32 = 32;
 
-/// Lane groups per threadgroup — four simdgroups, 128 threads, which is the
-/// threadgroup the reference launches this shape at.
 const GDN_SCAN_TG_ROWS: u32 = 4;
 
-/// The widest head row a scan stages in threadgroup memory.
 const SCAN_HEAD_MAX: u32 = 256;
 
 fn conv_grid(channels: u32, rows: u32) -> Grid {
@@ -34,10 +24,6 @@ const fn recurrence_grid(heads: u32, rows: u32) -> Grid {
     Grid::of([SCAN_WIDTH, heads, rows], [SCAN_WIDTH, 1, 1])
 }
 
-/// Every (VROWS, PER) point the register scan is stamped at, as literal
-/// entry names and stamps, for the plain scan and for its committed twin.
-/// `PER` is `k_dim / 32` (head widths 64/128/256); `VROWS` is
-/// [`crate::tuning::DeviceTuning::gdn_scan_rows`].
 macro_rules! gdn_scan_points {
     ($(($v:literal, $p:literal)),+ $(,)?) => {
         fn gdn_scan_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
@@ -96,11 +82,6 @@ gdn_scan_points!(
     (8, 8),
 );
 
-/// The register scan's point and geometry, or `None` to fall back to the
-/// threadgroup kernel (shapes the register scan was not stamped for).
-///
-/// Launch is one lane group (one simdgroup) per `VROWS` value rows:
-/// threads `[32, v_dim / VROWS, requests * v_heads]`, threadgroup `[32, 4, 1]`.
 fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'static str, Grid)> {
     let tuned = crate::tuning::current();
     if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
@@ -109,8 +90,6 @@ fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'stat
     gdn_scan_launch_at(shape, requests, tuned.gdn_scan_rows, gdn_scan_point)
 }
 
-/// The one-token step's point and geometry — [`gdn_scan_launch`]'s over
-/// `rows` independent tokens, one bank apiece.
 fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'static str, Grid)> {
     let tuned = crate::tuning::current();
     if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
@@ -119,8 +98,6 @@ fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'sta
     gdn_scan_launch_at(shape, rows, tuned.gdn_scan_rows, gdn_scan_step_point)
 }
 
-/// The committed scan's point and geometry — [`gdn_scan_launch`]'s, with
-/// the run's rows walked from the committed tables rather than the CSR alone.
 fn gdn_scan_committed_launch(
     shape: &Delta,
     lanes: u32,
@@ -132,9 +109,6 @@ fn gdn_scan_committed_launch(
     gdn_scan_launch_at(shape, lanes, tuned.gdn_scan_rows, gdn_scan_committed_point)
 }
 
-/// [`gdn_scan_launch`] with the fold stated rather than read, so a test can
-/// reach a fold this machine's table does not name; `point` names the stamp
-/// family (the plain scan or its committed twin).
 fn gdn_scan_launch_at(
     shape: &Delta,
     requests: u32,
@@ -146,8 +120,6 @@ fn gdn_scan_launch_at(
     }
     let (entry, stamp) = point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
     let row_groups = shape.v_dim / vrows;
-    // Threadgroup row extent must divide row_groups: this scan is a
-    // read-modify-write, so a spare lane group sharing a row is wrong, not wasteful.
     let tg_rows = if row_groups % GDN_SCAN_TG_ROWS == 0 {
         GDN_SCAN_TG_ROWS
     } else {
@@ -174,7 +146,6 @@ fn head_width(op: &'static str, width: u32, what: &'static str) -> Result<(), Er
     Ok(())
 }
 
-/// Request count a ragged fire spans: indptr is `[lanes + 1]`.
 fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     if x.indptr.dtype != Dtype::I32 {
         return Err(refuse(
@@ -191,7 +162,6 @@ fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     }
 }
 
-/// The gated-delta shape: four stated head numbers against the fused rows.
 struct Delta {
     k_heads: u32,
 
@@ -246,7 +216,6 @@ impl Delta {
     }
 }
 
-/// The KDA shape: two stated head numbers against the mixed rows.
 struct Kda {
     heads: u32,
 
@@ -288,8 +257,6 @@ impl Kda {
     }
 }
 
-/// History a dilated convolution keeps: `(conv_width − 1)·dilation + 1` rows
-/// of channels. Also the state-bank slab stride the shader indexes by.
 fn conv_history(op: &'static str, conv_width: u32, dilation: u32) -> Result<u32, Error> {
     nonzero(op, "the conv width this statement states", conv_width)?;
     nonzero(op, "the dilation this statement states", dilation)?;
@@ -344,8 +311,6 @@ pub fn causal_conv1d(
     )
 }
 
-/// Prefill form: walks the fire's request boundaries, one threadgroup row
-/// per request.
 pub fn causal_conv1d_chunked(
     ctx: &Ctx<'_>,
     x: RaggedTensor,
@@ -388,7 +353,6 @@ pub fn causal_conv1d_chunked(
     )
 }
 
-/// Folds `ba` with the dt bias and A-log into per-head decay gates.
 pub fn gdn_prep(
     ctx: &Ctx<'_>,
     ba: Tensor,
@@ -428,7 +392,6 @@ pub fn gdn_prep(
     )
 }
 
-/// `z` is unread here; this shader gates afterwards via `elementwise.rmsnorm_gated`.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
     ctx: &Ctx<'_>,
@@ -449,9 +412,6 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
-    // The register scan's one-token step for stamped shapes: the same body
-    // the prefill scan and the committed scan run, so a plain decode lands
-    // the bits a speculative window's verify lands (`ssm_gdn_scan.metal`).
     if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
@@ -468,9 +428,6 @@ pub fn gated_delta(
             ],
         );
     }
-    // The value columns of one (head, row) split across threadgroups down
-    // z, 32 columns each (a simdgroup a column, four simdgroups a group, so
-    // eight turns), so a one-row fire still spreads a head over the device.
     let splits = (shape.v_dim / 32).max(1);
     let grid = Grid::of(
         [SCAN_WIDTH, shape.v_heads, rows.saturating_mul(splits)],
@@ -493,7 +450,6 @@ pub fn gated_delta(
     )
 }
 
-/// Prefill form of [`gated_delta`]: one scan per request.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked(
     ctx: &Ctx<'_>,
@@ -526,8 +482,6 @@ pub fn gated_delta_chunked(
         stated(OP, shape.k_dim)?.arg(),
         stated(OP, shape.v_dim)?.arg(),
     ];
-    // Register scan for stamped shapes: same operands/recurrence, but the
-    // cell stays in registers and per-token folds are simdgroup shuffles.
     if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
@@ -581,7 +535,6 @@ pub fn kda_step(
     )
 }
 
-/// Prefill form of [`kda_step`]: one scan per request.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked(
     ctx: &Ctx<'_>,
@@ -624,10 +577,6 @@ pub fn kda_chunked(
     )
 }
 
-/// [`kda_chunked`] over the extended run, on a work copy of each lane's
-/// bank, persisting the bank as of the lane's `commit`
-/// ([`gated_delta_committed`]'s twin). `work` is
-/// `[fire lanes][heads][head_dim][head_dim]` f32.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_committed(
     ctx: &Ctx<'_>,
@@ -681,7 +630,6 @@ pub fn kda_committed(
 mod tests {
     use super::*;
 
-    // qwen3.6-27B's gated-delta shape.
     const D27B: Delta = Delta {
         k_heads: 16,
         v_heads: 48,
@@ -689,10 +637,13 @@ mod tests {
         v_dim: 128,
     };
 
+    fn ssm_every_case() {
+        the_three_scans_share_one_geometry();
+        a_shape_the_stamp_does_not_name_falls_back();
+    }
+
     #[test]
     fn the_three_scans_share_one_geometry() {
-        // qwen3.6-27B at the tuned fold of four rows: PER = 128 / 32 = 4,
-        // 32 row groups a head, one (lane, head) pair down z.
         let plain = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_point).expect("stamped");
         let step = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_step_point).expect("stamped");
         let committed = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_committed_point).expect("stamped");
@@ -705,46 +656,28 @@ mod tests {
         assert_eq!(plain.2, Grid::of([32, 32, 3 * 48], [32, 4, 1]));
     }
 
-    #[test]
     fn a_shape_the_stamp_does_not_name_falls_back() {
-        // k_dim not divisible by 32 lanes.
         let odd = Delta {
             k_dim: 100,
             ..D27B
         };
         assert!(gdn_scan_launch(&odd, 1).is_none());
-        // Divides evenly but PER=16 is outside the stamped packs (max 8).
         let deep = Delta {
             k_dim: 512,
             ..D27B
         };
         assert!(gdn_scan_launch(&deep, 1).is_none());
-        // v_dim not divisible by the fold width.
         let ragged = Delta { v_dim: 66, ..D27B };
         assert!(gdn_scan_launch(&ragged, 1).is_none());
     }
 
 }
 
-
-// ── the committed arm ──────────────────────────────────────────────────────
-//
-// The buffered recurrence's launches (`engine_metal::rs`): the same conv and
-// scan over an EXTENDED row run — buffered tokens replayed ahead of each
-// lane's own rows — with the state persisted only as far as each lane's
-// `commit`. The tables are the fire's, indexed at `lane0 + r`; the CSR is the
-// window's own.
-
-/// The per-lane tables a committed launch reads, fire-wide, at `lane0 + r`.
 #[derive(Clone, Copy, Debug)]
 pub struct Committed {
-    /// `i32`, `[fire lanes]`: buffered rows replayed ahead of each lane's own.
     pub replay: Tensor,
-    /// `i32`, `[fire lanes]`: rows (of the extended run) whose state persists.
     pub commit: Tensor,
-    /// `i32`, `[fire lanes]`: which bank each lane owns.
     pub slots: Tensor,
-    /// The window's first fire lane.
     pub lane0: u32,
 }
 
@@ -761,8 +694,6 @@ fn committed_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
     }
 }
 
-/// [`causal_conv1d_chunked`] over the extended run, persisting each lane's
-/// state as of its `commit`. `x` and `y` hold the extended rows end to end.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d_committed(
     ctx: &Ctx<'_>,
@@ -805,9 +736,6 @@ pub fn causal_conv1d_committed(
     )
 }
 
-/// [`gated_delta_chunked`] over the extended run, on a work copy of each
-/// lane's bank, persisting the bank as of the lane's `commit`. `work` is
-/// `[fire lanes][v_heads][v_dim][k_dim]` f32.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_committed(
     ctx: &Ctx<'_>,
@@ -829,10 +757,6 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
-    // The register scan for stamped shapes (`ssm_gdn_scan.metal`, the
-    // committed twin): the state stays in registers for the whole run, so
-    // there is no `work` carry to hand it. Over a sixteen-row window on the
-    // 27B this is the difference between 590 and ~40 us a layer.
     if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
@@ -853,7 +777,6 @@ pub fn gated_delta_committed(
             ],
         );
     }
-    // As `gated_delta`: a head's columns split across threadgroups down z.
     let splits = (shape.v_dim / 32).max(1);
     let grid = Grid::of(
         [SCAN_WIDTH, shape.v_heads, lanes.saturating_mul(splits)],

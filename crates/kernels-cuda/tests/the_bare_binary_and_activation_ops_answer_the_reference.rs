@@ -1,8 +1,3 @@
-//! `binary::{add, mul}` and `activation::{silu, gelu_tanh, tanh}` answer an
-//! f32 host reference, and each may write the rectangle it read.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_bare_binary_and_activation_ops_answer_the_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -30,6 +25,11 @@ fn close(got: f32, want: f32, what: &str, at: usize) {
         (got - want).abs() <= 1e-6 + want.abs() / 128.0,
         "{what} at {at}: {got} against {want}"
     );
+}
+
+fn the_bare_binary_and_activation_ops_answer_the_reference_every_case() {
+    the_bare_ops_answer_the_reference();
+    each_may_write_the_rectangle_it_read();
 }
 
 #[test]
@@ -62,7 +62,6 @@ fn the_bare_ops_answer_the_reference() {
     }
 }
 
-#[test]
 fn each_may_write_the_rectangle_it_read() {
     let mut lcg = Lcg::seeded(0xa11a52);
     let (x_raw, x) = lcg.row(N);

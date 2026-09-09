@@ -55,17 +55,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 INFERLET = os.path.join(REPO, "tests/inferlets/zimage-vae-parity")
 
-# The parity gate. The contract's own figure for this reading.
 COS_TOL = 0.999
-# The reference's own bf16 distance on these pixels, as a sanity ceiling on
-# the mean absolute error; a run that is cosine-close but scaled wrong would
-# pass the first and fail this.
 ABS_TOL = 0.05
-
-
-# ----------------------------------------------------------------------------
-# the golden
-# ----------------------------------------------------------------------------
 
 def f32s(path: str) -> list[float]:
     with open(path, "rb") as f:
@@ -73,7 +64,6 @@ def f32s(path: str) -> list[float]:
     if len(raw) % 4:
         raise SystemExit(f"{path}: {len(raw)} bytes is not whole f32")
     return list(struct.unpack(f"<{len(raw) // 4}f", raw))
-
 
 def shapes(golden: str) -> dict:
     path = os.path.join(golden, "shapes.json")
@@ -83,11 +73,6 @@ def shapes(golden: str) -> dict:
             f"first (see scripts/imagegen/README.md)."
         )
     return json.load(open(path))
-
-
-# ----------------------------------------------------------------------------
-# case
-# ----------------------------------------------------------------------------
 
 def case(args) -> str:
     """The golden latent as the inferlet's case JSON.
@@ -132,11 +117,6 @@ def case(args) -> str:
     )
     return path
 
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
-
 def wasm() -> str:
     """The newest `.wasm` a build left for the fixture, building one first.
 
@@ -161,12 +141,7 @@ def wasm() -> str:
         raise SystemExit(f"no wasm; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
-
-# The case is handed over as argv PIECES: one 64x64x16 latent is ~700 KB of
-# JSON, well past the kernel's 128 KiB ceiling on a single argument but fine
-# split sixteen ways, and this needs no sandbox filesystem.
 PIECES = 16
-
 
 def pieces(text: str, n: int = PIECES) -> list[str]:
     """Split `text` into `n` argv pieces, each starting with a comma.
@@ -186,14 +161,11 @@ def pieces(text: str, n: int = PIECES) -> list[str]:
         comma = text.find(",", at)
         cuts.append(len(text) if comma < 0 else comma)
     cuts.append(len(text))
-    # A degenerate split (a case with fewer commas than pieces) drops the
-    # empties rather than sending them.
     out = [text[a:b] for a, b in zip(cuts, cuts[1:]) if b > a]
     assert "".join(out) == text, "the pieces do not reassemble the case"
     for piece in out[1:]:
         assert piece.startswith(","), "a piece starts with something `pie run` may read as a flag"
     return out
-
 
 def run(args) -> None:
     path = os.path.join(args.out, "case.json")
@@ -221,8 +193,6 @@ def run(args) -> None:
     if args.png:
         cmd += ["--png", args.png]
     if not args.no_pixels:
-        # As a FILE, not a field: 512² of RGB is 786 432 numbers, which is
-        # past what the worker link will carry in one answer document.
         cmd += ["--pixels_file", "true"]
     print(f"[run] {' '.join(cmd[:6])} ... ({len(parts)} case pieces)")
     done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
@@ -237,7 +207,6 @@ def run(args) -> None:
         raise SystemExit(f"pie run failed ({done.returncode}); see {out[:-5]}.stderr")
     print(f"[run] -> {out}")
 
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -250,11 +219,6 @@ def document(path: str) -> dict:
         doc = json.loads(doc)
     return doc
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
 def score(got: list[float], want: list[float]) -> tuple[float, float, float]:
     """Cosine, mean |err|, max |err| — the same three the engine gate prints."""
     dot = sum(a * b for a, b in zip(got, want))
@@ -264,14 +228,10 @@ def score(got: list[float], want: list[float]) -> tuple[float, float, float]:
     errs = [abs(a - b) for a, b in zip(got, want)]
     return cos, sum(errs) / max(len(errs), 1), max(errs, default=0.0)
 
-
 def compare(args) -> int:
     doc = document(os.path.join(args.out, "pie.json"))
     meta = shapes(args.golden)
     want = f32s(os.path.join(args.golden, "pixels.f32"))
-    # The rows come back as a FILE when the run asked for them that way (a
-    # 512x512 picture is far past an answer document); the field is the
-    # small-case door.
     got = doc.get("pixels") or []
     if not got and doc.get("pixels_bytes"):
         dump = os.path.join(args.png_dir, "file-0000.bin")
@@ -320,9 +280,6 @@ def compare(args) -> int:
     )
     return 0 if ok else 1
 
-
-# ----------------------------------------------------------------------------
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,7 +305,6 @@ def main() -> int:
     if args.stage in ("compare", "all"):
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

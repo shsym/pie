@@ -1,7 +1,3 @@
-//! Program registry: decodes, binds, and prices ETA programs once, cached by
-//! `container_hash`; the engine ships the typed [`RegisteredProgram::launch`]
-//! package rather than raw container bytes.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -18,59 +14,29 @@ use eta_ir::registry::{ModelProfile, Port};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
 use lru::LruCache;
 
-/// Registration-time pricing: per-instance costs computed once per program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pricing {
-    /// Per-instance channel arena bytes: `Σ channel numel × elem_size ×
-    /// (capacity + 1)` (a capacity-N channel lowers to a ring of N+1 cells).
     pub channel_bytes: u64,
-    /// Number of declared channels.
     pub num_channels: usize,
-    /// Row count used to size stage buffers: from the readout port if
-    /// present, else the embed indptr's lane count, else 1.
     pub rows: u32,
 }
 
-/// The interned, immutable artifact for one distinct registered ETA program.
 #[derive(Debug)]
 pub struct RegisteredProgram {
-    /// Canonical container bytes (the host→engine wire artifact).
     pub bytes: Vec<u8>,
-    /// `container_hash(bytes)` — the program-set identity and cache key.
     pub hash: u64,
-    /// The validated, typed artifact.
     pub bound: BoundTrace,
-    /// Compiler-owned normalized stages, signatures, and region partitions —
-    /// input to [`Self::launch`], [`Self::region_analysis`], and emission.
     pub compiled_stages: Vec<CompiledStage>,
-    /// Backend source generated for this program, keyed by the backend an
-    /// engine advertised. Generated lazily and cached: generation is tens of
-    /// kilobytes per region, and a program registers once but binds many times.
     emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
-    /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
-    /// True when any stage materializes `IntrinsicId::AttnScore` — the sole
-    /// signal that a lane captures attention scores (no port or flag for it).
     pub reads_attn_score: bool,
-    /// True when any stage materializes `IntrinsicId::MtpLogits` — the sole
-    /// signal that a lane drafts (`Lane::drafts`), which is what selects the
-    /// model text's draft arm for the lane's rows.
     pub reads_mtp_logits: bool,
-    /// This program in the shape an engine executes it, built on first use.
-    /// See [`Self::launch`].
     launch: std::sync::OnceLock<LaunchPackage>,
-    /// Static geometry-derivability taint, and the per-pass shadow fold
-    /// schedule derived from it. Both are functions of `bound` alone; derived
-    /// once since many instances share one registered program.
     geometry_taint: std::sync::OnceLock<eta_compiler::eval::pareval::GeometryTaint>,
     shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
-    /// Registration-time pricing. `Pricing::rows` is read at bind
-    /// (`engine::BindExtents::sampled_rows`) rather than re-derived there.
     pub pricing: Pricing,
 }
 
-/// The generated kernels for one backend, plus the emitter version an engine's
-/// compile cache must key on.
 #[derive(Debug)]
 pub struct EmittedProgram {
     pub emitter_version: u32,
@@ -78,24 +44,17 @@ pub struct EmittedProgram {
 }
 
 impl RegisteredProgram {
-    /// This program in the shape an engine executes it: typed records rather
-    /// than a wire format the engine would need to parse.
     pub fn launch(&self) -> &LaunchPackage {
         self.launch.get_or_init(|| {
             eta_compiler::codegen::launch::build(&self.bound, &self.compiled_stages)
         })
     }
 
-    /// Whether the host can derive this program's submission geometry, and
-    /// which channels the device decides. Derived once — see the field.
     pub fn geometry_taint(&self) -> &eta_compiler::eval::pareval::GeometryTaint {
         self.geometry_taint
             .get_or_init(|| eta_compiler::eval::pareval::geometry_taint(&self.bound))
     }
 
-    /// The per-pass fold schedule every instance's [`HostShadow`] runs.
-    ///
-    /// [`HostShadow`]: crate::pipeline::fire::shadow::HostShadow
     pub fn shadow_plan(&self) -> Arc<crate::pipeline::fire::shadow::ShadowPlan> {
         Arc::clone(self.shadow_plan.get_or_init(|| {
             Arc::new(crate::pipeline::fire::shadow::ShadowPlan::derive(
@@ -104,20 +63,10 @@ impl RegisteredProgram {
         }))
     }
 
-    /// Per-region decisions the CUDA engine needs at bind time (gates and the
-    /// intrinsic side-table layout) — computed here so codegen doesn't answer
-    /// the same question twice.
     pub fn region_analysis(&self) -> Vec<RegionAnalysis> {
         eta_compiler::codegen::cuda::region_analysis::analyze_program(&self.compiled_stages)
     }
 
-    /// Backend source for this program, generated on first ask and cached.
-    ///
-    /// `backend` is what the engine advertised in
-    /// `EngineCapabilities::codegen_backend`; an unrecognised name means the
-    /// engine generates its own kernels, and nothing is emitted. That is what
-    /// lets the CUDA and Metal engines move off their in-engine emitters
-    /// independently.
     pub fn emitted(&self, backend: &str) -> Option<Arc<EmittedProgram>> {
         let backend = Backend::parse(backend)?;
         let mut cache = self.emitted.lock().unwrap();
@@ -130,7 +79,6 @@ impl RegisteredProgram {
     }
 }
 
-/// A registration failure — surfaces the validator/decoder's own message.
 #[derive(Debug)]
 pub enum RegisterError {
     Decode(ContainerDecodeError),
@@ -151,11 +99,8 @@ impl fmt::Display for RegisterError {
 }
 impl std::error::Error for RegisterError {}
 
-/// Default bound: distinct-program churn must not grow the registry without
-/// limit. Traces are small; this is generous.
 pub const DEFAULT_CAPACITY: usize = 256;
 
-/// A bounded LRU of registered ETA programs, keyed by `container_hash`.
 pub struct Registry {
     inner: LruCache<u64, Arc<RegisteredProgram>>,
 }
@@ -167,9 +112,6 @@ impl Registry {
         }
     }
 
-    /// Register `bytes` against `profile`: hash-deduped; on a miss, decode + bind
-    /// (validator is authoritative) + price once. Identical container bytes share
-    /// one `Arc`.
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
@@ -208,7 +150,6 @@ impl Registry {
         Ok(entry)
     }
 
-    /// Whether any stage materializes the attention-score rectangle.
     fn reads_attn_score(container: &TraceContainer) -> bool {
         container.stages.iter().any(|stage| {
             stage.ops.iter().any(|op| {
@@ -223,9 +164,6 @@ impl Registry {
         })
     }
 
-    /// Whether any stage materializes the draft head — its step-0 logits
-    /// (`MtpLogits`) or its argmax chain (`MtpDrafts`); either one makes the
-    /// lane a drafting lane.
     fn reads_mtp_logits(container: &TraceContainer) -> bool {
         container.stages.iter().any(|stage| {
             stage.ops.iter().any(|op| {
@@ -266,26 +204,21 @@ impl Registry {
         accesses
     }
 
-    /// Probe by identity hash (a hit bumps LRU recency).
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
 }
 
-/// Compute registration-time pricing from the decoded container.
 fn price(c: &TraceContainer) -> Pricing {
     let channel_bytes = c
         .channels
         .iter()
         .map(|ch| {
             let elem = container::const_elem_size(ch.dtype.program_dtype()) as u64;
-            let cells = (ch.capacity as u64) + 1; // ring of N+1 cells
+            let cells = (ch.capacity as u64) + 1;
             ch.shape.numel() * elem * cells
         })
         .sum();
-    // Prefer the readout port's row count (the `SampledRows` extent shared by
-    // `Port::Readout` and `IntrinsicId::Logits`); fall back to the embed
-    // indptr's lane count for a container that states no readout.
     let port_len = |port| {
         c.ports
             .iter()
@@ -298,11 +231,6 @@ fn price(c: &TraceContainer) -> Pricing {
                     .map(|decl| decl.shape.numel() as u32),
             })
     };
-    // A float lane's program (design D1) binds neither port: its read-out
-    // rows are the leading extent of the `velocity()` / `hidden()` /
-    // `pixels()` / `logits()` value it materializes, sized by the SDK from
-    // the latents port's rows — or, for a VAE reading (D8), from the clip
-    // the guest states, which is what a pixels epilogue reads back.
     let intrinsic_rows = || {
         c.stages
             .iter()
@@ -324,7 +252,6 @@ fn price(c: &TraceContainer) -> Pricing {
     let rows = port_len(eta_ir::registry::Port::Readout)
         .map(|readout| readout.max(1))
         .or_else(|| {
-            // A CSR of `lanes + 1` bounds, so the lane count is one less.
             port_len(eta_ir::registry::Port::EmbedIndptr)
                 .map(|indptr| indptr.saturating_sub(1).max(1))
         })
@@ -336,8 +263,6 @@ fn price(c: &TraceContainer) -> Pricing {
         rows,
     }
 }
-
-// Process-wide registry
 
 use std::sync::{LazyLock, MutexGuard};
 
@@ -351,7 +276,6 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Register into the process-wide registry. See [`Registry::register`].
 pub fn register(
     bytes: Vec<u8>,
     profile: &ModelProfile,
@@ -359,40 +283,26 @@ pub fn register(
     global().register(bytes, profile)
 }
 
-/// Probe the process-wide registry by identity hash. Only the `#[cfg(test)]`
-/// `instance::instantiate` path probes by hash; production carries the
-/// `Arc<RegisteredProgram>` from `register`.
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
 }
 
-/// Attach the host-generated kernels and region analysis an engine reads, if
-/// this engine reads them and the caller did not already supply them.
-///
-/// Generation is memoised per program per backend, so a re-registration costs
-/// a lookup. Borrowed back unchanged when there is nothing to attach.
 #[must_use]
 pub fn with_host_codegen<'a>(
     plan: &'a ::engine::ProgramRegistration,
     engine_backend: Option<&str>,
 ) -> std::borrow::Cow<'a, ::engine::ProgramRegistration> {
-    // Must be the engine's own answer, not derived from `Engine::kind()`:
-    // "metal" parses as a codegen backend, but a Metal engine may still run
-    // its own emitter (see `Engine::codegen_backend`).
     let Some(backend) = engine_backend.filter(|name| Backend::parse(name).is_some()) else {
         return std::borrow::Cow::Borrowed(plan);
     };
     let registered = lookup(plan.program_hash);
 
-    // The engine carries no emitter, so a fused region with no host source is
-    // a registration failure rather than a slower path.
     let emitted = plan
         .emitted_kernels
         .is_empty()
         .then(|| registered.as_ref()?.emitted(backend))
         .flatten();
 
-    // Region analysis only means something to the CUDA emitter's own kernels.
     let region_analysis = if plan.region_analysis.is_empty() && backend == "cuda" {
         registered
             .as_ref()
@@ -409,7 +319,6 @@ pub fn with_host_codegen<'a>(
     let mut next = plan.clone();
     if let Some(emitted) = emitted {
         next.emitter_version = emitted.emitter_version;
-        // EmittedKernel is the compiler's own record; carried directly.
         next.emitted_kernels = emitted.kernels.clone();
     }
     if !region_analysis.is_empty() {
@@ -418,9 +327,6 @@ pub fn with_host_codegen<'a>(
     std::borrow::Cow::Owned(next)
 }
 
-/// Build the bind-time [`ModelProfile`] from the loaded model. Model-gated
-/// intrinsics and second-party kernels default conservative until the model
-/// surfaces them.
 pub fn model_profile() -> ModelProfile {
     let m = crate::model::model();
     profile_from(
@@ -433,8 +339,6 @@ pub fn model_profile() -> ModelProfile {
     )
 }
 
-/// The pure caps -> profile mapping, split out so it is testable without a
-/// registered model.
 fn profile_from(
     vocab: u32,
     page_size: u32,
@@ -462,9 +366,6 @@ fn profile_from(
         velocity_width,
         has_pixels,
         pixels_width,
-        // Second-party kernels the backend advertises. `envelope_dot` is
-        // replayable (a pure function of the query and the page envelopes) and
-        // has no sink scope: it produces a value, it does not consume one.
         kernels: if eta.has_kv_envelopes {
             vec![eta_ir::registry::KernelInfo {
                 name: "envelope_dot".into(),
@@ -485,9 +386,6 @@ mod pricing_tests {
     use eta_ir::registry::Stage;
     use eta_ir::types::{Dtype, Shape};
 
-    /// A float lane's program binds no readout or embed port; its read-out
-    /// rows are the `velocity()` value's, so the engine's sampled-rows
-    /// extent is sized to the latent rows rather than to one.
     #[test]
     fn a_float_lane_is_priced_by_its_velocity_rows() {
         let container = TraceContainer {

@@ -90,9 +90,6 @@ impl OpParams {
             pred_tag: u32::from(op.pred_tag),
             lit_dtype: u32::from(wire_dtype(op.lit_dtype)),
             lit_bits: op.lit_bits,
-            // The device word keeps its own sentinel — `NO_CHANNEL = 0`, not
-            // `u32::MAX` — so the contract's `Option` unwraps into it here and
-            // the kernel-side encoding is byte-identical.
             channel_slot: op.channel.unwrap_or(NO_CHANNEL),
             intr: op.intrinsic.map_or(0, |intrinsic| intrinsic as u32),
             sink_bytes: 0,

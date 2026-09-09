@@ -1,18 +1,3 @@
-//! The voxel-axis reshapes: nearest upsample, pixel (un)shuffle, the
-//! patchify pair the DiT boundary names them by, and the averaging
-//! down-shuffle Wan 2.2's encoder shortcut is. Index arithmetic, one thread
-//! per output element, any 16-bit element; only [`avg_down`] does any
-//! arithmetic, and that is a mean in fp32.
-//!
-//! **CHANNEL ORDER.** The shuffles follow einops
-//! `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'` — `torch.pixel_shuffle`
-//! in two dimensions, and the transformer patchify
-//! `'b c (t pt) (h ph) (w pw) -> b (t h w) (c pt ph pw)'` inverted: within a
-//! block the offsets `(i1, i2, i3)` are the fast index under the channel,
-//! `c_in = c * r1*r2*r3 + (i1 * r2 + i2) * r3 + i3`. [`avg_down`] widens
-//! the row the same way and then folds runs of it, so the two agree on
-//! which elements a group holds.
-
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::spatial::{flat_elements, lane_pair};
@@ -26,12 +11,6 @@ fn element(op: &'static str, dtype: dtype::Dtype) -> Result<&'static str, Error>
     Ok(dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" }))
 }
 
-/// Nearest-neighbour upsample by `factor = [ft, fh, fw]`.
-///
-/// `x`: `[rows, C]`; `grid`/`o_grid`: the lane tables, the output box being
-/// `(t_out, h*fh, w*fw)` with `t_out = keep_first_frame ? 1 + (t-1)*ft :
-/// t*ft` — the causal video VAEs emit frame 0 once and every later frame
-/// `ft` times. `o`: `[rows_out, C]` at `x`'s width and dtype.
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx,
@@ -93,15 +72,6 @@ fn block_of(op: &'static str, r: [u32; 3]) -> Result<([i32; 3], u32), Error> {
     Ok((r, volume))
 }
 
-/// Depth to space: `[rows, C*r1*r2*r3]` over `(t, h, w)` into
-/// `[rows*r1*r2*r3, C]` over `(t*r1 - trim_t, h*r2, w*r3)`; `o_grid` states
-/// the output boxes.
-///
-/// `trim_t` is a causal temporal upsampler's ANCHOR DROP: the leading
-/// `trim_t` frames of the shuffled result are not emitted, so output frame
-/// `i` reads shuffled frame `i + trim_t` (LTX-2.5's `LTXVideoUpsampler3d`
-/// drops `r1 - 1`). `0` is the plain shuffle. `o` may over-allocate: only
-/// the rows `o_grid` claims are written, the rest land zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx,
@@ -152,9 +122,6 @@ pub fn pixel_shuffle(
     )
 }
 
-/// Space to depth, the inverse of [`pixel_shuffle`]: `[rows, C]` over
-/// `(t, h, w)` into `[rows/(r1*r2*r3), C*r1*r2*r3]` over `(t/r1, h/r2,
-/// w/r3)`. Every lane's box must divide by `r`.
 pub fn pixel_unshuffle(
     ctx: &Ctx,
     x: Tensor,
@@ -201,15 +168,6 @@ pub fn pixel_unshuffle(
     )
 }
 
-/// `AvgDown3D`: the time axis zero-padded IN FRONT to a multiple of `r[0]`,
-/// a channel-major space-to-depth by `r` ([`pixel_unshuffle`]'s ordering),
-/// then the MEAN of each `group` consecutive widened channels.
-///
-/// `x`: `[rows, C]`; `o`: `[rows_out, C*r1*r2*r3/group]` at `x`'s dtype,
-/// `o_grid` stating the `(ceil(t/r1), h/r2, w/r3)` boxes. `group == r1*r2*r3`
-/// is the plain average pool over the block; `group == r2*r3` is a spatial
-/// pool that keeps the time block as extra channels (Wan 2.2's every
-/// shortcut). fp32 accumulation, one rounding at the store.
 #[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx,
@@ -261,9 +219,6 @@ pub fn avg_down(
     )
 }
 
-/// `[rows, C]` voxels into `[tokens, C*pt*ph*pw]` patch tokens — the DiT
-/// boundary's name for [`pixel_unshuffle`] by the patch `p`; `o_grid` is
-/// the token box `(t/pt, h/ph, w/pw)` per lane.
 pub fn patchify(
     ctx: &Ctx,
     x: Tensor,
@@ -275,8 +230,6 @@ pub fn patchify(
     pixel_unshuffle(ctx, x, grid, p, o, o_grid)
 }
 
-/// `[tokens, C*pt*ph*pw]` back to `[rows, C]` voxels — [`pixel_shuffle`]
-/// by the patch `p`.
 pub fn unpatchify(
     ctx: &Ctx,
     x: Tensor,
@@ -285,6 +238,5 @@ pub fn unpatchify(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
-    // A patch grid never drops a frame: the DiT boundary is a reshape.
     pixel_shuffle(ctx, x, grid, p, 0, o, o_grid)
 }

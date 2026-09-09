@@ -15,9 +15,6 @@ __device__ __forceinline__ float silu_f(float z) {
     return z / (1.f + __expf(-z));
 }
 
-// What a conv tap lands: the recurrent mixers' `silu(acc)`; Inkling's short
-// convolution the raw sum with the token's own input added back
-// (`x + conv(x)`, in fp32 before the one rounding).
 template <bool SILU, bool RESIDUAL>
 __device__ __forceinline__ float conv_out(float acc, float x_t) {
     if constexpr (RESIDUAL) {
@@ -137,40 +134,15 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     const int r = blockIdx.y;
     if (c >= C) return;
 
-    // **THE STAGED-GEOMETRY SEAT, ON THE LANE AXIS** (the chunked-arm wave).
-    // This grid counts REQUESTS, not rows, so the word that retires a ceiling
-    // grid's padding is `win[2]` — the window's live LANE count — and not
-    // `win[0]`, which is its row count and belongs to the row-gridded entries.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
-    // **AND THE LANE SPLIT, WHICH IS THIS WAVE'S CRUX.** Two kinds of per-lane
-    // vector arrive here and they are indexed DIFFERENTLY:
-    //
-    //   * `qo_indptr` is the WINDOW'S OWN CSR — rebased, staged into the
-    //     fixed-stride window blob at an address a body may bake — so it is
-    //     read at the window-local ordinal `r` and at nothing else.
-    //   * `slot_ids`, `write_state_mask`, `commit_len` and `begin_at` are the
-    //     FIRE'S tables, handed over whole under a plane base
-    //     (`Run::recurrent_absolute`) because `lane_offset` is not a function
-    //     of a body key and a sliced pointer would be stale on every replay
-    //     but its recording one. Those are read at `r + win[3]`.
-    //
-    // Unarmed, `rl == r` and the tables arrive sliced, which is the launch
-    // this kernel has always made.
+
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    // And the ROW axis, for the two planes: `x` and `y` are the fire's
-    // activations, handed as PLANE bases under an armed seat, while the CSR
-    // above counts from the window's zero. `win[1]` is the bridge, added once,
-    // at the pointer.
+
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
 
     int t0 = static_cast<int>(qo_indptr[r]);
     int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
 
-    // THE SEGMENT THIS LAUNCH OWNS (the 2R split): `begin_at` cuts the front
-    // and `commit_len` cuts the back, and the two are never bound together —
-    // the head runs `[0, n)` and folds, the tail runs `[n, rows)` and does
-    // not. The front cut moves the row origin, so every index below is the
-    // segment's own.
     if (begin_at != nullptr) {
         int b = begin_at[rl];
         if (b > Nr) b = Nr;
@@ -182,8 +154,6 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     }
     if (Nr <= 0) return;
 
-    // The state slab is addressed by the slot's VALUE — a bank id, not a
-    // position in this fire — so it is never shifted by anything here.
     const int slot = slot_ids[rl];
     if (slot < 0) return;
     const T* x_r = x + (long long)(t0 + row0) * C;
@@ -249,11 +219,6 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     const int r = blockIdx.y;
     if (c >= C) return;
 
-    // The seat, the lane split and the row bridge — the per-channel form
-    // above carries the whole argument, and this arm differs only in how it
-    // tiles the channels. `win[2]` retires the padded lanes, `win[3]` turns
-    // this window's request number into a fire lane for the fire-wide tables,
-    // the window's own CSR stays on `r`, and `win[1]` shifts the two planes.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
@@ -261,7 +226,6 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     int t0 = static_cast<int>(qo_indptr[r]);
     int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
 
-    // The segment this launch owns — see the per-channel form above.
     if (begin_at != nullptr) {
         int b = begin_at[rl];
         if (b > Nr) b = Nr;
@@ -273,7 +237,6 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     }
     if (Nr <= 0) return;
 
-    // Addressed by the slot's VALUE, so never shifted.
     const int slot = slot_ids[rl];
     if (slot < 0) return;
     const T* x_r = x + static_cast<long long>(t0 + row0) * C;
@@ -331,14 +294,9 @@ __global__ void ssm_causal_conv1d_update_batched(
     const u32* __restrict__ win)
 {
     const int r = blockIdx.y;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns — the
-    // channel row in and the channel row out. The slot table is the LANES',
-    // and a lane ordinal is not a row.
+
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= R || c >= C) return;
@@ -374,9 +332,6 @@ __global__ void ssm_causal_conv1d_update_batched(
     state[span * C + c] = Elem<T>::from_f32(new_x);
 }
 
-// Eight channels per thread, dilation 1: the row, the window and the
-// weights move as 16-byte vectors, every read issued before any arithmetic,
-// and the shift is written back from the window already in registers.
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_update_batched_vec8(
     const T* __restrict__ x,
@@ -411,7 +366,7 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     if (bias != nullptr) {
         bv.raw = *reinterpret_cast<const uint4*>(bias + c0);
     }
-    // `weight` is `[C][K]`: this thread's eight channels are `K` vectors.
+
     Vec wv[K_MAX];
     const uint4* w = reinterpret_cast<const uint4*>(weight + (long long)c0 * K);
     #pragma unroll
@@ -483,9 +438,7 @@ __global__ void repeat_interleave_heads_fp32(
     const u32* __restrict__ win)
 {
     const int n   = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int h_v = blockIdx.y;
     const int d   = threadIdx.x;
@@ -569,14 +522,9 @@ __global__ void ssm_gdn_prep_qk_norm(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The
-    // projection is read there; the two normed planes it lands in are the
-    // fire's own scratch, which starts at its own zero.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
@@ -662,13 +610,9 @@ __global__ void ssm_gdn_prep_ba_gates(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns — the
-    // projection it folds and the gate row it lands share that row axis.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= N || h >= V_h) return;
@@ -696,14 +640,9 @@ __global__ void ssm_gdn_prep_v_gates(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The
-    // projection and the fused gate row are read there; the three planes this
-    // lands in are the fire's own scratch, which starts at its own zero.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
@@ -844,22 +783,10 @@ __global__ void ssm_gated_delta_chunked_batched(
 {
     const int r = blockIdx.x;
     const int h = blockIdx.y;
-    // **THE SEAT, AND THE LANE SPLIT** (the chunked-arm wave). This grid
-    // counts REQUESTS, so `win[2]` is the live lane count that retires a
-    // ceiling grid's padding. And the two kinds of per-lane vector are read at
-    // two different indices: `qo_indptr` is the WINDOW's own rebased CSR and
-    // stays on `r`; `slot_ids` is the FIRE's table, handed whole under a plane
-    // base so a body cannot bake a stale slice of it, and is read at
-    // `r + win[3]`.
+
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    // **AND THE ROW AXIS SPLITS TOO, WHICH IS WHY IT IS TWO INDICES BELOW.**
-    // The five staged planes (`q_norm` .. `beta`) are this fire's own SCRATCH,
-    // laid by the preps at the launch-local row (`ssm_gdn_prep_qk_norm` writes
-    // `n` and reads `n + win[1]`), so they are addressed off the rebased CSR
-    // with nothing added. `out` is the fire's activation plane, handed as a
-    // BASE under an armed seat, so it takes `win[1]`. The state slab is
-    // addressed by the slot's VALUE and is shifted by neither.
+
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int t0 = static_cast<int>(qo_indptr[r]);
     const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
@@ -882,8 +809,7 @@ __global__ void ssm_gated_delta_chunked_batched(
         const float* v_h = v      + bh * V_d;
         const float  g_h = __expf(g_log[bh]);
         const float  beta_h = beta[bh];
-        // The scratch row is `bh`; the PLANE row is `bh` shifted — see the
-        // seat's note above.
+
         float* out_bh = out + ((long long)(t0 + t + row0) * V_h + h) * V_d;
 
         for (int i = threadIdx.x; i < K_d; i += blockDim.x) {
@@ -1022,11 +948,6 @@ __global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa(
     const int v_idx = v_tile + warp;
     if (warp >= WARPS || v_idx >= V_d) return;
 
-    // The seat, the lane split and the row bridge — the plain chunked scan
-    // above carries the argument in full. `win[2]` retires padded lanes;
-    // `slot_ids` and the fold predicate are the FIRE's tables at `r + win[3]`;
-    // the window's own CSR stays on `r`; the five staged planes are scratch at
-    // the launch-local row and `out` is a plane base at `win[1]`.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
@@ -1087,7 +1008,7 @@ __global__ void ssm_gated_delta_chunked_batched_warp_tiled_gqa(
         }
         const float out_v = warp_sum(out_part);
         if (lane == 0) {
-            // `vh` is the SCRATCH row; the plane row is the shifted one.
+
             const long long out_vh = (long long)(t0 + t + row0) * V_h + h;
             out[out_vh * (long long)V_d + v_idx] = out_v;
         }
@@ -1315,15 +1236,9 @@ __global__ void ssm_gated_delta_step_batched_gqa(
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // accumulator is one — the five prep planes are this fire's own scratch,
-    // written at the same launch-local row this reads them at, and the slot
-    // table is the lanes'.
+
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int h = blockIdx.y;
     const int repeat = V_h / K_h;
@@ -1757,15 +1672,9 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
 {
     const int vt = blockIdx.x;
     const int r  = blockIdx.y;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // accumulator is one — the five prep planes are this fire's own scratch,
-    // written at the same launch-local row this reads them at, and the slot
-    // table is the lanes'.
+
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int h  = blockIdx.z;
     const int v_idx = vt * BV + threadIdx.x;
@@ -1855,13 +1764,6 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
     }
 }
 
-// ---- fused decode step ------------------------------------------------------
-//
-// One launch per step: q/k are L2-normed in the block, v and the gates are
-// read where the projection landed them, and each block owns a `K_d x BV`
-// tile of the head's state, so a one-token fire still spreads the state over
-// the device. Same arithmetic as the smem step above: the decayed state is
-// rounded to bf16 before the update, `kv_mem` reads it unrounded.
 
 __device__ __forceinline__ void gdn_load8(
     const __nv_bfloat16* __restrict__ p, float (&s)[8]) {
@@ -1896,10 +1798,6 @@ __device__ __forceinline__ void gdn_store8(
     }
 }
 
-// Sums `x` over the rows of the tile: lanes `TPR` apart in a warp hold the
-// same columns, the warps meet in `red`, and the first `BV` threads fold the
-// warps into `tot`. Every thread leaves with the totals of its own eight
-// columns.
 template <int TPR, int WARPS, int BV>
 __device__ __forceinline__ void gdn_column_sum(
     float (&x)[8], float (*red)[BV], float* tot, int tid, int lane, int warp) {
@@ -1949,9 +1847,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
     const int vt = blockIdx.x;
     const int r = blockIdx.y;
     const int h = blockIdx.z;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): the live-rows word
-    // retires a bucket's padded rows, `win[1]` is the plane row the launch's
-    // first row stands at; the slot table is the lanes'.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int slot = slot_ids[r];
@@ -1972,8 +1868,6 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
     __shared__ float tot[BV];
     __shared__ float norms[2];
 
-    // Every global read is issued here, before the first barrier, so the
-    // block pays one memory latency rather than one per phase.
     const int i = tid / TPR;
     const int j0 = vt * BV + (tid % TPR) * VEC;
     const bool live = i < K_d;
@@ -2079,13 +1973,6 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
 
-    // The seat, the lane split and the row bridge — the plain chunked scan
-    // carries the argument in full, and this arm's request axis is `blockIdx.y`
-    // rather than `x`. `win[2]` retires the lanes a ceiling grid padded in;
-    // the four RS tables and `slot_ids` are the FIRE's, read at `r + win[3]`;
-    // `qo_indptr` is the window's own and stays on `r`; the five staged planes
-    // are scratch at the launch-local row and `out` is a plane base at
-    // `win[1]`. The state slab is a slot VALUE and moves for nothing.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
@@ -2093,8 +1980,6 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     int t0 = static_cast<int>(qo_indptr[r]);
     int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
 
-    // THE SEGMENT THIS LAUNCH OWNS (the 2R split), exactly as the chunked
-    // conv reads it: `begin_at` cuts the front, `commit_len` cuts the back.
     if (begin_at != nullptr) {
         int b = begin_at[rl];
         if (b > T) b = T;
@@ -2129,16 +2014,6 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
-    // **THE ROUNDING POLICY IS ITS OWN ARGUMENT** (alto F3b).
-    //
-    // This was `commit_len != nullptr`, which read a LENGTH as a rounding:
-    // `single_round` folds the decay into the update instead of rounding the
-    // decayed state to bf16 first, so binding the length seat changed the
-    // NUMBERS as well as the count and a replay that accepted its whole
-    // window stopped being the fold it replaced. The two are now two
-    // arguments, and the shell binds the fold's own policy on every path —
-    // which is what makes a bound-but-non-truncating seat exact and a
-    // truncated fold exact against a shorter buffer.
     const bool single_round = fused_decay;
 
     for (int t = 0; t < T; ++t) {
@@ -2191,7 +2066,7 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
             out_v += sx * sq[k0];
             if (k1 < K_d) out_v += sy * sq[k1];
         }
-        // `bh` is the SCRATCH row; the plane row is the shifted one.
+
         out[((long long)(t0 + t + row0) * V_h + h) * V_d + v_idx] = out_v;
         __syncthreads();
     }
@@ -2310,14 +2185,9 @@ __global__ void ssm_kda_gate_beta(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The two
-    // projections are read there; the gates are this fire's own scratch, laid
-    // at the launch-local row the step will read them back at.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     const int h = blockIdx.y;
     if (t >= T || h >= H) return;
@@ -2354,8 +2224,7 @@ __global__ void ssm_kda_qkv_prep(
     int width, int head_dim, float eps,
     const u32* __restrict__ win)
 {
-    // q and k are L2-normed PER HEAD, and q is scaled by head_dim^-1/2 (the
-    // reference recurrence's `scale`); v is widened as stored.
+
     const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
@@ -2375,11 +2244,7 @@ __global__ void ssm_kda_qkv_prep(
     constexpr int kMaxHeads = 256;
     __shared__ float sums[kMaxHeads];
     const int heads = head_dim > 0 ? width / head_dim : 1;
-    // One warp per head, lanes striding the head, a shuffle tree in a fixed
-    // order: the sum is the same every fire. (A float `atomicAdd` over the
-    // head's elements landed in whatever order the threads arrived, and the
-    // rounding of a 46-layer stack's q/k norms moved from boot to boot —
-    // measured as run-to-run divergence of glm53's greedy tokens.)
+
     {
         constexpr int kWarps = BLOCK / 32;
         const int warp = tid / 32;
@@ -2419,15 +2284,9 @@ __global__ void ssm_kda_step_batched(
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // accumulator is one — the five prep planes are this fire's own scratch,
-    // written at the same launch-local row this reads them at, and the slot
-    // table is the lanes'.
+
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int h = blockIdx.y;
 
@@ -2504,16 +2363,6 @@ __global__ void ssm_kda_chunked_batched(
     const int r = blockIdx.x;
     const int h = blockIdx.y;
 
-    // The seat, the lane split and the row bridge (the chunked-arm wave; the
-    // chunked delta scan carries the argument in full). This grid counts
-    // REQUESTS, so `win[2]` is what retires a ceiling grid's padded lanes.
-    // `qo_indptr` is the WINDOW's own rebased CSR and stays on `r`; `slot_ids`
-    // is the FIRE's table, handed whole so a body cannot bake a stale slice,
-    // and is read at `r + win[3]`. The five staged planes are this fire's
-    // SCRATCH at the launch-local row — `ssm_kda_qkv_prep` writes them at `n`
-    // and reads the projection at `n + win[1]` — so they take no shift, while
-    // `out` is the activation PLANE and takes `win[1]`. The state slab is
-    // addressed by the slot's VALUE and is shifted by neither.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
@@ -2569,7 +2418,7 @@ __global__ void ssm_kda_chunked_batched(
             for (int off = 16; off > 0; off >>= 1) {
                 acc += __shfl_down_sync(0xffffffffu, acc, off);
             }
-            // `th` is the SCRATCH row; the plane row is the shifted one.
+
             if (lane == 0) out[((t + row0) * H + h) * D + vi] = acc;
         }
 

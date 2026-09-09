@@ -1,42 +1,12 @@
-//! What `pie` looks like: colour policy, units, glyphs, terminal width.
-//!
-//! One module, because the alternative is every op deciding for itself: a
-//! `stdout().is_terminal()` check for output that goes to stderr, a `NO_COLOR`
-//! nothing honours, and one 3 GiB printed as `3.00 GiB`, `3.0GiB`, `3072MiB`
-//! and `3.2 GB` -- the last decimal, so not even the same quantity.
-//!
-//! The rule this module exists to make enforceable: **ops code never emits an
-//! escape sequence and never formats a quantity itself.** It picks a [`Mark`],
-//! calls [`bytes`], and asks [`Palette`] for the styling.
-
 use std::io::IsTerminal;
 
-// -----------------------------------------------------------------------------
-// Colour policy
-// -----------------------------------------------------------------------------
-
-/// Which stream a [`Palette`] is being built for.
-///
-/// It matters: the download bar draws to stderr, so deciding its colour from
-/// `stdout().is_terminal()` asks the wrong file descriptor and
-/// `pie model import > log` would keep colouring.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stream {
     Stdout,
     Stderr,
-    /// Only ever asked about interactivity — there is nothing to colour on the
-    /// way in. [`confirm`] uses it to tell "the user is here" from "this is a
-    /// script".
     Stdin,
 }
 
-/// Whether to colour, honouring the conventions a user expects to work.
-///
-/// `NO_COLOR` is checked first and its presence alone disables colour,
-/// whatever the value -- that is what the convention specifies. `TERM=dumb`
-/// is the older spelling of the same request. Both beat a TTY check, because
-/// both are the user saying so and the TTY check is only a guess about what
-/// they want.
 pub fn colour_enabled(stream: Stream) -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
@@ -47,20 +17,10 @@ pub fn colour_enabled(stream: Stream) -> bool {
     match stream {
         Stream::Stdout => std::io::stdout().is_terminal(),
         Stream::Stderr => std::io::stderr().is_terminal(),
-        // Nothing is ever written to stdin, so there is nothing to colour.
         Stream::Stdin => false,
     }
 }
 
-/// Styling that renders to nothing when colour is off.
-///
-/// Every method takes the text it styles and hands back something that knows
-/// how to end itself. Handing out the escape sequences instead -- a
-/// `&'static str` `dim()` with the caller writing the matching `reset()` --
-/// makes "never emit an escape yourself" a rule an op can only follow
-/// voluntarily, and an op that stops following it silently breaks `NO_COLOR`.
-/// There is no way to ask this type for an escape, so there is no way to leak
-/// one or to forget its reset.
 #[derive(Clone, Copy)]
 pub struct Palette {
     on: bool,
@@ -73,10 +33,6 @@ impl Palette {
         }
     }
 
-    /// Colour forced on or off. For tests: there is deliberately no
-    /// `--color` flag, because `NO_COLOR` plus the TTY check already answer
-    /// the question and a three-way switch would be one more thing to get
-    /// wrong.
     pub fn forced(on: bool) -> Self {
         Self { on }
     }
@@ -93,11 +49,9 @@ impl Palette {
         }
     }
 
-    /// Secondary text: paths, notes, descriptions. Never the answer itself.
     pub fn dim<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
         self.wrap("2", text)
     }
-    /// Headings and section labels.
     pub fn bold<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
         self.wrap("1", text)
     }
@@ -110,22 +64,11 @@ impl Palette {
     pub fn red<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
         self.wrap("31", text)
     }
-    /// A screen's own accent, for a role the shared vocabulary does not name.
-    ///
-    /// `pie inferlet info` colours parameter names, which is one screen's
-    /// business and not a meaning any other command needs. It reached for a
-    /// literal `\x1b[36m` to do it. The escape still does not belong to the
-    /// caller -- what belongs to the caller is the choice of hue.
     pub fn accent<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
         self.wrap("36", text)
     }
 }
 
-/// Text that renders with its styling, or plainly when colour is off.
-///
-/// `Display`, so it drops into a format string like the string it wraps, and
-/// it closes what it opens. Width is the width of the text: nothing here is
-/// visible to a column count, which is what lets [`Table`] pad a styled cell.
 pub struct Styled<T> {
     text: T,
     code: &'static str,
@@ -142,30 +85,13 @@ impl<T: std::fmt::Display> std::fmt::Display for Styled<T> {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Glyphs
-// -----------------------------------------------------------------------------
-
-/// The one meaning each glyph carries.
-///
-/// A reader cannot learn a vocabulary that changes per command, so there is
-/// one: `✓` says one thing, and "absent" has a single spelling across every
-/// listing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mark {
-    /// The command did something. Only ever on a result line, never in a table.
     Did,
-    /// True of the machine or the config, and not a fault.
     Warn,
-    /// Would stop pie from working.
     Blocked,
-    /// The operator chose this value; it is not the default.
     Chosen,
-    /// Present and unremarkable. Renders as a blank, so the marked rows are
-    /// what the eye finds.
     Plain,
-    /// Not there. One spelling, whether that is "not downloaded yet", "no
-    /// engine compiled" or "unsupported".
     Absent,
 }
 
@@ -181,8 +107,6 @@ impl Mark {
         }
     }
 
-    /// The glyph in its colour, or bare when colour is off. Width is always
-    /// one column either way, so a table stays aligned.
     pub fn render(self, p: &Palette) -> String {
         let glyph = self.glyph();
         match self {
@@ -195,19 +119,6 @@ impl Mark {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Quantities
-// -----------------------------------------------------------------------------
-
-/// Bytes, in the largest binary unit that leaves a number worth reading.
-///
-/// Binary throughout, because every quantity pie reports is a memory or page
-/// count: `optimize` reported the same bytes in decimal GB, which made the
-/// same file look 7% larger there than in `cache list`.
-///
-/// No space before the unit, and the fraction is dropped past three digits
-/// where it is noise. The point is that a column of these lines up and can be
-/// compared at a glance.
 pub fn bytes(n: u64) -> String {
     const UNITS: [(&str, u64); 5] = [
         ("TiB", 1 << 40),
@@ -229,12 +140,10 @@ pub fn bytes(n: u64) -> String {
     "0B".to_string()
 }
 
-/// Bytes per second.
 pub fn rate(bytes_per_second: f64) -> String {
     format!("{}/s", bytes(bytes_per_second.max(0.0) as u64))
 }
 
-/// A duration, in the largest unit that leaves a number worth reading.
 pub fn duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3600 {
@@ -248,11 +157,6 @@ pub fn duration(d: std::time::Duration) -> String {
     }
 }
 
-/// A path with `$HOME` written as `~`.
-///
-/// Almost every path pie prints is under the user's home, and the prefix
-/// carries no information -- it is the same on every line, and it is what
-/// pushes the part that differs off the edge of a column.
 pub fn short_path(path: &std::path::Path) -> String {
     let Some(home) = std::env::var_os("HOME") else {
         return path.display().to_string();
@@ -263,15 +167,8 @@ pub fn short_path(path: &std::path::Path) -> String {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Tables
-// -----------------------------------------------------------------------------
-
-/// One printed row: a mark, then cells.
 pub struct Row {
     pub mark: Mark,
-    /// Cells left to right. The last one is treated as the note column and is
-    /// what gets cut when the terminal is narrow.
     pub cells: Vec<String>,
 }
 
@@ -284,19 +181,12 @@ impl Row {
     }
 }
 
-/// How a column is laid out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Align {
     Left,
     Right,
 }
 
-/// A column-aligned listing that fits the terminal.
-///
-/// Four listings each computed their own `{:<width$}`, and `doctor` computed
-/// none -- its fixed `{:<20}` key column was blown apart by the absolute
-/// config path beside it. Widths come from the rows actually being printed, so
-/// a filtered listing is not padded out to the width of the rows it excluded.
 pub struct Table {
     aligns: Vec<Align>,
     dim_from: usize,
@@ -304,9 +194,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// `dim_from` is the first column that is secondary text -- paths, notes,
-    /// descriptions. Everything from there on is dimmed and the last column is
-    /// what gets cut to fit.
     pub fn new(aligns: impl IntoIterator<Item = Align>, dim_from: usize) -> Self {
         Self {
             aligns: aligns.into_iter().collect(),
@@ -323,7 +210,6 @@ impl Table {
         self.rows.is_empty()
     }
 
-    /// Print with two spaces between columns, indented by two.
     pub fn print(&self, p: &Palette) {
         const GAP: usize = 2;
         const INDENT: usize = 2;
@@ -338,9 +224,6 @@ impl Table {
                     .unwrap_or(0)
             })
             .collect();
-        // Everything but the last column is laid out at its natural width; the
-        // last one gets whatever is left, because cutting a note is a loss a
-        // reader can absorb and cutting a name is not.
         let fixed: usize = INDENT
             + 2
             + widths.iter().take(columns.saturating_sub(1)).sum::<usize>()
@@ -358,18 +241,11 @@ impl Table {
                     raw.to_string()
                 };
                 let pad = width.saturating_sub(text.chars().count());
-                // Pad first, style second. The padding is inside the styling
-                // and the styling closes itself, so a dimmed column cannot
-                // leave the rest of the line dim.
                 let cell = match self.aligns.get(i).copied().unwrap_or(Align::Left) {
                     Align::Left if last => text,
                     Align::Left => format!("{text}{}", " ".repeat(pad)),
                     Align::Right => format!("{}{text}", " ".repeat(pad)),
                 };
-                // An empty cell gets no styling at all: wrapping nothing still
-                // wrote `\x1b[2m\x1b[0m`, so every `cache list` row with no
-                // note carried four invisible bytes that `trim_end` could not
-                // see and a `| cat -v` reader could.
                 if i >= self.dim_from && !cell.is_empty() {
                     line.push_str(&p.dim(cell).to_string());
                 } else {
@@ -384,23 +260,6 @@ impl Table {
     }
 }
 
-// -----------------------------------------------------------------------------
-// TOML highlighting
-// -----------------------------------------------------------------------------
-
-/// One line of TOML, coloured the way `pie config show` prints a config file.
-///
-/// Here rather than in `ops/config.rs` because it is presentation and this is
-/// where the colour policy lives. It was six `\x1b[..m` constants and its own
-/// `is_terminal()` check inside the op, which is how `NO_COLOR=1 pie config
-/// show` came to print escapes at a user who had asked it not to. It now goes
-/// through the same [`Palette`] as everything else and answers to the same
-/// three signals.
-///
-/// A tiny state machine over the line rather than a TOML parser: the input is
-/// one line at a time and the grammar of a line is `#comment`, `[header]`, or
-/// `key = value`. Mirrors the "monokai"-ish palette `rich.Syntax(lexer="toml")`
-/// produced, which is what this output looked like before.
 pub fn toml_line(line: &str, p: &Palette) -> String {
     let comment = |text: &str| p.wrap("2;37", text.to_string()).to_string();
     let header = |text: &str| p.wrap("1;34", text.to_string()).to_string();
@@ -409,13 +268,10 @@ pub fn toml_line(line: &str, p: &Palette) -> String {
     let trimmed_start = line.trim_start();
     let leading = &line[..line.len() - trimmed_start.len()];
 
-    // Whole-line comment.
     if trimmed_start.starts_with('#') {
         return format!("{leading}{}", comment(trimmed_start));
     }
-    // Section header: [foo] / [[foo]].
     if trimmed_start.starts_with('[') {
-        // Split off any trailing comment so it gets its own colour.
         let (head, tail) = split_trailing_comment(trimmed_start);
         let mut out = format!("{leading}{}", header(head));
         if let Some(c) = tail {
@@ -424,9 +280,7 @@ pub fn toml_line(line: &str, p: &Palette) -> String {
         }
         return out;
     }
-    // key = value [# comment]
     let Some(eq) = trimmed_start.find('=') else {
-        // No `=`: blank line or unrecognized — return as-is.
         return line.to_string();
     };
     let (key_part, rest) = trimmed_start.split_at(eq);
@@ -444,8 +298,6 @@ pub fn toml_line(line: &str, p: &Palette) -> String {
     out
 }
 
-/// Split off a `#`-prefixed trailing comment, respecting `#` characters
-/// inside double-quoted strings. Returns `(value, Option<comment>)`.
 fn split_trailing_comment(s: &str) -> (&str, Option<&str>) {
     let mut in_string = false;
     for (i, ch) in s.char_indices() {
@@ -467,8 +319,6 @@ fn toml_value(v: &str, p: &Palette) -> String {
         return p.wrap("32", trimmed).to_string();
     }
     if trimmed.starts_with('[') {
-        // Arrays: highlight individual elements, leaving brackets/commas
-        // un-coloured. Cheap and good enough for typical config arrays.
         let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
         let elements: Vec<String> = inner.split(',').map(|e| toml_value(e.trim(), p)).collect();
         return format!("[{}]", elements.join(", "));
@@ -479,20 +329,6 @@ fn toml_value(v: &str, p: &Palette) -> String {
     trimmed.to_string()
 }
 
-// -----------------------------------------------------------------------------
-// Asking
-// -----------------------------------------------------------------------------
-
-/// Ask before doing something irreversible. `Ok(false)` means "they said no".
-///
-/// The rule that matters is the one about a missing terminal: there is nobody
-/// to ask, so this refuses rather than assuming consent for a delete. It was
-/// written out twice, in `pie cache clear` and `pie model remove`, with the
-/// same logic and two different wordings; the second copy is how a rule gets
-/// half-changed later.
-///
-/// `escape_hatch` is the flag that skips the question, named so the refusal can
-/// say which one to pass.
 pub fn confirm(question: &str, escape_hatch: &str) -> anyhow::Result<bool> {
     use std::io::Write;
     if !is_interactive(Stream::Stdin) {
@@ -500,8 +336,6 @@ pub fn confirm(question: &str, escape_hatch: &str) -> anyhow::Result<bool> {
             "this needs confirmation and there is no terminal to ask; rerun with `{escape_hatch}`"
         );
     }
-    // The prompt goes to stderr so that `pie cache clear > log` still shows it
-    // to the person being asked.
     eprint!("{question} [y/N] ");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
@@ -511,15 +345,6 @@ pub fn confirm(question: &str, escape_hatch: &str) -> anyhow::Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-// -----------------------------------------------------------------------------
-// Progress
-// -----------------------------------------------------------------------------
-
-/// Whether a stream is something a redraw makes sense on.
-///
-/// Distinct from [`colour_enabled`]: `NO_COLOR` is a statement about colour and
-/// says nothing about whether `\r` will land somewhere useful. A bar checks
-/// this; a colour checks that.
 pub fn is_interactive(stream: Stream) -> bool {
     match stream {
         Stream::Stdout => std::io::stdout().is_terminal(),
@@ -528,18 +353,6 @@ pub fn is_interactive(stream: Stream) -> bool {
     }
 }
 
-/// A one-line progress bar redrawn in place on stderr.
-///
-/// Here rather than in the op that draws it, for the reason this module
-/// exists. Its previous home was `pie model import`, where it reported bytes as
-/// `read as f64 / 1e9` -- decimal GB, against the binary GiB every other line
-/// pie prints, so the same file read 7% larger in the bar than in `pie model
-/// list` right after. It also drew a fixed 20-cell bar and clipped names at a
-/// fixed 48 columns, which is where the wrapping-and-smearing on a narrow
-/// terminal came from.
-///
-/// Nothing is drawn when stderr is not a terminal: a log file collects the
-/// finished lines, not an animation.
 pub struct Bar {
     interactive: bool,
     last_draw: std::time::Instant,
@@ -561,8 +374,6 @@ impl Bar {
         }
     }
 
-    /// Redraw, at most ten times a second. The final frame always draws, so
-    /// the bar ends full rather than wherever the throttle last let it stop.
     pub fn draw(&mut self, done: u64, total: u64, label: &str) {
         if !self.interactive {
             return;
@@ -576,9 +387,6 @@ impl Bar {
 
         let percent = (done * 100).checked_div(total).map_or(100, |p| p.min(100));
         let quantity = format!("{}/{}", bytes(done), bytes(total));
-        // Everything but the label is fixed-width; the label gets what is left
-        // and is padded to it, because a redraw that shrinks the line leaves
-        // the tail of the previous one on screen.
         const CELLS: usize = 20;
         let fixed = 2 + CELLS + 3 + 4 + 2 + quantity.chars().count() + 2;
         let room = width().saturating_sub(fixed).max(8);
@@ -591,7 +399,6 @@ impl Bar {
         );
     }
 
-    /// End the line, if anything was ever drawn on it.
     pub fn finish(&mut self) {
         if self.drew {
             eprintln!();
@@ -600,50 +407,15 @@ impl Bar {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Machine-readable output
-// -----------------------------------------------------------------------------
-
-/// Print a value as the command's entire stdout, and nothing else.
-///
-/// Every `--json` path goes through here so the contract is one sentence: one
-/// JSON document per invocation, on stdout, with the human rendering
-/// suppressed entirely. A listing that printed a table *and* a document would
-/// be parseable by nobody.
-///
-/// Pretty-printed unconditionally. `jq` does not care, and a person checking
-/// what the shape is does.
 pub fn emit_json(value: &serde_json::Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// What a command answers with
-// -----------------------------------------------------------------------------
-
-/// A command's answer, in a form that reads to a person and parses to `jq`.
-///
-/// The two renderings come off **one** value. They were built separately: each
-/// `--json` branch assembled its own `json!({...})` and returned early, and the
-/// table below it was written from the same data by different code. Nothing
-/// stopped the two from drifting, and `doctor` -- the one command whose whole
-/// job is to be believed -- carries a comment saying it collects its sections
-/// before rendering precisely so "the table and the JSON cannot drift into
-/// disagreeing about the verdict". That was one command holding a rule the
-/// other seven did not know about.
-///
-/// `Serialize` gives the machine rendering; [`Report::render`] gives the human
-/// one. There is no way to implement one and forget the other.
 pub trait Report: serde::Serialize {
-    /// Draw to stdout. Never called when `--json` is on.
     fn render(&self, p: &Palette);
 }
 
-/// The object-safe half of [`Report`], so [`Output`] can carry any of them.
-///
-/// `Serialize` is not object-safe, so the erasure happens here: the blanket
-/// impl is the only implementor and it forwards to the real thing.
 pub trait AnyReport {
     fn render_any(&self, p: &Palette);
     fn to_json(&self) -> anyhow::Result<serde_json::Value>;
@@ -658,20 +430,6 @@ impl<T: Report> AnyReport for T {
     }
 }
 
-/// What an op hands back instead of printing: an answer, and the status the
-/// process exits with.
-///
-/// Three shapes of answer, because commands come in three kinds and pretending
-/// otherwise is what put `--json` on five subcommands out of twenty and left
-/// the rest unscriptable. A command either answers a question ([`Answer::report`]),
-/// changes something ([`Answer::did`]), or has already said everything it had
-/// to say while it worked ([`Answer::quiet`] -- `pie run`, whose output is the
-/// inferlet's).
-///
-/// The exit status rides along because for two commands it *is* the answer:
-/// `pie doctor && pie serve` has to work, and `pie run` reports the inferlet's
-/// status rather than its own. Everything else exits zero without having to
-/// write `Ok(ExitCode::SUCCESS)` to say so.
 pub struct Answer {
     kind: Kind,
     code: std::process::ExitCode,
@@ -679,38 +437,23 @@ pub struct Answer {
 
 enum Kind {
     Quiet,
-    /// `bool` is whether anything actually changed. See [`Answer::noop`].
     Did(bool, String),
-    // `Send`, because the ops that block run on `spawn_blocking` and the answer
-    // crosses back over that boundary. A report is plain data, so saying so
-    // costs nothing.
     Report(Box<dyn AnyReport + Send>),
 }
 
 impl Answer {
-    /// Nothing to print; the effect was the point, or it was already streamed.
     pub fn quiet() -> Self {
         Self::of(Kind::Quiet)
     }
 
-    /// One result line: what the command changed. Marked [`Mark::Did`].
     pub fn did(text: impl Into<String>) -> Self {
         Self::of(Kind::Did(true, text.into()))
     }
 
-    /// One result line for a command that changed **nothing** — it was already
-    /// in the asked-for state, the user declined the prompt, or `--dry-run` was
-    /// on.
-    ///
-    /// Unmarked, because `Mark::Did` means "the command did something" and
-    /// these did not: `✓ aborted; nothing to delete` says the opposite of what
-    /// happened, in the same glyph the tables use for success. A caller has to
-    /// pick one of the two constructors, which is what keeps them apart.
     pub fn noop(text: impl Into<String>) -> Self {
         Self::of(Kind::Did(false, text.into()))
     }
 
-    /// A document.
     pub fn report(report: impl Report + Send + 'static) -> Self {
         Self::of(Kind::Report(Box::new(report)))
     }
@@ -722,8 +465,6 @@ impl Answer {
         }
     }
 
-    /// The same answer, exiting non-zero. For a verdict, not for an error --
-    /// an error is an `Err` and is rendered by `main`'s reporter.
     pub fn with_code(mut self, code: std::process::ExitCode) -> Self {
         self.code = code;
         self
@@ -734,18 +475,10 @@ impl Answer {
     }
 }
 
-/// Show a command's answer, in whichever of the two renderings was asked for.
-///
-/// The single place that decides. An action under `--json` reports what it did
-/// rather than nothing, so a script driving `pie model remove --json` gets a
-/// document like every other command instead of an empty stdout.
 pub fn present(answer: Answer, json: bool) -> anyhow::Result<()> {
     let palette = Palette::for_stream(Stream::Stdout);
     match answer.kind {
         Kind::Quiet => Ok(()),
-        // `changed` rather than the message alone: "already downloaded" and
-        // "downloaded" are both successes and a script has to tell them apart
-        // without reading English.
         Kind::Did(changed, line) if json => {
             emit_json(&serde_json::json!({ "changed": changed, "message": line }))
         }
@@ -754,8 +487,6 @@ pub fn present(answer: Answer, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         Kind::Did(false, line) => {
-            // Indented to the same column as a marked line, so a run of result
-            // lines still aligns and the marked ones are what the eye finds.
             println!("{} {line}", Mark::Plain.render(&palette));
             Ok(())
         }
@@ -767,16 +498,6 @@ pub fn present(answer: Answer, json: bool) -> anyhow::Result<()> {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Terminal
-// -----------------------------------------------------------------------------
-
-/// Usable terminal columns, or 80 when there is no terminal to ask.
-///
-/// A redraw that writes past the edge wraps, and then `\r` returns to the
-/// start of the *last* screen row rather than the start of the line -- so the
-/// progress bar leaves a trail of half-erased rows on a narrow terminal. Every
-/// line this module draws in place is cut to this width.
 pub fn width() -> usize {
     #[cfg(unix)]
     {
@@ -792,10 +513,6 @@ pub fn width() -> usize {
     80
 }
 
-/// Cut `text` to `limit` display columns, ending with `…` when it had to.
-///
-/// Counts characters rather than bytes: cutting a multi-byte character in half
-/// writes a broken sequence to the terminal.
 pub fn clip(text: &str, limit: usize) -> String {
     if limit == 0 {
         return String::new();
@@ -804,8 +521,6 @@ pub fn clip(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     let head: String = text.chars().take(limit.saturating_sub(1)).collect();
-    // Prefer a word boundary, but only if one is close enough that cutting
-    // there does not throw away most of the line.
     match head.rfind(' ') {
         Some(space) if space * 4 >= limit * 3 => format!("{}…", head[..space].trim_end()),
         _ => format!("{head}…"),

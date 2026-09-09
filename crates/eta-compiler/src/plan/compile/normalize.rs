@@ -1,7 +1,3 @@
-//! Stage normalization: DCE, broadcast/CSE cleanup, constant folding, and
-//! dense renumbering, producing the [`NormalizedStage`] that gets signed,
-//! partitioned and encoded.
-
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -17,102 +13,55 @@ use super::fold::{canonicalize_commutative, cse_candidate, cse_key, fold_scalar,
 use super::signature::signature_ports;
 use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 
-/// What a normalized value is *about*, coarsely. Unread by any emitter or
-/// engine branch, but hashed into [`StageSignature`](super::signature::StageSignature),
-/// so it affects the emitted kernel's name and the engine's cache key.
-/// `PageDescriptor` and `EffectToken` are never produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValueDomain {
-    /// A rank-0 value, or one whose every dimension is `1`.
     Scalar = 0,
-    /// A per-row tensor — the fallthrough when nothing else applies, so
-    /// reductions land here too.
     PerRow = 1,
-    /// A tensor whose trailing dimension is the model's vocabulary width.
     Vocabulary = 2,
-    /// Device-materialized indices, i.e. the result of [`Op::Iota`].
     GeneratedIndex = 3,
-    /// A boolean (`Dtype::Bool`) mask.
     Mask = 4,
-    /// A KV-page descriptor. Reserved: `value_domain` never returns it.
     PageDescriptor = 5,
-    /// The result of a library op — [`Op::TopK`], [`Op::SortDesc`],
-    /// [`Op::MatMul`], or [`Op::KernelCall`].
     LibraryResult = 6,
-    /// An effect token. Reserved: `value_domain` never returns it.
     EffectToken = 7,
 }
 
-/// A position in a stage's op list. Deliberately not a [`ValueId`]: both are
-/// dense `u32` starting at zero, so mixing them up type-checks but names the
-/// wrong ops.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeIndex(pub u32);
 
 impl NodeIndex {
-    /// The wire form. Explicit because the wire cannot tell the two spaces
-    /// apart either.
     pub const fn get(self) -> u32 {
         self.0
     }
 
-    /// As a slice index into the stage's op list.
     pub const fn index(self) -> usize {
         self.0 as usize
     }
 }
 
-/// A channel's position in one stage's own channel table. Deliberately not a
-/// [`ChannelIndex`] (that numbers the container's channel declarations): both
-/// are dense `u32` from zero, so they silently diverge past the first channel.
-/// Only `localize_stage` converts between the two.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChannelSlot(pub u32);
 
 impl ChannelSlot {
-    /// The bare number, for the wire and the generated sources — neither can
-    /// tell the two spaces apart either.
     pub const fn get(self) -> u32 {
         self.0
     }
 
-    /// As a slice index into the stage's channel bindings.
     pub const fn index(self) -> usize {
         self.0 as usize
     }
 }
 
-/// A normalized stage with local channel/name numbering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedStage {
-    /// The stage this body belongs to.
     pub stage: Stage,
-    /// ETA op count before normalization, retained for the `source_ops`
-    /// metric now that [`ops`](Self::ops) has been thinned.
     pub source_op_count: u32,
-    /// The normalized op list, densely renumbered.
     pub ops: Vec<Op>,
-    /// Symbolic type of each SSA value, indexed by [`ValueId`].
     pub value_types: Vec<SymbolicType>,
-    /// [`ValueDomain`] of each SSA value, parallel to
-    /// [`value_types`](Self::value_types).
     pub value_domains: Vec<ValueDomain>,
-    /// Original ETA op positions represented by each normalized op.
     pub source_ops: Vec<Vec<u32>>,
-    /// **Original stage-local value id -> normalized value id**, `u32::MAX`
-    /// where normalization removed the value.
-    ///
-    /// The renumbering is many-to-one and lossy: CSE folds two originals onto
-    /// one normalized value, `simplify_alias` and the redundant-broadcast rule
-    /// alias one away, and a dead op's results are never assigned. So the two
-    /// numberings cannot be related by arithmetic, and a backend that indexes
-    /// the normalized value table — its descriptors, its scratch offsets —
-    /// while holding an original id needs this map to cross between them.
     pub value_map: Vec<u32>,
-    /// Local channel slot -> program-global dense channel index.
     pub channel_bindings: Vec<u32>,
-    /// Local name slot -> canonical second-party name.
     pub names: Vec<String>,
 }
 
@@ -138,8 +87,6 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         if !keep[op_index] {
             continue;
         }
-        // A scalar broadcast feeding only `Op::Select` is a no-op: `Select`
-        // already broadcasts its operands. Alias it away instead of keeping it.
         if redundant[op_index]
             && let Op::Broadcast { value, .. } = original_op
         {
@@ -148,14 +95,6 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         }
 
         let mut op = original_op.clone();
-        // A per-row vector reshaped to `[rows, 1]` and broadcast to
-        // `[rows, cols]` is the vector's own broadcast (leading axes align,
-        // see `can_broadcast_to`). The DSL spells a row's scalar this way —
-        // `broadcast(reshape(m, [n, 1]), [n, v])` — and the row-parallel
-        // emitters fuse a broadcast of a per-row scalar into the stream that
-        // reads it but materialise one of a `[n, 1]` value: a whole `[n, v]`
-        // scratch write per fire, then a read of it per pass. Fold the
-        // reshape away here so the stream sees the vector.
         if let Op::Broadcast { value, .. } = &mut op
             && let Some(source) = folded_broadcasts[op_index]
         {
@@ -239,10 +178,6 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
     }
 }
 
-/// Per op, the vector a `Broadcast` of a `Reshape(vector, [n, 1])` may read
-/// directly (leading axes align, see `can_broadcast_to`), `None` elsewhere.
-/// A reshape every consumer of which folds this way is marked dead in
-/// `keep`: left alive it would sit between the regions as its own launch.
 pub(crate) fn row_vector_broadcasts(
     stage_program: &eta_ir::container::StageProgram,
     original_types: &[eta_ir::types::ValueType],
@@ -251,7 +186,6 @@ pub(crate) fn row_vector_broadcasts(
 ) -> Vec<Option<ValueId>> {
     let ops = &stage_program.ops;
     let mut folds: Vec<Option<ValueId>> = vec![None; ops.len()];
-    // Consumers per value, to know when a reshape is read only by folds.
     let mut uses = vec![0u32; original_types.len()];
     let mut folded_uses = vec![0u32; original_types.len()];
     for op in ops {
@@ -284,7 +218,6 @@ pub(crate) fn row_vector_broadcasts(
     for (op_index, op) in ops.iter().enumerate() {
         if let Op::Reshape { .. } = op {
             let out = op_index;
-            // A reshape has one result; its value id is its producer slot.
             let value = producer
                 .iter()
                 .position(|p| p.index() == out)
@@ -314,9 +247,6 @@ pub(crate) fn result_layout(ops: &[Op]) -> (Vec<ValueId>, Vec<NodeIndex>) {
     (bases, producer)
 }
 
-/// A `Broadcast` of a scalar whose every consumer is an `Op::Select` operand
-/// (not the condition) is redundant, since `Select` already broadcasts its
-/// operands.
 pub(crate) fn redundant_select_broadcasts(
     stage_program: &eta_ir::container::StageProgram,
     original_types: &[ValueType],
@@ -345,7 +275,6 @@ pub(crate) fn redundant_select_broadcasts(
         let Some(uses) = consumers.get(result) else {
             continue;
         };
-        // `Op::Select` operands are `[cond, a, b]`; slot 0 keeps its own shape.
         if !uses.is_empty()
             && uses.iter().all(|(consumer, slot)| {
                 matches!(stage_program.ops[*consumer], Op::Select { .. }) && *slot != 0
@@ -365,7 +294,6 @@ pub(crate) fn live_ops(
     let mut keep = vec![false; stage_program.ops.len()];
     let mut values = Vec::new();
     for (op_index, op) in stage_program.ops.iter().enumerate() {
-        // DCE roots at the effectful ops.
         if op.is_effectful() {
             keep[op_index] = true;
             values.extend(op.operands());
@@ -379,7 +307,6 @@ pub(crate) fn live_ops(
         }
     }
 
-    // A kept multi-result producer keeps all of its positional results.
     debug_assert_eq!(
         result_bases.last().copied().unwrap_or(0)
             + stage_program.ops.last().map(Op::result_count).unwrap_or(0),
@@ -388,7 +315,6 @@ pub(crate) fn live_ops(
     keep
 }
 
-/// Classify one value.
 pub(crate) fn value_domain(vocab: u32, op: &Op, value_type: &SymbolicType) -> ValueDomain {
     if value_type.is_scalar() {
         return ValueDomain::Scalar;
@@ -419,7 +345,6 @@ pub(crate) fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
     let mut channels = Vec::new();
     let mut names = Vec::new();
     for op in &mut stage.ops {
-        // Not `else if`: an op could carry both.
         if let Some(channel) = op.channel_mut() {
             *channel = local_channel(&mut channels, *channel).get();
         }
@@ -437,8 +362,6 @@ pub(crate) fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
     stage.names = names;
 }
 
-/// The slot `global` occupies in this stage's channel table, binding it if the
-/// stage has not touched it yet.
 pub(crate) fn local_channel(channels: &mut Vec<ChannelIndex>, global: ChannelIndex) -> ChannelSlot {
     if let Some(local) = channels.iter().position(|channel| *channel == global) {
         ChannelSlot(local as u32)
@@ -463,8 +386,11 @@ mod value_domain_tests {
     use super::*;
     use crate::plan::compile::signature::stage_signature;
 
-    // Pins that the signature still hashes value_domains, since that hash is
-    // the emitted kernel's entry-point name and the engine's cache key.
+    fn normalize_every_case() {
+        the_signature_still_depends_on_value_domains();
+        reductions_are_per_row_by_falling_through();
+    }
+
     #[test]
     fn the_signature_still_depends_on_value_domains() {
         let mut stage = NormalizedStage {
@@ -493,8 +419,6 @@ mod value_domain_tests {
         );
     }
 
-    // Reductions fall through to PerRow.
-    #[test]
     fn reductions_are_per_row_by_falling_through() {
         let per_row = SymbolicType {
             dtype: Dtype::F32,

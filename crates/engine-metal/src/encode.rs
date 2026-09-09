@@ -1,17 +1,3 @@
-//! The encode sink: the engine side of `kernels_metal::Encode`. A kernel
-//! entry hands this module a [`Fire`] (shader path, entrypoint, grid) and a
-//! flat list of [`ArgValue`]s; the point is resolved to a compiled pipeline
-//! ([`Pipelines`]), each argument is bound at its own index, and one
-//! dispatch is encoded into the fire's open compute pass. Encode only,
-//! never sync: there is no synchronizing call in this file (the only one
-//! left in the shell is [`Pending::wait`](crate::device::Pending)).
-//!
-//! The argument space is one flat positional table, gaps included: a Metal
-//! shader declares every parameter at its own `[[buffer(n)]]`, so a slot a
-//! shader variant doesn't use is bound [`absent`](kernels_metal::Encode::absent)
-//! rather than omitted (an omission would shift every later index). A
-//! scalar is bound by value via `setBytes:length:`, not through a buffer.
-
 use std::cell::RefCell;
 
 use kernels_metal::{ArgValue, Encode, Error, Fire};
@@ -32,108 +18,49 @@ use crate::window::{At, Windows};
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 #[cfg(target_vendor = "apple")]
-/// The shader file every routing decision is made in.
 #[allow(dead_code, reason = "the router's dispatch no longer cuts; kept as the name of the seam")]
 const ROUTER_FILE: &str = "linear/moe_route.metal";
 
 #[cfg(target_vendor = "apple")]
-/// Entrypoints of [`ROUTER_FILE`] that land a routing vector, by prefix:
-/// the four ranked `Linear::MoeTopk*` arms lower to `router_topk…`, and
-/// `MoeHashRoute` lands the same pair off a table instead of logits.
-///
-/// This list is load-bearing and its omission is silent: a router whose
-/// point isn't named here fires and lands real expert ids, but the tier
-/// never rewrites the vector to seat indices, so a streamed load's matmul
-/// silently reads another band's bytes.
-///
-/// `route_sort` (same file) is deliberately excluded: it runs after the ids
-/// have already been rewritten.
 #[allow(dead_code, reason = "see ROUTER_FILE")]
 const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 
 #[cfg(target_vendor = "apple")]
-/// The file the gathered class's cut falls after: the n-gram hasher lands a
-/// vector of table rows exactly as a router lands a vector of experts.
 const HASHER_FILE: &str = "attn/ple.metal";
 
 #[cfg(target_vendor = "apple")]
-/// Entrypoints of [`HASHER_FILE`] that land a row vector, by prefix. Same
-/// warning as [`ROUTER_POINTS`]: an unlisted point is never cut, so the
-/// gather reads a slab of seats at ids that are not seats.
 const HASHER_POINT: &str = "ple_ngram_ids";
 
-/// One fire's encode sink: everything a dispatch needs, borrowed — and, for
-/// a streamed load, the command buffer itself.
-///
-/// Built per fire and dropped with it. On a full-residency load it owns
-/// nothing, which is what lets `Encode::fire` take `&self`.
-///
-/// A streamed load owns its frame, because it ends one mid-walk: a segment
-/// cut commits the command buffer, waits, swaps seats, and opens the next
-/// one — a borrowed `&Frame` can't be committed or replaced. Interior
-/// mutability (`RefCell`) rather than `&mut self`, since the walk holds the
-/// sink and the dispatch as two separate borrows.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sink<'a> {
     device: &'a Context,
     frame: Held<'a>,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
-    /// `None` for a full-residency load, and then this file is byte for byte
-    /// the sink it was before the tier existed.
     cuts: Option<Cuts<'a>>,
 }
 
-/// The command buffer, borrowed or owned — see [`Sink`].
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 enum Held<'a> {
-    /// A frame the caller opened and will commit: the full-residency path,
-    /// and the shape `device_floor`'s probe uses.
     Borrowed(&'a Frame),
-    /// The segment in flight. `None` only between the commit that closed one
-    /// and the call that opened the next, which is inside one cut.
     Owned(RefCell<Option<Frame>>),
 }
 
-/// Everything one segment cut needs, resolved once per fire: a trace fact
-/// (`experts::cuts` finds the routers), a fire fact (which region the walk
-/// is inside), and a plan fact (where the carve put the routing vector).
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Cuts<'a> {
-    /// Which region the walk is inside, and which run of its window.
     place: &'a At,
-    /// Per region: the routing vector the router in it writes, or `None`.
     at: &'a [Option<ValueId>],
-    /// Per region: the n-gram id vector the hasher in it writes, or `None`.
-    /// The gathered class's twin of [`Cuts::at`], and read the same way.
     ngram: &'a [Option<ValueId>],
-    /// This fire's arena rectangles — where the routing vector landed.
     slots: &'a SlotTable,
-    /// This fire's windows — which rows of it the region just wrote.
     windows: &'a Windows,
-    /// A retain of the arena reservation, which is where a routing vector
-    /// lives. Shared storage, so reading it is a `memcpy` and rewriting it is
-    /// a `memcpy` — no transfer, no staging buffer, no second copy.
     arena: RefCell<Buffer>,
-    /// The tier the swap happens in, or `None` for a load that streams no
-    /// band and is only here for the gathered class.
     tier: Option<&'a RefCell<Tier>>,
-    /// The row slab the gather seats into, or `None` for a load whose
-    /// tables are resident. Both this and `tier` may be `Some`: a capped
-    /// load can stream experts and gather its n-gram table independently.
     rows: Option<&'a RefCell<crate::gather::Slab>>,
-    /// The `(region, run)` whose first dispatch has been seen — the cut for
-    /// a routed segment happens once per run of the region that reads the
-    /// router's seats, before that run's first dispatch.
     seen: std::cell::Cell<(u32, u32)>,
-    /// How many expert groups the region being walked in passes has (set
-    /// at its pass 0 cut): passes past them seat nothing and dispatch
-    /// nothing, and the region's tail runs in the last one that does.
     groups: std::cell::Cell<u32>,
 }
 
 impl<'a> Cuts<'a> {
-    /// Bind what a cut resolves through.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -162,7 +89,6 @@ impl<'a> Cuts<'a> {
 }
 
 impl<'a> Sink<'a> {
-    /// Bind the four things a dispatch resolves through.
     #[must_use]
     pub fn new(
         device: &'a Context,
@@ -179,8 +105,6 @@ impl<'a> Sink<'a> {
         }
     }
 
-    /// The same sink over a frame it OWNS, cut into segments at `cuts` — the
-    /// streamed load's walk.
     #[must_use]
     pub fn streaming(
         device: &'a Context,
@@ -198,9 +122,6 @@ impl<'a> Sink<'a> {
         }
     }
 
-    /// The last segment's command buffer, for the caller to finish (readout
-    /// blit, epilogues, async commit). `None` for a borrowed sink, whose
-    /// caller already holds the frame.
     #[must_use]
     pub fn into_frame(self) -> Option<Frame> {
         match self.frame {
@@ -209,7 +130,6 @@ impl<'a> Sink<'a> {
         }
     }
 
-    /// Run `body` against whichever frame this sink holds.
     #[cfg(target_vendor = "apple")]
     fn with_frame<T>(&self, body: impl FnOnce(&Frame) -> T) -> T {
         match &self.frame {
@@ -222,26 +142,11 @@ impl<'a> Sink<'a> {
         }
     }
 
-    /// The segment cut (`crate::experts`): close this command buffer, wait
-    /// for it, swap the seats the segment ahead will read, rewrite the
-    /// routing vector to name them, and open the next command buffer.
-    ///
-    /// The wait is the whole correctness argument: this shell has no fence
-    /// and no second copy of the weight store, so what proves "nothing is
-    /// reading seat `s`" is that everything committed before this instant
-    /// has completed.
-    ///
-    /// A refusal here surfaces as a `Backend` [`Error`] via [`Sink::refuse`],
-    /// since that's the only thing `kernels_metal::Encode` may answer with.
     #[cfg(target_vendor = "apple")]
     fn cut(&self, fire: Fire, cuts: &Cuts<'_>) -> Result<(), Error> {
         let Some(tier) = cuts.tier else {
             return Ok(());
         };
-        // The router is the last node of ITS region (`model_compiler::region`
-        // breaks after every router), so the region whose run is beginning
-        // reads the routes the region before it wrote — and the cut's span is
-        // this run's, which is what lets a routed segment run in pieces.
         let region = cuts.place.region.get();
         let Some(routes) = region
             .checked_sub(1)
@@ -249,8 +154,6 @@ impl<'a> Sink<'a> {
         else {
             return Ok(());
         };
-        // The prediction the router carries, where the carve put it — read
-        // at the same cut, beside the routes.
         let hint = tier
             .borrow()
             .hint_for(routes)
@@ -261,10 +164,6 @@ impl<'a> Sink<'a> {
         })
     }
 
-    /// The gathered class's cut: everything [`Sink::cut`] says holds here
-    /// too. Only the vector's meaning differs — a router's entry is an
-    /// expert (tier answers with a seat), a hasher's entry is a table row
-    /// (slab answers with a seat) — the rewrite itself is the same.
     #[cfg(target_vendor = "apple")]
     fn cut_rows(&self, fire: Fire, cuts: &Cuts<'_>) -> Result<(), Error> {
         let Some(rows) = cuts.rows else {
@@ -281,10 +180,6 @@ impl<'a> Sink<'a> {
         })
     }
 
-    /// Close this command buffer, wait for it, let `seat` rewrite the
-    /// vector, and open the next — the half both cuts share. The wait is
-    /// what makes the host's `memcpy` of `vector` legal: the bytes are the
-    /// device's until everything committed before this instant has completed.
     #[cfg(target_vendor = "apple")]
     fn across(
         &self,
@@ -349,9 +244,6 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
-    /// A shell fault, restated as the [`Error`] a `kernels-metal` entry may
-    /// answer with. The entrypoint names the launch; the fault's sentence
-    /// becomes the detail, so nothing is lost but the variant.
     fn refuse(fire: Fire, fault: Fault) -> Error {
         Error::Backend {
             op: fire.entrypoint,
@@ -360,16 +252,6 @@ impl<'a> Sink<'a> {
     }
 }
 
-/// **THE KERNEL PROFILE** — `diagnostics = "kernel-profile"`.
-///
-/// With it set, every dispatch is committed in its own command buffer and
-/// timed on the device (`GPUEndTime - GPUStartTime`), and the time is
-/// summed here by entrypoint — an owned (segment) frame's dispatches in
-/// place, a borrowed frame's each in a buffer of its own. It is a
-/// measurement mode, not a serving one: a command buffer per kernel costs
-/// submission latency the sums do not include, so what the profile answers is
-/// "where does the DEVICE time of a token go", kernel by kernel — the
-/// question no tool on a box without Xcode can otherwise answer.
 static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -378,8 +260,6 @@ fn profiling() -> bool {
     crate::diag::on().kernel_profile.on()
 }
 
-/// Every entrypoint the profile has timed: `(name, device ns, launches)`,
-/// most device time first. Empty unless `diagnostics = "kernel-profile"`.
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
@@ -392,7 +272,6 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     rows
 }
 
-/// Forget every timing the profile holds.
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
@@ -401,9 +280,6 @@ pub fn reset_kernel_profile() {
 }
 
 #[cfg(target_vendor = "apple")]
-/// `kernel-profile=2`: the key carries the launch's scalar arguments (a
-/// matvec's K and N, a router's expert count…), so one entrypoint's time
-/// splits by shape.
 fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
     if !crate::diag::on().kernel_profile.shaped() {
         return entrypoint.to_string();
@@ -434,19 +310,12 @@ impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         #[cfg(target_vendor = "apple")]
         {
-            // Segment boundary: a streamed load ends its command buffer at the
-            // first dispatch of every run of a region that reads a router's
-            // seats — after the router decided (its region ended) and before
-            // the matmuls read. Once per `(region, run)`; a run of many
-            // pieces is many cuts, each seating its own rows' experts.
             if let Some(cuts) = &self.cuts {
                 let here = (cuts.place.region.get(), cuts.place.run.get());
                 if cuts.seen.get() != here {
                     cuts.seen.set(here);
                     self.cut(fire, cuts)?;
                 }
-                // Expert-major passes: a pass past the last group has no
-                // routed work, and the tail belongs to the last group's pass.
                 let window = cuts.windows.at(here.0, here.1);
                 if window.passes > 1 {
                     let groups = cuts.groups.get().max(1);
@@ -462,12 +331,6 @@ impl Encode for Sink<'_> {
                 .pipelines
                 .at(self.device.device(), fire)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
-            // ── The kernel profile on a BORROWED frame (a full-residency
-            // load): the caller's command buffer cannot be committed per
-            // dispatch, so each dispatch goes into a buffer of its own,
-            // committed and waited for here, in order. The caller's own
-            // encodings (the readout blit, the epilogues) land after every
-            // one of these has completed.
             if profiling() {
                 if let Held::Borrowed(_) = &self.frame {
                     let refuse = |fault: Fault| Sink::refuse(fire, fault);
@@ -522,7 +385,6 @@ impl Encode for Sink<'_> {
                 encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
                 Ok(())
             })?;
-            // ── The kernel profile: this dispatch alone, committed and timed.
             if profiling() {
                 if let Held::Owned(cell) = &self.frame {
                     let refuse = |fault: Fault| Sink::refuse(fire, fault);
@@ -535,9 +397,6 @@ impl Encode for Sink<'_> {
                     *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
                 }
             }
-            // The gathered class's cut stays at the hasher's own dispatch: its
-            // vector is the table rows to seat, read the instant it is written.
-            // A full-residency load has no `cuts`.
             if let Some(cuts) = &self.cuts {
                 if fire.file == HASHER_FILE && fire.entrypoint.starts_with(HASHER_POINT) {
                     self.cut_rows(fire, cuts)?;
@@ -559,7 +418,6 @@ impl Encode for Sink<'_> {
 
 #[cfg(target_vendor = "apple")]
 impl Sink<'_> {
-    /// One argument at one index.
     fn bind(
         &self,
         encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -599,13 +457,10 @@ impl Sink<'_> {
             ArgValue::I32(v) => self.scalar(encoder, &v, at),
             ArgValue::U32(v) => self.scalar(encoder, &v, at),
             ArgValue::F32(v) => self.scalar(encoder, &v, at),
-            // `size_t` is 64 bits in MSL, which is what the pool's stride
-            // seats are declared as.
             ArgValue::Usize(v) => self.scalar(encoder, &v, at),
         }
     }
 
-    /// A scalar bound by value into the encoder's argument storage.
     fn scalar<T: Copy>(
         &self,
         encoder: &objc2::runtime::ProtocolObject<dyn MTLComputeCommandEncoder>,

@@ -1,29 +1,3 @@
-//! **A CONV DECODER TRACES ON THE VOXEL AXIS: ITS ROWS GROW BY THE RULES,
-//! EVERY GRID IS A VALUE, AND ITS PIXELS ARE THE READOUT.** (design D8)
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_conv_decoder_traces_on_the_voxel_axis
-//! ```
-//!
-//! A two-layer decoder — conv3d, group norm + silu, nearest upsample, conv3d,
-//! pixel shuffle — over a `[Voxels, 8]` port:
-//!
-//! (a) the activations keep `[rows, channels]`: a conv keeps its rows and
-//!     lands `C_out`, the upsample grows rows by its volume
-//!     (`VoxelsTimes(4)`), the shuffle by its block and divides the width
-//!     (`VoxelsTimes(16)`, 3 channels);
-//! (b) every op that changes the box is preceded by one `spatial.grid`
-//!     node deriving its output grid from its input grid — four here — and
-//!     the norm, which keeps the box, derives none;
-//! (c) a conv weight is interned `ParamLayout::ConvTapsMajor`, so the
-//!     shell relabels it once at load; one declared natural is refused at
-//!     trace time;
-//! (d) `seam::PIXELS` planted on the returned value and its grid is the
-//!     readout: no `out` seam is planted, and the seam names two values;
-//! (e) `spatial.patchify` is the one op that leaves the axis: its output is
-//!     `[Tokens, C·p]`, and it reads the token grid the text declares;
-//! (f) the validator accepts the whole trace.
-
 use model_dsl::ops::spatial::{self, Conv};
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, seam,
@@ -109,6 +83,11 @@ impl ForwardHybrid for Decoder {
     }
 }
 
+fn a_conv_decoder_traces_on_the_voxel_axis_every_case() {
+    the_decoder_traces_and_its_grids_are_values();
+    the_patchify_pair_crosses_the_axis_and_back();
+}
+
 #[test]
 fn the_decoder_traces_and_its_grids_are_values() {
     let trace = trace_hybrid("conv-decoder", &Decoder::new(), Platform::Cuda);
@@ -131,7 +110,6 @@ fn the_decoder_traces_and_its_grids_are_values() {
         "one grid node ahead of every op that changes the box, none for the norm"
     );
 
-    // (c) the conv weights carry the relabelling; the planes beside them do not.
     for param in &trace.params {
         let want = if param.name == "conv1" {
             ParamLayout::ConvTapsMajor {
@@ -149,7 +127,6 @@ fn the_decoder_traces_and_its_grids_are_values() {
         assert_eq!(param.layout, want, "`{}`", param.name);
     }
 
-    // (d) the pixels seam is the readout: two values, no `out`.
     assert!(!trace.seams.iter().any(|seam| seam.seam == "out"));
     let pixels = trace
         .seams
@@ -201,7 +178,6 @@ impl ForwardHybrid for Patchifier {
     }
 }
 
-#[test]
 fn the_patchify_pair_crosses_the_axis_and_back() {
     let trace = trace_hybrid("patchify", &Patchifier, Platform::Cuda);
     model_ir::check(&trace).expect("the validator accepts the pair");

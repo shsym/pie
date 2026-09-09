@@ -1,15 +1,9 @@
-//! Checks the wide window-admission reading (`covers_fire_shifted` /
-//! `Windows::admits`) accepts a shifted composition per region, and that two
-//! row splits of one body key move a launch without moving the total.
-
 use engine_cuda::record::BodyKey;
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use model_exec::fire::{Composition, Lane, compose};
 use model_ir::ops::Elementwise;
 
-/// Ceilings generous enough to just hold; tests check window semantics, not
-/// the carve. Last three bound one gathered payload's rows, kv spaces, pages.
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
@@ -18,26 +12,16 @@ use model_ir::{
     ValueDecl, ValueId,
 };
 
-/// Activation width; arbitrary, just needs a value.
 const WIDTH: u64 = 8;
 
-/// `Budget::new` states no lattice, so a fire's bucket is its own row count —
-/// the two splits below share a bucket by sharing a total.
 fn budget() -> Budget {
     Budget::new(4, 64)
 }
 
-/// No class here is a decode class: a `record::BodyKey` rung is a per-class
-/// ceiling (bucket for prefill, lane ceiling for decode), and with no
-/// `attention.decode` arm both classes carve to the bucket, so the two splits
-/// share a key regardless of rows.
 fn no_decode_class() -> model_ir::ClassSet {
     model_ir::ClassSet::default()
 }
 
-/// `Shell::lane_ceiling` = `min(slots, max_lanes, max_tokens)`; `max_lanes`
-/// binds at four. Unused here (no decode class), but the key arithmetic
-/// requires it.
 const LANES: u32 = 4;
 
 fn act() -> Ty {
@@ -76,9 +60,6 @@ impl Build {
         ValueId((self.trace.values.len() - 1) as u32)
     }
 
-    /// One row-plane op, guarded. Uses `layernorm_no_scale` (on `SHIFTED`,
-    /// unlike its rmsnorm sibling) and takes no weight, so the trace needs no
-    /// checkpoint to compile.
     fn op(&mut self, x: ValueId, guard: Guard) -> ValueId {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act());
@@ -91,9 +72,6 @@ impl Build {
     }
 }
 
-/// A shared head, a two-way split on one fact, a merge, a shared tail. The
-/// guarded arms make the fire windowed: each region's window begins wherever
-/// the class order puts it, never row zero for at least one arm.
 fn subject() -> Trace {
     let mut b = Build::new();
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
@@ -123,9 +101,6 @@ fn baked() -> (Trace, CompiledModel) {
     (trace, compiled)
 }
 
-/// Reimplements `exports::regions_shifting` (crate-private) per region: ALL
-/// nodes must be `SHIFTED`, since one non-shifting op mis-addresses the whole
-/// region's launch.
 fn shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
     compiled
         .template()
@@ -141,9 +116,6 @@ fn shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
         .collect()
 }
 
-/// True for every region: this subject declares no cache and is
-/// `layernorm_no_scale` end to end, so no op is lane-indexed. This file only
-/// varies where a window's rows begin, not the lane clause.
 fn lane_shifting(compiled: &CompiledModel) -> Vec<bool> {
     vec![true; compiled.template().len()]
 }
@@ -162,7 +134,6 @@ fn boundaries(fire: &Composition) -> Vec<i32> {
     out
 }
 
-/// One composition's window table.
 fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windows {
     Windows::of(
         trace,
@@ -175,8 +146,6 @@ fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windo
     .expect("every region seats a window")
 }
 
-/// Per-launch row counts, in launch order — mirrors `record::launch_grids`'
-/// layout.
 fn launch_rows(compiled: &CompiledModel, table: &Windows) -> Vec<u32> {
     let mut rows = Vec::new();
     for region in 0..compiled.template().len() as u32 {
@@ -187,14 +156,17 @@ fn launch_rows(compiled: &CompiledModel, table: &Windows) -> Vec<u32> {
     rows
 }
 
-/// Two lanes, one in each class, at the stated row counts.
 fn split(compiled: &CompiledModel, hot: u32, cold: u32) -> Composition {
     compose(compiled, &budget(), &[Lane::new(1, hot), Lane::new(0, cold)])
         .expect("the two-class fire composes")
 }
 
-/// (a) Premise: every node is on the list, so every region moves its own
-/// base and the fire really is windowed.
+fn a_shifted_body_admits_the_split_that_moved_every_case() {
+    every_region_of_the_subject_addresses_off_the_seat();
+    the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits();
+    two_splits_of_one_key_move_a_launch_the_total_does_not();
+}
+
 #[test]
 fn every_region_of_the_subject_addresses_off_the_seat() {
     let (trace, compiled) = baked();
@@ -224,9 +196,6 @@ fn every_region_of_the_subject_addresses_off_the_seat() {
     );
 }
 
-/// (b) The flip: the narrow gate refuses this table, the wide one admits it,
-/// and `Windows::admits` says the same thing one region at a time.
-#[test]
 fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
     let (trace, compiled) = baked();
     let shifted = shifting(&trace, &compiled);
@@ -244,8 +213,6 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
          all read the seat's start, and the wide gate refused it anyway",
     );
 
-    // Not a blanket yes: removing the shift from one region brings the
-    // refusal back.
     let mut crippled = shifted.clone();
     let windowed = (0..compiled.template().len())
         .find(|&region| {
@@ -262,9 +229,6 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
          launch plane would hand it pre-shifted pointers under a disarmed seat",
     );
 
-    // The refusal costs one region, not the composition: `covers_fire_shifted`
-    // collapses `Windows::admits`, and the crippled region becomes an
-    // `Admit::Island` while the rest stay `Captured`.
     let table_admits = table.admits(fire.rows(), &crippled, &lane_shifting(&compiled));
     assert_eq!(
         table_admits[windowed],
@@ -291,11 +255,6 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
     );
 }
 
-/// (c) Staleness hazard: two fires with the same body key (same classes,
-/// bucket, ceilings, total rows) whose per-launch row counts still disagree.
-/// A body captured on one and replayed on the other would run a launch
-/// recorded for fewer rows than the live data has.
-#[test]
 fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
     let (trace, compiled) = baked();
     let first = split(&compiled, 5, 3);

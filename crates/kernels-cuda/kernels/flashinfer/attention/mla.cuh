@@ -1,27 +1,25 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_MLA_FA2_CUH_
 #define FLASHINFER_MLA_FA2_CUH_
 #include <cooperative_groups.h>
 
 #include <cstdint>
 #include <cuda/std/limits>
-// PIE: REMOVED -- host-only `<sstream>`. 1 line of host C++, guarded out of every NVRTC
-// compile before it was removed, so removing it changes no compile. This marker is one a strip
-// does NOT undo; see MODIFICATIONS.
+
 
 #include "../profiler.cuh"
 #include "mla_params.cuh"
@@ -34,8 +32,7 @@ namespace mla {
 
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
-  // Per-tensor symmetric-quantization scales for the FP8 KV path. Both 1.0 on
-  // the BF16/FP16 path so they are no-ops there.
+
   float ckv_scale;
   float kpe_scale;
 
@@ -62,8 +59,8 @@ struct SharedStorageQKVO {
           kpe_p_smem[NUM_STAGES]
                     [CTA_TILE_KV * (HEAD_DIM_KPE > CTA_TILE_Q ? HEAD_DIM_KPE : CTA_TILE_Q)];
       union {
-        alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
-        alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+        alignas(16) float m_wg[2][CTA_TILE_Q];
+        alignas(16) float d_wg[2][CTA_TILE_Q];
       };
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
@@ -76,9 +73,7 @@ template <bool CAUSAL_, uint32_t NUM_STAGES_, bool QK_SHARD_, uint32_t HEAD_DIM_
 struct KernelTraits {
   static constexpr bool CAUSAL = CAUSAL_;
   static constexpr uint32_t NUM_STAGES = NUM_STAGES_;
-  // NOTE(Zihao): whether to shard Q*K computation across warpgroups
-  // if true, each warpgroup will compute a subset of Q*K (sharded on the KV dimension)
-  // if false, each warpgroup will compute the full Q*K, which is duplicated across warpgroups
+
   static constexpr bool QK_SHARD = QK_SHARD_;
   static constexpr uint32_t NUM_MMA_KV = CTA_TILE_KV_ / 16;
   static constexpr uint32_t HEAD_DIM_CKV = HEAD_DIM_CKV_;
@@ -210,7 +205,6 @@ __device__ __forceinline__ void load_kv(
       uint32_t packed_block_iter = packed_block_iter_base + lane_idx / 8 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
 
-      // Cast page index to int64_t before multiplying to avoid overflow.
       DTypeKV* ckv_ptr =
           ckv +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
@@ -248,7 +242,6 @@ __device__ __forceinline__ void load_kv(
                                    (warpgroup_idx + mma_kv * 2) * 16 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
 
-      // See comment above: widen to int64_t to avoid 32-bit overflow when indices[q] is large.
       DTypeKV* ckv_ptr =
           ckv +
           static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
@@ -290,7 +283,7 @@ __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem,
                                             typename KTraits::DTypeQKAccum (*s_frag)[8]) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   alignas(16) uint32_t q_frag[4], k_frag[4];
-  // compute q*k^T
+
 #pragma unroll
   for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_QK; ++mma_d) {
     uint32_t q_smem_offset_r = q_smem.template get_permuted_offset<UPCAST_STRIDE_Q>(
@@ -491,9 +484,9 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
   smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+  compute_qk_<true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
               KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
-  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+  compute_qk_<false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
               KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
 }
 
@@ -511,7 +504,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
   uint32_t ckv_smem_offset_r = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
       lane_idx % 16, warpgroup_idx * NUM_MMA_D_CKV + lane_idx / 16);
   if constexpr (KTraits::QK_SHARD) {
-    // shard s_frag computation on KV dimension across warpgroups, need allgather
+
     alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV / 2][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
@@ -544,7 +537,6 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     uint32_t p_smem_offset_r = p_smem.template get_permuted_offset<UPCAST_STRIDE_P>(
         warp_idx_in_wg * 16 + lane_idx % 16, lane_idx / 16);
 
-    // wait for p_smem to be filled
     __syncthreads();
 
 #pragma unroll
@@ -566,7 +558,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
           NUM_MMA_D_CKV;
     }
   } else {
-    // no need to store p_smem because all warpgroups are working on the same p
+
     alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV][8];
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
@@ -611,7 +603,7 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
   }
 
   float d_rcp[2];
-  // compute reciprocal of d
+
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
     d_rcp[j] = (m[j] != typename KTraits::DTypeQKAccum(-math::inf)) ? math::ptx_rcp(d[j]) : 0.f;
@@ -649,7 +641,7 @@ __device__ void DevicePersistentMergeStates(
     float* partial_lse, typename KTraits::DTypeO* final_o, float* final_lse,
     const uint32_t o_stride_n, const uint32_t o_stride_h, const uint_fastdiv& num_heads,
     const bool& return_lse_base_on_e) {
-  constexpr uint32_t VEC_SIZE = 8;  // partial o has data type float
+  constexpr uint32_t VEC_SIZE = 8;
   constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
   constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
   const uint32_t cta_idx = (gridDim.x * blockIdx.y + blockIdx.x);
@@ -773,7 +765,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   }
 
   if (partial_o != nullptr) {
-    // write to partial_o
+
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
@@ -785,7 +777,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
       }
     }
 
-    // step 1. smem to gmem
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx / 8, warpgroup_idx * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
@@ -798,17 +789,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q_idx < q_len) {
-// PIE: `.template` must be followed by a TEMPLATE-ID, and `store_128b` is an
-// ordinary member function of `smem_t`. nvcc's frontend accepts the stray
-// keyword; NVRTC 13.0 rejects it at both `-std=c++17` and `-std=c++20`,
-// measured in isolation away from FlashInfer entirely. `src/source.rs` lists
-// every file under `csrc/`, so this file has shipped to every JIT compile for
-// months and
-// nothing ever instantiated a path that reached this line -- a dependency
-// satisfied by accident reads exactly like one satisfied on purpose. With the
-// token dropped, all six MLA instantiations lower: rc=0, 306-530 KB of PTX.
-// Upstream's spelling is kept under the guard so NOTICE's transform restores
-// the file. See also `:847`, the same expression in the finalise loop.
+
 #ifndef __CUDACC_RTC__
           o_smem.template store_128b(o_smem_offset_w, o_partial_ptr);
 #else
@@ -823,7 +804,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           NUM_MMA_D_CKV;
     }
   } else {
-    // write to final_o
+
 
     if (final_lse) {
 #pragma unroll
@@ -841,7 +822,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
       }
     }
 
-    // step 1. smem to gmem
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx / 8, warpgroup_idx * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
@@ -854,8 +834,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q < q_len) {
-// PIE: the same stray `template` keyword as `:806`, in the finalise loop. Both
-// sites, and only these two in the file.
+
 #ifndef __CUDACC_RTC__
           o_smem.template store_128b(o_smem_offset_w, o_final_ptr);
 #else
@@ -975,7 +954,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         (kv_start / CTA_TILE_KV);
 
     uint32_t block_iter_base = kv_indptr * block_size + kv_start;
-    // last kv tile
+
     __syncthreads();
     uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
     load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
@@ -994,24 +973,19 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       }
     }
 
-    // loop with mask
 #pragma unroll 1
     for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
-      // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
-      // logits mask
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
                             kv_end, num_heads, s_frag);
 
-      // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
                                   m, d);
 
-      // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
 
       if (kv_tile_idx - NUM_STAGES >= 0) {
@@ -1024,19 +998,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       }
     }
 
-    // loop without mask
 #pragma unroll 1
     for (; kv_tile_idx + 1 > NUM_STAGES; --kv_tile_idx) {
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
-      // compute mla qk
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
-      // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
                                   m, d);
-      // compute sfm * v
+
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
 
       __syncthreads();
@@ -1049,26 +1020,22 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     cp_async::wait_group<0>();
     __syncthreads();
 
-    // last tiles
 #pragma unroll
     for (; kv_tile_idx >= 0; --kv_tile_idx) {
-      // compute mla qk
+
       compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
       logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
                             kv_end, num_heads, s_frag);
 
-      // compute m,d states in online softmax
       update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
                                   m, d);
 
-      // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d, o_frag);
     }
 
     __syncthreads();
 
-    // normalize and write back
     normalize_d_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag, m, d);
 
     finalize_m_<KTraits>(variant, m);
@@ -1084,7 +1051,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   auto grid = cg::this_grid();
   grid.sync();
 
-  // the second stage, merge partial outputs
   DevicePersistentMergeStates<KTraits>(
       params.merge_packed_offset_start, params.merge_packed_offset_end,
       params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
@@ -1115,13 +1081,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     return cudaErrorNotSupported;                                                       \
   }
 
-// PIE: REMOVED -- `BatchMLAPagedAttention`, a host launcher. 36 lines of host C++ that built a
-// `void* args[]` for `cudaLaunchKernel`. Unguarded and unreached -- NVRTC parsed it as an
-// uninstantiated template, which is a weaker shield than a guard. Rust plans and fires these
-// kernels with `cuLaunchKernel`. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
-}  // namespace mla
+}
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_MLA_FA2_CUH_
+#endif

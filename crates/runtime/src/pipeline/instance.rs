@@ -1,44 +1,28 @@
-//! Instance construction — host-side `instantiate` logic behind WIT
-//! `pipeline.instantiate`. An instance binds a registered program to its
-//! per-instance state: seed values for `seeded` channels, plus the
-//! host-facing channel set.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::program::RegisteredProgram;
 
-/// Process-wide monotonic instance-id source (0 reserved as null). Each
-/// `instantiate` mints a fresh id; the engine caches one channel arena per id.
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Mint the next process-wide instance identity.
 pub fn next_instance_id() -> u64 {
     NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A per-instance channel seed value, by dense channel index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSeed {
     pub channel: u32,
     pub data: Vec<u8>,
 }
 
-/// A constructed instance: the registered program + its validated seeds.
 #[derive(Debug)]
 pub struct Instance {
     pub program: Arc<RegisteredProgram>,
-    /// This instance's identity — the engine's channel-arena cache key,
-    /// stable across its fires.
     pub instance_id: u64,
-    /// Validated seeds, one per `seeded` channel, in channel order.
     pub seeds: Vec<ChannelSeed>,
 }
 
 impl Instance {
-    /// Assemble host-known per-channel values for a fire's geometry map:
-    /// seeded channels carry their seed; everything else is host-unknown
-    /// (`None`), left for the engine to resolve.
     pub fn channel_values(&self) -> Vec<Option<Vec<u8>>> {
         let mut v = vec![None; self.program.bound.container.channels.len()];
         for s in &self.seeds {
@@ -47,10 +31,6 @@ impl Instance {
         v
     }
 
-    /// Map this instance's descriptor ports → the fire's [`ReqGeometry`] from
-    /// host-known channel values. Errs with
-    /// [`GeometryError::MissingChannelValue`] when a port binds a channel
-    /// whose value isn't host-known (needs engine/ws/run-ahead resolution).
     pub fn fire_geometry(
         &self,
     ) -> Result<
@@ -83,17 +63,12 @@ impl KvPageSpan {
     }
 }
 
-/// The pass's declared KV window; the owning working set is
-/// [`BoundForwardPass::kv_ws`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvDeclaration {
     pub readable: KvPageSpan,
     pub writable: KvPageSpan,
 }
 
-/// Which WIT forward interface a pass was built through. One Rust
-/// `ForwardPass` backs all three interfaces; this field makes a
-/// mis-selected interface fail loudly rather than silently run wrong logic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassKind {
     Attention,
@@ -112,7 +87,6 @@ impl PassKind {
         }
     }
 
-    /// The interface a guest must use for this kind.
     pub fn interface(self) -> &'static str {
         match self {
             PassKind::Attention => "pie:inferlet/forward",
@@ -123,14 +97,9 @@ impl PassKind {
     }
 }
 
-/// Which reading a diffusion pass runs — host mirror of WIT
-/// `forward-diffusion.mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanvasMode {
-    /// Causal; its KV writes are the sequence (prefill, commit).
     Encode,
-    /// Bidirectional over `[prefix | canvas]`; its KV writes are the
-    /// canvas's scratch.
     Denoise,
 }
 
@@ -141,79 +110,31 @@ pub struct ForwardBindings {
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
     pub rs_geom: Option<RsGeometryBinding>,
-    /// Host-known `rs-geometry.fold-len`, one per bound working set. `None`
-    /// when the channel had no seed — the fold length is device-computed
-    /// and the host plans against an upper bound.
     pub rs_fold_len: Option<Vec<u32>>,
-    /// Run layers [0, k) and take the head at k for this pass's fires;
-    /// `None` = full model.
     pub max_layers: Option<u32>,
-    /// This pass's rows are a block drafter's proposal (WIT
-    /// `set-drafting-block`), so every lane of every fire it submits carries
-    /// the fact a plan guards its trunk on.
     pub block_draft: bool,
-    /// The spans this pass's tokens carry, in the order `forward-pass.media`
-    /// attached them. Empty on every text-only pass. `Arc` so a decoded
-    /// image submitted to two passes is decoded once.
     pub media: Vec<std::sync::Arc<models::media::EncodedSpan>>,
-    /// `forward-diffusion`'s `canvas(mode)`; `None` on every other kind, and
-    /// on a diffusion pass that has not stated its reading yet (which
-    /// `program` refuses). `Denoise` makes every lane attend bidirectionally
-    /// over `[prefix | its rows]`, through the masked arm with an all-keeping
-    /// mask when the guest bound none; the KV it writes is the canvas's
-    /// scratch, overwritten by the encode pass that commits the block.
     pub canvas: Option<CanvasMode>,
-    /// `forward-diffusion.self-conditioning`: the taps staged for this
-    /// pass's NEXT submit, taken by it. `None` between submits and on every
-    /// encode pass.
     pub self_cond: Option<SelfCondPayload>,
-    /// `forward-pass.reading`: which of the family's declared readings this
-    /// pass runs, resolved to its index against `Model::readings()`. `None`
-    /// until stated; `program` falls back to the family's sole reading, or
-    /// to the implicit reading 0 of a text row.
     pub reading: Option<u8>,
-    /// `forward-pass.stream`: which lane stream this pass's rows are.
-    /// `None` is `Text`.
     pub stream: Option<models::Stream>,
-    /// `forward-pass.group`: the attention group this pass's lanes join.
     pub group: Option<u32>,
-    /// `forward-pass.peer`: which OTHER attention group holds the lane this
-    /// pass's epilogue reads `intrinsics::peer_velocity` off — its guidance
-    /// branch. `None` is no peer, and a program that reads a peer velocity
-    /// without one is refused.
     pub peer: Option<u32>,
-    /// `forward-pass.input`: the reading's float ports, each bound to a
-    /// channel whose committed cell feeds it at every submit.
     pub ports: Vec<PortBinding>,
 }
 
-/// One float port bound by `forward-pass.input`, validated against the
-/// reading's `PortFact` at the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortBinding {
-    /// The port's name, as the family states it.
     pub name: String,
-    /// The engine's port kind.
     pub kind: ::engine::fire::PortKind,
-    /// The family's index for a port of this kind.
     pub port: u8,
-    /// The channel resource, so `program` can check it is bound into the
-    /// pass's program.
     pub channel_rep: u32,
-    /// The channel's engine-registered id (`ChannelCell::global_id`).
     pub channel_id: u64,
-    /// The channel's leading extent for a `[rows, width]` port; `None` for
-    /// a lane vector. For a `Voxels` port it is the clip's VOXELS
-    /// (`t·h·w`), which are not the lane's token rows.
     pub rows: Option<u32>,
-    /// The clip box `[t, h, w]` a `Voxels` port's channel states (design
-    /// D8) — a channel cell carries no grid, so the box travels beside the
-    /// feed as `StepVoxels::clips`. `None` for every other port kind.
     pub clip: Option<[u32; 3]>,
 }
 
 impl PortBinding {
-    /// The feed the engine reads this port from.
     #[must_use]
     pub fn feed(&self) -> ::engine::fire::PortFeed {
         ::engine::fire::PortFeed {
@@ -224,9 +145,6 @@ impl PortBinding {
     }
 }
 
-/// What every lane of a bound pass is stamped with beyond its rows (design
-/// D1/D2): its reading, stream, group and port feeds. Copied from
-/// [`ForwardBindings`] at bind, resolved once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneFacts {
     pub reading: u8,
@@ -237,7 +155,6 @@ pub struct LaneFacts {
 }
 
 impl LaneFacts {
-    /// Stamp these facts onto every lane of `req`.
     pub fn stamp(&self, req: &mut crate::engine::FireRequest) {
         for lane in &mut req.lanes {
             lane.reading = self.reading;
@@ -249,43 +166,6 @@ impl LaneFacts {
     }
 }
 
-/// The size of attention group `group`'s cohort in this process: every
-/// `ForwardPass` in the table that names it, bound or not (a sibling still
-/// to bind will submit). `None` for a pass in no group. Stamped on a
-/// request at submit — not at bind, when the siblings may not have named
-/// the group yet.
-///
-/// **THE HOST COUNTS THE GROUP; THE GUEST DOES NOT STATE ITS SIZE.** The
-/// guest owns the algorithm and the host answers facts, and it is tempting
-/// to read that as "the size is the guest's to state" — a `group(id, size)`
-/// verb the guest fills in. It is the wrong way round here, because of what
-/// the two mistakes cost. This number has an asymmetric failure: state it
-/// too LARGE and the group never composes, which the runtime catches and
-/// names (`Doom::CohortNeverComplete`); state it too SMALL and the group
-/// seals short, the joint trunk attends the image rows without the caption,
-/// and the guest gets a plausible picture and a green gate — the exact
-/// silent wrong answer the whole cohort machinery exists to make
-/// impossible. A guest-stated size hands the one number whose understatement
-/// is silent to sixteen hand-written call sites, each of which must be kept
-/// in step with how many passes the guest actually built. Counting the live
-/// handles cannot understate it: a pass that is going to submit is a pass
-/// that exists. Counting distinct PIPELINES instead of passes — which is
-/// what the error message used to claim — would be worse still: two of a
-/// group's passes submitted down one pipeline (a pipeline is serial, so
-/// they arrive as two fires of one lane and the group cannot form) would
-/// count as one and fire short, silently, instead of dying by name.
-///
-/// The count is taken at SUBMIT, so the contract it puts on the guest is:
-/// **build every pass of a group before submitting any of them**, and let
-/// every one of them submit into the group's frame. `latent::DenoiseLoop`
-/// does both by construction (`fire(&[..])` takes the whole group).
-/// A guidance pair is ONE cohort. When a pass names a peer group, its lanes
-/// and that group's must be members of one fire — the peer's velocity is
-/// read off the fire-wide velocity plane, and a peer in another fire is not
-/// on that plane at all. So the count spans both groups, and both groups'
-/// passes must name each other so that both arrive at the same number.
-/// A pass naming a peer that never names it back fires short and is refused
-/// by name at readback rather than reading rows that are not there.
 #[must_use]
 pub fn cohort_of(
     table: &mut wasmtime::component::ResourceTable,
@@ -303,9 +183,6 @@ pub fn cohort_of(
     Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
 }
 
-/// The key a cohort gathers under: the group itself, or — for a guidance
-/// pair — the lower of the two group ids, so both branches gather under one
-/// key and the seal waits for all of them.
 #[must_use]
 pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
     match (group, peer) {
@@ -314,7 +191,6 @@ pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
     }
 }
 
-/// A catalog stream as the engine's lane stream (codes agree).
 #[must_use]
 pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {
     use ::engine::fire::LaneStream;
@@ -328,7 +204,6 @@ pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {
     }
 }
 
-/// The engine's lane stream as the catalog spells it.
 #[must_use]
 pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> models::Stream {
     use ::engine::fire::LaneStream;
@@ -342,60 +217,24 @@ pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> models::Stream {
     }
 }
 
-/// A pass that fires a FLOAT LANE: a reading with no KV space and no token
-/// rows (a DiT's denoise step, a VAE tile), whose rows are its latents
-/// port's and whose only state is its channels. Such a pass takes the
-/// float fire path (`pipeline::fire::float`) rather than the KV one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatLane {
-    /// The lane's row count: the latents port's channel rows. A VAE
-    /// reading (design D8) states no `[rows, ·]` port at all and takes ONE
-    /// dummy token row: its rows are its clips' voxels, on the third axis,
-    /// and the token rectangle it seats is a formality the lane needs to
-    /// exist in the fire's composition.
     pub rows: u32,
-    /// The clips this lane submits on the voxel axis, in the order its
-    /// `Voxels` ports were bound; empty for a lane with no VAE tile.
     pub clips: Vec<[u32; 3]>,
-    /// **A CACHELESS ENCODER'S TOKEN ROWS.** `true` for the one float
-    /// shape that DOES embed tokens: a reading with `takes_tokens` and no
-    /// KV space (Wan 2.2's umT5, which is bidirectional and holds nothing
-    /// between fires — its rows attend each other inside the arm, over the
-    /// lane's own indptr, and never through a page table). Its rows are the
-    /// ids' own count and its `Lane::tokens` are the ids themselves, where
-    /// every other float lane seats a rectangle of zeros.
-    ///
-    /// `false` for a denoise step or a VAE tile, whose rows come from a
-    /// port and whose token rectangle is a formality.
     pub embed: bool,
 }
 
-/// One staged self-conditioning payload: `canvas * taps` ids and weights,
-/// row major, validated against the model's canvas at the verb.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelfCondPayload {
     pub taps: u32,
     pub rows: Vec<u32>,
     pub weights: Vec<f32>,
-    /// The taps read off two of the pass's own channels at every submit
-    /// (their engine ids): a persistent binding rather than a payload,
-    /// `rows`/`weights` empty. See `forward-diffusion.self-conditioning-from`.
     pub channels: Option<(u64, u64)>,
 }
 
-/// Where a fire's folded boundary lands — host mirror of WIT
-/// `rs-geometry`. Absent only when no recurrent state is bound. Bound with
-/// the working sets, since the boundary is an input to the recurrence on
-/// every fire. Registry tags 10-14 stay reserved for compiled containers.
 #[derive(Clone, Copy, Debug)]
 pub struct RsGeometryBinding {
-    /// How far the folded boundary advances, per request, over `[buffer |
-    /// this fire's tokens]` — the twin of `kv-len`. Host-known value lives
-    /// in [`ForwardBindings::rs_fold_len`] (needs per-row token counts).
     pub fold_len: u32,
-    /// Capacity grant: how many buffer pages this fire may occupy — the
-    /// only buffer decision left to the guest; everything else is derived
-    /// from the store's own occupancy.
     #[allow(
         dead_code,
         reason = "written at bind time from the guest's `rs-geometry` record \
@@ -437,10 +276,7 @@ pub struct AttentionBinding {
     pub mask: Option<u32>,
 }
 
-/// The WIT forward-pass builder. It starts empty and acquires a native bound
-/// pass only when canonical program bytes are attached.
 pub struct ForwardPass {
-    /// The interface this pass was constructed through.
     pub kind: PassKind,
     pub bindings: ForwardBindings,
     bound: Option<Box<BoundForwardPass>>,
@@ -498,78 +334,30 @@ impl std::ops::DerefMut for ForwardPass {
     }
 }
 
-/// A traced forward pass bound to its first-class handles — one instance
-/// of a hash-deduped registered program. The engine's persistent channel
-/// arena is keyed by this pass's `instance_id`; a channel may bind to
-/// several passes, and the global channel registry resolves one shared
-/// device cell while the pipeline orders the fires.
 pub struct BoundForwardPass {
     pub instance: Instance,
     pub bound_instance: crate::engine::BoundInstance,
-    /// Bind-time scheduler address, stable for the instance lifetime.
     pub scheduler: crate::scheduler::worker::SchedulerHandle,
-    /// Bound channel cells, dense declaration order; writer puts coalesce
-    /// into each fire, reader cells hold direct mirrors.
     pub cells: crate::pipeline::channel::BoundCells,
-    /// Bound channel resource reps, so `submit` can point each channel's
-    /// await queue at the feeding pipeline.
     pub channel_reps: Vec<u32>,
-    /// Pipeline FIFO this pass has submitted through; kept on the pass so
-    /// teardown is safe even if guest channel handles dropped first.
     pub fires: Option<crate::pipeline::fire::PendingFires>,
-    /// Guest-owned KV working set bound into this pass (forward writes the
-    /// embedded token's K/V here and self-attends over it). Guest keeps it
-    /// alive for the pass's lifetime; the pass does not destroy it on drop.
     pub kv_ws: u32,
     pub kv_declaration: KvDeclaration,
-    /// This pass's layer truncation, copied from
-    /// [`ForwardBindings::max_layers`] at bind; stamped onto every fire's
-    /// [`crate::engine::LaunchPlan`].
     pub max_layers: Option<u32>,
-    /// Copied from [`ForwardBindings::block_draft`] at bind; stamped onto
-    /// every lane of every fire this pass submits.
     pub block_draft: bool,
-    /// Guest-owned recurrent-state working sets (hybrid/linear-attention
-    /// models), in resolved forward-request order; empty for pure attention.
     pub rs_ws: Vec<u32>,
-    /// How this pass treats recurrent state: fold, buffer, or replay.
-    /// Host-known `fold-len` per working set; `None` when device-resident.
     pub rs_fold_len: Option<Vec<u32>>,
-    /// Whether the bound writable declaration has performed its one-shot
-    /// COW against the sharing shape at first submit.
     pub kv_declaration_realized: bool,
-    /// Set when a fire of this pass failed: further submits error with the
-    /// root cause (KV cursor and device channel state are unspecified after).
     pub failed: Option<String>,
-    /// Device-geometry state: `Some` iff this pass's geometry is
-    /// device-produced (traced in-graph, resolved pre-forward), so the
-    /// host neither replays epilogue arithmetic nor projects per-lane KV.
-    /// Leases physical pages and delivers grants on the program's channel.
     pub devgeo: Option<crate::pipeline::fire::lease::DevGeo>,
-    /// Shape-derived decode layout whose values are resolved by the engine.
     pub decode_envelope: Option<crate::pipeline::fire::geometry::DecodeEnvelope>,
-    /// Host mirror of the instance's committed channel state (seeds, then
-    /// per-fire stage folds) — the value oracle for evaluated fire geometry.
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
-    /// What every lane of this pass is stamped with (reading, stream,
-    /// group, port feeds), resolved from the bindings at bind.
     pub lane: LaneFacts,
-    /// `Some` iff this pass fires a float lane (no KV, no tokens). Then
-    /// [`BoundForwardPass::kv_ws`] is a SCRATCH working set the host
-    /// minted at bind to seat the lane and hold its fire lease — it
-    /// reserves no pages, the guest never sees it, and `close_native`
-    /// releases it.
     pub float: Option<FloatLane>,
-    /// Idempotency guard for [`ForwardPass::close_native`], set the first
-    /// time native cleanup runs (explicit WIT drop, or this type's `Drop`
-    /// fallback), guarding against double-closing.
     pub(crate) closed: bool,
 }
 
 impl BoundForwardPass {
-    /// Replace only the recurrent-state resource reps. Legal only at an
-    /// empty pipeline FIFO boundary, so no in-flight fire retains the old
-    /// request-row mapping.
     pub fn replace_rs_working_sets(&mut self, reps: Vec<u32>) -> Result<(), String> {
         let pending = self
             .fires
@@ -585,13 +373,6 @@ impl BoundForwardPass {
         Ok(())
     }
 
-    /// Idempotent ordered native teardown: closes the bound engine, detaches
-    /// this pass's `instance_id` from every bound `ChannelCell`, and
-    /// reclaims outstanding device-geometry page grants. Gated by `closed`,
-    /// so repeat calls are no-ops; never panics or awaits.
-    ///
-    /// Callers must first confirm [`Self::can_close_native_on_drop`] (or
-    /// have already drained the fires FIFO).
     pub fn close_native(&mut self) {
         if std::mem::replace(&mut self.closed, true) {
             return;
@@ -610,19 +391,11 @@ impl BoundForwardPass {
         for cell in &self.cells {
             cell.lock().unwrap().detach(self.bound_instance.instance_id);
         }
-        // Leased slots are logical reserve indexes; discarding them here
-        // would shift surviving indexes under other passes on the same
-        // working set, so cleanup only clears the lease's own bookkeeping.
         if let Some(devgeo) = self.devgeo.as_mut() {
             let _ = devgeo.lease.reclaim_all();
         }
     }
 
-    /// Whether it's safe to run [`Self::close_native`] from the `Drop`
-    /// fallback: the fires FIFO must hold no in-flight fire, since closing
-    /// mid-completion would race a live engine write against page reuse
-    /// (use-after-free). `Drop` can't await the drain, so it checks this
-    /// instead; the explicit path always finds it true.
     pub(crate) fn can_close_native_on_drop(&self) -> bool {
         match &self.fires {
             None => true,
@@ -632,13 +405,6 @@ impl BoundForwardPass {
 }
 
 impl Drop for BoundForwardPass {
-    /// Fallback for when a `ResourceTable`/`ProcessCtx` teardown drops this
-    /// value directly, bypassing `HostForwardPass::drop`'s FIFO drain.
-    /// Idempotent with the explicit path via `closed`.
-    ///
-    /// Refuses to run teardown while a fire is still in flight (`Drop` has
-    /// no `.await` to drain safely): logs an error and leaves the instance,
-    /// attachments and lease alone — a bounded leak, not corruption.
     fn drop(&mut self) {
         if self.closed {
             return;

@@ -1,11 +1,5 @@
-//! Grep gate: no shell (`engine-cuda`, `engine-metal`, `engine-vulkan`,
-//! `engine-wgpu`) may call
-//! `env::var` — every knob must be typed in `Boot`/`Budget`/`Profile`.
-
 use std::path::{Path, PathBuf};
 
-/// Every shell: the constitution's count is over shells, not one, so this
-/// also polices `engine-metal`, `engine-vulkan` and `engine-wgpu`.
 const SHELLS: [&str; 4] = [
     "../engine-cuda/src",
     "../engine-metal/src",
@@ -13,8 +7,6 @@ const SHELLS: [&str; 4] = [
     "../engine-wgpu/src",
 ];
 
-/// Matches `var`, `var_os`, and any future `var_*` — the spelling doesn't
-/// matter, the provenance does.
 const FORBIDDEN: &str = "env::var";
 
 #[test]
@@ -60,7 +52,6 @@ fn no_shell_reads_the_environment() {
     );
 }
 
-/// Every `.rs` file under `directory`, depth-first.
 fn rust_files(directory: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![directory.to_path_buf()];

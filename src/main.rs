@@ -1,18 +1,7 @@
-//! `pie` — the standalone composition root. A multi-call CLI that either
-//! boots the full engine in-proc (`local`/`serve`, composing the controller +
-//! gateway + worker libs over loopback) or runs a one-shot operational command
-//! (`model`/`doctor`/...). The only crate that depends on all three role libs.
-//!
-//! Process model: `#[tokio::main]` owns the one runtime; every
-//! subcommand runs on it. `local`/`serve` use the full daemon `bootstrap::init`
-//! + `run_until_signal`; one-shot ops use the light `bootstrap::init_cli`.
-
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use pie::{compose, derive, local, ops, ui};
-/// Top-level `pie` invocation. The shared global flags (`--config`,
-/// `--log-level`, `--metrics-addr`) are flattened from `bootstrap`.
 #[derive(Parser, Debug)]
 #[command(
     name = "pie",
@@ -24,28 +13,9 @@ struct Cli {
     #[command(flatten)]
     global: bootstrap::GlobalArgs,
 
-    /// Emit one JSON document instead of the human rendering. Works on every
-    /// command.
-    //
-    // Global for that last reason. It was a per-subcommand flag on five of them
-    // and absent from the rest, which is not a policy so much as the order
-    // things were written in -- `pie cache list` was scriptable and `pie config
-    // show` was not, for no reason either could state.
     #[arg(long, global = true)]
     json: bool,
 
-    /// Turn engine diagnostics on for this run, as a comma-separated word
-    /// list: `--diag golden-probe,arm-trace`, `--diag ptr-trace=decode`.
-    ///
-    /// It fills `[engine] diagnostics` in the config this command just read,
-    /// so nothing is edited and nothing is rebuilt. The words are the
-    /// engine's own (`engine_cuda::Diagnostics`); one it does not speak is
-    /// refused at boot, by name, with the vocabulary. Only `serve` and `run`
-    /// boot an engine, so only they read this.
-    //
-    // Global for the same reason `--json` is: `pie run --diag x` and `pie
-    // --diag x run` both read as the same wish, and a flag whose position
-    // matters is a flag people get wrong.
     #[arg(long, global = true, value_name = "WORDS")]
     diag: Option<String>,
 
@@ -55,50 +25,33 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
-    /// Run one inferlet on a one-shot engine, print what it produces, exit.
-    ///
-    /// Arguments for the inferlet go after `--`:
-    /// `pie run chat-completion -- --prompt "The capital of France is"`.
     Run(ops::run::RunArgs),
 
-    /// The models pie serves (list / info / import / remove).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,
     },
 
-    /// What pie has written under `$PIE_HOME` (list / clear).
     Cache {
         #[command(subcommand)]
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (list / show / set / unset / edit / init / tune).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
     },
 
-    /// The programs pie runs (list / info / download / remove).
     Inferlet {
         #[command(subcommand)]
         cmd: ops::inferlet::InferletCmd,
     },
 
-    /// Will pie run here, and with this config? Exits non-zero if not.
     Doctor,
 }
 
-/// Die quietly when a reader goes away, the way every other CLI does.
-///
-/// Rust masks SIGPIPE at bootstrap, so a `println!` into a closed pipe returns
-/// EPIPE, and `println!` panics on a write error. `pie config list | head` was
-/// therefore printing a panic and exiting non-zero -- for doing exactly what
-/// `head` asks of it. Restoring the default disposition turns that back into
-/// the signal it is.
 #[cfg(unix)]
 fn die_quietly_on_closed_pipe() {
     // SAFETY: setting a signal disposition to SIG_DFL before any threads that
@@ -112,23 +65,10 @@ fn die_quietly_on_closed_pipe() {
 #[cfg(not(unix))]
 fn die_quietly_on_closed_pipe() {}
 
-/// Render a failure the way the rest of the CLI renders everything else.
-///
-/// anyhow's default is `Error: <context>` followed by a `Caused by:` list,
-/// which puts the least specific line first and in the one position a reader
-/// actually looks. `pie config set worker.server.port abc` led with "setting
-/// worker.server.port = \"abc\"" -- a restatement of the command -- and buried
-/// "invalid type: string" under a heading.
-///
-/// Same glyph vocabulary as everything else: `✗` is what blocks.
 fn report(error: &anyhow::Error) {
     let palette = ui::Palette::for_stream(ui::Stream::Stderr);
     eprintln!("{} {error}", ui::Mark::Blocked.render(&palette));
     for cause in error.chain().skip(1) {
-        // Indented and dim: the chain is why, and the first line is what.
-        // Line by line, because a cause can be several -- a TOML parse error
-        // carries its own snippet, and letting those start at column 0 put the
-        // detail outside the block it belongs to.
         for line in cause.to_string().lines() {
             eprintln!("  {}", palette.dim(line));
         }
@@ -150,35 +90,20 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
-    // `serve` is the one command that is not an op: it takes the full daemon
-    // `init` (banner, config, metrics) rather than the light CLI one, and it
-    // ends on a signal rather than with an answer.
     if let Command::Serve = cli.command {
         return serve(cli.global, cli.diag.as_deref()).await;
     }
 
-    // Once, for every op, rather than at the head of each arm.
     bootstrap::init_cli(&cli.global)?;
 
-    // What each op decides for itself is whether it blocks and what it answers
-    // with. The threading policy is stated here rather than arm by arm, in one
-    // place where the three answers can be compared.
     let answer = match cli.command {
-        // Handled above; `Command` has no other arm that skips `init_cli`.
         Command::Serve => unreachable!("serve returns before the op dispatch"),
 
-        // Blocking: HF downloads and multi-gigabyte checkpoint rewrites.
         Command::Model { cmd } => {
-            // The globals travel because `import` reads the SERVING config to
-            // decide whether it can prepare the weight tiers it just made
-            // importable, and `--config` has to name the same file every
-            // other command resolves.
             let global = cli.global.clone();
             tokio::task::spawn_blocking(move || ops::model::run(cmd, &global)).await??
         }
 
-        // Blocking: `cache list` walks the whole of `$PIE_HOME`, and `doctor`
-        // shells out to `nvidia-smi`.
         Command::Cache { cmd } => {
             tokio::task::spawn_blocking(move || ops::cache::run(cmd)).await??
         }
@@ -187,7 +112,6 @@ async fn run() -> anyhow::Result<ExitCode> {
             tokio::task::spawn_blocking(move || ops::doctor::run(&global)).await??
         }
 
-        // Async: these reach the engine or the registry over the network.
         Command::Run(args) => ops::run::run(&cli.global, args, cli.diag.as_deref()).await?,
         Command::Config { cmd } => ops::config::run(cmd, &cli.global).await?,
         Command::Inferlet { cmd } => ops::inferlet::run(cmd, &cli.global).await?,
@@ -198,25 +122,15 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-/// The `serve` path: full daemon `init` → derive the three typed role Configs
-/// from the standalone TOML → boot the in-proc cluster → run until
-/// SIGINT/SIGTERM, then drain.
 async fn serve(global: bootstrap::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
     let ctx = bootstrap::init(
         bootstrap::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
     let (controller, gateway, mut worker) = derive::derive_standalone(ctx.config_str())?;
-    // `--diag` states `[engine] diagnostics` for this boot alone; the file on
-    // disk is not touched.
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    // Provision the embedded Python-WASM runtime before booting — the worker
-    // daemon never downloads, so the standalone root does it. Only when
-    // the config asks for Python at all, so an offline or Rust-only deployment
-    // makes no network call. Best-effort: a present runtime is a no-op; a
-    // failure is logged, not fatal here.
     let want_python = worker.sandbox.python_runtime;
     tokio::task::spawn_blocking(move || {
         local::py_runtime::ensure_installed_best_effort(want_python)

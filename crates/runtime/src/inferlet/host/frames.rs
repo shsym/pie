@@ -1,20 +1,3 @@
-//! pie:inferlet/frames — the pixel and sample OUTPUT resources.
-//!
-//! The inverse of [`super::media`], and the reason design.md D11 exists: a
-//! generative pass produces megabytes of picture, and the one thing that must
-//! not happen to them is a trip through WASM linear memory on the way to the
-//! client. So the payload lives here, the guest holds a handle, and the
-//! encoders are [`crate::codec`]'s.
-//!
-//! [`FrameStore`] is where that promise will be cashed. Today every handle is
-//! `Host(Vec<u8>)` — `frames.from-rgb8` is the only producer, and it is fed
-//! from the guest. When a `vae.decode` reading writes its pixels to the
-//! device, the second variant carries the device pointer and the encoders
-//! reach it without a host copy: [`crate::codec::nvenc`] would register the
-//! allocation with `NvEncRegisterResource` instead of filling a system-memory
-//! input buffer, and the still encoders would copy down once. Nothing outside
-//! this file and that one changes, which is what the enum is for.
-
 use crate::codec::{mp4, still, wav, y4m};
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
@@ -23,30 +6,17 @@ use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Where a handle's pixels are.
 pub enum FrameStore {
-    /// Interleaved RGB8, `count * height * width * 3` bytes, frame-major.
     Host(Vec<u8>),
-    /// **Not built yet.** The same pixels as a device allocation, for the
-    /// path where a VAE decode writes them there and nothing brings them
-    /// down: the H.264 encoder takes a `CUdeviceptr` directly, and only the
-    /// still formats — one frame, already small — would copy.
-    ///
-    /// Held as a variant rather than added later so the shape of the store is
-    /// settled while there is exactly one producer to change.
     #[allow(dead_code)]
     Device(DevicePlane),
 }
 
-/// The device half of [`FrameStore`], deliberately empty until there is a
-/// producer: an allocation handle plus a pitch is what it will carry, and
-/// naming those fields before the allocator is chosen would be a guess.
 #[allow(dead_code)]
 pub struct DevicePlane {
     _private: (),
 }
 
-/// A host-side clip: `count` frames of `width` x `height` RGB8.
 pub struct Frames {
     pub store: FrameStore,
     pub width: u32,
@@ -55,16 +25,12 @@ pub struct Frames {
     pub fps: f32,
 }
 
-/// A host-side audio buffer: interleaved f32 in [-1, 1].
 pub struct Pcm {
     pub samples: Vec<f32>,
     pub rate: u32,
     pub channels: u32,
 }
 
-// `Debug` by hand on both: a derived one would print megabytes of payload
-// into a panic message, which is the opposite of what a reader wants from a
-// handle whose whole point is that the payload stays out of sight.
 impl std::fmt::Debug for Frames {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let store = match &self.store {
@@ -91,11 +57,6 @@ impl std::fmt::Debug for Pcm {
     }
 }
 
-/// The CUDA ordinal NVENC opens its session on.
-///
-/// Device 0 unless `PIE_NVENC_DEVICE` says otherwise. A follow-up once the
-/// `Device` store lands: the encoder must run on the card the pixels are on,
-/// which is the engine's, not an environment variable's.
 #[cfg(feature = "cuda")]
 fn nvenc_device() -> usize {
     std::env::var("PIE_NVENC_DEVICE")
@@ -105,7 +66,6 @@ fn nvenc_device() -> usize {
 }
 
 impl Frames {
-    /// The pixels, wherever they are. Only the host store answers today.
     pub fn rgb8(&self) -> Result<&[u8], String> {
         match &self.store {
             FrameStore::Host(v) => Ok(v),
@@ -115,27 +75,17 @@ impl Frames {
         }
     }
 
-    /// **THE WAY IN**: an encoded still becomes a one-frame handle, extent
-    /// and all read off the picture. The pair to [`Frames::encode`], and
-    /// what lets a guest hand a picture to a `vae.encode` reading.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let (rgb, width, height) = still::decode(bytes)?;
         Ok(Frames {
             store: FrameStore::Host(rgb),
             width,
             height,
-            // A still is one frame at no rate, the same shape `from-rgb8`
-            // gives a caller who states `count = 1, fps = 0`.
             count: 1,
             fps: 0.0,
         })
     }
 
-    /// These pixels as the f32 plane a `pixels` port reads: `[-1, 1]`, one
-    /// row per voxel in `(t, h, w)` order with `w` fastest. Exactly undoes
-    /// [`Frames::from_pixels`]'s `(x + 1) / 2`, so a handle that made the
-    /// round trip through a channel comes back to the bytes it started as
-    /// (up to the 8-bit quantisation the store holds).
     pub fn to_pixels(&self) -> Result<Vec<f32>, String> {
         Ok(self
             .rgb8()?
@@ -144,8 +94,6 @@ impl Frames {
             .collect())
     }
 
-    /// Build a handle from raw interleaved RGB8, checking the one invariant
-    /// every encoder below depends on.
     pub fn from_rgb8(
         bytes: Vec<u8>,
         width: u32,
@@ -176,15 +124,6 @@ impl Frames {
         })
     }
 
-    /// Build a handle from a `pixels` seam's plane: `count * height * width`
-    /// rows of RGB f32 in the model's own `[-1, 1]`, one row per output voxel
-    /// in `(t, h, w)` order — which is presentation order — mapped to RGB8 by
-    /// `(x + 1) / 2` and clamped.
-    ///
-    /// The clamp is deliberate. A VAE's last convolution is not bounded, and
-    /// the reference pipelines clamp too; refusing an overshoot would turn a
-    /// picture that is right everywhere but four pixels into no picture at
-    /// all.
     pub fn from_pixels(
         values: &[f32],
         width: u32,
@@ -220,9 +159,6 @@ impl Frames {
         })
     }
 
-    /// The whole encoder dispatch. One place, so the refusals read the same
-    /// way whichever door reached them (`frames.encode` or
-    /// `session.send-frames`).
     pub fn encode(&self, format: ImageFormat) -> Result<Vec<u8>, String> {
         let rgb = self.rgb8()?;
         let still_only = |what: &str| {
@@ -270,12 +206,9 @@ impl Frames {
         mp4::mux_annexb(self.width, self.height, self.fps, &pictures)
     }
 
-    /// The refusal a build without the CUDA shell gives. It names the missing
-    /// encoder rather than the missing feature flag, because the person
-    /// reading it is holding a clip, not a `Cargo.toml`.
     #[cfg(not(feature = "cuda"))]
     fn mp4_h264(&self, _rgb: &[u8]) -> Result<Vec<u8>, String> {
-        let _ = &mp4::mux_annexb; // the muxer is built on every platform
+        let _ = &mp4::mux_annexb;
         Err(
             "mp4-h264 needs the NVIDIA H.264 encoder (NVENC), and this runtime \
              was built without the CUDA shell. Encode `y4m` for an \
@@ -314,8 +247,6 @@ impl Pcm {
     }
 }
 
-/// The file-name extension each format wants, so `session.send-frames` can
-/// finish a name the guest left bare.
 pub fn image_extension(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Png => "png",
@@ -327,7 +258,6 @@ pub fn image_extension(format: ImageFormat) -> &'static str {
     }
 }
 
-/// The same, for audio.
 pub fn audio_extension(format: AudioFormat) -> &'static str {
     match format {
         AudioFormat::Wav => "wav",
@@ -352,10 +282,6 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
         }
     }
 
-    /// The VAE road (design D8/D11): the channel's committed cell becomes a
-    /// handle without the pixels entering linear memory. The take is the same
-    /// one `channel.take-blocking` does — same await discipline, same poison —
-    /// and the only difference is that the bytes stop here.
     async fn from_channel(
         &mut self,
         ch: Resource<super::forward::Channel>,
@@ -391,7 +317,6 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
         }
     }
 
-    /// The way in, sniffed: PNG / JPEG / GIF / WebP to a one-frame handle.
     async fn decode(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Frames>, String>> {
         match Frames::decode(&bytes) {
             Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
@@ -399,10 +324,6 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
         }
     }
 
-    /// The VAE road run backwards: these pixels into `ch`'s cell as the f32
-    /// plane a pixel port reads, without the bytes entering linear memory.
-    /// The put is `channel.set`'s, so the cell is SEEDED and the channel
-    /// must be one a pass binds as an input.
     async fn to_channel(
         &mut self,
         this: Resource<Frames>,
@@ -416,10 +337,6 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
         for v in &values {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        // `put`, not `set`: a picture handed to a `vae.encode` port has to be
-        // there for the FIRST fire, and `set` rewrites a cell already in the
-        // ring — a channel has no ring until a fire has run. `put` before the
-        // first fire is the seed.
         let cell = self.ctx().table.get(&ch)?.cell.clone();
         let result = cell
             .lock()

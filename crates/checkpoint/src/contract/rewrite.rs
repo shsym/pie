@@ -1,27 +1,9 @@
-//! Contract-to-contract rewrites that run before the plan is built.
-//!
-//! Optimizations, not semantics: each one returns a contract declaring
-//! exactly the same tensors as the one it was given, reasoning only about
-//! shape and cost.
-//!
-//! What they return is a contract for one rank: a rewrite runs with the
-//! target in hand and resolves the shards it rewrites, so its expressions
-//! name concrete bands. The rank-independent input contract still declares
-//! whole-tensor shapes, which is what [`coalesce_direct_row_shards`]
-//! matches against.
-
 use crate::file::{Metadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract, local_range};
 use crate::error::{Error, OrOverflow};
 use crate::plan::StorageTarget;
 use crate::types::{Axis, Encoding};
 
-/// Replace many equally-shaped row shards with one bank plus views of it.
-///
-/// A rank holding the same row band of a hundred identically-shaped weights
-/// reads a hundred small strided copies; stated as one `Concat` of those bands
-/// plus a `Slice` per member, it reads one. Purely an optimization: the
-/// contract it returns declares exactly the same tensors.
 pub fn coalesce_direct_row_shards(
     contract: &ModelContract,
     metadata: &Metadata,
@@ -44,7 +26,6 @@ pub fn coalesce_direct_row_shards(
     let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
     let mut local_bytes_by_index = vec![0_u64; contract.tensors.len()];
     for (index, tensor) in contract.tensors.iter().enumerate() {
-        // this tensor is a whole checkpoint tensor, split by row.
         let Expr::Shard { src, axis: Axis(0) } = &tensor.expr else {
             continue;
         };
@@ -54,7 +35,6 @@ pub fn coalesce_direct_row_shards(
         let Some(raw) = metadata.tensor_by_name(name) else {
             continue;
         };
-        // extents come off the checkpoint, not the contract's own shape.
         if raw.shape.len() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 {
             continue;
         }
@@ -71,7 +51,6 @@ pub fn coalesce_direct_row_shards(
             target.tp_rank,
             &format!("the row count of '{}'", tensor.name),
         )?;
-        // a declaration claims the whole tensor's shape, not this rank's band.
         if tensor.shape.as_deref() != Some(&raw.shape[..]) {
             continue;
         }
@@ -176,7 +155,6 @@ fn emit_row_shard_bank(
         &format!("the row count of '{}'", first.name),
     )?;
 
-    // the bank is the local row band of every member, end to end.
     let mut parts = Vec::with_capacity(indices.len());
     for &old_index in indices {
         let raw = direct_raw(metadata, &contract.tensors[old_index])?;
@@ -221,8 +199,6 @@ fn direct_raw<'a>(
     })
 }
 
-/// The checkpoint tensor a direct contract reads, seeing through the partition
-/// a sharded one wraps it in — a rank's band of a tensor is still that tensor.
 fn direct_src(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Src(name) => Some(name.as_str()),

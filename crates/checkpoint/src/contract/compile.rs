@@ -1,6 +1,3 @@
-//! Lowering the affine fragment of [`Expr`] to byte movement: maximal
-//! contiguous [`Run`]s, or [`Lowering::Gather`] where that is not affordable.
-
 use std::collections::HashMap;
 
 use super::Expr;
@@ -9,16 +6,11 @@ use crate::error::{Error, OrOverflow};
 use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
 
-/// Maximum tensor rank the walker supports. GPT-OSS MXFP4 blocks are rank 4;
-/// the headroom is free because coordinates live on the stack.
 const MAX_RANK: usize = 8;
 
-/// Where a run's bytes come from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Leaf {
-    /// A tensor read from the checkpoint.
     Checkpoint(String),
-    /// A buffer produced by an earlier contract.
     Contract(String),
 }
 
@@ -30,11 +22,6 @@ impl Leaf {
     }
 }
 
-/// One maximal contiguous copy: `len` elements from `source`, landing at
-/// `dst_elem` in the output.
-///
-/// Offsets are in logical elements, not bytes (element width depends on the
-/// encoding). Use [`CopyList::byte_runs`] to convert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
     pub source: RunSource,
@@ -44,23 +31,10 @@ pub struct Run {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunSource {
-    /// Index into [`CopyList::leaves`], plus an element offset into that leaf.
     Leaf { leaf: usize, src_elem: i64 },
-    /// A hole: a coordinate no source reaches, left as the zero the
-    /// destination was filled with. Introduced by [`Expr::Fill`].
     Zero,
 }
 
-/// What one expression compiles to: the two shapes an executor can be asked
-/// for, not two encodings of one thing.
-///
-/// * A [`CopyList`] is stretches of addresses. It folds into rectangles and
-///   prices as [`CopyList::cost`] strided copies.
-/// * A [`GatherList`] is a table of indices. It never folds and always costs
-///   one element-granular pass.
-///
-/// [`compile`] always tries a copy list first, falling back only when it
-/// would exceed `max_runs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lowering {
     Copy(CopyList),
@@ -68,7 +42,6 @@ pub enum Lowering {
 }
 
 impl Lowering {
-    /// Leaves in first-use order, whichever form this is.
     pub fn leaves(&self) -> &[Leaf] {
         match self {
             Lowering::Copy(copies) => &copies.leaves,
@@ -76,7 +49,6 @@ impl Lowering {
         }
     }
 
-    /// Total elements in the output.
     pub fn elements(&self) -> i64 {
         match self {
             Lowering::Copy(copies) => copies.elements,
@@ -84,9 +56,6 @@ impl Lowering {
         }
     }
 
-    /// What this expression costs to execute, in the units of
-    /// [`CopyList::cost`]: a gather is one pass over the destination, so it
-    /// costs one, same as a whole-tensor copy.
     pub fn cost(&self) -> usize {
         match self {
             Lowering::Copy(copies) => copies.cost(),
@@ -94,8 +63,6 @@ impl Lowering {
         }
     }
 
-    /// The copy list, or `None` for a gather. For callers that only ever
-    /// see the affine fragment.
     pub fn as_copy(&self) -> Option<&CopyList> {
         match self {
             Lowering::Copy(copies) => Some(copies),
@@ -104,56 +71,26 @@ impl Lowering {
     }
 }
 
-/// One leaf, one index table: `out[r, i, j] = src[r, indices[i], j]`, with
-/// `j` ranging over a [`block`](Self::block) of elements and `r` over
-/// [`rows`](Self::rows).
-///
-/// The lowering the copy list cannot express affordably: a permutation whose
-/// blocks are single elements folds to a copy list of thousands of tiny
-/// rectangles, while the same permutation is one index per block.
-///
-/// The table is stated once and repeated over `rows`: the axes outside the
-/// gathered one are untouched, so writing their product into the table
-/// would just repeat the same numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatherList {
-    /// Leaves in first-use order, as [`CopyList::leaves`] is. A gather reads
-    /// exactly one of them, but the vector is kept whole so both forms
-    /// answer [`Lowering::leaves`] the same way.
     pub leaves: Vec<Leaf>,
-    /// Which leaf, indexing [`leaves`](Self::leaves).
     pub leaf: usize,
-    /// Destination block `i` reads source block `indices[i]`.
     pub indices: Vec<i64>,
-    /// Elements in one block: the operand's extent below the gathered axis.
-    /// One, when the gather is on the innermost axis.
     pub block: i64,
-    /// How many times the table repeats: the operand's extent above the
-    /// gathered axis.
     pub rows: i64,
-    /// Elements between consecutive source rows.
     pub src_row: i64,
-    /// Total elements in the output.
     pub elements: i64,
 }
 
 impl GatherList {
-    /// Elements between consecutive destination rows. Derived, not stored: a
-    /// destination row is exactly the table.
     pub fn dst_row(&self) -> i64 {
         self.indices.len() as i64 * self.block
     }
 
-    /// Elements the gather reads. The whole operand, because a table may name
-    /// any of its blocks and the executor reads once.
     pub fn source_elements(&self) -> i64 {
         self.rows * self.src_row
     }
 
-    /// The table's geometry in bytes, under the encoding the tensor is
-    /// stored in. Lives here because [`ByteScale`] does: a blocked payload
-    /// carries its scale inside the block, and this gets the same answer
-    /// [`CopyList::byte_pieces`] does.
     pub fn byte_geometry(&self, encoding: &Encoding) -> Result<GatherBytes, Error> {
         let scale = ByteScale::of(encoding);
         Ok(GatherBytes {
@@ -164,10 +101,6 @@ impl GatherList {
         })
     }
 
-    /// The same mapping written as one rectangle per index. Not what an
-    /// executor runs (that is the table, walked once), but what the mapping
-    /// means, so the reference oracle can check a gather with the same
-    /// scatter it checks every copy list with.
     pub fn byte_rects(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         let block = scale.extent(self.block, "gather block")?;
@@ -211,47 +144,31 @@ impl GatherList {
     }
 }
 
-/// A [`GatherList`]'s geometry in bytes. `indices` stays in blocks — a block
-/// is the unit the table names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GatherBytes {
-    /// Bytes in one gathered block.
     pub block_bytes: u64,
-    /// How many times the table repeats.
     pub rows: u64,
-    /// Bytes between consecutive source rows.
     pub src_row_bytes: u64,
 }
 
 impl GatherBytes {
-    /// Bytes the gather reads: the whole operand.
     pub fn source_bytes(&self) -> u64 {
         self.rows.saturating_mul(self.src_row_bytes)
     }
 }
 
-/// The copy-list form of a lowering: maximal contiguous stretches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CopyList {
-    /// Leaves in first-use order; [`RunSource::Leaf`] indexes this.
     pub leaves: Vec<Leaf>,
     pub runs: Vec<Run>,
-    /// Total elements in the output. `runs` covers exactly this many.
     pub elements: i64,
 }
 
 impl CopyList {
-    /// How many separate copies this expression costs, known before any I/O
-    /// happens. Count [`CopyList::pieces`] instead when the executor can
-    /// issue strided copies — a row shard is thousands of runs but one
-    /// piece. Nothing on the load path reads this; it is test observability
-    /// ([`CopyList::cost`] picks the lowering).
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
 
-    /// Mean run length in elements, or 0 for an empty lowering. Test
-    /// observability, as [`CopyList::run_count`] is.
     pub fn mean_run_elements(&self) -> i64 {
         if self.runs.is_empty() {
             0
@@ -260,43 +177,14 @@ impl CopyList {
         }
     }
 
-    /// Fold the runs back into loop nests.
-    ///
-    /// Runs are the semantics; pieces are the cost. A column shard is one
-    /// run per row, but every row is the same length with both offsets in
-    /// arithmetic progression, so the whole thing folds to a single
-    /// rectangular copy (the low IR's `Extent`).
-    ///
-    /// A repeated sweep: find maximal consecutive groups of same-source,
-    /// same-size items whose offsets are both in arithmetic progression, and
-    /// wrap each group in one more loop. Cannot change the meaning: it only
-    /// rewrites a run list into a form enumerating the same `(src, dst)`
-    /// pairs.
     pub fn pieces(&self) -> Vec<Piece> {
         fold(self.runs.iter().map(seed).collect())
     }
 
-    /// What this expression costs to execute: the number of strided copies,
-    /// plus one fill if the destination has holes. Known before any I/O
-    /// happens. A whole tensor, a row shard, and a strided expert select all
-    /// cost 1; a fusion of three sources costs 3.
-    ///
-    /// `plan/build.rs` reads it to decide a lowering: cost 1 means one
-    /// rectangle covering the whole destination, so the tensor aliases the
-    /// checkpoint bytes instead of copying. It does not decide whether to
-    /// slab-scatter — that coalesces across tensors and lives in
-    /// `plan/passes/rewrite.rs` after offsets are assigned.
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }
 
-    /// The pieces that actually move data.
-    ///
-    /// A hole is not copied as zeros; the destination is zeroed once and
-    /// then not written there, so padding costs one fill rather than one
-    /// copy per band. They do not fold further: the destination stride
-    /// across a padded row is wider than the row, and `fold` refuses a
-    /// destination that skips.
     pub fn copy_pieces(&self) -> Vec<Piece> {
         fold(
             self.runs
@@ -307,13 +195,10 @@ impl CopyList {
         )
     }
 
-    /// Whether the destination has holes, and so must be zeroed before the
-    /// copies in [`CopyList::copy_pieces`] run.
     pub fn needs_zero_fill(&self) -> bool {
         self.runs.iter().any(|run| run.source == RunSource::Zero)
     }
 
-    /// Convert to byte offsets under `encoding`.
     pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, Error> {
         let scale = ByteScale::of(encoding);
         self.runs
@@ -334,9 +219,6 @@ impl CopyList {
             .collect()
     }
 
-    /// The copy pieces with every offset, stride and extent converted to
-    /// bytes: the form the low IR wants (`load_plan::Extent` addresses
-    /// bytes; a sub-byte encoding has no element addresses).
     pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         self.copy_pieces()
@@ -350,10 +232,6 @@ impl CopyList {
                     .iter()
                     .enumerate()
                     .map(|(level, dim)| {
-                        // The innermost dimension is the contiguous block the
-                        // walker found, so in bytes it counts bytes and steps
-                        // one at a time. The outer ones count iterations and
-                        // keep their counts; only their strides scale.
                         if level + 1 == piece.dims.len() {
                             debug_assert_eq!((dim.src_stride, dim.dst_stride), (1, 1));
                             return Ok(Dim {
@@ -380,21 +258,8 @@ impl CopyList {
     }
 }
 
-/// Element index to byte offset, for one encoding.
-///
-/// Sub-byte encodings (MXFP4, AWQ/GPTQ int4) only have byte addresses on
-/// group boundaries; a violation is reported rather than silently rounded.
-///
-/// A blocked scheme is not just a bit width: a GGUF block carries its own
-/// scale inside the payload (Q4_0 spends 18 bytes on 32 elements, 2 for the
-/// F16 scale and 16 for the codes), so reading it as "4 bits per element"
-/// forgets the scale and drifts every row after the first.
 enum ByteScale {
-    /// Elements are `bits` wide and pay for nothing else.
     Bits(i64),
-    /// Elements come in blocks that cost `bytes` per `elems`, scale
-    /// included. Only whole blocks have addresses: half a block is codes
-    /// with no scale to read them by.
     Blocked { elems: i64, bytes: i64 },
 }
 
@@ -477,13 +342,6 @@ pub enum ByteRunSource {
     Zero,
 }
 
-/// One rectangular copy: a loop nest, outermost dimension first.
-///
-/// Reading `dims` from the outside in, the element at loop counters
-/// `(i0, .., in)` moves from `src_elem + sum(ik*src_stride_k)` to
-/// `dst_elem + sum(ik*dst_stride_k)`. The innermost dimension always has
-/// unit strides, so every piece ends in a contiguous stretch — the shape
-/// `load_plan::Extent` already carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub source: RunSource,
@@ -492,14 +350,11 @@ pub struct Piece {
 }
 
 impl Piece {
-    /// Elements moved by this piece.
     pub fn elements(&self) -> i64 {
         self.dims.iter().map(|dim| dim.count).product()
     }
 }
 
-/// One run as a depth-1 nest. A hole has no source address, so its source
-/// stride is zero rather than one.
 fn seed(run: &Run) -> Piece {
     Piece {
         source: run.source,
@@ -519,25 +374,18 @@ fn fold(mut items: Vec<Piece>) -> Vec<Piece> {
     items
 }
 
-/// One sweep of the fold. Returns `None` when nothing more can be merged.
 fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
     let mut out: Vec<Piece> = Vec::new();
     let mut changed = false;
     let mut at = 0;
     while at < items.len() {
         let head = &items[at];
-        // The first pair fixes the strides; the rest must match exactly.
         let mut end = at + 1;
         let mut src_stride = 0;
         let mut dst_stride = 0;
         if let Some(next) = items.get(at + 1)
             && let Some(strides) = step_between(head, next)
-            // The destination must stay dense: a loop that skips in the
-            // destination is a scatter, which nothing below can execute.
             && strides.1 == head.elements()
-            // The source must advance forward from `file_offset`; a
-            // descending progression (e.g. Concat re-joining `[up | gate]`)
-            // is left unfolded instead.
             && strides.0 >= 0
         {
             (src_stride, dst_stride) = strides;
@@ -571,9 +419,6 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
     changed.then_some(out)
 }
 
-/// The `(src, dst)` step from `a` to `b`, if `b` is a translate of `a`. Two
-/// pieces only compose when they read the same leaf (or are both padding)
-/// and have identical extents.
 fn step_between(a: &Piece, b: &Piece) -> Option<(i64, i64)> {
     if a.dims != b.dims {
         return None;
@@ -592,7 +437,6 @@ fn step_between(a: &Piece, b: &Piece) -> Option<(i64, i64)> {
     Some((src_stride, b.dst_elem - a.dst_elem))
 }
 
-/// Storage width of one logical element, in bits.
 pub fn bits_per_element(encoding: &Encoding) -> u32 {
     match encoding {
         Encoding::Raw(dtype) => u32::try_from(dtype.bytes_ceil()).unwrap_or(0) * 8,
@@ -600,14 +444,6 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
     }
 }
 
-/// Compile `expr` into the lowering that satisfies it, using the types the
-/// resolver already resolved for it.
-///
-/// `max_runs` bounds the walker's own output so a pathological expression
-/// cannot make the compiler allocate without limit. It is not the cost model
-/// — ask [`CopyList::cost`] what the expression actually costs. A copy list
-/// is tried first, always; past the cap, an [`Expr::Gather`] over a whole
-/// tensor falls back to an index table, and anything else refuses.
 pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, Error> {
     let mut builder = Builder {
         checked,
@@ -619,11 +455,9 @@ pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Loweri
     builder.lower(root, max_runs)
 }
 
-/// A node of the flattened, shape-annotated expression.
 struct Node {
     kind: Kind,
     shape: Vec<i64>,
-    /// Row-major strides of `shape`, in elements.
     strides: Vec<i64>,
     elements: i64,
 }
@@ -634,8 +468,6 @@ enum Kind {
         src: usize,
         axis: usize,
         start: i64,
-        /// Whether the band covers the operand's whole axis, in which case it
-        /// introduces no discontinuity at all.
         whole: bool,
     },
     Stride {
@@ -651,13 +483,11 @@ enum Kind {
     },
     Concat {
         axis: usize,
-        /// `(offset along axis, node)`, in increasing order.
         parts: Vec<(i64, usize)>,
     },
     Transmute {
         src: usize,
     },
-    /// Backed by nothing. Every coordinate under it is a hole.
     Fill,
 }
 
@@ -707,7 +537,6 @@ impl Builder<'_> {
         index
     }
 
-    /// Flatten `expr` into `self.nodes`, returning the root index.
     fn build(&mut self, expr: &Expr) -> Result<usize, Error> {
         match expr {
             Expr::Src(name) => {
@@ -824,9 +653,6 @@ impl Builder<'_> {
                     shape,
                 )
             }
-            // Nothing moves. When the element width changes, `infer_transmute`
-            // has already proved the operand is a whole tensor, so the leaf
-            // is simply read under its new type over the same bytes.
             Expr::Transmute { src, to } => match src.as_ref() {
                 Expr::Src(name) => {
                     let leaf = self.intern(Leaf::Checkpoint(name.clone()));
@@ -842,9 +668,6 @@ impl Builder<'_> {
                 }
             },
             Expr::Fill { ty, .. } => self.push(Kind::Fill, ty.shape.clone()),
-            // Each of these needs a kernel; lowering them is `plan::build`'s
-            // job, and reaching here means one was nested where only the
-            // affine fragment fits.
             Expr::Repack { .. }
             | Expr::Cast { .. }
             | Expr::Scale { .. }
@@ -871,8 +694,6 @@ impl Builder<'_> {
         }
     }
 
-    /// Pick a lowering: the copy list if it fits, the index table if the
-    /// expression has one, and the refusal if it has neither.
     fn lower(&mut self, root: usize, max_runs: usize) -> Result<Lowering, Error> {
         if let Some(runs) = self.walk(root, max_runs)? {
             return Ok(Lowering::Copy(CopyList {
@@ -891,10 +712,6 @@ impl Builder<'_> {
         Ok(gather)
     }
 
-    /// The index-table lowering, when the root is a [`Expr::Gather`] whose
-    /// operand is a whole tensor. Only then: the table addresses the leaf
-    /// directly, so nothing may sit between them, and a gather over a
-    /// computed operand would need a second instruction to materialize it.
     fn gather(&mut self, root: usize) -> Result<Option<Lowering>, Error> {
         let Kind::Gather { src, axis, indices } = &self.nodes[root].kind else {
             return Ok(None);
@@ -926,10 +743,6 @@ impl Builder<'_> {
         })))
     }
 
-    /// Walk the output in flat order, emitting one run per maximal contiguous
-    /// stretch. `None` when the list would exceed `max_runs`: the walker
-    /// declines rather than fails, and [`Builder::lower`] turns that into an
-    /// answer or an error.
     fn walk(&mut self, root: usize, max_runs: usize) -> Result<Option<Vec<Run>>, Error> {
         let total = self.nodes[root].elements;
         let mut runs: Vec<Run> = Vec::new();
@@ -944,8 +757,6 @@ impl Builder<'_> {
                 None => RunSource::Zero,
             };
             match runs.last_mut() {
-                // Each node's bound is conservative, so genuinely adjacent
-                // stretches can arrive as two runs; merge them.
                 Some(last) if adjacent(last, source, flat) => last.len += span,
                 _ => {
                     if runs.len() >= max_runs {
@@ -963,8 +774,6 @@ impl Builder<'_> {
         Ok(Some(runs))
     }
 
-    /// Resolve one output position and report how far the mapping stays
-    /// contiguous from there. `(None, n)` means `n` padded elements.
     fn step(
         &self,
         index: usize,
@@ -985,8 +794,6 @@ impl Builder<'_> {
                 inner.dims[*axis] = start + coord.dims[*axis];
                 let inner_flat = flatten(&inner, &self.nodes[*src].shape);
                 let (found, span) = self.step(*src, &inner, inner_flat)?;
-                // A band leaves every inner extent alone, so the source
-                // advances in lockstep except across a wrap of `axis`.
                 let limit = if *whole || *axis == 0 {
                     i64::MAX
                 } else {
@@ -994,8 +801,6 @@ impl Builder<'_> {
                 };
                 Ok((found, span.min(limit).min(remaining)))
             }
-            // Where a band advances in lockstep, a stride does not: the
-            // source jumps by `step` every time `axis` increments.
             Kind::Stride {
                 src,
                 axis,
@@ -1009,8 +814,6 @@ impl Builder<'_> {
                 let limit = distance_to(node, coord, flat, *axis, coord.dims[*axis] + 1);
                 Ok((found, span.min(limit).min(remaining)))
             }
-            // A gather's run ends at the first index not one past the last,
-            // so a permutation of contiguous blocks costs one run per block.
             Kind::Gather { src, axis, indices } => {
                 let at = coord.dims[*axis] as usize;
                 let mut inner = *coord;
@@ -1045,22 +848,16 @@ impl Builder<'_> {
                 Ok((found, span.min(limit).min(remaining)))
             }
             Kind::Transmute { src } => {
-                // A rename preserves flat order, so it is the identity here.
                 let mut inner = Coord::default();
                 unflatten(flat, &self.nodes[*src].shape, &mut inner);
                 let (found, span) = self.step(*src, &inner, flat)?;
                 Ok((found, span.min(remaining)))
             }
-            // The whole node is a hole, so the walk can jump to its end.
             Kind::Fill => Ok((None, remaining)),
         }
     }
 }
 
-/// The operand's extent along `axis`, or an internal error if there is none
-/// (the type checker bounds-checks every axis first, so this means a
-/// compiler bug). Reported rather than panicked: this crate is reached
-/// across an FFI boundary, where an unwind is not recoverable.
 fn axis_extent(shape: &[i64], axis: usize, node: &str) -> Result<i64, Error> {
     shape.get(axis).copied().ok_or_else(|| {
         Error::Internal(format!(
@@ -1087,7 +884,6 @@ fn adjacent(last: &Run, source: RunSource, flat: i64) -> bool {
     }
 }
 
-/// Flat-index distance from `flat` until `coord[axis]` reaches `target`.
 fn distance_to(node: &Node, coord: &Coord, flat: i64, axis: usize, target: i64) -> i64 {
     let stride = node.strides[axis];
     (target - coord.dims[axis]) * stride - flat.rem_euclid(stride)
@@ -1122,4 +918,3 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
     }
     flat
 }
-

@@ -1,9 +1,3 @@
-//! The ETA trace container: the versioned blob carrying one traced pass
-//! (stage-tagged programs, channel declarations, descriptor-port bindings,
-//! the name table). Identity is [`crate::container_hash`] over these
-//! canonical bytes. Not in the container (per-instance data): channel seed
-//! values, working-set binding, rng seeds.
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -15,32 +9,22 @@ use super::wire::{OpWire, predicate_tags};
 use crate::types::{Dtype, MAX_RANK, RngKind, Shape, from_wire, to_wire, wire_dtype};
 use crate::{ETA_MAGIC, ETA_VERSION, ETA_VERSION_EXTERN};
 
-/// Channel element dtype: a concrete scalar type or the late-bound
-/// model-intrinsic activation type (`ACT`, wire tag 4). `ACT` resolves to the
-/// backend's quantized float at bind; in-program it materializes as F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ChanDType {
-    /// A scalar type fixed by the trace.
     Concrete(Dtype),
-    /// The backend's activation type, resolved at bind.
     Act,
 }
 
-/// Wire tag for [`ChanDType::Act`].
 pub const DT_ACT: u8 = 4;
 
 impl ChanDType {
-    /// This dtype's wire tag, or `None` if the concrete dtype is one ETA does
-    /// not compute in (see [`crate::types::class_of`]). `Act` is not a
-    /// `Dtype`: [`DT_ACT`] sits one past the last wire byte.
     pub fn tag(self) -> Option<u8> {
         match self {
             ChanDType::Concrete(d) => to_wire(d),
             ChanDType::Act => Some(DT_ACT),
         }
     }
-    /// The dtype tag `t` names, or `None` if no dtype claims it.
     pub fn from_tag(t: u8) -> Option<Self> {
         if t == DT_ACT {
             return Some(ChanDType::Act);
@@ -50,8 +34,6 @@ impl ChanDType {
             None => None,
         }
     }
-    /// The dtype a program-side `take`/`read` of this channel yields (`ACT`
-    /// materializes F32).
     pub fn program_dtype(self) -> Dtype {
         match self {
             ChanDType::Concrete(d) => d,
@@ -60,23 +42,16 @@ impl ChanDType {
     }
 }
 
-/// The host endpoint of a channel, if any (the other endpoint is the pass).
-/// SPSC: `Writer` forbids any stage put; `Reader` forbids any stage
-/// take/read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum HostRole {
-    /// Both endpoints are inside the pass; the host never touches it.
     None = 0,
-    /// Host puts, pass consumes (e.g. an attention `mask`).
     Writer = 1,
-    /// Pass puts, host takes/reads (e.g. a sampled `out`).
     Reader = 2,
 }
 
 impl HostRole {
-    /// The role wire byte `v` names, or `None` if no role claims it.
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => HostRole::None,
@@ -87,71 +62,40 @@ impl HostRole {
     }
 }
 
-/// One channel declaration: GPU-resident ordered memory —
-/// a bounded queue of cells with full/empty bits. Capacity is trace-known;
-/// a capacity-N channel lowers to a ring of N+1 cells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelDecl {
-    /// The shape of one cell.
     pub shape: Shape,
-    /// The element type of one cell.
     pub dtype: ChanDType,
-    /// Queue capacity ≥ 1 (deeper run-ahead = larger capacity).
     pub capacity: u32,
-    /// Which endpoint, if either, the host holds.
     pub host_role: HostRole,
-    /// `Channel::from(v)`: starts full. The seed *value* is per-instance
-    /// data supplied at instantiation — never in the container.
     pub seeded: bool,
 }
 
-/// A descriptor port's source: a channel (contents read at execution time —
-/// contract C1) or a trace-known constant (folded, e.g. a rectangular
-/// `indptr`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PortSource {
-    /// Read from a channel at execution time, so the value can change per
-    /// fire.
     Channel(ChannelIndex),
-    /// Raw little-endian payload: 4 bytes/element for F32/I32/U32, 1
-    /// byte/element for Bool (the packed wire format is the runtime's, D1).
     Const {
-        /// Element type of `data`.
         dtype: Dtype,
-        /// Shape of the constant; its `numel` fixes `data`'s length.
         shape: Shape,
-        /// The payload bytes.
         data: Vec<u8>,
     },
 }
 
-/// One descriptor-port binding.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PortBinding {
-    /// Which descriptor port is being bound.
     pub port: Port,
-    /// Where the port's value comes from.
     pub source: PortSource,
 }
 
-/// Direction of an extern channel — whose endpoint THIS trace holds.
-/// (wire-version 2: this is what lets an SPSC pair span two pipelines.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum ExternDir {
-    /// This trace CONSUMES: the other instance is the producer (e.g. the
-    /// expert importing the amateur's logits channel). Stages may
-    /// take/read, never put.
     Import = 0,
-    /// This trace PRODUCES: the other instance consumes (e.g. the amateur
-    /// exporting its logits). Stages may put, never take/read.
     Export = 1,
 }
 
 impl ExternDir {
-    /// The direction wire byte `v` names, or `None` if no direction claims
-    /// it.
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => ExternDir::Import,
@@ -161,73 +105,37 @@ impl ExternDir {
     }
 }
 
-/// An extern-channel binding (v1.1): channel `chan`'s other endpoint lives in
-/// a different instance, paired at instantiation by `name`. The channel decl
-/// itself keeps `host_role = None` and `seeded = false` (the producer fills
-/// it); dtype/shape/capacity must match the peer's at pairing time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExternDecl {
-    /// Index into the container's name table; the pairing key.
     pub name: crate::op::NameIndex,
-    /// Which endpoint this trace holds.
     pub dir: ExternDir,
-    /// The channel whose other endpoint is external.
     pub chan: ChannelIndex,
 }
 
-/// One stage-tagged program: a flat SSA op list (see [`super::op`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageProgram {
-    /// When in the pass this body runs.
     pub stage: Stage,
-    /// The body, in SSA order.
     pub ops: Vec<Op>,
 }
 
-/// A complete traced pass.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct TraceContainer {
-    /// Second-party kernel/sink names ([`Op::KernelCall`]/[`Op::SinkCall`]
-    /// reference by index). Sorted + deduped for canonicality.
     pub names: Vec<String>,
-    /// Channel declarations, indexed by [`ChannelIndex`].
     pub channels: Vec<ChannelDecl>,
-    /// Sorted by port tag, unique.
     pub ports: Vec<PortBinding>,
-    /// Sorted by stage tag, unique (at most one program per stage).
     pub stages: Vec<StageProgram>,
-    /// v1.1 extern channels (sorted by `chan`, unique). When EMPTY the
-    /// container encodes as wire-version 1 byte-identically (existing hashes
-    /// never move); when present it encodes as version 2.
     pub externs: Vec<ExternDecl>,
 }
 
 impl TraceContainer {
-    /// This container's canonical bytes; see [`encode`].
     pub fn encode(&self) -> Vec<u8> {
         encode(self)
     }
-    /// The identity hash of this container's canonical bytes.
-    ///
-    /// Taken over the encoding rather than the structure, so two containers
-    /// hash alike exactly when they ship the same bytes.
     pub fn hash(&self) -> u64 {
         super::container_hash(&encode(self))
     }
 }
 
-// ===========================================================================
-// Encode
-// ===========================================================================
-
-/// A table length as it goes on the wire. Every count in the container is
-/// narrower than `usize`, and a table that overflows its width must not
-/// encode: a truncated count describes a shorter table, and the bytes that
-/// follow would then decode cleanly into a different program.
-///
-/// # Panics
-///
-/// If `len` does not fit the wire width of `table`.
 fn wire_len<T>(len: usize, table: &str) -> T
 where
     T: TryFrom<usize>,
@@ -238,17 +146,9 @@ where
     }
 }
 
-/// Lower a [`TraceContainer`] to its canonical bytes. Does not validate.
-///
-/// # Panics
-///
-/// If any table is longer than the wire width of its count; see
-/// `wire_len`. If any dtype in the container is one ETA does not compute in;
-/// see `wire_dtype`.
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&ETA_MAGIC);
-    // Preserve version-1 hashes when the extern extension is absent.
     let v2 = !c.externs.is_empty();
     put_u16(
         &mut w,
@@ -258,7 +158,7 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
             ETA_VERSION
         },
     );
-    put_u16(&mut w, 0); // flags
+    put_u16(&mut w, 0);
     put_u32(&mut w, wire_len(c.names.len(), "name"));
     put_u32(&mut w, wire_len(c.channels.len(), "channel"));
     put_u32(&mut w, wire_len(c.ports.len(), "port"));
@@ -310,15 +210,9 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     w
 }
 
-/// Append one op's tag byte and body to `w`. A walk over
-/// [`OpSpec::wire`](crate::op::OpSpec::wire), so the field order here is the
-/// field order the decoder reads and the op table declares — never spelled
-/// out separately, which would make this a third copy of the layout.
 pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
     let wire = OpWire::of(op);
     w.push(wire.tag);
-    // `tag()` only produces tags `declare_ops!` defines, and every row has a
-    // layout, so this cannot miss.
     let layout = op::spec(wire.tag).expect("op tag has no OP_TABLE row").wire;
     let mut value = 0usize;
     let mut imm = 0usize;
@@ -328,8 +222,6 @@ pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
                 put_u32(w, wire.args[value]);
                 value += 1;
             }
-            // `chan` is `-1` on every op whose layout has no channel field,
-            // and this arm runs only for the ops whose layout has one.
             WireField::Chan => put_u32(
                 w,
                 u32::try_from(wire.chan).expect("a chan-carrying op records its channel index"),
@@ -356,8 +248,6 @@ pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
             }
             WireField::Name => put_u16(w, wire.name_idx),
             WireField::Intrinsic => put_u16(w, wire.intr),
-            // Variadic, and last by `variadic_args_come_last`: whatever the
-            // fixed `Value` fields did not consume is the argument list.
             WireField::Args => {
                 let rest = &wire.args[value..];
                 w.push(wire_len(rest.len(), "operand"));
@@ -369,12 +259,6 @@ pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
     }
 }
 
-/// Appends `shape` as a rank byte followed by that many little-endian `u32`
-/// dims — the encoding [`WireField::Shape`] names.
-///
-/// # Panics
-///
-/// If the rank does not fit a byte; see [`MAX_RANK`].
 pub fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
     w.push(wire_len(shape.rank(), "shape dim"));
     for &d in shape.dims() {
@@ -382,67 +266,34 @@ pub fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
     }
 }
 
-/// Appends `v` as 2 little-endian bytes.
 pub fn put_u16(w: &mut Vec<u8>, v: u16) {
     w.extend_from_slice(&v.to_le_bytes());
 }
-/// Appends `v` as 4 little-endian bytes.
 pub fn put_u32(w: &mut Vec<u8>, v: u32) {
     w.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Bytes per element of a const-port payload. Reads [`Dtype::bits`] (itself
-/// exhaustive) rather than restating a width table here. A const port only
-/// ever carries a dtype ETA computes in, so `bytes_ceil`'s sub-byte rounding
-/// is unreachable.
 pub fn const_elem_size(dtype: Dtype) -> usize {
     usize::try_from(dtype.bytes_ceil())
         .expect("an element's byte count fits a usize on every served target")
 }
 
-// ===========================================================================
-// Decode
-// ===========================================================================
-
-/// A container decode failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainerDecodeError {
-    /// The leading bytes are not [`ETA_MAGIC`], so this
-    /// is not a container at all.
     BadMagic,
-    /// A container version this build cannot read.
     UnsupportedVersion(u16),
-    /// A field ran past the end of the input.
     UnexpectedEof,
-    /// An op tag no [`OP_TABLE`](crate::op::OP_TABLE) row claims.
     UnknownOpcode(u8),
-    /// A tagged enum byte outside its declared set.
     UnknownTag {
-        /// Which enum the tag was read for, for the diagnostic.
         what: &'static str,
-        /// The byte that no variant claims.
         tag: u8,
     },
-    /// A shape rank above [`MAX_RANK`].
     RankTooLarge(u8),
-    /// A shape dim of `0`; every extent must be at least 1.
     ZeroDimension,
-    /// A name-table entry that is not valid UTF-8.
     BadUtf8,
-    /// Bytes remain after the container ends.
-    ///
-    /// Rejected rather than ignored: a trailing region is a place to hide
-    /// payload that changes nothing this decoder sees, which would let two
-    /// different byte strings present as the same program.
     TrailingBytes,
-    /// A table that the format requires to be sorted and deduplicated is
-    /// not.
-    ///
-    /// Canonicality is what makes the container hash an identity: without
-    /// it, the same program has as many hashes as it has orderings.
     NonCanonical,
-    /// A table length above its ceiling; the payload names which table.
     CountTooLarge(&'static str),
 }
 
@@ -477,24 +328,13 @@ impl From<ReadError> for ContainerDecodeError {
     }
 }
 
-/// Decoder ceilings. Resource limits, not semantic ones: a container within
-/// them can still be rejected by `bind`. `MAX_STAGES` is different in kind —
-/// a container carries at most one program per stage, so `Stage::ALL.len()`
-/// is a structural fact rather than a budget.
 pub const MAX_STAGES: usize = Stage::ALL.len();
-/// Per-stage op ceiling. Planning is linear in this, so it bounds compile time
-/// as well as memory.
 pub const MAX_OPS: usize = 1 << 16;
-/// Channel-table ceiling.
 pub const MAX_CHANNELS: usize = 1 << 12;
-/// Name-table ceiling.
 pub const MAX_NAMES: usize = 1 << 12;
-/// Port-table ceiling.
 pub const MAX_PORTS: usize = 1 << 8;
-/// Extern-table ceiling; one extern per channel is the most that can pair.
 pub const MAX_EXTERNS: usize = MAX_CHANNELS;
 
-/// Parse container bytes back into the model. Does not validate (bind does).
 pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     let mut r = Reader::new(bytes);
     if r.take(4)? != ETA_MAGIC {
@@ -623,10 +463,6 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     Ok(container)
 }
 
-/// Read one op's tag byte and body — the mirror walk of [`encode_op`] over
-/// the same [`OpSpec::wire`](crate::op::OpSpec::wire) layout. Each field is
-/// validated where it is read, so a malformed byte is named by the field it
-/// broke.
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
     let tag = r.u8()?;
     let layout = op::spec(tag)
@@ -652,9 +488,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 imm += 1;
             }
             WireField::Dtype => {
-                // Validated, then kept as the byte it arrived as: `OpWire`
-                // carries wire bytes, and re-deriving one from the `Dtype`
-                // would be `to_wire` undoing `from_wire`.
                 let byte = r.u8()?;
                 decode_dtype(byte)?;
                 wire.dtype = byte;
@@ -662,9 +495,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             WireField::Shape => wire.shape = decode_shape(r)?.dims().to_vec(),
             WireField::RngKind => wire.kind = decode_rng_kind(r.u8()?)? as u8,
             WireField::Predicate => {
-                // The tag is rejected before its payload is consumed, which is
-                // what makes an unknown predicate an `UnknownTag` rather than
-                // an EOF four bytes later.
                 let pred = r.u8()?;
                 if pred > predicate_tags::PROB_GE {
                     return Err(ContainerDecodeError::UnknownTag {
@@ -676,8 +506,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 wire.pred_payload = r.u32()?;
             }
             WireField::Literal => {
-                // Payload first, then the tag check: a truncated literal is an
-                // EOF, not an unknown dtype.
                 let dtype = r.u8()?;
                 wire.lit_bits = r.u32()?;
                 if from_wire(dtype).is_none() {
@@ -692,9 +520,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             WireField::Intrinsic => {
                 let intr = r.u16()?;
                 if IntrinsicId::from_u16(intr).is_none() {
-                    // The diagnostic's `tag` is a byte, so a wide id keeps
-                    // only its low half; naming the field it came from is what
-                    // keeps that from reading as the whole value.
                     return Err(ContainerDecodeError::UnknownTag {
                         what: "intrinsic (low byte)",
                         tag: intr.to_le_bytes()[0],
@@ -711,8 +536,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             }
         }
     }
-    // Every field the layout names has been read and validated, so the only
-    // way back is the one the roundtrip test pins.
     wire.to_op().ok_or(ContainerDecodeError::UnknownOpcode(tag))
 }
 
@@ -730,8 +553,6 @@ fn decode_rng_kind(t: u8) -> Result<RngKind, ContainerDecodeError> {
     })
 }
 
-/// The dtype a container's tag byte names, rejecting the rest. Reads
-/// [`crate::types::from_wire`] — ETA's numbering, not [`Dtype`]'s.
 fn decode_dtype(t: u8) -> Result<Dtype, ContainerDecodeError> {
     match from_wire(t) {
         Some(d) => Ok(d),
@@ -761,8 +582,6 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
-    // A miniature two-channel greedy epilogue: tok (device loop-carried),
-    // out (host-read); epilogue = argmax(logits) -> tok, out.
     fn sample() -> TraceContainer {
         let vocab = 32u32;
         TraceContainer {
@@ -804,8 +623,8 @@ mod tests {
                         intr: IntrinsicId::Logits,
                         shape: Shape::matrix(1, vocab),
                         dtype: Dtype::F32,
-                    }, // id 0
-                    Op::ReduceArgmax(0), // id 1
+                    },
+                    Op::ReduceArgmax(0),
                     Op::ChanPut { chan: 0, value: 1 },
                     Op::ChanPut { chan: 1, value: 1 },
                 ],
@@ -814,19 +633,22 @@ mod tests {
         }
     }
 
+    fn container_every_case() {
+        round_trip_every_op();
+        no_byte_of_an_op_encoding_is_ignored_by_its_decoder();
+        rejects_bad_magic_version_and_truncation();
+        rejects_noncanonical_encodings();
+        rejects_wire_counts_before_allocating_from_them();
+    }
+
     #[test]
     fn round_trip_every_op() {
-        // The extra `Const` literals are payload variation, not table
-        // coverage: `Literal` has four arms and the representative row
-        // carries only one.
         let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),
             Op::Const(Literal::U32(7)),
             Op::Const(Literal::Bool(true)),
         ];
         ops.extend(crate::op::representatives());
-        // Without this sweep a new op could land in `declare_ops!` with an
-        // `encode_op` arm and no `decode_op` arm.
         let missing: Vec<&str> = crate::op::OP_TABLE
             .iter()
             .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))
@@ -866,20 +688,12 @@ mod tests {
         assert_eq!(decode(&bytes).expect("decode"), c);
     }
 
-    // Every byte an op encodes is a byte its decoder reads. `round_trip_
-    // every_op` alone wouldn't catch a decoder that ignores a byte and
-    // substitutes the representative's own value; flipping each byte closes
-    // that gap.
-    #[test]
     fn no_byte_of_an_op_encoding_is_ignored_by_its_decoder() {
         let mut ignored: Vec<String> = Vec::new();
         let mut flipped = 0usize;
         for op in crate::op::representatives() {
             let mut bytes = alloc::vec::Vec::new();
             encode_op(&mut bytes, &op);
-            // Byte 0 is the tag, which selects the decoder arm rather than
-            // feeding it; `decode_rejects_every_tag_the_table_does_not_declare`
-            // is what holds that byte.
             for index in 1..bytes.len() {
                 for mask in [0x01u8, 0x80, 0xff] {
                     let mut mutant = bytes.clone();
@@ -910,7 +724,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn rejects_bad_magic_version_and_truncation() {
         let mut b = encode(&sample());
         b[0] = b'X';
@@ -928,7 +741,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn rejects_noncanonical_encodings() {
         assert!(Shape::new(&[0]).is_none());
         let minimal = TraceContainer {
@@ -956,7 +768,6 @@ mod tests {
         assert_eq!(decode(&empty_v2), Err(ContainerDecodeError::NonCanonical));
     }
 
-    #[test]
     fn rejects_wire_counts_before_allocating_from_them() {
         let mut names = TraceContainer::default().encode();
         names[8..12].copy_from_slice(&u32::MAX.to_le_bytes());

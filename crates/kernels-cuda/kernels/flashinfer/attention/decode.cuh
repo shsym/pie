@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_DECODE_CUH_
 #define FLASHINFER_DECODE_CUH_
 #include <cooperative_groups.h>
@@ -21,9 +21,6 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-// PIE: REMOVED -- host-only `<iostream>`, wanted only by the `Dispatched` launchers' error
-// paths. 1 line of host C++, guarded out of every NVRTC compile before it was removed, so
-// removing it changes no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 #include "../cp_async.cuh"
 #include "../math.cuh"
@@ -43,24 +40,23 @@ using cp_async::SharedMemFillMode;
 
 namespace {
 
-/*!
- * \brief Load k tile from smem and compute qk
- * \tparam pos_encoding_mode The positional encoding mode used in the kernel
- * \tparam head_dim A template integer indicates the head dimension
- * \tparam vec_size A template integer indicates the vector size
- * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam tile_size A template integer indicates the tile size per (bdx * bdy) threads.
- * \tparam T A template type indicates the input data type
- * \param smem A pointer to the start of shared memory
- * \param q_vec A vector of float indicates the thread-local query vector
- * \param freq A vector of float indicates the thread-local rope frequency
- * \param kv_shared_offset An array of uint32_t indicates the k/v tiles offset
- *   in shared memory of different pipeline stages
- * \param kv_idx A integer indicates the thread-local kv position in kv-cache
- * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
- * \param s A float indicates the thread-local result of qk
- * \param st The self-attention state to be updated
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
 __device__ __forceinline__ void compute_qk(
@@ -73,11 +69,11 @@ __device__ __forceinline__ void compute_qk(
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> k_vec;
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-      // apply rotary embedding for all rows in k matrix of kv-cache
+
       k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
                                                   kv_idx_base + tz * tile_size + j);
     } else {
-      // do not apply rotary embedding
+
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
     s[j] = 0.f;
@@ -90,13 +86,13 @@ __device__ __forceinline__ void compute_qk(
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
-    s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
+    s[j] = variant.LogitsTransform(params, s[j], batch_idx, 0, pos,
                                    qo_head_idx, kv_head_idx);
     if constexpr (variant.use_softmax) {
       s[j] *= variant.sm_scale_log2;
     }
 
-    bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
+    bool mask = variant.LogitsMask(params, batch_idx, 0, pos, qo_head_idx,
                                    kv_head_idx);
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
     st.m = max(st.m, s[j]);
@@ -117,19 +113,18 @@ __device__ __forceinline__ void compute_qk(
   }
 }
 
-/*!
- * \brief Load v tile from shared memory and update local state
- * \tparam vec_size A template integer indicates the vector size
- * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam tile_size A template integer indicates the tile size per (bdx * bdy) threads.
- * \tparam T A template type indicates the input data type
- * \param smem A pointer to the start of shared memory
- * \param s A float indicates the pre-softmax attention score
- * \param kv_shared_offset An array of uint32_t indicates the k/v tiles offset
- * in shared memory of different pipeline stages
- * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
- * \param st The flashattention state to be updated
- */
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
@@ -145,15 +140,14 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
   }
 }
 
-/*!
- * \brief Synchronize the state of all warps inside a threadblock.
- * \tparam vec_size A template integer indicates the vector size
- * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam bdy A template integer indicates the block size in y dimension
- * \param st The warp local state
- * \param smem The pointer to shared memory buffer for o
- * \param smem_md The pointer to shared memory buffer for m/d
- */
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec_size>& st,
                                            float* smem, float* smem_md, const uint32_t tx,
@@ -190,29 +184,28 @@ __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec
   }
 }
 
-}  // namespace
+}
 
-/*!
- * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
- * \tparam pos_encoding_mode The positional encoding mode
- * \tparam vec_size A template integer indicates the vector size
- * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam bdy A template integer indicates the block size in y dimension
- * \tparam DTypeQ A template type indicates the query data type
- * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeO A template type indicates the output data type
- * \param q [num_qo_heads, head_dim] The query matrix
- * \param k [seq_len, num_kv_heads, head_dim] The key matrix in kv-cache
- * \param v [seq_len, num_kv_heads, head_dim] The value matrix in kv-cache
- * \param o [num_qo_heads, head_dim] The output matrix
- * \param head_dim A integer indicates the head dimension
- * \param rope_rcp_scale A floating number indicate the reciprocal
- *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
- *   Positional Embeddings)
- * \param rope_rcp_theta A floating number indicate the reciprocal
- *   of "theta" used in RoPE (Rotary Positional Embeddings)
- * \param kv_chunk_size A integer indicates the kv-chunk size
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
@@ -241,7 +234,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   uint32_t num_qo_heads = params.num_qo_heads;
 
   extern __shared__ uint8_t smem[];
-  AttentionVariant variant(params, /*batch_idx=*/0, smem);
+  AttentionVariant variant(params, 0, smem);
   const uint32_t seq_len = variant.kv_len;
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
@@ -263,10 +256,9 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
 
-    // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(q + qo_head_idx * q_stride_h, freq, seq_len - 1);
   } else {
-    // do not apply rotary embedding to q matrix
+
     q_vec.cast_load(q + qo_head_idx * q_stride_h + tx * vec_size);
   }
   block.sync();
@@ -275,7 +267,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
   uint32_t chunk_end = chunk_start + kv_chunk_size;
 
-  // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
   constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
 #pragma unroll
@@ -301,23 +292,22 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
   }
 
-  // pipelining k/v tiles loading and state updating
   uint32_t consumer_kv_idx_base = chunk_start, stage_idx = 0;
   state_t<vec_size> st_local;
   float s[bdy * tile_size_per_bdx];
 
 #pragma unroll 2
   for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
-    // compute qk
+
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
-        params, variant, /*batch_idx=*/0,
+        params, variant, 0,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, qo_head_idx,
         kv_head_idx, s, st_local, tx, ty, tz);
     block.sync();
-    // load k
+
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -328,7 +318,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     }
     cp_async::commit_group();
 
-    // update m/d/o state
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
@@ -336,7 +325,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
         st_local, tx);
     block.sync();
 
-    // load v
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -354,13 +342,12 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   cp_async::wait_group<0>();
   block.sync();
 
-  // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md,
                                       tx, ty, tz);
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    st_local.o[i] = variant.OutputTransform(params, st_local.o[i], /*batch_idx=*/0, /*qo_idx=*/0,
-                                            qo_head_idx, st_local.m, st_local.d, /*scale=*/1.0f);
+    st_local.o[i] = variant.OutputTransform(params, st_local.o[i], 0, 0,
+                                            qo_head_idx, st_local.m, st_local.d, 1.0f);
   }
 
   st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
@@ -369,29 +356,28 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   }
 }
 
-/*!
- * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
- * \tparam pos_encoding_mode The positional encoding mode
- * \tparam vec_size A template integer indicates the vector size
- * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam bdy A template integer indicates the block size in y dimension
- * \tparam bdz A template integer indicates the block size in z dimension
- * \tparam DTypeQ A template type indicates the query data type
- * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeO A template type indicates the output data type
- * \tparam IdType A template type indicates the index data type
- * \param q [batch_size, num_qo_heads, head_dim] The query matrix
- * \param paged_kv The paged kv-cache data structure
- * \param o [num_qo_heads, head_dim] The output matrix
- * \param tmp Used-allocated temporary buffer
- * \param lse The logsumexp values
- * \param sm_scale A float indicates the scale applied to pre-softmax logits
- * \param rope_rcp_scale A floating number indicate the reciprocal
- *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
- *   Positional Embeddings)
- * \param rope_rcp_theta A floating number indicate the reciprocal
- *   of "theta" used in RoPE (Rotary Positional Embeddings)
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
@@ -420,8 +406,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
   const uint32_t kv_head_idx = by;
   const uint32_t qo_head_idx = kv_head_idx * bdy + ty;
-  // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
-  // the actual batch size, so we need to check if the current batch is valid
+
   if (block_valid_mask && !block_valid_mask[bx]) return;
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
   const uint32_t kv_len = paged_kv.get_length(batch_idx);
@@ -462,23 +447,20 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    // apply rotary embedding to q matrix
+
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
         q + params.q_indptr[batch_idx] * q_stride_n + qo_head_idx * q_stride_h, freq,
         q_rope_offset_val);
   } else {
-// do not apply rotary embedding to q matrix
+
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    // PIE: the request's query row, read from `q_indptr` rather than taken as
-    // `batch_idx` -- the same row when the vector is the launch's own, and the
-    // plane's row when `batch_idx` is a fire lane.
+
     q_vec.cast_load(q + params.q_indptr[batch_idx] * q_stride_n + qo_head_idx * q_stride_h +
                     tx * vec_size);
   }
 
-  // preload k/v tiles
   uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
@@ -540,7 +522,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
             paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
       }
     }
-    // compute qk
+
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
@@ -560,7 +542,6 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
                      tx * vec_size;
     }
 
-    // load k tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -571,14 +552,12 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     }
     cp_async::commit_group();
 
-    // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
     block.sync();
 
-    // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
@@ -593,18 +572,17 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   cp_async::wait_group<0>();
   block.sync();
 
-  // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md, tx, ty,
                                       tz);
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    st.o[i] = variant.OutputTransform(params, st.o[i], bx, /*qo_idx=*/0, qo_head_idx, st.m, st.d,
-                                      /*scale=*/1.0f);
+    st.o[i] = variant.OutputTransform(params, st.o[i], bx, 0, qo_head_idx, st.m, st.d,
+                                      1.0f);
   }
 
   if (tz == 0) {
     st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-    // write lse
+
     if (lse != nullptr) {
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
     }
@@ -623,15 +601,14 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
                                     bdx, bdy, bdz, AttentionVariant>(params, smem);
 }
 
-/*!
- * \brief Get the heuristic number of threads per threadblock
- * \param group_size The number of qo heads that maps to the same kv head in GQA.
- * \param sizeof_dtype The size (in terms of bytes) of the input data type
- */
+
+
+
+
 constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
   if (group_size == 8U) {
     if (sizeof_dtype == 1U) {
-      return 256U;  // not enough registers for 512 threads
+      return 256U;
     } else {
       return 512U;
     }
@@ -640,11 +617,6 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
   }
 }
 
-// PIE: REMOVED -- `SingleDecodeWithKVCacheDispatched` and
-// `BatchDecodeWithPagedKVCacheDispatched`, host launchers. 192 lines of host C++ that built a
-// `void* args[]` for `cudaLaunchKernel`. Unguarded and unreached -- NVRTC parsed it as an
-// uninstantiated template, which is a weaker shield than a guard. Rust plans and fires these
-// kernels with `cuLaunchKernel`. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
@@ -735,8 +707,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   const uint32_t t_offset = dim3_offset(bdy, bdx, tz, ty, tx);
 
-  // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
-  // the actual batch size, so we need to check if the current batch is valid
   if (block_valid_mask && !block_valid_mask[batch_idx]) return;
   const uint32_t mapped_batch_idx = params.request_indices[batch_idx];
 
@@ -786,7 +756,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
-  // load q_nope and q_pe tile
+
 #pragma unroll
   for (int i = 0; i < tile_size_qo_heads; ++i) {
     qo_head_idx[i] = dim3_offset(bdy, tile_size_qo_heads, blockIdx.y, threadIdx.y, i);
@@ -800,11 +770,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
     }
   }
 
-  // init paged-cache read offset to be used
   uint32_t q, r;
   paged_kv.page_size.divmod(packed_page_iter_base + t_offset, q, r);
-  ckv_offset_smem[t_offset] = paged_kv.protective_get_offset_ckv(q, r, /*feat_idx*/ 0, last_indptr);
-  kpe_offset_smem[t_offset] = paged_kv.protective_get_offset_kpe(q, r, /*feat_idx*/ 0, last_indptr);
+  ckv_offset_smem[t_offset] = paged_kv.protective_get_offset_ckv(q, r,  0, last_indptr);
+  kpe_offset_smem[t_offset] = paged_kv.protective_get_offset_kpe(q, r,  0, last_indptr);
   block.sync();
 
   uint32_t stage_idx = 0;
@@ -848,7 +817,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
           ckv_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile) * head_dim_ckv, q_nope_vec[i],
           kpe_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile) * head_dim_kpe, q_pe_vec[i],
           freq, kv_idx_base,
-          /*iter_base*/ iter * kv_iter_len, /*iter_bound*/ cur_chunk_len, st[i]);
+           iter * kv_iter_len,  cur_chunk_len, st[i]);
     }
 
     if ((iter + num_stages_smem) % bdx == 0) {
@@ -856,9 +825,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
       paged_kv.page_size.divmod(
           packed_page_iter_base + (iter + num_stages_smem) * kv_iter_len + t_offset, q, r);
       ckv_offset_smem[t_offset] =
-          paged_kv.protective_get_offset_ckv(q, r, /*feat_idx*/ 0, last_indptr);
+          paged_kv.protective_get_offset_ckv(q, r,  0, last_indptr);
       kpe_offset_smem[t_offset] =
-          paged_kv.protective_get_offset_kpe(q, r, /*feat_idx*/ 0, last_indptr);
+          paged_kv.protective_get_offset_kpe(q, r,  0, last_indptr);
     }
     block.sync();
 
@@ -898,8 +867,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
       if (qo_head_idx[i] < num_qo_heads) {
 #pragma unroll
         for (size_t j = 0; j < vec_size_ckv; ++j) {
-          st[i].o[j] = variant.OutputTransform(params, st[i].o[j], batch_idx, /*qo_idx=*/0,
-                                               qo_head_idx[i], st[i].m, st[i].d, /*scale=*/1.0f);
+          st[i].o[j] = variant.OutputTransform(params, st[i].o[j], batch_idx, 0,
+                                               qo_head_idx[i], st[i].m, st[i].d, 1.0f);
         }
         st[i].o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_ckv +
                            tx * vec_size_ckv);
@@ -915,12 +884,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
 #endif
 }
 
-// PIE: REMOVED -- `BatchDecodeWithPagedKVCacheDispatchedMLA`, a host launcher. 82 lines of
-// host C++ that built a `void* args[]` for `cudaLaunchKernel`. Unguarded and unreached --
-// NVRTC parsed it as an uninstantiated template, which is a weaker shield than a guard. Rust
-// plans and fires these kernels with `cuLaunchKernel`. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_DECODE_CUH_
+#endif

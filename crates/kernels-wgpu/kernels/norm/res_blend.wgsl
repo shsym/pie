@@ -1,5 +1,4 @@
-//#include "common/bf16.inc.wgsl"
-//#include "common/reduce.inc.wgsl"
+
 
 const PIE_MAX_BLOCKS = 32u;
 
@@ -106,4 +105,3 @@ fn main(
     }
 }
 
-// pie:instantiate res_blend_bf16 PIE_GROUP_X=256

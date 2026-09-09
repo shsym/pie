@@ -1,28 +1,23 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_POS_ENC_CUH_
 #define FLASHINFER_POS_ENC_CUH_
 
-// PIE: REMOVED -- host-only `<cmath>`. 1 line of host C++, guarded out of every NVRTC compile
-// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
 #include <cstdint>
-// PIE: REMOVED -- host-only `<iostream>` and `<string>`. 2 lines of host C++, guarded out of
-// every NVRTC compile before it was removed, so removing it changes no compile. This marker is
-// one a strip does NOT undo; see MODIFICATIONS.
+
 #include <type_traits>
 
 #include "layout.cuh"
@@ -57,26 +52,21 @@ struct RopeQuantizeAppendPagedKVCacheParams {
   float quant_scale_kv;
 };
 
-/*!
- * \brief An enumeration class that defines different modes for applying RoPE
- *   (Rotary Positional Embeddings).
- */
+
+
+
 enum class PosEncodingMode {
-  // No rotary positional embeddings
+
   kNone = 0U,
-  // Apply Llama-style rope.
+
   kRoPELlama = 1U,
-  // Apply ALiBi bias
+
   kALiBi = 2U
 };
 
-/*!
- * \brief Convert PosEncodingMode to string
- * \param pos_encoding_mode A PosEncodingMode value
- */
-// PIE: REMOVED -- `PosEncodingModeToString`, which returns `std::string` and had no caller
-// left. 12 lines of host C++, guarded out of every NVRTC compile before it was removed, so
-// removing it changes no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
+
+
+
 
 __device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num_heads) {
   int n = math::ptx_exp2((int)math::ptx_log2(num_heads));
@@ -84,17 +74,16 @@ __device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num
                       : math::ptx_exp2(-4. * float((head_idx + 1 - n) * 2 - 1) / float(n));
 }
 
-/*!
- * \brief Apply RoPE (Rotary Positional Embeddings) to x[0: head_dim],
- *   return thread-local vector
- * \tparam vec_size A template integer indicates the vector size used
- *   in the kernel
- * \tparam bdx A template integer indicates the blockDim.x
- * \tparam T A template type indicates the x data type
- * \param x A pointer to the start of x data
- * \param freq A vector of float indicates the thread-local rope frequency
- * \param offset A integer indicates the offset of the position in RoPE
- */
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
     const T* x, const vec_t<float, vec_size>& freq, int32_t offset,
@@ -140,17 +129,16 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
   return vec;
 }
 
-/*!
- * \brief Apply RoPE (Rotary Positional Embeddings) to x[0: head_dim] with interleave,
- *   return thread-local vector.
- * \tparam vec_size A template integer indicates the vector size used
- *   in the kernel
- * \tparam bdx A template integer indicates the blockDim.x
- * \tparam T A template type indicates the x data type
- * \param x A pointer to the start of x data
- * \param freq A vector of float indicates the thread-local rope frequency
- * \param offset A integer indicates the offset of the position in RoPE
- */
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_interleave(
     const T* x, const vec_t<float, vec_size>& freq, int32_t offset,
@@ -188,25 +176,24 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
   return vec;
 }
 
-/*
-HACK (ByronHsu): in the interleave mode with cos_sin_cache, we actually only use the first half of
-cos and sin
 
-For example,
-In the below example, the vec_size is 4
-the computation in the kernel is:
-    [x1, x2, x3, x4...] * [cos1, cos1, cos2, cos2] + [-x2, x1, -x4, x3...] * [sin1, sin1, sin2,
-sin2] the data we loaded are:
-    - loaded vec = [x1, x2, x3, x4]
-    - loaded cos = [cos1, cos2, cos3, cos4]
-    - loaded sin = [sin1, sin2, sin3, sin4]
-But only the first half of cos and sin is used in the computation.
 
-However, we argue the additional overhead is acceptable:
-    1. loading additional elements of cos and sin is not adding much overhead. The arithmetic
-intensity is the same as non-interleave mode. Each elements of cos and sin is load twice
-    2. we don't want two code paths of cos and sin vector for interleave and non-interleave mode.
-*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size>
 vec_apply_llama_rope_cos_sin_interleave_reuse_half(const T* x, const vec_t<float, vec_size>& cos,
@@ -219,7 +206,7 @@ vec_apply_llama_rope_cos_sin_interleave_reuse_half(const T* x, const vec_t<float
     vec_before = vec;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      // i / 2 is to get the index of the first half of cos and sin
+
       vec[i] = vec[i] * cos[i / 2] +
                ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
     }
@@ -227,20 +214,19 @@ vec_apply_llama_rope_cos_sin_interleave_reuse_half(const T* x, const vec_t<float
   return vec;
 }
 
-/*
-HACK (raayandhar): RoPE + quant kernels expect `no_rope_dim` to be a multiple of `rope_dim`.
-That meant that every chunk covered a full vector load/store.
 
-Now, since BatchQKApplyRotaryPosIdsCosSinCache is routed to the RopeQuantize kernel, the
-"no rope" slice can be smaller than `rope_dim`.
-e.g. consider head_dim = 192, rope_dim = 128, no_rope_dim = 64.
 
-We want to write 64 values only, but the kernel will load and write 128, and cause
-an error.
 
-We guard these partial chunks by zero-padding unused lanes, and only writing
-back the elements that actually exist in the chunk.
-*/
+
+
+
+
+
+
+
+
+
+
 template <typename DType, typename QuantType, uint32_t vec_size>
 __device__ __forceinline__ void scale_store_partial_chunk(const DType* in_ptr, QuantType* out_ptr,
                                                           uint32_t lane_elem_offset,
@@ -302,19 +288,13 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
 
     const int half_rotary_dim = rotary_dim / 2;
 
-    // 1. if interleave:
-    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
-    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
-    // 2. if not interleave
-    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
-    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
       int sin_offset = rotary_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
+        vec_idx = (tx * vec_size) / 2;
       } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+        vec_idx = (tx * vec_size) % half_rotary_dim;
       }
       cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
       sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
@@ -367,25 +347,18 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
     const IdType pos = pos_ids[idx];
     const int half_rotary_dim = rotary_dim / 2;
 
-    // 1. if interleave:
-    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
-    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
-    // 2. if not interleave
-    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
-    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
       int sin_offset = rotary_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
+        vec_idx = (tx * vec_size) / 2;
       } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+        vec_idx = (tx * vec_size) % half_rotary_dim;
       }
       cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
       sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
     }
 
-    // not to unroll the loop, because num head might be large and might lead to worse performance
 #pragma unroll 1
     for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
       DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
@@ -430,7 +403,7 @@ __global__ void RopeQuantizeKernel(
     size_t q_nope_out_stride_n, size_t q_nope_out_stride_h, size_t k_rope_in_stride,
     size_t k_rope_in_stride_h, size_t k_nope_in_stride, size_t k_nope_in_stride_h,
     size_t k_rope_out_stride, size_t k_rope_out_stride_h, size_t k_nope_out_stride,
-    size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv) {  // generalized kernel
+    size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
@@ -438,8 +411,7 @@ __global__ void RopeQuantizeKernel(
   uint32_t by = blockIdx.y;
   uint32_t bdy = blockDim.y;
 
-  // Calculate flexible boundaries for block allocation
-  uint32_t rope_chunk_size = rope_dim;  // Process entire rope_dim per chunk
+  uint32_t rope_chunk_size = rope_dim;
   uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
   uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
 
@@ -453,27 +425,21 @@ __global__ void RopeQuantizeKernel(
     const IdType pos = pos_ids[idx];
 
     const int half_rope_dim = rope_dim / 2;
-    // Load cos/sin for RoPE processing blocks only
-    // 1. if interleave:
-    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
-    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
-    // 2. if not interleave
-    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
-    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
+
     if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
       int sin_offset = rope_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
+        vec_idx = (tx * vec_size) / 2;
       } else {
-        vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
+        vec_idx = (tx * vec_size) % half_rope_dim;
       }
       cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
       sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
     }
 
     if (by < q_rope_end) {
-      // Q RoPE processing: num_qo_heads * rope_chunks blocks
+
       uint32_t q_head_idx = by / rope_chunks;
       uint32_t rope_chunk_idx = by % rope_chunks;
       uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
@@ -499,7 +465,7 @@ __global__ void RopeQuantizeKernel(
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
     } else if (by < k_rope_end) {
-      // K RoPE processing: num_kv_heads * rope_chunks blocks
+
       uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
       uint32_t rope_chunk_idx = (by - q_rope_end) % rope_chunks;
       uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
@@ -524,10 +490,10 @@ __global__ void RopeQuantizeKernel(
       k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
 
     } else if (by < k_nope_end) {
-      // K Non-RoPE processing: num_kv_heads * no_rope_chunks blocks
+
       uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
       uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
-      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;  // Use same chunk size
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
 
       DType* k_nope_in_ptr = k_nope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
                                                               k_nope_in_stride, k_nope_in_stride_h);
@@ -538,15 +504,15 @@ __global__ void RopeQuantizeKernel(
       uint32_t chunk_valid =
           (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
       uint32_t lane_elem_offset = tx * vec_size;
-      // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
+
       scale_store_partial_chunk<DType, QuantType, vec_size>(
           k_nope_in_ptr, k_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_kv);
 
     } else {
-      // Q Non-RoPE processing: num_qo_heads * no_rope_chunks blocks
+
       uint32_t q_head_idx = (by - k_nope_end) / no_rope_chunks;
       uint32_t nope_chunk_idx = (by - k_nope_end) % no_rope_chunks;
-      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;  // Use same chunk size
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
 
       DType* q_nope_in_ptr =
           q_nope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_in_stride_n,
@@ -558,7 +524,7 @@ __global__ void RopeQuantizeKernel(
       uint32_t chunk_valid =
           (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
       uint32_t lane_elem_offset = tx * vec_size;
-      // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
+
       scale_store_partial_chunk<DType, QuantType, vec_size>(
           q_nope_in_ptr, q_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_q);
     }
@@ -576,7 +542,7 @@ __global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h, float smooth_a,
     float smooth_b, float rope_rcp_scale, float rope_rcp_theta) {
-  // NOTE: q and q_rope may be the same ptr, so do k and k_rope
+
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
   const uint32_t bdy = blockDim.y;
@@ -592,7 +558,7 @@ __global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
       }
 
       float smooth = freq[i] * smooth_a + smooth_b;
-      smooth = max(0.0f, min(1.0f, smooth));  // clamp to [0, 1]
+      smooth = max(0.0f, min(1.0f, smooth));
       freq[i] = (1 - smooth) * (freq[i] * rope_rcp_scale) + smooth * freq[i];
     }
   }
@@ -647,7 +613,7 @@ __global__ void BatchQKApplyRotaryPosIdsKernel(
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h, float smooth_a,
     float smooth_b, float rope_rcp_scale, float rope_rcp_theta) {
-  // NOTE: q and q_rope may be the same ptr, so do k and k_rope
+
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
   vec_t<float, vec_size> freq;
@@ -662,7 +628,7 @@ __global__ void BatchQKApplyRotaryPosIdsKernel(
       }
 
       float smooth = freq[i] * smooth_a + smooth_b;
-      smooth = max(0.0f, min(1.0f, smooth));  // clamp to [0, 1]
+      smooth = max(0.0f, min(1.0f, smooth));
       freq[i] = (1 - smooth) * (freq[i] * rope_rcp_scale) + smooth * freq[i];
     }
   }
@@ -733,13 +699,13 @@ __global__ void BatchQKApplyRotaryKernel(
       }
 
       float smooth = freq[i] * smooth_a + smooth_b;
-      smooth = max(0.0f, min(1.0f, smooth));  // clamp to [0, 1]
+      smooth = max(0.0f, min(1.0f, smooth));
       freq[i] = (1 - smooth) * (freq[i] * rope_rcp_scale) + smooth * freq[i];
     }
   }
 
   if (bx < batch_size * num_qo_heads) {
-    // apply rotary to q
+
     const uint32_t batch_idx = bx / num_qo_heads;
     const uint32_t qo_head_idx = bx % num_qo_heads;
     const uint32_t seq_len = indptr[batch_idx + 1] - indptr[batch_idx];
@@ -764,7 +730,7 @@ __global__ void BatchQKApplyRotaryKernel(
       }
     }
   } else {
-    // apply rotary to k
+
     uint32_t batch_idx = (bx - batch_size * num_qo_heads) / num_kv_heads;
     uint32_t kv_head_idx = (bx - batch_size * num_qo_heads) % num_kv_heads;
     const uint32_t seq_len = indptr[batch_idx + 1] - indptr[batch_idx];
@@ -791,12 +757,11 @@ __global__ void BatchQKApplyRotaryKernel(
   }
 }
 
-/*!
- * \brief Unified CUDA kernel to apply RoPE, quantize to FP8, and append to paged cache.
- *
- * Templated on CacheT to support both GQA/MHA (paged_kv_t) and MLA (paged_kv_mla_t).
- * Cache-only behaviors are selected with constexpr on the CacheT.
- */
+
+
+
+
+
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename RoPEIdType,
           typename PagedKVIdType, typename QuantType, typename CacheT>
 __global__ void RopeQuantizeAppendPagedKVCacheKernel(
@@ -812,7 +777,6 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
   uint32_t by = blockIdx.y;
   uint32_t bdy = blockDim.y;
 
-  // Local aliases for params for readability
   const uint32_t nnz = params.nnz;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -835,17 +799,15 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
   const float quant_scale_q = params.quant_scale_q;
   const float quant_scale_kv = params.quant_scale_kv;
 
-  // Calculate flexible boundaries for block allocation
   uint32_t rope_chunk_size = rope_dim;
   uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
   uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
 
   uint32_t q_rope_end = num_qo_heads * rope_chunks;
-  // For MLA, num_kv_heads is effectively 1
+
   uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
   uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
 
-  // Deduce MLA vs GQA/MHA from CacheT
   constexpr bool IS_MLA = std::is_same<CacheT, paged_kv_mla_t<QuantType, PagedKVIdType>>::value;
 
   vec_t<float, vec_size> cos, sin;
@@ -853,21 +815,20 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     const uint32_t idx = bx * bdy + ty;
     const RoPEIdType pos = pos_ids[idx];
 
-    // skip padding tokens with batch_indices < 0
     if (batch_indices[idx] >= 0) {
-      // Compute page location for this token
+
       uint32_t page_iter, entry_idx;
       paged_kv_like.page_size.divmod(
           paged_kv_like.indptr[batch_indices[idx]] * paged_kv_like.page_size + positions[idx],
           page_iter, entry_idx);
 
       const int half_rope_dim = rope_dim / 2;
-      // Load cos/sin for RoPE processing blocks only
+
       if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
         int sin_offset = rope_dim / 2;
         int vec_idx;
         if constexpr (interleave) {
-          vec_idx = (tx * vec_size) / 2;  // Force integer division
+          vec_idx = (tx * vec_size) / 2;
         } else {
           vec_idx = (tx * vec_size) % half_rope_dim;
         }
@@ -876,7 +837,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
       }
 
       if (by < q_rope_end) {
-        // ============ Q RoPE processing ============
+
         uint32_t q_head_idx = by / rope_chunks;
         uint32_t rope_chunk_idx = by % rope_chunks;
         uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
@@ -903,17 +864,17 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
       } else if (by < k_rope_end) {
-        // ============ K RoPE processing & Cache Append ============
+
         uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
         uint32_t rope_chunk_idx = (by - q_rope_end) % rope_chunks;
         uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
 
         DType* k_rope_in_ptr;
         if constexpr (IS_MLA) {
-          // MLA: 2D K
+
           k_rope_in_ptr = k_rope_in + idx * k_rope_in_stride + elem_offset;
         } else {
-          // GQA/MHA: 3D K
+
           k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
                                                            k_rope_in_stride, k_rope_in_stride_h);
         }
@@ -942,7 +903,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         }
 
       } else if (by < k_nope_end) {
-        // ============ K Non-RoPE processing & Cache Append ============
+
         uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
         uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
         uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
@@ -973,12 +934,12 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         }
 
       } else if (by < k_nope_end + (IS_MLA ? 0u : num_kv_heads)) {
-        // ============ V processing & Cache Append (GQA/MHA only) ============
+
         if constexpr (!IS_MLA) {
           uint32_t kv_head_idx = by - k_nope_end;
           DType* v_in_ptr =
               v_in + get_elem_offset_impl(idx, kv_head_idx, 0, v_in_stride, v_in_stride_h);
-          // Cover the full head dimension (rope_dim + no_rope_dim) in chunks of rope_chunk_size
+
           uint32_t head_dim_total = rope_dim + no_rope_dim;
           uint32_t v_chunks = (head_dim_total + rope_chunk_size - 1) / rope_chunk_size;
 #pragma unroll 1
@@ -999,9 +960,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
         }
 
       } else {
-        // ============ Q Non-RoPE processing ============
-        // MLA has no V section, so Q-nope starts immediately after K-nope.
-        // GQA/MHA has a V section of length num_kv_heads blocks.
+
         uint32_t q_nope_start = k_nope_end + (IS_MLA ? 0u : num_kv_heads);
         uint32_t q_head_idx = (by - q_nope_start) / no_rope_chunks;
         uint32_t nope_chunk_idx = (by - q_nope_start) % no_rope_chunks;
@@ -1029,11 +988,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 #endif
 }
 
-// PIE: REMOVED -- fourteen `cudaError_t` host launchers, `RopeQuantize` through
-// `BatchQKApplyLlama31Rotary`, each building a `void* args[]` for `cudaLaunchKernel`. 591 lines
-// of host C++, guarded out of every NVRTC compile before it was removed, so removing it changes
-// no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_POS_ENC_CUH_
+#endif

@@ -4,22 +4,15 @@ use model_dsl::{Platform, Shard, Weight};
 use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model, Tower};
 use checkpoint_dsl::{Builder, Error};
 
-/// The checkpoint's draft head, `layers.45` of the language model.
 const HEAD: &str = "model.language_model.layers.45.";
-/// The checkpoint's vision tower.
 const VISUAL: &str = "model.visual.";
 
-/// Where a trunk plane is read from: the checkpoint's names, or (for an
-/// overlay onto an artifact) the artifact's own — every trunk plane by its
-/// declared name, as the artifact already holds it.
 #[derive(Clone, Copy)]
 enum From {
     Source,
     Own,
 }
 
-/// A [`Builder`] whose trunk reads honour [`From`]; head planes always read
-/// by name, since they are the new bytes either way.
 struct Land<'a> {
     b: Builder<'a>,
     from: From,
@@ -69,8 +62,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // An artifact with the head overlaid (`pie model import <artifact.zt>
-        // --aux <shards>`): the head under `aux.`, every trunk plane its own.
         let overlaid = |name: &str| src.get(&format!("aux.{name}")).is_some();
         if (self.mtp.is_some() && overlaid(&format!("{HEAD}enorm.weight")))
             || (self.tower.is_some() && overlaid(&format!("{VISUAL}post_layernorm.weight")))
@@ -80,9 +71,6 @@ impl Model {
         self.import_from_mlx(src, platform)
     }
 
-    /// The `Vontra/GLM-5.3-Flash-MLX-2bit-MTP` names: a text tower under
-    /// `model.language_model.`, its head at the root, the draft head (on a
-    /// row that declares one) at `layers.45`, the vision tower unread.
     pub fn import_from_mlx(
         &self,
         src: &ztensor::Source,
@@ -91,10 +79,6 @@ impl Model {
         self.land(src, platform, From::Source, "")
     }
 
-    /// Reads a STAMPED ARTIFACT of this family's text row with the draft head
-    /// overlaid beside it: every trunk plane by its own name, the head's
-    /// through the `aux.` reading. What lets a head be put onto a
-    /// hundred-gigabyte artifact whose source snapshot is gone.
     pub fn import_from_own_with_aux(
         &self,
         src: &ztensor::Source,
@@ -111,8 +95,6 @@ impl Model {
         self.land(src, platform, From::Own, "aux.")
     }
 
-    /// `new` prefixes the names of the planes an overlay brings (the head,
-    /// the tower): empty for a snapshot, `aux.` for an artifact overlay.
     fn land(
         &self,
         src: &ztensor::Source,
@@ -157,9 +139,6 @@ impl Model {
             }
         }
 
-        // The draft head and the tower: new bytes when the overlay brings
-        // them, so read by name — unless the artifact already holds them
-        // (a tower overlaid onto a drafting artifact), when they are its own.
         let held = |own: &str| matches!(from, From::Own) && src.get(own).is_some();
         let mut b = Land {
             b: b.b,
@@ -184,8 +163,6 @@ impl Model {
         let hidden = i64::from(self.hidden);
         b.read(&mtp.enorm, n("enorm.weight"))?;
         b.read(&mtp.hnorm, n("hnorm.weight"))?;
-        // `eh_proj` is one `[hidden, 2·hidden]` plane over `[e; h]`: its first
-        // `hidden` columns multiply the embedding, the rest the residual.
         b.read_expr(&mtp.e_proj, || {
             Ok(Expr::src(n("eh_proj.weight")).slice(1, 0, hidden))
         })?;
@@ -207,8 +184,6 @@ fn tower(
     v: &dyn Fn(&str) -> String,
     t: &Tower,
 ) -> Result<(), Error> {
-    // The Conv3d kernel `[hidden, C, T, P, P]` is already stored in the
-    // matmul bank's byte order (a transmute).
     b.read_expr(&t.patch_embed, || {
         reshaped(
             src,
@@ -243,8 +218,6 @@ fn tower(
         )?;
     }
     b.read(&t.post_norm, v("post_layernorm.weight"))?;
-    // The Conv2d kernel `[out, C, kh, kw]` flattens to `(c, kh, kw)` columns;
-    // the merged rows come `(kh, kw, c)`, so the columns are permuted.
     b.read_expr(&t.downsample, || {
         let (c, k) = (i64::from(t.hidden), i64::from(t.merge));
         let out = extent(t.downsample.dim(0));
@@ -267,7 +240,6 @@ fn tower(
     Ok(())
 }
 
-/// The same bytes read as `want`: a stored rank-N kernel as a rank-2 bank.
 fn reshaped(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));
@@ -304,7 +276,6 @@ fn moe(b: &mut Land, n: &dyn Fn(&str) -> String, mlp: &Mlp) -> Result<(), Error>
     };
     b.read(router, n("mlp.gate.weight"))?;
     b.read(bias, n("mlp.gate.e_score_correction_bias"))?;
-    // Stored one expert at a time; the rows stack on axis 0.
     let pair = |e: u32| {
         vec![
             n(&format!("mlp.experts.{e}.gate_proj.weight")),
@@ -369,8 +340,6 @@ fn kda(
             n("self_attn.v_proj.weight"),
         ],
     )?;
-    // Each conv bank is stored [channels, 1, kernel] (the 1 is `groups`); the
-    // declared type is rank-2, so each leg is squeezed before concatenation.
     b.read_expr(&k.conv, || {
         Ok(Expr::concat(
             as_axis(cut_axis(&k.conv), &k.conv.name),
@@ -386,7 +355,6 @@ fn kda(
     b.read(&k.g_a, n("self_attn.g_a_proj.weight"))?;
     b.read(&k.g_b, n("self_attn.g_b_proj.weight"))?;
     b.read(&k.b, n("self_attn.b_proj.weight"))?;
-    // Stored flat [heads * head_dim]; the text states it per head.
     b.read_expr(&k.dt_bias, || {
         Ok(Expr::src(n("self_attn.dt_bias")).transmute(TensorType::new(
             vec![extent(u64::from(k.heads)), extent(u64::from(k.head_dim))],
@@ -399,7 +367,6 @@ fn kda(
     Ok(())
 }
 
-/// Drops the singleton `groups` axis: [channels, 1, kernel] -> [channels, kernel].
 fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));

@@ -1,7 +1,3 @@
-//! `Layout`: gathers, cuts, and slices — data movement with no arithmetic.
-//! One entry per IR variant, plus the quantized embed-gather the driver
-//! selects when the table is an affine bank.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -41,11 +37,6 @@ pub fn embed(
     )
 }
 
-/// `y[row, column] = argmax_c x[row, c]` — one column of the i32 plane `y`
-/// (`[rows, depth]`), one threadgroup of 1024 threads per row (the kernel's
-/// thirty-two simdgroups; at 256 a 262k-wide row was a thousand serial
-/// compares a thread and 0.4 ms a launch). Ties go to the lowest column and
-/// a NaN never wins.
 pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.argmax";
     debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
@@ -74,10 +65,6 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     )
 }
 
-/// The concatenating gather's geometry (qwen4's PLE): `ids` is one row of
-/// `heads` ids per token, `y` is `heads` table rows laid side by side, so this
-/// is [`embed`] with the head axis folded into the row axis — `(rows · heads)`
-/// slices of `y.width / heads`.
 fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), Error> {
     let heads = nonzero(op, "the ids per row", ids.width)?;
     if y.width == 0 || y.width % heads != 0 {
@@ -102,7 +89,6 @@ fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32),
     Ok((slices, y.width / heads))
 }
 
-/// `heads` gathers per row, concatenated — the dense table.
 pub fn embed_concat(
     ctx: &Ctx<'_>,
     ids: Tensor,
@@ -130,9 +116,6 @@ pub fn embed_concat(
     )
 }
 
-/// `heads` gathers per row, concatenated — the affine bank, dequantized for
-/// exactly the rows touched and never landed dense. Otherwise identical to
-/// [`embed_gather_mb_4bit`].
 pub fn embed_concat_mb_4bit(
     ctx: &Ctx<'_>,
     ids: Tensor,
@@ -173,7 +156,6 @@ pub fn split_qkv(
     )
 }
 
-/// Deinterleaves per-head `(q, gate)` pairs from the packed projection.
 pub fn split_q_gate(
     ctx: &Ctx<'_>,
     packed: Tensor,
@@ -207,7 +189,6 @@ pub fn split_q_gate(
     )
 }
 
-/// Splits each row at column `width`.
 pub fn split_rows(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -216,7 +197,10 @@ pub fn split_rows(
     right: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "split_rows_bfloat16" });
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "split_rows_bfloat16",
+        F32 => "split_rows_float32",
+    });
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
     debug_assert_eq!(left.width, width, "the left half is the width this cut states");
@@ -240,7 +224,6 @@ pub fn split_rows(
     )
 }
 
-/// Copies layer `layer`'s `width`-wide slice out of a stacked table.
 pub fn select(
     ctx: &Ctx<'_>,
     table: Tensor,
@@ -249,7 +232,10 @@ pub fn select(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.select";
-    let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "select_slice_bfloat16" });
+    let entry = dtype_dispatch!(OP, table.dtype, {
+        Bf16 => "select_slice_bfloat16",
+        F32 => "select_slice_float32",
+    });
     nonzero(OP, "the slice width this select states", width)?;
     debug_assert_eq!(
         y.width, width,
@@ -307,10 +293,6 @@ fn affine_point(op: &'static str, group: i32, bits: i32) -> Result<usize, Error>
     Ok(g * 2 + b)
 }
 
-/// The embed gather over an affine-quantized table — what `layout.embed`
-/// becomes when the driver resolves the table to a bank instead of a dense
-/// weight. Dequantizes one row per token; the six stamped points differ only
-/// in the `(group, bits)` pair.
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
     ids: Tensor,
@@ -326,9 +308,6 @@ pub fn embed_gather_mb_4bit(
     gather_mb_4bit(ctx, OP, ids, table, vocab, y, y.rows, y.width)
 }
 
-/// The banked gather both embed points fire, over a slice count/width the
-/// caller carved. `vocab` is passed since a bank reads three planes (codes,
-/// scales, biases) per id, so an out-of-range id is three reads past the end.
 fn gather_mb_4bit(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -349,8 +328,6 @@ fn gather_mb_4bit(
     ];
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{op}` gathers by i32 token ids");
     nonzero(op, "the row count this embedding table states", vocab)?;
-    // All six points are affine (`bias + code * scale` unconditionally), so a
-    // symmetric table has no valid biases to read.
     let Some(biases) = table.biases else {
         return Err(refuse(
             op,
@@ -384,10 +361,6 @@ fn gather_mb_4bit(
     )
 }
 
-/// The two halves of one row permutation, which differ only in which way the
-/// index is read, so they share one body. The index dtype is required to be
-/// `i32` to match the CUDA twin's convention, even though the shader itself
-/// reads it as `uint` (same bits, non-negative).
 fn move_rows(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -437,14 +410,6 @@ fn move_rows(
     )
 }
 
-/// Gather: the rows a fragmented window covers, laid down as one
-/// (`Fallback::Copy`'s first half). Reads rows of `wide` in the order `index`
-/// names and writes them contiguously into `tight`. `index` is `i32`, one
-/// entry per row of `tight`, naming the fire row it stands at.
-///
-/// # Errors
-///
-/// bf16/f32 only; a refusal for a mismatched index or rectangle.
 pub fn gather_rows(
     ctx: &Ctx<'_>,
     wide: Tensor,
@@ -459,14 +424,6 @@ pub fn gather_rows(
     move_rows(ctx, OP, entry, wide, tight, index, [wide, tight])
 }
 
-/// Scatter: the answers put back where their rows came from
-/// (`Fallback::Copy`'s second half). The same map as [`gather_rows`] read the
-/// other way: row `i` of `tight` lands at fire row `index[i]` of `wide`. Rows
-/// the window does not cover are not written.
-///
-/// # Errors
-///
-/// As [`gather_rows`].
 pub fn scatter_rows(
     ctx: &Ctx<'_>,
     tight: Tensor,
@@ -481,10 +438,77 @@ pub fn scatter_rows(
     move_rows(ctx, OP, entry, wide, tight, index, [tight, wide])
 }
 
-/// The two folds' shared arithmetic: how many rows one block is, and how many
-/// whole blocks the source has. Floors rather than refusing a partial tail:
-/// the preprocessor always rounds image dimensions down to a whole number of
-/// blocks, so the dropped rows are padding.
+fn permute_rows(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    entry: &'static str,
+    x: Tensor,
+    perm: Tensor,
+    o: Tensor,
+    args: [Tensor; 2],
+    rows: u32,
+) -> Result<(), Error> {
+    if perm.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the permutation is {:?}, and a row map is i32 — one row named per moved row",
+                perm.dtype
+            ),
+        ));
+    }
+    let rows = nonzero(op, "rows to move", rows)?;
+    if u64::from(perm.rows) * u64::from(perm.width) < u64::from(rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the permutation is {} x {} and this launch moves {rows} rows",
+                perm.rows, perm.width
+            ),
+        ));
+    }
+    if x.dtype != o.dtype || x.width != o.width {
+        return Err(refuse(
+            op,
+            format!(
+                "the source rectangle is {} x {:?} and the destination {} x {:?}; a row \
+                 permutation does not reshape",
+                x.width, x.dtype, o.width, o.dtype
+            ),
+        ));
+    }
+    let width = nonzero(op, "the width of a row this permutation moves", o.width)?;
+    ctx.fire(
+        Fire::at("layout/row_gather.metal", entry)
+            .apply(Grid::of(elementwise_rows(op, width, rows)?, [256, 1, 1])),
+        &[
+            args[0].arg(),
+            args[1].arg_mut(),
+            perm.arg(),
+            width.arg(),
+            rows.arg(),
+        ],
+    )
+}
+
+pub fn pack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.pack_rows";
+    let entry = dtype_dispatch!(OP, o.dtype, {
+        Bf16 => "row_gather_bfloat16",
+        F32 => "row_gather_float32",
+    });
+    permute_rows(ctx, OP, entry, x, perm, o, [x, o], o.rows)
+}
+
+pub fn unpack_rows(ctx: &Ctx<'_>, x: Tensor, perm: Tensor, o: Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.unpack_rows";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "row_scatter_bfloat16",
+        F32 => "row_scatter_float32",
+    });
+    permute_rows(ctx, OP, entry, x, perm, o, [x, o], x.rows)
+}
+
 fn fold_extent(op: &'static str, x: Tensor, side: u32) -> Result<(u32, u32), Error> {
     nonzero(op, "the folding square's side", side)?;
     nonzero(op, "the folded row's width", x.width)?;
@@ -507,15 +531,6 @@ fn fold_extent(op: &'static str, x: Tensor, side: u32) -> Result<(u32, u32), Err
     Ok((block, x.rows / block))
 }
 
-/// The spatial pool: `y[j]` is the mean of rows `[j·side², (j+1)·side²)` of
-/// `x`, over `x.rows / side²` output rows. Requires the submission's patches
-/// to be in pool-block-major order. Compacting: the tail of `y` past
-/// `x.rows / side²` rows is not written.
-///
-/// # Errors
-///
-/// bf16 only; refusals for zero `side`, mismatched widths, too few rows, or
-/// a destination too short.
 pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.pool_rows";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "pool_rows_bfloat16" });
@@ -553,14 +568,6 @@ pub fn pool_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), E
     )
 }
 
-/// The merging fold: `y[j]` is rows `[j·side², (j+1)·side²)` of `x` laid end
-/// to end — `side²` rows of `width` becoming one row of `side²·width`. Same
-/// patch order and compacting tail rule as [`pool_rows`].
-///
-/// # Errors
-///
-/// As [`pool_rows`], plus a refusal if the destination width is not `side²`
-/// times the source's.
 pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.merge_rows";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "merge_rows_bfloat16" });
@@ -602,14 +609,6 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
     )
 }
 
-/// The embed merge, with a drop sentinel: row `i` of `src` lands at token row
-/// `routes[i]` of `y`; any negative `routes[i]` places it nowhere (`-1` is
-/// the sentinel a submission writes). The upper bound (`route < y.rows`) is
-/// checked upstream, not here.
-///
-/// # Errors
-///
-/// As [`scatter_rows`].
 pub fn scatter_live_rows(
     ctx: &Ctx<'_>,
     src: Tensor,
@@ -624,15 +623,6 @@ pub fn scatter_live_rows(
     move_rows(ctx, OP, entry, y, src, routes, [src, y])
 }
 
-/// The gather that interpolates: `y[r] = Σₜ weights[r, t] · table[ids[r, t]]`.
-/// `ids` is `[rows, taps]` `i32`, `weights` is `[rows, taps]` `f32`; `taps` is
-/// read off their width (2 for a separable read, 4 for bilinear, 16 for
-/// bicubic). `vocab` is the table's row count.
-///
-/// # Errors
-///
-/// Table must be bf16, `ids` i32, `weights` f32; refusals for mismatched
-/// geometry, zero taps, or an empty output.
 pub fn embed_weighted(
     ctx: &Ctx<'_>,
     ids: Tensor,
@@ -654,8 +644,6 @@ pub fn embed_weighted(
             ),
         ));
     }
-    // Weights are the preprocessor's arithmetic, not the activation's: a bf16
-    // weight would move the resample more than the gather it feeds.
     if weights.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
@@ -717,8 +705,6 @@ mod tests {
         Tensor::new(7, rows, 1, Dtype::I32)
     }
 
-    /// A four-bit affine bank of `vocab` rows at `width`, in groups of 32 —
-    /// the shape qwen4's PLE table lands as.
     fn u4_bank(vocab: u32, width: u32) -> Bank {
         Bank {
             codes: Tensor::new(10, vocab, width / 8, Dtype::U32),
@@ -729,7 +715,17 @@ mod tests {
         }
     }
 
-    /// A table of no rows is refused up front, not on the device.
+    fn layout_every_case() {
+        a_banked_table_of_no_rows_is_refused_by_name();
+        a_row_map_that_is_not_an_i32_vector_is_refused_by_name();
+        a_map_that_names_a_different_number_of_rows_is_refused_by_name();
+        a_copy_does_not_reshape();
+        an_element_with_no_instantiation_is_refused_by_dtype();
+        a_rectangle_thinner_than_one_block_is_refused_by_name();
+        a_destination_of_the_wrong_width_is_refused_in_the_folds_own_words();
+        a_destination_too_short_for_the_blocks_is_refused_by_name();
+    }
+
     #[test]
     fn a_banked_table_of_no_rows_is_refused_by_name() {
         let probe = Probe::default();
@@ -745,7 +741,6 @@ mod tests {
         assert!(probe.fires().is_empty());
     }
 
-    #[test]
     fn a_row_map_that_is_not_an_i32_vector_is_refused_by_name() {
         let probe = Probe::default();
         let why = scatter_rows(
@@ -759,7 +754,6 @@ mod tests {
         assert!(probe.fires().is_empty());
     }
 
-    #[test]
     fn a_map_that_names_a_different_number_of_rows_is_refused_by_name() {
         let probe = Probe::default();
         let why = gather_rows(&probe, bf16(1, 64, 64), map(7), bf16(2, 8, 64))
@@ -767,7 +761,6 @@ mod tests {
         assert!(format!("{why}").contains("rows named"), "{why}");
     }
 
-    #[test]
     fn a_copy_does_not_reshape() {
         let probe = Probe::default();
         let why = gather_rows(&probe, bf16(1, 64, 128), map(8), bf16(2, 8, 64))
@@ -775,9 +768,6 @@ mod tests {
         assert!(format!("{why}").contains("does not reshape"), "{why}");
     }
 
-    /// Unlike the CUDA twin (dtype-blind), this plane only stamps the
-    /// elements a copied region can hold.
-    #[test]
     fn an_element_with_no_instantiation_is_refused_by_dtype() {
         let probe = Probe::default();
         let why = gather_rows(
@@ -790,9 +780,6 @@ mod tests {
         assert!(matches!(why, Error::DtypeUnsupported { .. }), "{why}");
     }
 
-    /// A fold with no whole block is refused rather than launched at zero
-    /// rows.
-    #[test]
     fn a_rectangle_thinner_than_one_block_is_refused_by_name() {
         let probe = Probe::default();
         let why = pool_rows(&probe, bf16(1, 8, 64), 3, bf16(2, 8, 64))
@@ -805,8 +792,6 @@ mod tests {
         assert!(probe.fires().is_empty());
     }
 
-    /// The two folds disagree about the destination's width.
-    #[test]
     fn a_destination_of_the_wrong_width_is_refused_in_the_folds_own_words() {
         let probe = Probe::default();
         let pooled = pool_rows(&probe, bf16(1, 36, 64), 3, bf16(2, 4, 128))
@@ -818,8 +803,6 @@ mod tests {
         assert!(format!("{merged}").contains("concatenate into 576"), "{merged}");
     }
 
-    /// A destination too short to hold the blocks the source has is refused.
-    #[test]
     fn a_destination_too_short_for_the_blocks_is_refused_by_name() {
         let probe = Probe::default();
         let why = pool_rows(&probe, bf16(1, 90, 64), 3, bf16(2, 4, 64))
@@ -829,11 +812,6 @@ mod tests {
 
 }
 
-
-/// **A run of bytes, moved on the device**, one 32-bit word a thread — the
-/// recurrent buffer's scatter and gather (`engine_metal::rs`). `src` and
-/// `dst` are minted at the run's own offsets; `bytes` must be a multiple of
-/// four, which every activation row this crate lands is.
 pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
     const OP: &str = "layout.rs_copy";
     if bytes == 0 {
@@ -850,17 +828,8 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
     )
 }
 
-/// Rows the top-k kernel walks at once — one threadgroup a row.
 const TOPK_THREADS: u32 = 128;
 
-/// The `k` largest entries of every row of `x`, sorted descending with ties
-/// to the lower column and a NaN never chosen: `values` `[rows, k]` f32,
-/// `indices` `[rows, k]` i32.
-///
-/// # Errors
-///
-/// Refuses a dtype or a `k` the kernel is not stamped for (8 and 16), and
-/// outputs of the wrong shape.
 pub fn topk(ctx: &Ctx<'_>, x: Tensor, k: u32, values: Tensor, indices: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.topk";
     let entry = match (x.dtype, k) {

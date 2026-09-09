@@ -129,16 +129,6 @@ using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
 using DecodeCaptureParams = PieScoreParams<DecodeParams, IdType>;
 using PrefillCaptureParams = PieScoreWindowParams<PrefillParams, IdType>;
 
-// ── A learned relative-position bias on every score (Inkling) ────────────
-// `rel_bias` is one f32 profile per (query row, head) over backward distance
-// `d = key position - query position`, negated: `bias[(row * heads + h) *
-// extent + d]` for `0 <= d < extent`, nothing added outside. Rows are the
-// fire's q rows, so a request's block starts at `q_indptr[batch_idx]` like
-// its queries do. The score arrives unscaled; the scale is applied here (the
-// alibi convention) and the closure's `sm_scale_log2` is a bare log2e.
-// `log_floor`/`log_alpha`: Inkling's log attention scaling past the floor —
-// query position `n` (one-based) scales its scores and bias by
-// `1 + alpha · ln(max(1, n / floor))`; alpha 0 (or floor 0) is none.
 template <typename Base>
 struct RelBiasParams : Base {
     const float* rel_bias = nullptr;
@@ -186,8 +176,7 @@ struct VariantRelBias
                                      static_cast<std::size_t>(d)];
                 }
                 if (log_alpha != 0.f && log_floor != 0) {
-                    // The query's one-based position; the reference scales q
-                    // and the bias alike, which is the sum scaled once.
+
                     const float n = static_cast<float>(this->kv_len - this->qo_len + qo_idx + 1);
                     const float ratio = n / static_cast<float>(log_floor);
                     if (ratio > 1.f) out *= 1.f + log_alpha * __logf(ratio);
@@ -215,17 +204,6 @@ template <class KTraits>
 __device__ unsigned smem_bytes_paged =
     static_cast<unsigned>(sizeof(typename KTraits::SharedStoragePaged));
 
-// ── the ragged (unpaged) prefill: `attention.ragged` ──────────────────────
-//
-// `BatchPrefillWithRaggedKVCacheKernel` reads k/v straight out of two
-// row-major rectangles through `kv_indptr`, no page table anywhere. It takes
-// the same `KernelTraits` as the paged kernel (`PagedTraits` above is only
-// an alias for those) and picks its own shared storage
-// (`KTraits::SharedStorage`, which for head widths at or below 256 is
-// byte-identical to `SharedStoragePaged`). The host mirror of this parameter
-// block is `fa2_abi::PrefillRaggedParams`; the static assertion pins the
-// layout the Rust side is written against, so a drift fails the NVRTC
-// compile rather than misreading a field on the device.
 
 using RaggedParams = ::flashinfer::BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
@@ -234,12 +212,6 @@ static_assert(sizeof(RaggedParams) == 312,
 static_assert(alignof(RaggedParams) == 8,
               "fa2_abi::PrefillRaggedParams mirrors an 8-byte-aligned BatchPrefillRaggedParams");
 
-// `RaggedMask::ReferenceSelfOnly`: the block plus one per-group table.
-// `ref_start[g]` is the row of group `g` (local to the group, the same
-// number on the query and the key side) where its reference rows begin: a
-// query row at or past it sees only keys at or past it; every other row
-// sees every key. Group-relative on both sides, so the mask is for the
-// self-attention reading, where q and kv tables agree.
 struct RaggedRefParams : RaggedParams {
     const IdType* ref_start = nullptr;
 };
@@ -247,11 +219,6 @@ struct RaggedRefParams : RaggedParams {
 static_assert(sizeof(RaggedRefParams) == 320,
               "fa2_abi::PrefillRaggedRefParams mirrors a 320-byte RaggedRefParams");
 
-/// The full-attention variant with the reference mask on top. Instantiated
-/// under `MaskMode::kCustom`, which is what makes the kernel ask
-/// `LogitsMask` on every kv tile rather than only the causal frontier; the
-/// custom-mask bit plane itself is never read (this variant overrides the
-/// mask outright).
 struct ReferenceSelfOnly : VariantFull {
     std::uint32_t ref_start = 0;
 
@@ -268,15 +235,6 @@ struct ReferenceSelfOnly : VariantFull {
     })
 };
 
-// `RaggedMask::ReferenceSelfOnly` in its TAG form: the block plus two i32
-// tag tables indexed by FIRE-ABSOLUTE packed row — `q_tags[row]` for the
-// query rectangle, `kv_tags[row]` for the key rectangle — each `-1` for a
-// row of a lane that is not a reference, else that lane's fire index. A
-// query with tag `t >= 0` sees only keys with tag `t` (each reference lane
-// attends itself alone, however many a group holds); a query with tag `-1`
-// sees every key of its segment, the references' included. The contract's
-// spelling (`IMAGEGEN_CONTRACT.md` §1); `ref_start` above is its one-tail
-// fast case.
 struct RaggedTagParams : RaggedParams {
     const IdType* q_tags = nullptr;
     const IdType* kv_tags = nullptr;
@@ -285,11 +243,6 @@ struct RaggedTagParams : RaggedParams {
 static_assert(sizeof(RaggedTagParams) == 328,
               "fa2_abi::PrefillRaggedTagParams mirrors a 328-byte RaggedTagParams");
 
-/// The tag form of the reference mask. `LogitsMask` sees group-local
-/// `qo_idx`/`kv_idx`; the group's first packed rows (`q_indptr[g]`,
-/// `kv_indptr[g]`) turn them into the absolute rows the tables are indexed
-/// by. The query's tag is read per call (the mask is asked per fragment
-/// element, the row varying across them), the key's likewise.
 struct ReferenceTags : VariantFull {
     std::uint32_t q_base = 0;
     std::uint32_t kv_base = 0;
@@ -308,14 +261,6 @@ struct ReferenceTags : VariantFull {
     })
 };
 
-// `RaggedMask::RelativeBias`: the block plus one relative-position table.
-// `bias` is `[num_qo_heads, 2·max_len − 1]` f32, row-major, one row per
-// QUERY head (a grouped kv head's queries each read their own row). Query
-// row `qi` and key row `kj` of a group — both group-relative — read
-// `bias[h][clamp(kj − qi + max_len − 1, 0, 2·max_len − 2)]`, added to the
-// SCALED logit. The umT5 / T5 relative position bias (whose bucket
-// function is precomputed into this dense table per layer by
-// `elementwise.relative_bucket_bias`) and an ALiBi slope table both fit.
 struct RaggedBiasParams : RaggedParams {
     const float* bias = nullptr;
     std::uint32_t max_len = 0;
@@ -324,17 +269,11 @@ struct RaggedBiasParams : RaggedParams {
 static_assert(sizeof(RaggedBiasParams) == 328,
               "fa2_abi::PrefillRaggedBiasParams mirrors a 328-byte RaggedBiasParams");
 
-/// The full-attention variant with an additive relative-position bias on
-/// its logits. Instantiated under `MaskMode::kNone` like the plain arm —
-/// nothing is masked beyond the segment, only the transform hook is used.
-/// The hook applies `sm_scale` itself (the bias is in logit units, not
-/// `q·k` units), so the online softmax scales by `log2e` alone — exactly
-/// FlashInfer's own ALiBi arm (`DefaultAttention<.., use_alibi = true>`).
 struct RelativeBias : VariantFull {
     const float* bias = nullptr;
-    /// `2·max_len − 1`, the table's row width.
+
     std::uint32_t span = 1;
-    /// `max_len − 1`, the column a zero distance reads.
+
     std::uint32_t centre = 0;
 
     template <typename Params>
@@ -349,9 +288,7 @@ struct RelativeBias : VariantFull {
 
     REGISTER_LOGITS_TRANSFORM(
         params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-            // The hook is asked for every (row, key) pair of a tile,
-            // including rows past the segment's end and keys the tail mask
-            // retires after it, so the column is clamped rather than trusted.
+
             const long long d = static_cast<long long>(kv_idx) -
                                 static_cast<long long>(qo_idx) +
                                 static_cast<long long>(centre);
@@ -404,12 +341,9 @@ __global__ void sink_rescale(
     const u32* __restrict__ win)
 {
     const i32 t = static_cast<i32>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<i32>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns.
+
     const i32 t_row = win != nullptr ? t + static_cast<i32>(win[1]) : t;
     const i32 h = static_cast<i32>(blockIdx.y);
     if (t >= N || h >= num_q_heads) return;
@@ -664,13 +598,9 @@ __global__ void merge_lse_combine(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Both
-    // partials, both log-sums and both outputs ride that one row axis.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y;
 

@@ -1,26 +1,3 @@
-//! **THE HUNYUANIMAGE 3 IMPORT READS EVERY TRUNK AND IMAGE-HEAD TENSOR OF
-//! THE CHECKPOINT'S OWN SPELLING, AND NOTHING OF THE VAE OR THE ViT — AND
-//! THE FOUR PLACES IT REARRANGES ARE THE FOUR THE MODEL STUDY NAMES.**
-//!
-//! ```text
-//! cargo test -p models --test the_hunyuan_image_3_import_reads_the_miniature
-//! ```
-//!
-//! ```text
-//! (a) over the goldens' own `hy3_mini.safetensors`
-//!     (`scripts/imagegen/hy3_golden.py --mini`), when present: the
-//!     miniature reads every tensor of the file, the contract types, and
-//!     the four rearrangements are there — the `qkv_proj` gather (one
-//!     `Expr::Gather` of `q_w + 2·kv_w` rows), the two QK-norm gathers, the
-//!     swapped `gate_and_up_proj` halves, the doubled `timestep_emb.mlp.2`
-//!     — beside two constant planes no checkpoint carries
-//! (b) the rotary channel permutation is a permutation: every head's
-//!     channels appear exactly once, the `y` pairs in the low half and the
-//!     `x` pairs in the high half, in `RopeForm::Split`'s pairing
-//! ```
-//!
-//! (a) is skipped by name when the golden file is absent.
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -36,7 +13,11 @@ fn golden() -> PathBuf {
     PathBuf::from(root).join("hy3").join("hy3_mini.safetensors")
 }
 
-/// (a)
+fn the_hunyuan_image_3_import_reads_the_miniature_every_case() {
+    the_miniature_reads_the_golden_and_rearranges_where_the_study_says();
+    the_rotary_channel_permutation_is_one();
+}
+
 #[test]
 fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
     let path = golden();
@@ -53,8 +34,6 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         .contract(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the miniature does not read its own golden: {why}"));
 
-    // Every checkpoint tensor the contract names, and how many contracts
-    // name it.
     let mut reads: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
         for name in tensor.expr.sources() {
@@ -80,7 +59,6 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
     }
 
     let d = Dims::mini();
-    // The four rearrangements.
     let mut gathers: Vec<usize> = Vec::new();
     let mut concats = 0usize;
     for tensor in &contract.tensors {
@@ -112,9 +90,6 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         layers * per_layer.len(),
         "and nothing else gathers"
     );
-    // Per layer: the shared `gate_and_up_proj`'s swap, the routed bank's
-    // outer stack plus one swap an expert, and the `down_proj` stack. Then
-    // `timestep_emb.mlp.2`'s weight and bias doubled, and `special.ones`.
     assert_eq!(
         concats,
         layers * (3 + d.experts as usize) + 3,
@@ -122,8 +97,6 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
          and `timestep_emb.mlp.2` is stacked twice"
     );
 
-    // The two constant planes: `special.ones` is `[+1 | -1]` and no
-    // checkpoint carries it.
     let ones = contract
         .tensors
         .iter()
@@ -134,19 +107,14 @@ fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
         "a constant reads no checkpoint tensor"
     );
 
-    // The row's own numbers, restated: `hy3_golden.py --mini` and
-    // `Dims::mini` are one config.
     let model = Model::mini(Dtype::Bf16, Dtype::Bf16, 1);
     assert_eq!(model.dims, d);
     assert_eq!(model.layers.len(), layers);
 }
 
-/// (b)
-#[test]
 fn the_rotary_channel_permutation_is_one() {
     for head_dim in [64u32, 128] {
         let scale = models::hunyuan_image_3::model::rope_x_scale(head_dim);
-        // theta^(-2/d) — one rung of the reference's own ladder.
         let want = 10_000f32.powf(-2.0 / head_dim as f32);
         assert!((scale - want).abs() < 1e-9, "head {head_dim}");
         assert!(head_dim.is_multiple_of(4));

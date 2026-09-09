@@ -97,11 +97,6 @@ impl Site {
 
 pub use eta_compiler::codegen::fault::FaultClass;
 
-/// What a raw fault code turned out to be, read against one program's table.
-/// `class` borrows the name out of that table (via
-/// [`LaunchPackage::fault_classes`]), which is why this carries a lifetime.
-///
-/// [`LaunchPackage::fault_classes`]: eta_compiler::codegen::launch::LaunchPackage::fault_classes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fault<'a> {
     pub class: Option<&'a str>,
@@ -111,9 +106,6 @@ pub struct Fault<'a> {
     pub ambiguous_with_op_tag: bool,
 }
 
-/// Name a raw fault code, against the table `package` shipped with. Takes
-/// the whole package rather than a `&[FaultClass]` so the table used is
-/// always the one the emitter that compiled this fire's kernels produced.
 #[must_use]
 pub fn describe_fault(package: &LaunchPackage, fault: u32, max_channel: u32) -> Fault<'_> {
     let mut found: Option<(&FaultClass, u32)> = None;
@@ -200,8 +192,6 @@ impl Diagnosis {
     }
 }
 
-/// One status, as the sentence an engine prints — the class from `package`'s
-/// own table, the diagnosis, and the guard site.
 #[must_use]
 pub fn report(
     package: &LaunchPackage,

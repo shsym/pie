@@ -4,13 +4,6 @@ pub const ALIGN: u64 = 256;
 
 pub const DUMMY_BYTES: u64 = ALIGN;
 
-/// The most scratch one lane's program may carve. Was 512 MiB, which a
-/// single-row sampler never approaches; a block-diffusion denoiser reads
-/// out 256 rows of a 262 144-wide vocabulary, and its epilogue names a
-/// dozen `[256, vocab]` f32 rectangles (3.5 GB laid out one slot each).
-/// The stride is a `u32` downstream, so this stops just short of 4 GiB.
-/// [`layout_reusing`] brings such a program back under it by handing a
-/// dead value's slot on; [`layout`] is the one-slot-each form.
 pub const MAX_BYTES: u64 = (4 << 30) - ALIGN;
 
 const TEMPORARIES_PER_ELEMENT: u64 = 4;
@@ -75,51 +68,22 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
     })
 }
 
-/// One value's life on a launch clock: defined at step `def`, last read at
-/// step `last` (inclusive). A step is whatever the shell can order — a
-/// region launch, or one node of a region whose nodes run one block per
-/// lane with a barrier between them. A value nothing reads has
-/// `last == def`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lifetime {
     pub def: u32,
     pub last: u32,
-    /// Whether the value never touches scratch at all: a stream's
-    /// register (`eta_compiler::codegen::cuda::stream`), read only inside
-    /// the pass that defines it. A dead value takes no slot; its offset is
-    /// the dummy region's and nothing forms a pointer to it.
     pub dead: bool,
-    /// Whether this value may take an offset an earlier value vacated. Only
-    /// a result its op always writes in full qualifies: a never-reused slot
-    /// reads back as zero (the per-fire clear), a reused one as whatever
-    /// died there, so a result that may go unwritten (a predicated pivot, a
-    /// channel materialisation) keeps a fresh slot.
     pub reusable: bool,
-    /// The launch (a kernel) in which the value is defined, and the one in
-    /// which it is last read. Launches are ordered; steps within one may
-    /// run on many blocks at once.
     pub launch_def: u32,
     pub launch_last: u32,
-    /// How the blocks of a many-block launch touch the value — in the
-    /// launch that defines it (`class_def`) and the one that last reads it
-    /// (`class_last`). Two values of one launch may share bytes only when
-    /// their classes match and are non-zero: then every block touches the
-    /// same disjoint slice of both (its row, its element). Class 0 is a
-    /// value every block reads whole — a scalar, a constant — and shares
-    /// with nothing in its launch: a fast block would overwrite what a slow
-    /// one still reads. A one-block launch runs its steps in order, so all
-    /// its values are one class ([`Lifetime::SEQUENTIAL`]).
     pub class_def: u64,
     pub class_last: u64,
 }
 
 impl Lifetime {
-    /// The class of every value in a one-block launch.
     pub const SEQUENTIAL: u64 = u64::MAX;
 }
 
-/// A vacated span: where, how wide, the launch that last read its value
-/// and that value's class there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vacant {
     offset: u64,
@@ -128,10 +92,6 @@ struct Vacant {
     class: u64,
 }
 
-/// Best-fit vacant span of at least `span` bytes a value defined in
-/// `launch` with `class` may take: one vacated by an earlier launch, or by
-/// this launch's own values of the same non-zero class. Split if wider,
-/// the remainder keeping the span's provenance; `None` when nothing fits.
 fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u64> {
     let best = free
         .iter()
@@ -152,8 +112,6 @@ fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u6
     Some(offset)
 }
 
-/// Return `[offset, offset + span)` to the free list, coalescing with a
-/// neighbour of the same provenance; the list stays sorted by offset.
 fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
     let at = free.partition_point(|block| block.offset < vacant.offset);
     free.insert(at, vacant);
@@ -174,18 +132,6 @@ fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
     }
 }
 
-/// [`layout`], reusing a value's bytes once the last step that reads it
-/// has run. `temporary_floor` is the least the temporary arena may be — the
-/// shell's own sum for the blocks that share it (a row-parallel region's
-/// blocks each take `temporary_bytes / rows` of it). Steps run in order, so a value whose `last` step precedes
-/// another's `def` step is dead before the other is written; nothing
-/// defined at the same step as a value's last read may share with it.
-/// Widest-first within a step keeps the free list packed. Falls back to
-/// [`layout`] when `lifetimes` does not cover every descriptor.
-///
-/// # Errors
-///
-/// As [`layout`].
 pub fn layout_reusing(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
@@ -217,8 +163,6 @@ pub fn layout_reusing(
     for &i in &by_def {
         let life = lifetimes[i];
         if step != Some(life.def) {
-            // Entering `life.def`: whatever was last read strictly before it
-            // is vacant.
             while expired < count && lifetimes[by_last[expired]].last < life.def {
                 let dead = by_last[expired];
                 expired += 1;
@@ -242,11 +186,6 @@ pub fn layout_reusing(
             continue;
         }
         let descriptor = &descriptors[i];
-        // Every CUDA consumer of the temporary arena works one row at a
-        // time (`m1_reduce_*`, `ptir_parallel_reduce_f32`, the order
-        // kernels: `work[i]` for `i < last`), so it is sized by the widest
-        // ROW, not the widest value as [`layout`] does; a `[256, 262144]`
-        // f32 asks 4 MiB here, not 1 GiB.
         widest = widest.max(u64::from(descriptor.last.max(1)));
         let span = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
         let taken = if life.reusable {
@@ -307,7 +246,6 @@ mod tests {
         }
     }
 
-    /// One launch per step, every value sequential.
     fn life(def: u32, last: u32) -> Lifetime {
         Lifetime {
             dead: false,
@@ -321,7 +259,6 @@ mod tests {
         }
     }
 
-    /// A value of one many-block launch (steps `def..=last` inside it).
     fn rowed(def: u32, last: u32, launch: u32, class: u64) -> Lifetime {
         Lifetime {
             dead: false,
@@ -335,9 +272,20 @@ mod tests {
         }
     }
 
+    fn scratch_every_case() {
+        a_value_dead_before_the_next_region_hands_its_slot_on();
+        a_value_last_read_where_another_is_defined_does_not_share();
+        within_a_many_block_launch_only_one_class_shares();
+        a_result_that_may_go_unwritten_keeps_a_fresh_slot();
+        a_wider_taker_gets_a_coalesced_pair_of_slots();
+        the_temporary_arena_is_sized_by_the_widest_row();
+        the_temporary_floor_lifts_the_arena();
+        mismatched_lifetimes_fall_back_to_the_naive_layout();
+        a_dead_value_takes_no_slot();
+    }
+
     #[test]
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {
-        // a: r0..r1, b: r1..r2, c: r2 — c can take a's slot, not b's.
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 2), life(2, 2)];
         let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
@@ -347,7 +295,6 @@ mod tests {
         assert!(reused.total < naive.total);
     }
 
-    #[test]
     fn a_value_last_read_where_another_is_defined_does_not_share() {
         let descriptors = [desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 1)];
@@ -355,11 +302,7 @@ mod tests {
         assert_ne!(reused.values[0], reused.values[1]);
     }
 
-    #[test]
     fn within_a_many_block_launch_only_one_class_shares() {
-        // Same launch: a row-sliced value (class 7) dead at step 0 hands its
-        // slot to a class-7 value at step 1, not to a class-3 one, and never
-        // to a whole-value (class 0) one; the next launch takes anything.
         let descriptors = [desc(1024), desc(1024), desc(1024), desc(1024), desc(1024)];
         let lifetimes = [
             rowed(0, 0, 0, 7),
@@ -376,7 +319,6 @@ mod tests {
         assert_eq!(reused.values[4], reused.values[0], "the next launch may take it");
     }
 
-    #[test]
     fn a_result_that_may_go_unwritten_keeps_a_fresh_slot() {
         let descriptors = [desc(1024), desc(1024)];
         let lifetimes = [
@@ -390,16 +332,13 @@ mod tests {
         assert_ne!(reused.values[0], reused.values[1]);
     }
 
-    #[test]
     fn a_wider_taker_gets_a_coalesced_pair_of_slots() {
-        // a and b (adjacent, both dead after r0) merge to fit c's double width.
         let descriptors = [desc(1024), desc(1024), desc(2048)];
         let lifetimes = [life(0, 0), life(0, 0), life(1, 1)];
         let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
         assert_eq!(reused.values[2], reused.values[0].min(reused.values[1]));
     }
 
-    #[test]
     fn the_temporary_arena_is_sized_by_the_widest_row() {
         let wide = ValueDesc {
             len: 4 * 1024,
@@ -417,13 +356,11 @@ mod tests {
         );
     }
 
-    #[test]
     fn the_temporary_floor_lifts_the_arena() {
         let reused = layout_reusing(&[desc(1024)], &[life(0, 0)], 1 << 20).unwrap();
         assert_eq!(reused.temporary_bytes, 1 << 20);
     }
 
-    #[test]
     fn mismatched_lifetimes_fall_back_to_the_naive_layout() {
         let descriptors = [desc(1024), desc(1024)];
         assert_eq!(
@@ -432,11 +369,7 @@ mod tests {
         );
     }
 
-    /// A stream's register never lands: a dead value takes no slot and the
-    /// live ones lay out as if it were not there.
-    #[test]
     fn a_dead_value_takes_no_slot() {
-        // Three values alive at once, so none can take another's slot.
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let mut lifetimes = [life(0, 2), life(1, 2), life(2, 2)];
         let with = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");

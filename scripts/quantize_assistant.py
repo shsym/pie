@@ -17,7 +17,6 @@ import shutil
 
 import mlx.core as mx
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
@@ -59,7 +58,6 @@ def main():
             shutil.copy(p, args.out)
     total = sum(v.nbytes for v in out.values())
     print(f"{len(out)} tensors, {total / 2**20:.0f} MiB -> {args.out}")
-
 
 if __name__ == "__main__":
     main()

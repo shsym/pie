@@ -1,18 +1,7 @@
-//! Banks decoded to bf16 at load, for the ops that read a weight as one
-//! dense plane and have no quantized arm: the MLA absorbs' `kv_b`. The CUDA
-//! shell decodes the same bank into fire scratch on every launch
-//! (`dense_or_decoded`); this shell does it once, since its memory is the
-//! host's and the decode is a few hundred MiB of arithmetic at boot.
-//!
-//! The codec is MLX's affine one, as `mlx_quantized_block.metal` reads it:
-//! `w = code * scale + bias`, codes packed least-significant-first inside a
-//! byte, one scale and one bias per `group` codes along the row.
-
 use std::collections::BTreeSet;
 
 use model_ir::{Attention, Def, Operation, Trace};
 
-/// The weight rows the trace's MLA absorbs read as dense `kv_b` planes.
 pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     let mut rows = BTreeSet::new();
     for node in &trace.nodes {
@@ -28,12 +17,32 @@ pub(crate) fn absorbed_weights(trace: &Trace) -> BTreeSet<usize> {
     rows
 }
 
-/// A bf16 bit pattern's value.
+pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
+    let f32_rows = |value: model_ir::ValueId| {
+        matches!(
+            trace.values.get(value.0 as usize).map(|v| &v.ty),
+            Some(model_ir::Ty::Tensor { dtype: model_ir::Dtype::F32, .. })
+        )
+    };
+    let mut rows = BTreeSet::new();
+    for node in &trace.nodes {
+        let Operation::Linear(model_ir::Linear::Matmul { act, w, .. }) = &node.op else {
+            continue;
+        };
+        if !f32_rows(*act) {
+            continue;
+        }
+        if let Some(Def::Weight(index)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+            rows.insert(*index as usize);
+        }
+    }
+    rows
+}
+
 pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-/// The nearest bf16 (round to nearest even, as the device converts).
 pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     if value.is_nan() {
@@ -43,14 +52,6 @@ pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     ((bits.wrapping_add(round)) >> 16) as u16
 }
 
-/// One `[n, k]` affine bank decoded row-major to bf16 bytes. `codes` is
-/// `n * k * bits / 8` bytes, `scales` and `biases` (`None` for a symmetric
-/// scheme) are `n * k / group` bf16 each.
-///
-/// # Errors
-///
-/// A refused geometry: bits outside {2, 4, 8}, a row not a whole number of
-/// groups, or planes shorter than the geometry says.
 pub(crate) fn decode_affine(
     codes: &[u8],
     scales: &[u8],
@@ -107,6 +108,12 @@ mod tests {
         f32_to_bf16(v).to_le_bytes()
     }
 
+    fn decoded_every_case() {
+        eight_bit_codes_are_bytes();
+        sub_byte_codes_unpack_least_significant_first();
+        bf16_round_trips();
+    }
+
     #[test]
     fn eight_bit_codes_are_bytes() {
         let codes = [1u8, 2, 3, 4];
@@ -120,9 +127,7 @@ mod tests {
         assert_eq!(got, vec![-0.5, 0.0, 0.5, 1.0]);
     }
 
-    #[test]
     fn sub_byte_codes_unpack_least_significant_first() {
-        // 4-bit: 0xBA = low nibble 0xA first, then 0xB. 2-bit: 0b11100100 = 0,1,2,3.
         let out = decode_affine(&[0xBA], &bf(1.0), None, 1, 2, 2, 4).unwrap();
         let got: Vec<f32> = out
             .chunks(2)
@@ -137,7 +142,6 @@ mod tests {
         assert_eq!(got, vec![1.0, 3.0, 5.0, 7.0]);
     }
 
-    #[test]
     fn bf16_round_trips() {
         for v in [0.0f32, 1.0, -2.5, 3.0e-3, 1.0e30] {
             assert_eq!(bf16_to_f32(f32_to_bf16(v)), bf16_to_f32(f32_to_bf16(v)));

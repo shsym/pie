@@ -1,10 +1,3 @@
-//! Worker control-plane seam: the [`ControlLink`] trait the worker's
-//! register + heartbeat/report/watch loops run against, plus the distributed
-//! [`controller_api::ControlClient`] implementation. Keeps `worker` depending
-//! only on the `controller-api` contract, never the controller
-//! implementation; a single-node build injects an in-proc adapter behind the
-//! same trait so [`spawn_control_tasks`]'s loops stay transport-agnostic.
-
 use std::future::Future;
 use std::time::{Duration, Instant};
 
@@ -18,27 +11,11 @@ use tokio::sync::watch;
 use super::gateway::GatewayLinkManager;
 use super::partner::PartnerLinkManager;
 
-/// Worker→controller heartbeat cadence; well under the controller's liveness
-/// timeout so a few dropped beats never trip a false eviction.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-/// Coarse-load report cadence; the controller coalesces these per epoch.
-/// This is the longest a gateway can go without hearing from a quiet
-/// worker; a change of load is reported as soon as [`REPORT_POLL`] sees it.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
-/// How often the load is sampled for a change worth reporting early. A
-/// parked ask that cleared, or a lane that finished, used to stay invisible
-/// to every gateway for a whole [`REPORT_INTERVAL`] (sep-4 §7.15: a launch
-/// refused at the door on a stale "saturated"); the sample is two atomic
-/// loads and a pool census, so it is cheap to take often.
 const REPORT_POLL: Duration = Duration::from_millis(100);
-/// How often the dial-in links are checked for death when the roster is quiet.
-/// Cheap (a `JoinHandle::is_finished` per link) and only ever leads to work
-/// when a link has actually ended, so this can be brisk.
 const LINK_HEAL_INTERVAL: Duration = Duration::from_secs(2);
-/// `watch_worker` long-poll client deadline; must exceed the controller's
-/// `T_HANG` keepalive so its same-epoch return always lands before we time out.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
-/// Backoff before re-polling `watch_worker` after a transport error.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 fn restart_after_lost_registration(kind: &str) -> ! {
@@ -51,31 +28,22 @@ fn restart_after_lost_registration(kind: &str) -> ! {
     }
 }
 
-/// Control-plane operations the worker's loops need, abstracted over the
-/// transport. `Clone` so each of the three loops can hold its own cheap copy.
 pub trait ControlLink: Clone + Send + Sync + 'static {
-    /// Register this worker; returns its controller-minted [`WorkerId`].
     fn register_worker(&self, info: WorkerInfo) -> impl Future<Output = Result<WorkerId>> + Send;
 
-    /// Liveness ping. [`Ack::ReRegister`] ⇒ the controller lost our record and
-    /// the worker must re-register.
     fn heartbeat(&self, id: NodeId) -> impl Future<Output = Result<Ack>> + Send;
 
-    /// Push this worker's coarse load (write-only).
     fn report_worker(
         &self,
         id: WorkerId,
         status: WorkerStatus,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// A receiver of this worker's latest neighbor view.
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors>;
 }
 
 impl ControlLink for ControlClient {
     async fn register_worker(&self, info: WorkerInfo) -> Result<WorkerId> {
-        // The tarpc-generated inherent method shadows this trait method, so
-        // this dispatches to the RPC, not back into itself.
         self.register_worker(tarpc::context::current(), info)
             .await
             .context("register_worker rpc")
@@ -104,9 +72,6 @@ impl ControlLink for ControlClient {
     }
 }
 
-/// Long-poll `watch_worker`, republishing each new [`Neighbors`] view into the
-/// shared channel; re-polls with the returned epoch, backs off on transport
-/// error, exits when all receivers drop.
 async fn watch_neighbors_loop(
     client: ControlClient,
     worker_id: WorkerId,
@@ -120,7 +85,7 @@ async fn watch_neighbors_loop(
             Ok(neighbors) => {
                 since = neighbors.epoch;
                 if tx.send(neighbors).is_err() {
-                    break; // all subscribers dropped
+                    break;
                 }
             }
             Err(e) => {
@@ -135,8 +100,6 @@ async fn watch_neighbors_loop(
     }
 }
 
-/// Dial the controller's tarpc endpoint and spawn the request dispatcher.
-/// `addr` is `tcp://host:port`, a bare `host:port`, or `unix:/path`.
 pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     let cfg = tarpc::client::Config::default();
     if let Some(path) = addr
@@ -157,10 +120,6 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
-/// What a gateway routes and admits on, coarsened to the steps it acts on:
-/// the saturation line (240), the pressure pin (224), sixteenths of the
-/// pool below that, and whether the worker is idle. A report is sent early
-/// when this changes; a change within a band waits for the interval.
 fn report_band(status: &WorkerStatus) -> (u8, bool) {
     let bucket = status.kv_pressure_bucket;
     let band = if bucket >= 240 {
@@ -173,14 +132,6 @@ fn report_band(status: &WorkerStatus) -> (u8, bool) {
     (band, status.inflight == 0)
 }
 
-/// Spawn the worker's three control-plane loops against `ctrl` and return
-/// their join handles.
-///
-/// - heartbeat every [`HEARTBEAT_INTERVAL`]; [`Ack::ReRegister`] is fatal since
-///   gateway/partner state is keyed by the old worker id.
-/// - report coarse load every [`REPORT_INTERVAL`], or as soon as it changes band.
-/// - watch the neighbor view and reconcile the [`GatewayLinkManager`]'s
-///   dial-in links against each update.
 pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
@@ -267,22 +218,18 @@ pub fn spawn_control_tasks<C: ControlLink>(
             if let Some(partners) = partners.as_ref() {
                 partners.lock().await.reconcile(&last.peers).await;
             }
-            // A roster change is not the only reason a link needs attention:
-            // one can simply die. Waiting only on `changed()` meant a worker
-            // whose gateway link broke stayed dead forever in any deployment
-            // where the roster is static — which is every standalone one.
             loop {
                 tokio::select! {
                     changed = rx.changed() => {
                         if changed.is_err() {
-                            return; // controller gone → shutdown
+                            return;
                         }
                         last = rx.borrow_and_update().clone();
                         break;
                     }
                     _ = tokio::time::sleep(LINK_HEAL_INTERVAL) => {
                         if !gateways.reap_dead().is_empty() {
-                            break; // re-dial on the next pass through
+                            break;
                         }
                     }
                 }
@@ -293,8 +240,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
     vec![heartbeat_task, report_task, watch_task]
 }
 
-/// Spawn controller liveness loops for an executor. Executors do not dial
-/// gateways or query runtime/store globals.
 pub fn spawn_executor_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,

@@ -1,19 +1,3 @@
-//! The ATEM (Muse Glimmer) and Inkling templates write the token sequences
-//! transformers' `apply_chat_template` renders for the same turn, checked
-//! against the real tokenizers (the miniature snapshots' `tokenizer.json`,
-//! skipped when a box does not hold them). The expected ids below are the
-//! reference renderings, recorded once:
-//!
-//! ```text
-//! tok.apply_chat_template([{"role": "user", "content": "What is 17 times 23?"}],
-//!                         add_generation_prompt=True)
-//! ```
-//!
-//! Inkling's is the whole rendering (the effort line, the user message, the
-//! cue). Glimmer's reference injects a dated system block first, which is
-//! not a template's to write; the user turn and cue after it are what the
-//! template writes, and they are compared as that suffix.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,6 +21,11 @@ fn snapshot(repo: &str, revision: &str) -> Option<Arc<Tokenizer>> {
     Some(Arc::new(Tokenizer::from_file(&path).expect("the tokenizer loads")))
 }
 
+fn the_new_templates_write_what_the_reference_renders_every_case() {
+    inkling_writes_the_effort_line_the_user_turn_and_the_cue();
+    atem_writes_the_user_turn_and_the_cue_after_the_opening();
+}
+
 #[test]
 fn inkling_writes_the_effort_line_the_user_turn_and_the_cue() {
     let Some(tokenizer) = snapshot("thinkingmachines/Inkling", "mini-l7-e8") else {
@@ -53,7 +42,6 @@ fn inkling_writes_the_effort_line_the_user_turn_and_the_cue() {
     assert_eq!(template.seal(), vec![200006, 199999]);
 }
 
-#[test]
 fn atem_writes_the_user_turn_and_the_cue_after_the_opening() {
     let Some(tokenizer) = snapshot("meta-models/Muse-Glimmer-30B", "mini-l8-ends") else {
         return;
@@ -69,8 +57,6 @@ fn atem_writes_the_user_turn_and_the_cue_after_the_opening() {
     assert_eq!(template.prefix(), vec![200000]);
     assert_eq!(template.seal(), vec![200008, 200001]);
 
-    // A system turn: the reference appends the reasoning strength (when the
-    // message states none) and the recipient list before closing it.
     let mut got = template.system_user("You are terse.", MESSAGE);
     got.extend(template.cue());
     let want: Vec<u32> = vec![
@@ -79,7 +65,6 @@ fn atem_writes_the_user_turn_and_the_cue_after_the_opening() {
         3668, 373, 220, 1087, 4332, 220, 1504, 43, 200008, 200022, 140680,
     ];
     assert_eq!(got, want);
-    // A stated strength is kept, not doubled.
     let mut got = template.system_user("You are terse.\n\nReasoning strength: low.", MESSAGE);
     got.extend(template.cue());
     let want: Vec<u32> = vec![

@@ -1,7 +1,3 @@
-//! DeepSeek's turn format: bare role markers, no closing tag, and a tool call
-//! written as a fenced JSON block between `<｜tool▁call▁begin｜>` and
-//! `<｜tool▁call▁end｜>`.
-
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -15,9 +11,6 @@ use crate::{
 const END_OF_SENTENCE: &str = "<｜end▁of▁sentence｜>";
 const END_OF_TURN: &str = "<|EOT|>";
 
-/// The two markers a turn stops on, as one citable list — what a serving
-/// row's tokenizer contract reads, and what `new` resolves its `stop_ids`
-/// from, so the demand and the use cannot drift apart.
 pub const STOP_TOKENS: &[&str] = &[END_OF_SENTENCE, END_OF_TURN];
 
 const TOOL_CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
@@ -168,9 +161,6 @@ tool-name ::= {alternatives}
     }
 }
 
-/// Reads fenced tool calls back out of generated text. Both begin/end
-/// markers are matched in decoded text (one clock), so a batch carrying two
-/// calls yields two events and the tail survives.
 struct DeepSeekToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,

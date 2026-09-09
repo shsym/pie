@@ -7,13 +7,11 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// head counts and width are model-wide; `window` is the sliding-window width.
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
     pub window: u32,
 
-    /// Adapter bank shape (slots, rank); same at every layer.
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -23,8 +21,6 @@ pub struct Model {
     pub final_norm: Weight,
     pub final_norm_eps: f32,
 
-    /// z-lab's block drafter (`gpt-oss-20b-DFlash`), when an overlay carries
-    /// one — the same text every family carries it as (`crate::drafter::dflash`).
     pub dflash: Option<DFlash>,
 }
 
@@ -37,15 +33,10 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Moe,
-    /// Adapter bank for the attention sublayer: `[slots, rank, hidden]` down,
-    /// `[slots, hidden, rank]` up. Applied after `all_reduce` and after
-    /// `o_bias`, on the replicated output — earlier would be summed `tp`
-    /// times or correct only half the site.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
 
-/// Which attention reading a layer takes; indexes into `forward`'s per-class schedule pair.
 #[derive(Clone, Copy)]
 pub enum Reading {
     Windowed = 0,
@@ -109,10 +100,6 @@ struct Dims {
     norm_eps: f32,
 }
 
-/// `z-lab/gpt-oss-20b-DFlash`: block eight, EIGHT layers all full attention
-/// (bidirectional over the block), the trunk's own 64 × 64 query geometry
-/// over 8 kv heads — the first head whose attention is not 32 / 8 / 128 —
-/// biased projections, theta 150000, mask id 200000.
 pub const GPTOSS_20B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 6, 11, 16, 21],
     windows: &[None; 8],
@@ -130,7 +117,6 @@ pub const GPTOSS_20B_DFLASH: dflash::Head = dflash::Head {
 };
 
 impl Model {
-    /// The 20B with z-lab's block drafter overlaid (`gpt-oss-20b-DFlash`).
     pub fn b20_dflash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut m = Model::b20(w, experts, kv, tp);
         let dense = crate::dense(w);
@@ -218,10 +204,7 @@ impl Model {
         let kv_heads = d.kv_heads / tp;
         let inter = d.inter / tp;
 
-        // Dtype for norms, biases and sinks: never quantized like matmul banks.
         let dense = crate::dense(weights);
-        // Router gate is quantized one width coarser than the rest of the stack
-        // (U8g64 instead of U4g64); bf16 stacks keep the router bf16.
         let router = match weights {
             Dtype::U4g64 => Dtype::U8g64,
             other => other,
@@ -314,11 +297,6 @@ impl Model {
             window: d.window,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
-            // The untied head is `vocab x hidden` of its own and every rank
-            // streamed all of it. Band it on the vocab axis: each rank lands
-            // its slice and `forward` all-gathers the logits shard. Exact —
-            // partitioning a GEMM's output changes no reduction.
-            // `PIE_NO_VOCAB_SHARD` restores the replicated head.
             head: {
                 let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
@@ -333,8 +311,6 @@ impl Model {
     }
 }
 
-/// Adapter capacity for this family. A deployment choice, not a checkpoint
-/// fact; changing it requires a re-trace.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {}

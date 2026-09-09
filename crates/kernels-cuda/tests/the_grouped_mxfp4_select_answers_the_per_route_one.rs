@@ -1,25 +1,3 @@
-//! **THE GROUPED mxfp4 SELECT AGAINST THE ONE IT REPLACES.**
-//!
-//! `matmul_select_quant` split on the presence of zero points: an affine
-//! bank got `moe_route_order` and a grouped kernel — one block per expert,
-//! the plane decoded once per K chunk and applied to sixteen routes — while
-//! an mxfp4 bank got a block per route. On an L40S at gpt-oss's shapes that
-//! was 4.8 TFLOP/s against the affine path's 34.
-//!
-//! The grouped mxfp4 kernel is the affine one with the decode swapped, so
-//! what has to be checked is that the swap is faithful. The per-route select
-//! is the reference: it ships, it is what every mxfp4 fire has been
-//! answering with, and `PIE_NO_MXFP4_GROUP` still reaches it. A host
-//! reference would mean transcribing e2m1 by hand and checking my
-//! transcription instead of the kernel.
-//!
-//! The two do not agree bit for bit and must not be asked to: the per-route
-//! select accumulates a 32-code block and scales the sum, the grouped one
-//! scales each weight and accumulates. Same arithmetic, different rounding.
-//!
-//!   cargo test --release -p kernels-cuda --features cuda \
-//!     --test the_grouped_mxfp4_select_answers_the_per_route_one
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -31,23 +9,12 @@ use kernels_cuda::tensor::Tensor;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-/// **ONE ARM AT A TIME IN THIS PROCESS.** Every test here fires both legs by
-/// toggling `PIE_NO_MXFP4_GROUP`, which is process-wide: two of them on
-/// cargo's threads would read each other's setting and compare a leg
-/// against itself. The prices want the serialisation anyway — two fires
-/// contending for one device price each other.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn serialized() -> MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A variable set for the length of a scope, **restored even if the scope
-/// unwinds**. Restoring it on the happy path only is how a failing arm
-/// leaves its setting behind for every test after it: an assertion inside
-/// `check_fp32_form` used to skip the removal, and the tensor-core arms
-/// that ran next took the fp32 kernel and failed for a reason that was not
-/// theirs. That is a mutation test reporting six failures for one defect.
 struct Env(&'static str);
 
 impl Env {
@@ -68,10 +35,8 @@ impl Drop for Env {
 const EXPERTS: usize = 8;
 const TOP_K: usize = 4;
 
-/// mxfp4's block: 32 codes to one e8m0 scale byte.
 const BLOCK: usize = 32;
 
-/// A deterministic byte stream — the two arms must read the same bank.
 fn bytes(seed: u64, count: usize) -> Vec<u8> {
     let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
     (0..count)
@@ -84,9 +49,6 @@ fn bytes(seed: u64, count: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Block scales as e8m0 exponents: `mxfp4_block_scale` reads the byte as a
-/// float's exponent field, so 127 is 1.0. Drawn near it, because a bank
-/// spanning 2^±127 would make every comparison a comparison of infinities.
 fn scale_bytes(seed: u64, count: usize) -> Vec<u8> {
     bytes(seed, count)
         .into_iter()
@@ -104,18 +66,11 @@ fn routes_of(tokens: usize) -> Vec<i32> {
         .collect()
 }
 
-/// One shape, both arms, compared.
 fn check(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     let _one = serialized();
     check_held(tokens, n, k, by_token, biased);
 }
 
-/// [`check`]'s body, with the serialisation already taken. Split out
-/// because `check_fp32_form` has to set its variable INSIDE the lock: it
-/// used to set it and then block on the mutex, so whichever test held the
-/// lock ran the fp32 kernel while claiming to test the tensor-core one —
-/// which a mutation of the fp32 decode found by failing tests that should
-/// not have noticed it.
 fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     assert_eq!(k % BLOCK, 0, "K is whole mxfp4 blocks");
     let groups = k / BLOCK;
@@ -129,10 +84,6 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
         .chunks(2)
         .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
         .collect();
-    // **BIG ENOUGH TO SEE.** The dots here land around ±280 and `close` is a
-    // 3 % relative check, so a bias of ±0.25 hides inside the tolerance: an
-    // epilogue that dropped it entirely still passed. Scaled to the same
-    // order as the result, dropping it fails.
     let bias: Vec<u16> = bytes(0x44, EXPERTS * n)
         .into_iter()
         .map(|b| to_bf16((f32::from(b) / 128.0 - 1.0) * 120.0))
@@ -149,17 +100,10 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
 
     let ctx = gpu.ctx();
     let x = Tensor::new(act_at, act_rows as u32, k as u32, Dtype::Bf16);
-    // One row per expert: the codes row is the whole plane at four bits an
-    // element, the scales row one byte per 32-code block.
     let codes_t = Tensor::new(codes_at, EXPERTS as u32, (n * k / 2) as u32, Dtype::U8);
     let scales_t = Tensor::new(scales_at, EXPERTS as u32, (n * groups) as u32, Dtype::U8);
     let bias_t = Tensor::new(bias_at, EXPERTS as u32, n as u32, Dtype::Bf16);
     let routes_t = Tensor::new(routes_at, tokens as u32, TOP_K as u32, Dtype::I32);
-    // **THE TWO DOORS ARE NOT ONE DOOR WITH A FLAG.** `matmul_select_quant`
-    // reads the presence of a companion plane as the SCHEME — `Some` is an
-    // affine bank's zero points and lands on the affine kernel entirely.
-    // mxfp4's own output bias goes through `matmul_select_bias`, which is
-    // what the IR's `MoeMatmulSelectBias` dispatches to.
     let mut fire = |into: u64| {
         let mut y = Tensor::new(into, route_count as u32, n as u32, Dtype::Bf16);
         if biased {
@@ -203,49 +147,38 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     );
 }
 
-/// The up leg: one activation row per token, a bias per (expert, row), and
-/// a rectangle that divides both tiles — two K chunks by two row tiles.
+fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
+    the_token_read_leg_with_a_bias_agrees();
+    the_route_read_leg_agrees();
+    the_token_read_leg_without_a_bias_agrees();
+    the_route_read_leg_with_a_bias_agrees();
+    a_rectangle_that_divides_neither_tile_agrees();
+    the_gpt_oss_legs_are_priced();
+    the_fp32_form_agrees_at_both_readings();
+    the_fp32_form_agrees_on_a_ragged_rectangle();
+}
+
 #[test]
 fn the_token_read_leg_with_a_bias_agrees() {
     check(64, 256, 256, true, true);
 }
 
-/// The down leg: one activation row per route already, and no bias.
-#[test]
 fn the_route_read_leg_agrees() {
     check(64, 256, 256, false, false);
 }
 
-/// The same two readings with the bias the other way round, because the
-/// bias is read once per row pair OUTSIDE the batch loop and a leg that
-/// read it inside, or per route, would still pass the two above.
-#[test]
 fn the_token_read_leg_without_a_bias_agrees() {
     check(64, 256, 256, true, false);
 }
 
-#[test]
 fn the_route_read_leg_with_a_bias_agrees() {
     check(64, 256, 256, false, true);
 }
 
-/// **THE TAILS.** `n = 200` leaves a row tile part-full, so the grouped
-/// kernel's clamped decode rows must not be written back; `k = 160` is five
-/// mxfp4 blocks, so the last K chunk is part-full and the rest of the tile
-/// has to read as zero. Both guards are the kind that pass every aligned
-/// shape and fail every real one.
-#[test]
 fn a_rectangle_that_divides_neither_tile_agrees() {
     check(48, 200, 160, true, true);
 }
 
-/// **WHAT THE GROUPING IS WORTH**, at gpt-oss-20b's own mxfp4 shapes: 32
-/// experts, top-4 over a 256-row canvas, the `[5760, 2880]` gate/up leg
-/// read by token and the `[2880, 2880]` down leg read by route.
-///
-/// Prints the price; asserts only that the grouped leg is the faster one.
-/// Run with `--test-threads=1` — two fires contending for one device price
-/// each other, and this file's arms toggle a process-wide variable besides.
 fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let _one = serialized();
     let tokens = 256usize;
@@ -260,9 +193,6 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
         .map(|p| to_bf16((f32::from(p[0]) / 128.0 - 1.0) * 0.5))
         .collect();
     let act_at = gpu.up(&act);
-    // The bank is left zeroed: neither leg's price depends on what it
-    // reads, and filling a quarter of a gigabyte per shape costs more than
-    // the measurement.
     let codes_at = gpu.zeros(EXPERTS * n * k / 2);
     let scales_at = gpu.zeros(EXPERTS * n * groups);
     let routes_at = gpu.up(&routes);
@@ -315,30 +245,22 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     );
 }
 
-#[test]
 fn the_gpt_oss_legs_are_priced() {
     price(5760, 2880, true, "gate/up");
     price(2880, 2880, false, "down");
 }
 
-/// **THE fp32 FORM, WHICH NOTHING ELSE REACHES.** With a bf16 activation
-/// the dispatch always takes the tensor-core kernel, so the fp32 grouped
-/// one — the first form written, and the one an f16 row would take — would
-/// ship having never run. `PIE_MXFP4_NO_WMMA` is what makes it reachable,
-/// and this is what makes it checked: the same four shapes, same reference.
 fn check_fp32_form(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     let _one = serialized();
     let _fp32 = Env::set("PIE_MXFP4_NO_WMMA");
     check_held(tokens, n, k, by_token, biased);
 }
 
-#[test]
 fn the_fp32_form_agrees_at_both_readings() {
     check_fp32_form(64, 256, 256, true, true);
     check_fp32_form(64, 256, 256, false, false);
 }
 
-#[test]
 fn the_fp32_form_agrees_on_a_ragged_rectangle() {
     check_fp32_form(48, 200, 160, true, true);
 }

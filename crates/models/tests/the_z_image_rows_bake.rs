@@ -1,35 +1,3 @@
-//! **THE Z-IMAGE ROWS TRACE, CLASSIFY AND BAKE: THREE READINGS UNDER ONE
-//! PLAN, AN ENCODER WITH A KV SPACE BESIDE A DENOISER WITH NONE, AND A
-//! VELOCITY WHERE THE LOGITS WOULD BE.**
-//!
-//! ```text
-//! cargo test -p models --test the_z_image_rows_bake
-//! ```
-//!
-//! `z-image-turbo` is the first real generative family; `z-image-mini` is
-//! the parity fixture `scripts/imagegen/zimage_golden.py --mini` writes.
-//! What is asserted, for both rows:
-//!
-//! ```text
-//! (a) every platform traces; the flagship declares the encoder's 35 kv rows
-//!     and the miniature declares none
-//! (b) the readouts: `velocity` planted, `out` never; one `hidden` per
-//!     reading that reads back hidden rows (the flagship's encoder tap sits
-//!     at layer 34)
-//! (c) the ports are exactly the facts' ports, at the facts' widths and
-//!     kind-relative indices
-//! (d) every (reading, stream) lane the facts list classifies into a class
-//!     where every merge resolves, and no two such lanes share a class
-//! (e) the attention shapes: 2+2+30 ragged reads for the DiT, self-paired,
-//!     the refiners over lane CSRs and the joint blocks over the group CSR
-//!     of the denoise reading; the encoder's 35 paged prefills
-//! (f) the rope: three interleaved axes summing to the head on the DiT, the
-//!     full neox head at θ 1e6 on the encoder
-//! (g) the plan bakes on CUDA and Metal, every node tiled once
-//! (h) the generative facts: reading indices dense from 0, the schedule the
-//!     Turbo checkpoint pins, the latent space the VAE states
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
@@ -70,12 +38,10 @@ fn dims(sku: &str) -> Dims {
     }
 }
 
-/// The reading codes of a row: `(text, refine, denoise)`.
 fn codes(sku: &str) -> (u8, u8, u8) {
     if sku == TURBO { (0, 1, 2) } else { (0, 0, 1) }
 }
 
-/// Every reading the row states, with the lanes a request submits on it.
 fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
     let facts = row(sku)
         .generative
@@ -98,7 +64,17 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
-/// (a), (b)
+fn the_z_image_rows_bake_every_case() {
+    every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states();
+    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves();
+    the_refiners_attend_within_a_lane_and_the_trunk_within_the_group();
+    the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head();
+    the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk();
+    every_row_bakes();
+    the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
+}
+
 #[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     for sku in ROWS {
@@ -152,8 +128,6 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     }
 }
 
-/// (c) — the ports the trace binds are the ports the facts declare.
-#[test]
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -185,7 +159,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             "{sku}: the facts and the trace bind one list of ports"
         );
 
-        // The named ports resolve to the indices `model::port` states.
         let reading = |name: &str| {
             facts
                 .readings
@@ -239,10 +212,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             (model::port::CAPTION, PortKind::Context, d.cap_width)
         );
 
-        // A `(kind, index)` pair is seated once per PLAN, at one width
-        // (`IMAGEGEN_CONTRACT.md` §2): two readings sharing a pair must
-        // agree on its width, or the second reader lands in the first's
-        // rectangle.
         let mut widths: std::collections::BTreeMap<(String, u8), u32> =
             std::collections::BTreeMap::new();
         for (kind, index, width) in &traced {
@@ -258,10 +227,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             at(refine, "positions"),
             (model::port::POSITIONS, PortKind::AxisPositions, axes)
         );
-        // Which lanes bind what: the pad and the latents are the image
-        // lane's, the context the caption lane's, the timestep and the
-        // positions both lanes' (the joint trunk modulates every row by its
-        // own lane's vector).
         let streams = |reading: &models::ReadingFact, name: &str| {
             reading.port(name).unwrap().1.streams.clone()
         };
@@ -291,8 +256,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             );
         }
 
-        // The timestep is embedded once: `[cos | sin]` of `1000 − t` at
-        // scale 1, 256 wide.
         let sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -319,9 +282,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     }
 }
 
-/// (d) — every lane the facts list has its own class, and every merge
-/// resolves in it.
-#[test]
 fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -346,8 +306,6 @@ fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves(
     }
 }
 
-/// (e) — the attention reads, and which tables pair their segments.
-#[test]
 fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -391,7 +349,6 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{sku}"
         );
 
-        // The joint CSR selects exactly the denoise reading's two lanes.
         let (text, refine, denoise) = codes(sku);
         let (_, joint, _) = ragged.iter().find(|(kind, _, _)| *kind == "group").unwrap();
         assert!(joint.holds(word(denoise, Stream::Image)));
@@ -400,8 +357,6 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
         if sku == TURBO {
             assert!(!joint.holds(word(text, Stream::Text)));
         }
-        // The context refiner's CSR selects the refine lane and not the
-        // denoise lanes; the noise refiner's the image lane alone.
         let mut lane_selects: Vec<Selection> = Vec::new();
         for (_, select, _) in ragged.iter().filter(|(kind, _, _)| *kind == "lane") {
             if !lane_selects.contains(select) {
@@ -434,8 +389,6 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
     }
 }
 
-/// (f) — the rope numbers, stated once by the family and read back here.
-#[test]
 fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -455,7 +408,6 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
                 _ => None,
             })
             .collect();
-        // q and k, per attention sublayer of the DiT.
         assert_eq!(
             axis_ropes.len(),
             2 * (2 * d.refiner_layers + d.joint_layers) as usize
@@ -494,10 +446,6 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
     }
 }
 
-/// The modulation is a per-lane f32 scale over a bf16 trunk, the pad
-/// overwrite a per-row bf16 scale-shift projected off the flag, and every
-/// gated fold aliases the stream it folds into.
-#[test]
 fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -555,8 +503,6 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                 }
             }
         }
-        // Two scales per modulated block (noise refiners + joint), plus the
-        // final layer's one; two pad overwrites (image rows, caption rows).
         let modulated = (d.refiner_layers + d.joint_layers) as usize;
         assert_eq!((lane_scales, row_pads), (2 * modulated + 1, 2), "{sku}");
 
@@ -577,8 +523,6 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
     }
 }
 
-/// (g) — the plan bakes, on the two platforms that serve.
-#[test]
 fn every_row_bakes() {
     for sku in ROWS {
         for platform in [Platform::Cuda, Platform::Metal] {
@@ -593,9 +537,6 @@ fn every_row_bakes() {
                     .collect(),
                 max_adapters: 0,
             };
-            // The flagship's VAE readings run on the voxel axis: a ladder
-            // of one 64x64 latent's worth of voxels (`the_z_image_vae_bakes`
-            // sizes it properly); the miniature states no voxel row.
             let budgets = model_compiler::Budgets::of(budget)
                 .with_voxels(model_compiler::VoxelLadder::new(4096, 4));
             let compiled = model_compiler::compile_axes(
@@ -622,8 +563,6 @@ fn every_row_bakes() {
     }
 }
 
-/// (h) — the guest-facing facts.
-#[test]
 fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
     for sku in ROWS {
         let facts = row(sku).generative.as_ref().expect("facts");
@@ -662,7 +601,6 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
             (schedule.kind, schedule.shift, schedule.train_steps),
             (ScheduleKind::Flow, 3.0, 1000)
         );
-        // The study's §B.3 table, shift 3.0 over `linspace(1, 1/8, 8)`.
         let want = [
             1.0,
             0.954_545_4,

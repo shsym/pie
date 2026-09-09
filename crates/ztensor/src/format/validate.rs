@@ -1,16 +1,3 @@
-//! The `.zt` reading algorithm (spec §8) and validation summary (spec §3.6).
-//!
-//! Two entry points onto the same rules: [`image`] over a complete in-memory
-//! file, which is what the conformance corpus and the fuzz targets drive, and
-//! an internal one over an opened container, which reads only the footer and
-//! the manifest blob, so opening a 100 GB checkpoint to plan against it touches
-//! two ranges, not a hundred gigabytes.
-//!
-//! Canonical form (§6.4) is decided here too, as a pure function of a manifest
-//! and of where the file put things. The reader supplies both; nothing here
-//! opens a path. [`read::canonical_violations`](crate::read::canonical_violations)
-//! is the entry point that does.
-
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{Error, Result, Rule};
@@ -22,23 +9,17 @@ use crate::format::{
 use crate::provide::store::Store;
 use crate::vocab::Vocabulary;
 
-/// What the footer points at.
 pub(crate) struct Footer {
     offset: u64,
     length: u64,
     hash: u64,
 }
 
-/// A validated `.zt` file: its manifest and where the manifest blob lies
-/// (absent for a data shard), and every byte range it occupies.
 pub(crate) struct Parsed {
     pub manifest: Option<(Manifest, Placement)>,
     pub occupied: Vec<(u64, u64)>,
 }
 
-/// Checks the frame every container shares (minimum size, header magic,
-/// footer magic, supported version) and returns the footer bytes. `read`
-/// fetches a range of the file.
 fn check_frame(file_len: u64, read: impl Fn(u64, u64) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
     if file_len < MIN_FILE_LEN {
         return Err(Error::reject(
@@ -63,8 +44,6 @@ fn check_frame(file_len: u64, read: impl Fn(u64, u64) -> Result<Vec<u8>>) -> Res
     Ok(footer)
 }
 
-/// `None` where a footer describes a data shard (spec §7.2): no manifest,
-/// and the other fields must be zero.
 fn parse_footer(footer: &[u8]) -> Result<Option<Footer>> {
     let offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
     let length = u64::from_le_bytes(footer[8..16].try_into().unwrap());
@@ -119,8 +98,6 @@ fn frame_ranges(mut ranges: Vec<(u64, u64)>, file_len: u64) -> Vec<(u64, u64)> {
     ranges
 }
 
-/// Validates a complete in-memory `.zt` file image and returns its manifest
-/// (`None` for a data shard).
 pub fn image(buf: &[u8], vocab: &Vocabulary) -> Result<Option<Manifest>> {
     let file_len = buf.len() as u64;
     let footer = check_frame(file_len, |at, n| Ok(buf[at as usize..(at + n) as usize].to_vec()))?;
@@ -136,7 +113,6 @@ pub fn image(buf: &[u8], vocab: &Vocabulary) -> Result<Option<Manifest>> {
     Ok(Some(manifest))
 }
 
-/// Where a file put the things canonical form has an opinion about.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Placement {
     pub manifest_at: u64,
@@ -144,12 +120,6 @@ pub(crate) struct Placement {
     pub file_len: u64,
 }
 
-/// Checks a manifest and its placement against canonical form (spec §6.4) and
-/// returns every rule they break, in rule order. An empty list means the file
-/// is canonical.
-///
-/// Blob sharing (rule 3) is judged by digest and length rather than by
-/// comparing payloads. Rule 4 guarantees every object carries one.
 pub(crate) fn canonical_violations(manifest: &Manifest, at: &Placement) -> Vec<String> {
     let Placement {
         manifest_at,
@@ -262,8 +232,6 @@ pub(crate) fn canonical_violations(manifest: &Manifest, at: &Placement) -> Vec<S
     bad
 }
 
-/// Opens a `.zt` store: reads the footer and the manifest blob, validates
-/// both, and reports every occupied range.
 pub(crate) fn store(store: &Store, vocab: &Vocabulary) -> Result<Parsed> {
     let file_len = store.len();
     let footer = check_frame(file_len, |at, n| store.read(at, n))?;
@@ -287,8 +255,6 @@ pub(crate) fn store(store: &Store, vocab: &Vocabulary) -> Result<Parsed> {
     })
 }
 
-/// Every metadata rule of §3.6. Returns the blob ranges that live in this
-/// file, manifest blob included.
 pub(crate) fn validate_manifest(
     manifest: &Manifest,
     data_end: u64,

@@ -1,7 +1,3 @@
-//! The trace-recording context: a thread-local session holding the stage
-//! currently being traced plus the channel registry. Single-threaded by
-//! construction (wasm inferlets; host tests run each trace on one thread).
-
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,12 +9,8 @@ use eta_ir::types::{Dtype, Shape, ValueType};
 use crate::error::{Span, TraceError};
 use crate::value::ConstData;
 
-/// Attachment stage — re-export of the IR's canonical [`Stage`](eta_ir::registry::Stage).
 pub use eta_ir::registry::Stage;
 
-/// A channel's mutable shared state (behind `Rc<RefCell<..>>`; a `Channel` is a
-/// handle to it). Carries the trace decl, the per-instance seed flag, and the
-/// endpoint claims the SPSC/host-role derivation + span lints read.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ChannelState {
@@ -27,20 +19,15 @@ pub struct ChannelState {
     pub shape: Shape,
     pub dtype: Dtype,
     pub capacity: u32,
-    /// Per-instance seed value (from `Channel::from` / a pre-submit host `put`);
-    /// its bytes are instance data, never in the container.
     pub seed: Option<ConstData>,
     pub seeded: bool,
 
-    // -- endpoint claims (host-role derivation + span lints) --
     pub prog_puts: Vec<(Stage, Span)>,
     pub prog_takes: Vec<(Stage, Span)>,
     pub prog_reads: Vec<(Stage, Span)>,
     pub host_puts: Vec<Span>,
     pub host_takes: Vec<Span>,
     pub host_reads: Vec<Span>,
-    /// Descriptor-port claims: `embed`/`positions`/`w_slot`/`w_off` consume
-    /// (take), geometry/masks peek (read).
     pub desc_takes: Vec<Span>,
     pub desc_reads: Vec<Span>,
 }
@@ -53,8 +40,6 @@ impl ChannelState {
 
 pub type ChannelRef = Rc<RefCell<ChannelState>>;
 
-/// A sink call recorded in a stage (for the T11 span pre-lint; the IR's validator
-/// is the authoritative gate).
 #[derive(Clone, Debug)]
 pub(crate) struct SinkCall {
     pub name: String,
@@ -62,13 +47,10 @@ pub(crate) struct SinkCall {
     pub scope: eta_ir::registry::SinkScope,
 }
 
-/// The stage currently being traced.
 pub(crate) struct Recorder {
     pub stage: Stage,
-    /// Read-out rows for `intrinsics::logits()` shape.
     pub rows: u32,
     pub ops: Vec<Op>,
-    /// Light per-value types (author ergonomics; the IR's `infer` is authoritative).
     pub types: Vec<ValueType>,
     pub sinks: Vec<SinkCall>,
 }
@@ -84,10 +66,6 @@ impl Recorder {
         }
     }
 
-    /// Records `op` and returns the id of its first result. `result_tys` is
-    /// checked against `op.result_count()` (a real assert, not
-    /// debug-only, since debug-asserts are compiled out of release guest
-    /// traces) — a mismatch would silently shift every later value id.
     fn push(&mut self, op: Op, result_tys: &[ValueType]) -> u32 {
         let base = self.types.len() as u32;
         assert_eq!(
@@ -104,18 +82,11 @@ impl Recorder {
     }
 }
 
-/// The trace session accumulating one forward's channels + stage programs.
 pub(crate) struct Session {
     chan_by_gid: alloc::collections::BTreeMap<u64, ChannelIndex>,
     pub channels: Vec<ChannelRef>,
     pub current: Option<Recorder>,
-    /// Second-party names, in first-use order. The container's name table is
-    /// SHARED across stages (a `NameIndex` in one stage's op means the same
-    /// thing in another), so it is interned at session scope, not stage scope.
     pub names: Vec<String>,
-    /// Authoring mistakes found while recording. Collected instead of
-    /// panicked so one `build()` reports all of them; see
-    /// [`TraceError::Authoring`](crate::error::TraceError::Authoring).
     pub errors: Vec<TraceError>,
 }
 
@@ -144,15 +115,7 @@ impl Session {
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
-    /// Authoring mistakes recorded before a session opened — from a `Channel`
-    /// constructor, which runs ahead of the trace body. Drained by
-    /// [`with_session`] into the session it belongs to.
     static PENDING: RefCell<Vec<TraceError>> = const { RefCell::new(Vec::new()) };
-    /// gid -> channel state. The guest-facing `Channel` is a `Copy` token
-    /// holding only its gid; every op resolves shared state through this
-    /// registry, which owns entries until [`release_channel_state`] is
-    /// called (unbounded retention otherwise — acceptable since channels are
-    /// declared once at model setup, not per request).
     static CHANNELS_BY_GID: RefCell<alloc::collections::BTreeMap<u64, ChannelRef>> =
         const { RefCell::new(alloc::collections::BTreeMap::new()) };
 }
@@ -171,13 +134,10 @@ pub(crate) fn release_channel_state(gid: u64) -> bool {
     CHANNELS_BY_GID.with_borrow_mut(|map| map.remove(&gid).is_some())
 }
 
-/// How many channels the registry is holding. Surfaced as
-/// [`Channel::registered_count`](crate::channel::Channel::registered_count).
 pub(crate) fn registered_channel_count() -> usize {
     CHANNELS_BY_GID.with_borrow(|map| map.len())
 }
 
-/// Are we currently tracing a stage closure?
 pub(crate) fn is_tracing() -> bool {
     SESSION.with_borrow(|s| s.as_ref().map(|s| s.current.is_some()).unwrap_or(false))
 }
@@ -186,7 +146,6 @@ pub(crate) fn intern_channel(ch: &ChannelRef) -> ChannelIndex {
     SESSION.with_borrow_mut(|s| s.as_mut().expect("session active").intern(ch))
 }
 
-/// Run `f` with a fresh session active; return `f`'s result + the interned channels.
 pub(crate) fn with_session<R>(
     f: impl FnOnce() -> R,
 ) -> (R, Vec<ChannelRef>, Vec<String>, Vec<TraceError>) {
@@ -205,11 +164,6 @@ pub(crate) fn with_session<R>(
     (r, channels, names, errors)
 }
 
-/// Record an authoring mistake for the next [`Builder::build`] to report.
-/// Works with no session active (channels are declared before the trace
-/// runs): errors land in [`PENDING`] and [`with_session`] adopts them.
-///
-/// [`Builder::build`]: crate::builder::Builder::build
 pub(crate) fn record_error(detail: String, span: Span) {
     let error = TraceError::Authoring { detail, span };
     SESSION.with_borrow_mut(|s| match s.as_mut() {
@@ -218,8 +172,6 @@ pub(crate) fn record_error(detail: String, span: Span) {
     });
 }
 
-/// Trace one stage closure into a completed [`StageResult`]. `rows` = the pass's
-/// read-out row count.
 pub(crate) fn trace_stage(stage: Stage, rows: u32, body: impl FnOnce()) -> StageResult {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");
@@ -248,10 +200,6 @@ pub(crate) struct StageResult {
     pub sinks: Vec<SinkCall>,
 }
 
-// ---------------------------------------------------------------------------
-// Recording primitives called by Tensor / Channel / intrinsics.
-// ---------------------------------------------------------------------------
-
 pub(crate) fn current_rows() -> u32 {
     SESSION.with_borrow(|s| {
         s.as_ref()
@@ -260,7 +208,6 @@ pub(crate) fn current_rows() -> u32 {
     })
 }
 
-/// Emit an op into the current stage; returns its first result id.
 pub(crate) fn emit(op: Op, result_tys: &[ValueType]) -> u32 {
     SESSION.with_borrow_mut(|s| {
         s.as_mut()
@@ -270,8 +217,6 @@ pub(crate) fn emit(op: Op, result_tys: &[ValueType]) -> u32 {
     })
 }
 
-/// Record a channel `take`/`read` inside a stage: intern, push the op, register
-/// the endpoint claim; return the produced value id + type.
 pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) -> (u32, ValueType) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");
@@ -297,14 +242,6 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
     })
 }
 
-/// Record a channel `put` inside a stage (the value id must already match the
-/// channel's shape+dtype — the caller reshapes as needed).
-///
-/// A channel bound to a peeked descriptor port ([`eta_ir::registry::Port::consumes`]
-/// false — geometry and masks) is drained first: the descriptor phase reads
-/// its front without draining, so a bare re-put would grow the ring forever.
-/// Safe even if the guest already took explicitly, since take is a per-pass
-/// flag and not a counter.
 pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");
@@ -328,9 +265,6 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     })
 }
 
-/// Intern a second-party name into the session's shared name table, returning
-/// its `NameIndex`. First use wins, so the table is deterministic in trace
-/// order and the container bytes stay byte-stable across runs.
 pub(crate) fn intern_name(name: &str) -> u16 {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("name interned outside a session");

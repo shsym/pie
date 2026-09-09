@@ -57,21 +57,12 @@ DEFAULT_GOLDEN = os.path.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# The golden is fp32 (`ltx2_golden.py --mini` runs on CPU in float32); pie
-# runs the same weights cast to bf16 with bf16 activations. Two blocks of
-# drift, plus one more source this family has that the others do not: the
-# rope's frequency ladder is a float64 `pow` rounded to f32 in the reference
-# and an f32 `powf` in the kernel, which at the top of the ladder
-# (theta^1 = 1e4) is a few 1e-3 radians -- the same order as the bf16
-# rounding of the rotated activation (README section 3).
 TOLERANCES = ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"]
 PIECES = 12
-
 
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "ltx2_mini_config.json")) as f:
         return json.load(f)
-
 
 def numbered(out: str, stem: str, tail: str) -> list[str]:
     pattern = re.compile(rf"^{re.escape(stem)}{re.escape(tail)}_(\d+)\.json$")
@@ -82,23 +73,16 @@ def numbered(out: str, stem: str, tail: str) -> list[str]:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
 
-
 def suffix(args) -> str:
     return "_refine" if args.refine else ""
-
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
-
 
 def cases(args) -> list[str]:
     dump = np.load(os.path.join(args.golden, "ltx2_mini.npz"))
     os.makedirs(args.out, exist_ok=True)
     written = []
     if args.refine:
-        text = dump["mini.conn.in.text"]  # [B, T, caption*49]
-        pos = dump["mini.conn.in.positions"]  # [T, 1]
+        text = dump["mini.conn.in.text"]
+        pos = dump["mini.conn.in.positions"]
         for i in range(text.shape[0]):
             case = {
                 "kind": "refine",
@@ -114,12 +98,12 @@ def cases(args) -> list[str]:
         print(f"[case] {len(written)} connector case(s), {text.shape[1]} text rows -> {args.out}")
         return written
 
-    x_v = dump["mini.dit.in.latents"]  # [B, S, C]
-    x_a = dump["mini.dit.in.audio_latents"]  # [B, L, C]
-    ctx = dump["mini.dit.in.context"]  # [B, T, Dc]
-    actx = dump["mini.dit.in.audio_context"]  # [B, T, Da]
-    pos = dump["mini.dit.in.positions"]  # [B, S, 3]
-    apos = dump["mini.dit.in.audio_positions"]  # [B, L, 1]
+    x_v = dump["mini.dit.in.latents"]
+    x_a = dump["mini.dit.in.audio_latents"]
+    ctx = dump["mini.dit.in.context"]
+    actx = dump["mini.dit.in.audio_context"]
+    pos = dump["mini.dit.in.positions"]
+    apos = dump["mini.dit.in.audio_positions"]
     t_v = dump["mini.dit.in.timestep"]
     t_a = dump["mini.dit.in.audio_timestep"]
     for i in range(x_v.shape[0]):
@@ -150,12 +134,6 @@ def cases(args) -> list[str]:
     )
     return written
 
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
-
-
 def split(text: str, pieces: int) -> list[str]:
     """`pieces` roughly equal cuts of `text`, none of them starting with `-`.
 
@@ -174,7 +152,6 @@ def split(text: str, pieces: int) -> list[str]:
         bounds.append(max(at, bounds[-1]))
     bounds.append(len(text))
     return [text[bounds[i] : bounds[i + 1]] for i in range(pieces)]
-
 
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
@@ -199,7 +176,6 @@ def wasm(inferlet: str) -> str:
     if not present:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
-
 
 def run(args) -> None:
     paths = numbered(args.out, "case", suffix(args))
@@ -238,12 +214,6 @@ def run(args) -> None:
             f.write(done.stdout)
         print(f"[run] batch {b} -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -255,7 +225,6 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
-
 
 def collect(args) -> str:
     dump = np.load(os.path.join(args.golden, "ltx2_mini.npz"))
@@ -284,12 +253,6 @@ def collect(args) -> str:
     print(f"[collect] {shapes} from {len(docs)} case(s) -> {path}; golden -> {target}")
     return path
 
-
-# ----------------------------------------------------------------------------
-# does the conditioning matter?
-# ----------------------------------------------------------------------------
-
-
 def one_run(args, case: dict) -> tuple[np.ndarray, np.ndarray]:
     """One pie run of `case`, in memory — the video and audio answers."""
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
@@ -312,7 +275,6 @@ def one_run(args, case: dict) -> tuple[np.ndarray, np.ndarray]:
     v = np.asarray(doc["video"], dtype=np.float32).reshape(doc["video_rows"], -1)
     a = np.asarray(doc["audio"], dtype=np.float32).reshape(doc["audio_rows"], -1)
     return v, a
-
 
 def matters(args) -> int:
     """**EVERY CONDITIONING STREAM MOVES THE ANSWER.**
@@ -367,12 +329,6 @@ def matters(args) -> int:
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
-
 def compare(args) -> int:
     mine = os.path.join(args.out, f"ltx2_mini_pie{suffix(args)}.npz")
     theirs = os.path.join(args.out, f"ltx2_mini_target{suffix(args)}.npz")
@@ -390,7 +346,6 @@ def compare(args) -> int:
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -434,7 +389,6 @@ def main() -> int:
         collect(args)
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

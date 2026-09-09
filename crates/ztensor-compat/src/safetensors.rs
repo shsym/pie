@@ -1,20 +1,3 @@
-//! safetensors → the zTensor object model.
-//!
-//! The format: `[header_len: u64 LE][JSON header][data]`, where the header
-//! maps tensor names to `{dtype, shape, data_offsets: [begin, end]}` with
-//! offsets relative to the data section.
-//!
-//! This is a deliberately strict reader. safetensors headers are JSON, and
-//! JSON parsers resolve duplicate keys silently (the classic safetensors
-//! aliasing attack); we defuse that class entirely by requiring the tensor
-//! ranges to tile the data section exactly: sorted, gap-free, overlap-free,
-//! ending at EOF. A file that fails any of it is rejected.
-//!
-//! Every tensor is a raw range of the file, so every one of them gets a
-//! [`Payload::At`]: addressable, mappable, and evictable where the ranges
-//! happen to land on pages. What they never get is a digest, because the
-//! format carries none.
-
 use serde_json::Value as Json;
 use ztensor::format::cbor::Value;
 use ztensor::provide::Catalog;
@@ -24,14 +7,12 @@ use ztensor::{Error, Leaf, Result, Store, StoreId};
 use crate::project::Projection;
 use crate::safe;
 
-/// Practical cap on the JSON header (matches the reference implementation).
 const MAX_HEADER: u64 = 100 << 20;
 
 fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("safetensors: {}", detail.into()))
 }
 
-/// safetensors dtype → leaf (spec Appendix A).
 fn map_dtype(st: &str) -> Result<Leaf> {
     Ok(match st {
         "F64" => Leaf::F64,
@@ -49,7 +30,6 @@ fn map_dtype(st: &str) -> Result<Leaf> {
         "BOOL" => Leaf::Bool,
         "F8_E4M3" => Leaf::E4M3,
         "F8_E5M2" => Leaf::E5M2,
-        // Packed two per byte, lsb-first, in both formats.
         "F4_E2M1" => Leaf::E2M1,
         "F8_E8M0" => Leaf::E8M0,
         other => {
@@ -83,13 +63,10 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
 
     let mut attributes: Vec<(Value, Value)> = Vec::new();
     let mut catalog = Catalog::new();
-    // (begin, end) for the exact-tiling check, in data-section coordinates.
     let mut ranges: Vec<(u64, u64)> = Vec::new();
 
     for (name, entry) in entries {
         if name == "__metadata__" {
-            // Some writers (MLX conversions among them) emit `"__metadata__":
-            // null` for "no metadata"; that reads as an empty block.
             if entry.is_null() {
                 continue;
             }
@@ -145,7 +122,7 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         ranges.push((begin, end));
         let at = Location {
             store: StoreId(0),
-            offset: data_start + begin, // absolute file offset
+            offset: data_start + begin,
             len: end - begin,
         };
         if catalog
@@ -156,9 +133,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         }
     }
 
-    // Exact tiling of the data section: sorted, gap-free, overlap-free, ending
-    // at EOF. This forecloses aliasing regardless of how the JSON parser
-    // resolved duplicate keys.
     ranges.sort_unstable();
     let mut cursor = 0u64;
     for (begin, end) in &ranges {
@@ -179,9 +153,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         catalog.set_attributes(Some(Value::Map(attributes)));
     }
 
-    // The header occupies everything before the first tensor, and the tensors
-    // tile the rest, so the occupancy map is exact and page exclusivity is a
-    // fact about this file rather than an assumption.
     let mut occupied = vec![(0, data_start)];
     occupied.extend(
         ranges

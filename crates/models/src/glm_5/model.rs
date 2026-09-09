@@ -5,12 +5,9 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// MLA reading shared by every layer: `heads` queries against a
-    /// `kv_lora_rank`-wide absorbed plane.
     pub heads: u32,
     pub kv_lora_rank: u32,
 
-    /// Adapter bank shape (slots, rank); same at every layer.
     pub adapters: Adapters,
 
     pub kv_dtype: Dtype,
@@ -30,10 +27,6 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// Adapter bank for the attention sublayer: `[slots, rank, hidden]` down,
-    /// `[slots, hidden, rank]` up. Applied after `all_reduce`, on the
-    /// replicated output, since `o_proj`'s output is rows-cut and would be
-    /// summed `tp` times if corrected before the reduce.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -292,11 +285,6 @@ impl Model {
             adapters: ADAPTERS,
             kv_dtype: kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-            // The untied head is `vocab x hidden` of its own and every rank
-            // streamed all of it. Band it on the vocab axis: each rank lands
-            // its slice and `forward` all-gathers the logits shard. Exact —
-            // partitioning a GEMM's output changes no reduction.
-            // `PIE_NO_VOCAB_SHARD` restores the replicated head.
             head: {
                 let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
@@ -310,8 +298,6 @@ impl Model {
     }
 }
 
-/// Adapter capacity for this family. A deployment choice, not a checkpoint
-/// fact; changing it requires a re-trace.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {}

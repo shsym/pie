@@ -33,13 +33,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const int r = blockIdx.x;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: `packed`, `q_out`,
-    // `positions`, `rope_table`, `row_valid` and the staged `w_page` / `w_off`
-    // write tables are all row planes handed at their base, and move with it.
-    // The `kv_page_indptr` / `kv_last_page_lens` FALLBACK below stays on the
-    // raw block index: those are per-REQUEST prefix sums, and a window that
-    // starts anywhere but row zero is admissible through the staged write
-    // tables only.
+
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
@@ -153,7 +147,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
             const float ang = static_cast<float>(pos) * freq;
             __sincosf(ang, &sin_v, &cos_v);
         }
-        // Past the rotated width (a partial rope): normed, unrotated.
+
         if (dim_pair >= rotary_dim / 2) {
             cos_v = 1.f;
             sin_v = 0.f;
@@ -203,15 +197,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const int r = unit / total_qk_heads;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: `packed`, `q_out`,
-    // `positions`, `rope_table`, `row_valid` and the staged `w_page` / `w_off`
-    // write tables are all row planes handed at their base, and move with it.
-    // The `kv_page_indptr` / `kv_last_page_lens` FALLBACK below stays on the
-    // raw block index: those are per-REQUEST prefix sums, and a window that
-    // starts anywhere but row zero is admissible through the staged write
-    // tables only.
+
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    // `head_idx` un-flattens the LAUNCH unit and keeps the raw `r`.
+
     const int head_idx = unit - r * total_qk_heads;
     const bool is_q = head_idx < num_q_heads;
     if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
@@ -281,7 +269,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
             const float ang = static_cast<float>(pos) * freq;
             __sincosf(ang, &sin_v, &cos_v);
         }
-        // Past the rotated width (a partial rope): normed, unrotated.
+
         if (dim_pair >= rotary_dim / 2) {
             cos_v = 1.f;
             sin_v = 0.f;
@@ -459,7 +447,7 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv(
         const float ang = static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
-        // Past the rotated width (a partial rope): normed, unrotated.
+
         if (dim_pair >= rotary_dim / 2) {
             cos_v = 1.f;
             sin_v = 0.f;

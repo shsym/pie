@@ -1,43 +1,3 @@
-//! **THE Z-IMAGE VAE, LOADED FROM THE REAL SNAPSHOT THROUGH THE FAMILY'S
-//! OWN IMPORT, DECODES A 64x64 LATENT INTO THE REFERENCE'S 512x512 PIXELS
-//! AND ENCODES THOSE PIXELS BACK INTO THE REFERENCE'S POSTERIOR MEAN.**
-//! (design D8, milestone M1 parity)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_z_image_vae_answers_the_reference -- --nocapture
-//! ```
-//!
-//! The golden is `scripts/imagegen/zimage_golden.py --vae`: the FLUX VAE in
-//! fp32 over the centre 64x64 of the full run's final latent — `latent.f32`
-//! (`[64·64, 16]`, DiT space), `pixels.f32` (`[512·512, 3]` in `[-1, 1]`)
-//! and `mean.f32` (`[64·64, 16]`, the posterior mean of those pixels),
-//! rows of voxels in `(h, w)` order under
-//! `$PIE_IMAGEGEN_GOLDEN/z-image/zimage_vae/`. The weights come from the
-//! `Tongyi-MAI/Z-Image-Turbo` snapshot in the HuggingFace cache through
-//! `Model::import_vae` (the same reads the whole-model import states) and
-//! the shell's load (the conv kernels relabelled tap-major, the affines
-//! cast to f32). Each reading is its own plan and load here — the decoder
-//! against a 4 096-voxel ladder, the encoder against a 262 144-voxel one —
-//! so the arena is sized for the reading it serves.
-//!
-//! Gates (bf16 activations against an fp32 reference): decode `cos ≥ 0.999`,
-//! `mean |err| ≤ 0.005` and at most one value in ten thousand past 0.05
-//! (`max |err| ≤ 0.2`) on pixels in `[-1, 1]` — measured: cos 0.99998,
-//! mean 0.0023, 27 of 786 432 values past 0.05, the worst 0.15 at one
-//! interior pixel in all three channels, which is bf16 through sixty
-//! convolutions at a high-gradient spot and not a padding fault (a border
-//! fault would line the edge); encode `cos ≥ 0.9995`, `mean |err| ≤ 0.02`
-//! and `max |err| ≤ 3` on the mean (range `[-9.8, 10.8]`) — measured: cos
-//! 0.99973, mean 0.0117, max 2.2 at scattered interior voxels. The
-//! encoder's gate is what the REFERENCE itself does under bf16: diffusers'
-//! fp32 encoder over the same pixels rounded to bf16 (the port's element)
-//! lands cos 0.99977, mean 0.0089, max 2.19 against the fp32 golden, and
-//! the whole VAE in bf16 cos 0.99978, mean 0.0126, max 2.28 — the
-//! posterior mean is that sensitive to its input's last bits, so the gate
-//! is the bf16 reference's own distance and not tighter. Skipped by name
-//! without a device, the snapshot or the golden.
-
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -51,7 +11,6 @@ use models::z_image::forward::Facts;
 use models::z_image::model::Model;
 use models::z_image::vae;
 
-/// One VAE reading as a plan of its own: the whole input is that arm.
 struct OneArm {
     model: Model,
     decode: bool,
@@ -147,7 +106,6 @@ fn score(got: &[f32], want: &[f32]) -> Score {
     }
 }
 
-/// Load one reading of the VAE from the snapshot and fire one clip through it.
 fn fire(
     root: &PathBuf,
     decode: bool,
@@ -172,10 +130,6 @@ fn fire(
         &arm,
         Platform::Cuda,
     );
-    // The contract states the whole VAE; this plan is one side of it. Keep
-    // the planes the plan names and the internal steps they are stated
-    // through (`vae.shift` off `vae.shift.raw`), nothing else — a load
-    // refuses a contract publishing a plane the plan does not name.
     let mut keep: std::collections::BTreeSet<String> =
         trace.params.iter().map(|p| p.name.clone()).collect();
     loop {
@@ -241,7 +195,6 @@ fn fire(
         clips: &[clip],
         payload: &bytes,
     }];
-    // Once to warm the JIT, once for the clock.
     let _ = shell.fire_voxels(&lanes, &clips).expect("the first fire");
     let started = Instant::now();
     let mut answered = shell.fire_voxels(&lanes, &clips).expect("the second fire");
@@ -266,8 +219,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
         eprintln!("skipping the VAE parity gate: no zimage_golden.py --vae dump");
         return;
     };
-    // The golden's clips are square stills: the box is read off each
-    // plane's length (`shapes.json` beside them says the same).
     let latent = f32s(&gold.join("latent.f32"));
     let pixels = f32s(&gold.join("pixels.f32"));
     let mean = f32s(&gold.join("mean.f32"));
@@ -288,7 +239,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     assert_eq!(pixels.len(), voxels(pixel_box) * 3);
     assert_eq!(mean.len(), voxels(mean_box) * 16);
 
-    // ---- decode ----------------------------------------------------------
     let (got, boxes, load_s, fire_s) = fire(
         &root,
         true,
@@ -298,8 +248,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     );
     assert_eq!(boxes, vec![pixel_box], "the clip comes back at 8x");
     let s = score(&got, &pixels);
-    // Where the worst pixels are: a border-only error would be a padding
-    // bug, a scattered one is bf16 through sixty convolutions.
     {
         let side = pixel_box[1] as usize;
         let mut worst: Vec<(f32, usize, usize, usize)> = got
@@ -336,7 +284,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
         s.max_abs
     );
 
-    // ---- encode ----------------------------------------------------------
     let (got, boxes, load_s, fire_s) = fire(
         &root,
         false,

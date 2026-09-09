@@ -1,9 +1,3 @@
-//! The fa2 decode work split: given the host copy of the kv page indptr,
-//! decides whether to split kv, partitions requests into `(request, kv
-//! tile)` work items, and stages the index vectors the decode kernel walks.
-//! A native reimplementation of FlashInfer's host planner (schedule is
-//! valid and deterministic, not byte-identical to the C++ reference).
-
 use crate::error::Error;
 
 use crate::attn::plan::{Built, DecodePlanInfo, Live, Sizes, Toggles};
@@ -12,15 +6,8 @@ use crate::jit::refuse;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// Host copy of the kv page indptr — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// The lane count this schedule is carved for: what the padding, the
-    /// allocations, and the grid arithmetic below are sized at. Often larger
-    /// than the fire's live lane count (`engine_cuda::run::Run::planning`
-    /// carves at the bucket ceiling so the plan's hash stops following the
-    /// batch); work items past the live ones are masked off in [`schedule`].
     pub batch_size: u32,
-    /// The origin-and-extent this fire actually brought.
     pub live: Live,
     pub num_qo_heads: u32,
     pub gqa_group_size: u32,
@@ -37,8 +24,6 @@ pub struct WorkEstimate {
     pub gdy: u32,
 }
 
-/// Decides the kv split: the chunk width in pages and the work-item count
-/// it produces against the grid the occupancy probe granted.
 pub fn estimate(
     op: &'static str,
     req: &Request<'_>,
@@ -56,40 +41,15 @@ pub fn estimate(
         return Err(refuse(op, "the pool's page size is zero"));
     }
 
-    // A batch that already fills the grid takes one work item per request.
     if u64::from(req.batch_size) * u64::from(gdy) >= u64::from(max_grid_size) {
         return Ok(WorkEstimate {
-            // Splits under capture too: `block_valid_mask` (laid only when
-            // split_kv is set) is what retires an over-launched work item.
             split_kv: req.enable_cuda_graph,
             kv_chunk_size_in_pages: pages.iter().copied().max().unwrap_or(0).max(1),
-            // One work item per live lane (chunk spans the longest).
             new_batch_size: req.live.requests,
             gdy,
         });
     }
 
-    // Otherwise, the smallest chunk whose work items still fit the grid.
-    //
-    // **THE FLOOR IS ONE PAGE, NOT FLASHINFER'S `128 / page_size`.** That
-    // reference floor keeps a chunk at least 128 tokens wide, which at a
-    // low lane count collapses a whole decode into ONE work item — one block
-    // per kv head carrying the entire attention, at 128 threads, latency
-    // bound with nothing to hide it. The search below is already bounded by
-    // the grid (it raises the chunk until the work items fit), so the floor
-    // only decides how much of a granted grid a small batch is allowed to
-    // use. Measured single-stream at a 512-token context: gemma-4-E4B tp2
-    // 91.7 -> 96.2 tok/s (+4.9%, three runs each, <0.2% spread), tp1 +3.5%,
-    // qwen3.5-0.8b tp1 +2.3%; batch-32 throughput unchanged (that shape
-    // already fills the grid). The decode kernel itself goes 14.5 -> 5.5 us
-    // per call; the extra partials cost ~0.01 ms/step more in the merge.
-    //
-    // **THIS CHANGES TOKENS AT NEAR-TIES.** A different chunking is a
-    // different float reduction order, so the merged logits differ in the
-    // last bits: gemma stayed byte-identical over 64 tokens, qwen3.5
-    // diverged at token 15. Both splits are valid attention — but a golden
-    // recorded against the old floor will not replay. `PIE_DECODE_LEGACY_FLOOR`
-    // restores it for exactly that comparison.
     let mut low = if std::env::var_os("PIE_DECODE_LEGACY_FLOOR").is_some() {
         (128 / req.page_size).max(1)
     } else {
@@ -117,7 +77,6 @@ pub fn estimate(
     })
 }
 
-/// The computed schedule: pure data, laid out and staged by [`plan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
@@ -140,9 +99,6 @@ pub fn schedule(
 
     let mut request_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
-    // o_indptr stays window-local (unlike request_indices, which go
-    // absolute): the cascade fold walks it at the launch's own request
-    // number from zero, so adding lane_offset would misalign it.
     let mut o_indptr = vec![0i64];
     for (batch_idx, &p) in pages.iter().enumerate() {
         let chunks = p.max(1).div_ceil(est.kv_chunk_size_in_pages);
@@ -154,13 +110,6 @@ pub fn schedule(
     }
     let o_indptr = narrow_all(op, "batch_decode_o_indptr", &o_indptr)?;
 
-    // Padded batch = max(grid, carved lane count) — a function of the graph
-    // key, not of this fire's kv lengths, which is what the graph arm needs.
-    // A fire whose zero-page and split live lanes together outrun both is
-    // refused rather than served with a wrong schedule. Every padding work
-    // item is masked off by `block_valid_mask` (laid whenever split_kv is
-    // set, which it always is under capture) and reads zeros regardless
-    // (`Staging` zero-fills the grant before any `put`).
     let padded_batch_size = if req.enable_cuda_graph {
         ((max_grid_size / est.gdy) as usize).max(req.batch_size as usize)
     } else {
@@ -188,8 +137,6 @@ pub fn schedule(
     })
 }
 
-/// The offsets a schedule occupies in the granted workspace, assigned but
-/// not yet written.
 struct Laid {
     info: DecodePlanInfo,
     int_bytes: usize,
@@ -294,8 +241,6 @@ pub fn plan(
     })
 }
 
-/// The sizing pass: schedule and layout only, unbounded, so the engine can
-/// learn the workspace a plan would need before granting one.
 pub fn workspace_size(
     op: &'static str,
     req: &Request<'_>,
@@ -316,8 +261,6 @@ pub fn workspace_size(
     })
 }
 
-/// The static non-split fast path: small batches on cc >= 8 skip the
-/// planner entirely — one work item per request, no kv split.
 #[must_use]
 pub fn can_use_static_nonsplit(
     num_requests: u32,
@@ -328,8 +271,6 @@ pub fn can_use_static_nonsplit(
     !enable_cuda_graph && !toggles.force_split_small && cc_major >= 8 && num_requests <= 512
 }
 
-/// Builds the static schedule [`can_use_static_nonsplit`] admits, through
-/// the same layout and staging the planned path takes.
 pub fn static_nonsplit(
     op: &'static str,
     num_requests: u32,
@@ -338,8 +279,6 @@ pub fn static_nonsplit(
     enable_cuda_graph: bool,
     int_bytes: usize,
 ) -> Result<Built<DecodePlanInfo>, Error> {
-    // `n` is the carved count (padding/allocations); `live_n` is what this
-    // fire actually stages.
     let n = narrow(op, "batch_decode_request_indices", i64::from(num_requests))?;
     let live_n = narrow(op, "batch_decode_request_indices", i64::from(live.requests))?;
     let first = narrow(op, "batch_decode_request_indices", i64::from(live.lane_offset))?;

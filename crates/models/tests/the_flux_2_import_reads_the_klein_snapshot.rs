@@ -1,37 +1,3 @@
-//! **THE FLUX.2 IMPORT READS EVERY `dit.` TENSOR OF THE KLEIN-4B SNAPSHOT,
-//! THE 27 ENCODER LAYERS IT RUNS, THE VAE'S DECODER SIDE AND NOTHING OF ITS
-//! ENCODER — AND EVERY PLANE IT DECLARES TYPES TO THE EXTENTS THE PLAN
-//! STATES.**
-//!
-//! ```text
-//! cargo test -p models --test the_flux_2_import_reads_the_klein_snapshot
-//! ```
-//!
-//! A diffusers pipeline opens as one prefixed name space
-//! (`checkpoint::file::diffusers`): `dit.<transformer>`, `te.<text_encoder>`,
-//! `vae.<vae>`. This test builds the two rows' contracts and checks them
-//! from both ends — what they read against the index, and what they declare
-//! against the contract type checker and the load-plan compiler:
-//!
-//! ```text
-//! (a) over a SYNTHETIC source shaped like `flux2_golden.py --mini`'s
-//!     state_dict (fp32, no bytes): the miniature reads every tensor, each
-//!     once per slice it is cut into; every plane types
-//!     to its extents and lowers to a load plan; the same under `dit.`
-//! (b) over the REAL `black-forest-labs/FLUX.2-klein-4B` snapshot, when the
-//!     HuggingFace cache holds one: every `dit.` tensor is read;
-//!     `te.model.layers.{0..27}` and the embedding are read, the last nine
-//!     layers and the final norm are not; `vae.decoder.*`,
-//!     `vae.post_quant_conv.*` and `vae.bn.running_*` are read and
-//!     `vae.encoder.*`, `vae.quant_conv.*` are not; the contract types and
-//!     lowers; identification lands on the flagship
-//! (c) over the golden's own `flux2_mini.safetensors`, when present: the
-//!     miniature reads it, and the BatchNorm-free, guidance-carrying
-//!     transformer types
-//! ```
-//!
-//! (b) and (c) are skipped by name where their files are absent.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -46,11 +12,8 @@ use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
 
-/// One tensor of a checkpoint: its name, its shape, its element.
 type Named = (String, Vec<u64>, Leaf);
 
-/// The transformer's `state_dict`, as `flux2_golden.py --mini` and the
-/// snapshot's header both spell it, at one [`Dims`], one element type.
 fn transformer(d: &Dims, leaf: Leaf) -> Vec<Named> {
     let dim = u64::from(d.dim);
     let hd = u64::from(model::HEAD_DIM);
@@ -141,9 +104,6 @@ fn bytes_of(leaf: Leaf) -> u64 {
     }
 }
 
-/// A source of these names and shapes over a sparse file holding no bytes:
-/// enough for a contract to build and type-check, which never reads a
-/// value.
 fn synthetic(dir: &Path, tensors: &[Named]) -> ztensor::Source {
     let path = dir.join("synthetic.bin");
     let mut catalog = Catalog::new();
@@ -185,7 +145,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// The checkpoint's types, for the contract type checker.
 struct Types<'a>(&'a ztensor::Source);
 
 impl CheckpointTypes for Types<'_> {
@@ -199,7 +158,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-/// How many times each checkpoint tensor is named by the contract.
 fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -210,9 +168,6 @@ fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     counts
 }
 
-/// Every declared plane, in contract order, types to the extents it
-/// declares — `Out` references resolving against what came before — and the
-/// whole contract lowers to a load plan.
 fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     let types = Types(src);
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
@@ -241,16 +196,10 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     assert!(!plan.instrs.is_empty());
 }
 
-/// The read counts a transformer's tensors get: one each, but the single
-/// blocks' `to_out` (two column blocks) and, on the flagship, the
-/// `context_embedder` (three).
 fn expected_dit_reads(prefix: &str, d: &Dims, flagship: bool) -> BTreeMap<String, usize> {
     transformer(d, Leaf::F32)
         .into_iter()
         .map(|(name, ..)| {
-            // A cut names its source once per slice: the two column blocks
-            // of `to_out`, the three of the flagship's `context_embedder`,
-            // the six (three) reordered slices of a modulation linear.
             let count = if name.ends_with(".attn.to_out.weight") {
                 2
             } else if flagship && name == "context_embedder.weight" {
@@ -267,7 +216,6 @@ fn expected_dit_reads(prefix: &str, d: &Dims, flagship: bool) -> BTreeMap<String
         .collect()
 }
 
-/// The miniature's contract over `src` (bare names or `dit.`-prefixed).
 fn check_mini(src: &ztensor::Source, prefix: &str) {
     let row = models::sku(MINI).expect("the catalog ships the miniature");
     let contract = row
@@ -281,7 +229,13 @@ fn check_mini(src: &ztensor::Source, prefix: &str) {
     type_checks(&contract, src);
 }
 
-/// (a)
+fn the_flux_2_import_reads_the_klein_snapshot_every_case() {
+    the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed();
+    neither_row_serves_the_other_rows_checkpoint();
+    the_flagship_reads_the_real_snapshot();
+    the_miniature_reads_the_golden_fixture();
+}
+
 #[test]
 fn the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     for prefix in ["", "dit."] {
@@ -295,11 +249,6 @@ fn the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     }
 }
 
-/// A raw checkpoint is read by name and typed by shape: the flagship over the
-/// bare miniature refuses at build, having no encoder or VAE to read; the
-/// miniature over a flagship-shaped transformer builds (every name it wants
-/// is there, `guidance_embedder` aside — which it wants and does not find).
-#[test]
 fn neither_row_serves_the_other_rows_checkpoint() {
     let dir = scratch();
     let bare = transformer(&Dims::mini(), Leaf::F32);
@@ -319,8 +268,6 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The repo directory in the HuggingFace cache, honoring the same
-/// precedence `huggingface_hub` uses.
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -340,8 +287,6 @@ fn snapshot() -> Option<PathBuf> {
         .find(|path| path.join("model_index.json").is_file())
 }
 
-/// (b)
-#[test]
 fn the_flagship_reads_the_real_snapshot() {
     let Some(root) = snapshot() else {
         eprintln!(
@@ -353,8 +298,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let index: BTreeSet<String> = src.names().map(str::to_string).collect();
 
-    // The synthetic transformer of (a) is the snapshot's, name for name and
-    // shape for shape.
     let synthesized = prefixed("dit.", transformer(&Dims::klein_4b(), Leaf::BF16));
     assert_eq!(synthesized.len(), 169);
     for (name, shape, _) in &synthesized {
@@ -376,7 +319,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));
     let counts = reads(&contract);
 
-    // Every `dit.` tensor, at the counts the cuts imply.
     let dit: BTreeMap<String, usize> = counts
         .iter()
         .filter(|(n, _)| n.starts_with("dit."))
@@ -384,8 +326,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .collect();
     assert_eq!(dit, expected_dit_reads("dit.", &Dims::klein_4b(), true));
 
-    // The encoder: the 27 layers this plan runs and the embedding; not the
-    // last nine layers, not the final norm, no head.
     let te_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("te.")).collect();
     let te_want: BTreeSet<&String> = index
         .iter()
@@ -404,9 +344,6 @@ fn the_flagship_reads_the_real_snapshot() {
     );
     assert_eq!(te_want.len(), 1 + 11 * model::TE_LAYERS as usize);
 
-    // The VAE: the whole autoencoder but the frozen BatchNorm's step
-    // counter (`tests/the_flux_2_vae_bakes.rs` states the shape of those
-    // reads; here only that this import performs them).
     let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
     let vae_want: BTreeSet<&String> = index
         .iter()
@@ -417,7 +354,6 @@ fn the_flagship_reads_the_real_snapshot() {
         "the VAE planes read are every one but the BatchNorm's step counter"
     );
 
-    // Every other tensor exactly once.
     let odd: BTreeSet<&String> = counts
         .iter()
         .filter(|(n, c)| **c != 1 && !n.starts_with("dit."))
@@ -427,7 +363,6 @@ fn the_flagship_reads_the_real_snapshot() {
 
     type_checks(&contract, &src);
 
-    // The identification sweep lands on the flagship and no earlier row.
     let identified = models::identify(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the snapshot identifies as nothing: {why}"));
     assert_eq!(identified, KLEIN);
@@ -441,8 +376,6 @@ fn golden_mini() -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// (c)
-#[test]
 fn the_miniature_reads_the_golden_fixture() {
     let Some(file) = golden_mini() else {
         eprintln!("skipping: no flux2_mini.safetensors under $PIE_IMAGEGEN_GOLDEN/flux2");

@@ -1,5 +1,4 @@
-// flashinfer: adapted from sglang + vllm code
-// refer to: https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cuh
+
 #pragma once
 
 #include <cuda.h>
@@ -7,45 +6,18 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// PIE: REMOVED -- host-only `<array>`, `<iostream>`, `<limits>`, `<map>`, `<sstream>`,
-// `<unordered_map>` and `<vector>`. 7 lines of host C++ serving `CustomAllreduce`'s
-// bookkeeping members, which are removed below; no name in the device half of this file
-// comes from any of them. This marker is one a strip does NOT undo; see MODIFICATIONS.
-// PIE: ADDED -- `<type_traits>`, and it is an ADDITION rather than a removal.
-// `upcast` and `downcast` below name `std::is_same`, which upstream reached
-// transitively through the seven host headers on the line above. Removing those
-// removes the name, so the header that actually carries it is named here. This
-// is the only inserted line in this file; see MODIFICATIONS.
 #include <type_traits>
 
-// PIE: REMOVED -- `struct cuda_error : public std::runtime_error` and the
-// `CHECK_CUDA_SUCCESS(cmd)` macro that threw it. 25 lines of host C++: `std::stringstream`,
-// `std::string`, `cudaGetErrorString` and a `throw`. Every expansion was inside the host
-// `CustomAllreduce` class, which is removed below, so nothing here expands the macro and
-// nothing constructs the type. `driver-cuda`'s `error::check_rt` is the Rust that replaced
-// it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 namespace vllm {
 
 constexpr int kMaxBlocks = 36;
-// PIE: REMOVED -- `constexpr CUpointer_attribute rangeStartAddrAttr =
-// CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;`. 1 line of host C++: its only reader was
-// `get_graph_buffer_ipc_meta`'s `cuPointerGetAttribute` call, removed below, and
-// `csrc/shim/cuda.h` deliberately declares no driver-API name at all -- see that file's
-// banner, which measures that `CUDA_VERSION` is the only `CU`-spelled token the whole
-// closure reaches. `driver-cuda`'s `fire::all_reduce::base_ptr` is the Rust that
-// replaced it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
-// Counter may overflow, but it's fine since unsigned int overflow is
-// well-defined behavior.
+
 using FlagType = uint32_t;
 struct Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][8];
-  // Two sets of peer counters are needed for two syncs. The reason is that
-  // it's possible for peer GPU block to arrive at the second sync point while
-  // the current GPU block haven't passed the first sync point. Thus, peer GPU
-  // may write counter+1 while current GPU is busy waiting for counter. We use
-  // alternating counter array to avoid this possibility.
+
   alignas(128) FlagType peer_counter[2][kMaxBlocks][8];
 };
 
@@ -57,7 +29,6 @@ struct __align__(16) RankSignals {
   Signal* signals[8];
 };
 
-// like std::array, but aligned
 template <typename T, int sz>
 struct __align__(alignof(T) * sz) array_t {
   T data[sz];
@@ -65,19 +36,16 @@ struct __align__(alignof(T) * sz) array_t {
   static constexpr int size = sz;
 };
 
-// use packed type to maximize memory efficiency
-// goal: generate ld.128 and st.128 instructions
 template <typename T>
 struct packed_t {
-  // the (P)acked type for load/store
+
   using P = array_t<T, 16 / sizeof(T)>;
-  // the (A)ccumulator type for reduction
+
   using A = array_t<float, 16 / sizeof(T)>;
 };
 
 #define DINLINE __device__ __forceinline__
 
-// scalar cast functions
 DINLINE float upcast_s(half val) { return __half2float(val); }
 
 template <typename T>
@@ -87,9 +55,6 @@ DINLINE half downcast_s(float val) {
   return __float2half(val);
 }
 
-// scalar add functions
-// for some reason when compiling with Pytorch, the + operator for half and
-// bfloat is disabled so we call the intrinsics directly
 DINLINE half& assign_add(half& a, half b) {
   a = __hadd(a, b);
   return a;
@@ -173,20 +138,14 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   return flag;
 }
 
-// is_start: whether this is the very first synchronization barrier.
-// need_fence: whether a memory fence is needed. If true, a release-acquire
-// semantic is used to enforce memory access order before and after this
-// barrier.
 template <int ngpus, bool is_start, bool need_fence = false>
 DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank) {
   if constexpr (!is_start) __syncthreads();
-  static_assert(!(is_start && need_fence));  // Start barrier shouldn't need fence.
+  static_assert(!(is_start && need_fence));
   if (threadIdx.x < ngpus) {
-    // Increment the counter. Technically we only need one counter, but we use
-    // multiple per block to eliminate the need to share the counter via smem.
+
     auto val = self_sg->self_counter[blockIdx.x][threadIdx.x] += 1;
-    // Write the expected counter value to peer and wait for correct value from
-    // peer.
+
     auto peer_counter_ptr = &sg.signals[threadIdx.x]->peer_counter[val % 2][blockIdx.x][rank];
     auto self_counter_ptr = &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x];
     if constexpr (need_fence) {
@@ -216,11 +175,10 @@ __global__ void __launch_bounds__(512, 1)
                                T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
-  // note: we don't reorder the address so the accumulation order is the same
-  // for all ranks, ensuring bitwise identical results
+
   auto dp = *_dp;
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
-  // do the actual reduction
+
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
@@ -254,17 +212,12 @@ __global__ void __launch_bounds__(512, 1)
   }
   auto tmp_out = tmps[0];
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
-  // stage 1: reduce scatter
+
   for (int idx = start + tid; idx < end; idx += stride) {
     tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
   }
   multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
 
-  // stage 2: allgather. Note: it's important to match the tid between
-  // the two stages, because visibility across devices is only guaranteed
-  // between threads that have the same tid. If thread i computes the sum of
-  // start + i in the first stage, then thread i also gathers start + i from all
-  // ranks.
   for (int idx = tid; idx < largest_part; idx += stride) {
 #pragma unroll
     for (int i = 0; i < ngpus; i++) {
@@ -277,27 +230,9 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
-// PIE: REMOVED -- `using IPC_KEY`, its two `static_assert`s and the whole of
-// `class CustomAllreduce`. 221 lines of host C++ and the largest single removal in this
-// directory: `std::unordered_map`, `std::map`, `std::vector`, `std::string`,
-// `std::pair`, `cudaIpcOpenMemHandle`/`cudaIpcGetMemHandle`/`cudaIpcCloseMemHandle`,
-// `cudaMemcpy`, `cudaStreamIsCapturing`, five `throw`s and one destructor. Not one line
-// of it is device text: the class's ONLY device-reaching member was the
-// `allreduce<T>()` template's two `<<<>>>` sites, and those name
-// `cross_device_reduce_1stage` and `cross_device_reduce_2stage`, which stand above.
-//
-// `driver-cuda`'s `fire::all_reduce::CustomAllReduce` is the Rust that replaced it,
-// member for member -- `buffers_` and the wrapper's `registered_bases_` merged into one
-// `buffers` map, `ipc_handles_` into `ipc_handles`, `d_rank_data_base_` into the
-// `rank_data_next` index, `graph_unreg_buffers_` unchanged -- and
-// `kernels_cuda::comm::all_reduce_bf16` is the launcher's host arithmetic. That file's
-// own header records two IPC-handle leaks this class had, closed by the crossing.
-//
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
-/**
- * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
- a template instantiation:
- * template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
- half *, int, int, int);
-*/
-}  // namespace vllm
+
+
+
+
+
+}

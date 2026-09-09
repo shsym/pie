@@ -1,36 +1,13 @@
-//! The device-side struct layouts, declared once. The lane table is the ABI
-//! between the host planner and the kernels it emits; each copy below is
-//! either printed from this field list or read back and compared against it,
-//! so a field added on one side and not the other is a compile error or test
-//! failure rather than a silent reinterpretation.
-//!
-//! | copy | how it is tied here |
-//! |---|---|
-//! | `#[repr(C)]` structs in `eta-compiler` | `offset_of!` in `static_assertions` |
-//! | MSL `M1*`/`M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
-//! | MSL `M1Status` in the effect emitters | printed by [`DeviceStruct::emit_msl`] |
-//! | `runtime/cuda/fused_block0.cuh` | [`DeviceStruct::emit_cuda`], compared in `cuda::fused` |
-//! | `runtime/metal/ptir_m1_grouped.metal` | `metal::preamble::tests::file_matches_emitted_text` |
-//!
-//! The two runtime files are hand-written C++/MSL and so checked rather than
-//! produced; the MSL goldens pin the emitted text byte-identical to them.
-
 use alloc::format;
 use alloc::string::String;
 
-/// The two scalar widths the lane table uses. Addresses are `u64` on both
-/// supported backends, so there is no pointer-shaped case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FieldType {
-    /// A 32-bit unsigned field (`uint32_t` / `uint` / `m1_u32`).
     U32,
-    /// A 64-bit unsigned field (`uint64_t` / `ulong` / `m1_u64`); also every
-    /// address, since both backends use 64-bit pointers.
     U64,
 }
 
 impl FieldType {
-    /// Spelling in Metal Shading Language.
     const fn msl(self) -> &'static str {
         match self {
             FieldType::U32 => "uint",
@@ -38,8 +15,6 @@ impl FieldType {
         }
     }
 
-    /// Spelling in the CUDA runtime headers, which typedef their own widths
-    /// rather than including `<cstdint>` — NVRTC compiles these as a string.
     const fn cuda(self) -> &'static str {
         match self {
             FieldType::U32 => "m1_u32",
@@ -47,7 +22,6 @@ impl FieldType {
         }
     }
 
-    /// Size in bytes. Used by the layout self-check, not by the emitters.
     pub const fn size(self) -> usize {
         match self {
             FieldType::U32 => 4,
@@ -56,17 +30,10 @@ impl FieldType {
     }
 }
 
-/// One field of a device struct: its C name, its MSL spelling, and its scalar
-/// width.
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
-    /// The field's name in the generated C header and in `eta-compiler`'s
-    /// `#[repr(C)]` struct.
     pub name: &'static str,
-    /// The name MSL uses, when it differs (exactly one place, see
-    /// [`LANE_TABLE_HEADER`]).
     pub msl_name: &'static str,
-    /// The field's scalar width.
     pub ty: FieldType,
 }
 
@@ -96,35 +63,21 @@ impl Field {
     }
 }
 
-/// How a struct is printed in MSL. Cosmetic, but the goldens record the exact
-/// bytes, so the choice has to be recorded too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MslStyle {
-    /// All fields on the declaration line.
     Inline,
-    /// One field per line, two-space indent.
     Block,
 }
 
-/// One device struct: its name in each dialect, its MSL layout style, and its
-/// ordered field list.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceStruct {
-    /// Name in the generated C header, `Ptir`-prefixed.
     pub c_name: &'static str,
-    /// Name in MSL, minus the `M1`/`M3` prefix the caller supplies. The two
-    /// dialects do not agree on every suffix (`LaneTableHeader` is
-    /// `LaneHeader` in MSL), so both are spelled out.
     pub msl_suffix: &'static str,
-    /// How the MSL printer lays the fields out.
     pub msl_style: MslStyle,
-    /// The struct's fields in declaration order; offsets follow from their
-    /// widths.
     pub fields: &'static [Field],
 }
 
 impl DeviceStruct {
-    /// `struct M1Name { ... };` followed by a newline.
     pub fn emit_msl(&self, prefix: &str) -> String {
         let name = format!("{prefix}{}", self.msl_suffix);
         match self.msl_style {
@@ -147,8 +100,6 @@ impl DeviceStruct {
         }
     }
 
-    /// `struct Name { ... };` in the CUDA runtime's dialect: the C names and
-    /// declaration order, the CUDA width spellings, two-space indent.
     pub fn emit_cuda(&self) -> String {
         let mut out = format!("struct {} {{\n", self.c_name);
         for field in self.fields {
@@ -158,9 +109,6 @@ impl DeviceStruct {
         out
     }
 
-    /// `static_assert(sizeof(Name) == N, "...");` — the size check the CUDA
-    /// runtime carries. It is not enough on its own (reordering two fields of
-    /// equal width keeps the size), which is why `emit_cuda` exists.
     pub fn emit_cuda_size_assert(&self, note: &str) -> String {
         format!(
             "static_assert(sizeof({}) == {}, \"{note}\");\n",
@@ -169,8 +117,6 @@ impl DeviceStruct {
         )
     }
 
-    /// Total size with the natural alignment, from the same walk `offsets`
-    /// does.
     pub fn size_bytes(&self) -> usize {
         let mut end = 0usize;
         let mut alignment = 1usize;
@@ -182,10 +128,6 @@ impl DeviceStruct {
         end.next_multiple_of(alignment)
     }
 
-    /// Byte offset of each field, assuming the natural C alignment both
-    /// backends use. Only meaningful because every field is 4 or 8 bytes and
-    /// the declarations are already ordered to avoid padding; the
-    /// `offset_of!` assertions below are what prove that.
     pub fn offsets(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
         let mut offset = 0usize;
         self.fields.iter().map(move |field| {
@@ -198,9 +140,6 @@ impl DeviceStruct {
     }
 }
 
-/// The status word a lane's commit slot points at. No `eta-compiler`
-/// counterpart (the host only hands out the address), so pinned by the
-/// goldens alone.
 pub const STATUS: DeviceStruct = DeviceStruct {
     c_name: "PtirStatus",
     msl_suffix: "Status",
@@ -213,8 +152,6 @@ pub const STATUS: DeviceStruct = DeviceStruct {
     ],
 };
 
-/// Header of the grouped-dispatch lane table. MSL calls the third field
-/// `channel_count`; host/C header call it `channel_slots_per_lane`.
 pub const LANE_TABLE_HEADER: DeviceStruct = DeviceStruct {
     c_name: "PtirLaneTableHeader",
     msl_suffix: "LaneHeader",
@@ -227,7 +164,6 @@ pub const LANE_TABLE_HEADER: DeviceStruct = DeviceStruct {
     ],
 };
 
-/// One lane's worth of dispatch state.
 pub const LANE_RECORD: DeviceStruct = DeviceStruct {
     c_name: "PtirLaneRecord",
     msl_suffix: "LaneRecord",
@@ -260,7 +196,6 @@ pub const LANE_RECORD: DeviceStruct = DeviceStruct {
     ],
 };
 
-/// One channel slot within a lane.
 pub const LANE_CHANNEL_SLOT: DeviceStruct = DeviceStruct {
     c_name: "PtirLaneChannelSlot",
     msl_suffix: "LaneChannelSlot",
@@ -273,20 +208,13 @@ pub const LANE_CHANNEL_SLOT: DeviceStruct = DeviceStruct {
     ],
 };
 
-/// The three structs the host also builds, in the order the C header declares
-/// them.
 pub const HOST_SHARED: &[DeviceStruct] = &[LANE_TABLE_HEADER, LANE_RECORD, LANE_CHANNEL_SLOT];
 
-/// Compile-time proof that this table describes the `eta-compiler` structs
-/// the host actually writes: without these, a field added to `LaneRecord`
-/// and not [`LANE_RECORD`] would compile and produce wrong numbers silently.
 mod static_assertions {
     use super::*;
     use crate::plan::{LaneChannelSlot, LaneRecord, LaneTableHeader};
     use core::mem::{offset_of, size_of};
 
-    /// Byte offset of field `index`, laid out the way both backends lay out
-    /// a `#[repr(C)]` struct of 4- and 8-byte scalars.
     const fn field_offset(table: &DeviceStruct, index: usize) -> usize {
         let mut offset = 0usize;
         let mut i = 0usize;
@@ -301,7 +229,6 @@ mod static_assertions {
         offset
     }
 
-    /// Total size including trailing padding to the widest member.
     const fn table_size(table: &DeviceStruct) -> usize {
         let mut offset = 0usize;
         let mut align = 1usize;
@@ -318,8 +245,6 @@ mod static_assertions {
         offset.next_multiple_of(align)
     }
 
-    /// `$rust` must have exactly the fields `$table` lists, in order, at the
-    /// offsets `$table` implies, and no others.
     macro_rules! pin_layout {
         ($rust:ty, $table:expr, $($field:ident),+ $(,)?) => {
             const _: () = {
@@ -333,8 +258,6 @@ mod static_assertions {
                     index += 1;
                 )+
                 assert!(index == $table.fields.len(), "layout table has extra fields");
-                // Catches a field appended past the last one the table knows
-                // about, which the per-field offsets alone would not see.
                 assert!(
                     size_of::<$rust>() == table_size(&$table),
                     "struct size disagrees with the layout table",

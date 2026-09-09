@@ -1,26 +1,15 @@
-//! Weight declarations without generics: `Dtype` is a plain field, so there
-//! is one `Weight` struct and no monomorphized model trees.
-
 use model_ir::{
     BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND,
     TILED_STEP,
 };
 
-/// One logical weight: name, logical shape, on-device representation, how it
-/// is laid out across ranks, and where its bytes come from. The recorder
-/// interns it into `Trace::params` — one param per stored plane — the first
-/// time a wrapper touches it.
 #[derive(Clone, Debug)]
 pub struct Weight {
     pub name: String,
     pub shape: Vec<u64>,
     pub dtype: Dtype,
     pub shard: Shard,
-    /// The checkpoint's, unless [`registered`](Weight::registered) says
-    /// otherwise.
     pub source: ParamSource,
-    /// The on-device element order; [`ParamLayout::Natural`] unless
-    /// [`conv_taps_major`](Weight::conv_taps_major) says otherwise.
     pub layout: ParamLayout,
 }
 
@@ -41,12 +30,6 @@ impl Weight {
         }
     }
 
-    /// A convolution weight, declared as the checkpoint stores it —
-    /// `[C_out, C_in·kt·kh·kw]` (`weight.reshape(C_out, -1)`) — and served
-    /// in the tap-major channel-fastest order `spatial.conv3d` reads. The
-    /// shell relabels the landed rectangle once at load
-    /// (`ParamLayout::ConvTapsMajor`); the shape does not change.
-    /// `ops::spatial::conv3d` requires it and refuses a natural weight.
     #[must_use]
     pub fn conv_taps_major(mut self, c_in: u32, taps: u32) -> Weight {
         assert!(
@@ -60,42 +43,28 @@ impl Weight {
         self
     }
 
-    /// An adapter bank: the checkpoint does not publish this plane. It is
-    /// reserved at load from the shape declared here, zeroed (a zeroed
-    /// low-rank `A` is the identity correction), and filled a row at a time
-    /// by `Engine::register_adapter` — a pool write, not a recapture, since
-    /// the graph key is the fire's composition and a bank's contents aren't
-    /// in it. Capacity lives here because it's a shape, and shapes are the
-    /// model text's; `model_compiler::compile` refuses a `Budget::max_adapters`
-    /// this bank cannot seat.
     #[must_use]
     pub fn registered(mut self) -> Weight {
         self.source = ParamSource::Registered;
         self
     }
 
-    /// Cut along the output axis: each rank holds a column block.
     #[must_use]
     pub fn columns(self) -> Weight {
         self.cut(0, None)
     }
 
-    /// Cut along the reduction axis: each rank holds a row block and the
-    /// matmul's partial sums meet in a collective.
     #[must_use]
     pub fn rows(self) -> Weight {
         let last = self.shape.len().wrapping_sub(1);
         self.cut(last, None)
     }
 
-    /// Cut axis 0 at the stated seams — a fused projection whose halves must
-    /// not straddle ranks.
     #[must_use]
     pub fn packed(self, segments: impl IntoIterator<Item = u64>) -> Weight {
         self.cut(0, Some(segments.into_iter().collect()))
     }
 
-    /// Cut axis 1 at the stated seams — the per-expert form of `packed`.
     #[must_use]
     pub fn bank(self, segments: impl IntoIterator<Item = u64>) -> Weight {
         self.cut(1, Some(segments.into_iter().collect()))
@@ -130,10 +99,6 @@ impl Weight {
             .unwrap_or_else(|| panic!("`{}` is {:?} and has no axis {i}", self.name, self.shape))
     }
 
-    /// The dtype activations see through this weight. Mxfp4 and U4g64 banks
-    /// store codes and compute in bf16; the rest of `Dtype` names kv-cache
-    /// schemes, index layouts, and the companion planes a bank interns beside
-    /// itself — never a weight an author declares.
     #[must_use]
     pub fn compute_dtype(&self) -> Dtype {
         compute_dtype(self.dtype).unwrap_or_else(|| {
@@ -144,16 +109,8 @@ impl Weight {
         })
     }
 
-    /// The stored planes behind one logical weight. Every dtype stores itself
-    /// verbatim except mxfp4, which packs each 32-code block into 16 bytes
-    /// and interns an e8m0 scale-per-block companion under `.scales`.
     pub(crate) fn planes(&self) -> Vec<BankPlane> {
         match self.dtype {
-            // Affine schemes (U4g64, U8g64, U4g32, U2g32/64/128): codes keep
-            // the logical shape; two bf16-per-group companions (scale,
-            // offset) since `code * scale + bias` needs both. Width and
-            // group are the only things that differ between these dtypes,
-            // so they share one arm.
             Dtype::U4g64
             | Dtype::U8g64
             | Dtype::U4g32
@@ -196,14 +153,6 @@ impl Weight {
                     },
                 ]
             }
-            // The tiled affine row: same scheme, same group of 64, same two
-            // bf16 companions, but codes and factors have gone through
-            // `kernels_cuda::linear::tiled`'s relabelling, which pads the
-            // output column axis up to a whole 16-column mma band (padded
-            // columns decode to a zero weight). A different rectangle from
-            // the row-major weight, hence its own arm. Also a projection,
-            // not a bank — a routed expert bank has an axis it does not
-            // carve, and a repack of one is refused here.
             Dtype::U4g64tiled => {
                 let [n, k] = self.shape[..] else {
                     panic!(
@@ -212,8 +161,6 @@ impl Weight {
                         self.name, self.shape,
                     )
                 };
-                // Band and step are the layout's own constants; `checkpoint`'s
-                // repack checks a declared target against these same two numbers.
                 const GROUP: u64 = 64;
                 let band = u64::from(TILED_BAND);
                 let step = u64::from(TILED_STEP);
@@ -278,8 +225,6 @@ impl Weight {
                     },
                 ]
             }
-            // Served formats no model text declares yet: they reach the
-            // engine through an import plan, not a weight declaration.
             Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
                 "`{}`: {} is served but not yet a weight representation a \
                  model text declares",
@@ -305,12 +250,6 @@ impl Weight {
                 shape: self.shape.clone(),
                 dtype: self.dtype,
             }],
-            // Stored super-block families (GGUF K-quant etc): scales live
-            // inside the super-block, so there's no companion to intern —
-            // one rectangle of `n` rows by `Dtype::row_bytes(k)` bytes,
-            // exactly what `linear::kquant` reads. The text still declares
-            // the logical `[n, k]`; this is where it folds into the stored
-            // container shape.
             Dtype::U2g16k
             | Dtype::I3g16k
             | Dtype::U4g32k
@@ -345,7 +284,6 @@ impl Weight {
     }
 }
 
-/// One stored plane of a weight: what actually lands in `Trace::params`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BankPlane {
     pub suffix: &'static str,
@@ -354,9 +292,6 @@ pub(crate) struct BankPlane {
 }
 
 impl Weight {
-    /// This weight as `platform` lands it: a placed dtype resolves to the
-    /// canonical one where the platform's kernels do not read the placement
-    /// ([`Platform::placement`]).
     #[must_use]
     pub fn placed(&self, platform: Platform) -> Weight {
         Weight {
@@ -367,9 +302,6 @@ impl Weight {
 }
 
 impl Weight {
-    /// The weight a stored plane of a trace was interned from: the inverse of
-    /// [`planes`](Weight::planes) for the codes plane, up to the row padding
-    /// a tiled bank carries. A companion plane has no weight of its own.
     #[must_use]
     pub fn of_plane(p: &Param) -> Weight {
         let shape: Vec<u64> = match p.dtype {
@@ -414,21 +346,12 @@ pub fn biases_name(of: &str) -> String {
     format!("{of}{BIASES}")
 }
 
-/// The dtype a weight of this representation is multiplied as, or `None` for
-/// a dtype no weight is declared in. Asked of the dtype rather than the
-/// weight, so a model text can state a bank's neighbours without owning a
-/// bank: a norm beside a U4g64 projection is bf16 because the projection
-/// computes in bf16. [`Weight::compute_dtype`] is this plus the weight's
-/// name in the panic.
 #[must_use]
 pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
     match dtype {
         Dtype::Bf16 => Some(Dtype::Bf16),
         Dtype::F16 => Some(Dtype::F16),
         Dtype::F32 => Some(Dtype::F32),
-        // A quant term says how a weight is stored, nothing about what it
-        // multiplies as: every weight-only quant point decodes inside the
-        // dot and accumulates against a bf16 activation.
         Dtype::Mxfp4
         | Dtype::Nvfp4
         | Dtype::U4g64
@@ -445,9 +368,6 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128 => Some(Dtype::Bf16),
-        // A lookup table computes as itself: `I64` is `ffn.gate.tid2eid`,
-        // DeepSeek-V4-Flash's token-id -> expert-id table, which
-        // `linear.moe_hash_route` gathers rather than dequantizes.
         Dtype::I64 => Some(Dtype::I64),
         Dtype::I32
         | Dtype::U32

@@ -1,7 +1,3 @@
-//! Kimi tokenizer latency for Pie-style independent requests.
-//!
-//! Run: `cargo bench -p pie-tokenizer --bench tiktoken`
-
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::PathBuf;

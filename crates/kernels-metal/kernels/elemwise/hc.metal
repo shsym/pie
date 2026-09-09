@@ -2,41 +2,12 @@
 
 using namespace metal;
 
-// `Hc`: hyper-connections — the residual stream carried as `M` parallel
-// copies, mixed into one layer input by learned gates, and folded back after
-// the sublayer under a DOUBLY STOCHASTIC combiner. Ported organ-for-organ
-// from `kernels-cuda/kernels/elemwise/hc.cuh`, whose four points these four
-// entrypoints answer one for one.
-//
-// The mixing matrix is projected onto the Birkhoff polytope by Sinkhorn-Knopp:
-// softmax the `M x M` logits along the row to seed, ONE column normalization,
-// then `sinkhorn_iters - 1` alternating row/column sweeps. That off-by-one is
-// the whole subtlety — 20 stated iterations are one seed column-norm plus 19
-// sweeps, exactly as the MLX reference (`v4mlx/hc.py`) spells it — and it is
-// the reason the loop below counts to `sinkhorn - 1` and not to `sinkhorn`.
-//
-// **THE SINKHORN RUNS IN FP32, ALWAYS.** The residual planes are bf16 and the
-// gate planes are f32 by the op's own signature; the sums here are small and
-// the doubly-stochastic property is what a bf16 accumulation would lose
-// first. Nothing in this file accumulates in the storage type.
-//
-// The two gate curves are NOT the same function: the pre gate is
-// `sigmoid(.) + eps` (a width weight, ~0..1) and the post gate is
-// `alpha * sigmoid(.)` with the model's `alpha = 2` (a depth weight, 0..2).
 
-// The largest stream fan the mixers unroll into threadgroup and register
-// arrays — `MAX_HC_MULT` in the CUDA twin, and a hard refusal at the host
-// entry rather than a shape check here.
 constant constexpr int HC_MAX_MULT = 8;
-// Hidden columns one `hc_gates` threadgroup collapses (`hc.rs` launches
-// `ceil(H / HC_GATES_CHUNK)` of them per token).
+
 constant constexpr int HC_GATES_CHUNK = 256;
 
-// ---- expand ---------------------------------------------------------------
 
-// Tiles one `H`-wide row across `M` residual streams: the `[N, H]` embedding
-// becomes the `[N, M, H]` hyper stream every layer then rides. One thread per
-// INPUT element, each writing its own `M` outputs.
 template <typename T>
 [[kernel]] void hc_expand(
     const device T* input      [[buffer(0)]],
@@ -64,11 +35,7 @@ template <typename T>
 
 instantiate_hc_expand(bfloat16, bfloat)
 
-// ---- rmsnorm, widened to f32 ----------------------------------------------
 
-// RMS-normalises the WIDE stream row (`M * H` across, weightless) and lands it
-// in f32: the mix coefficients read off it downstream are too sensitive for a
-// bf16 round trip. One threadgroup per row.
 template <typename T, int BLOCK>
 [[kernel]] void hc_rmsnorm_f32(
     const device T* input      [[buffer(0)]],
@@ -118,20 +85,7 @@ template <typename T, int BLOCK>
 
 instantiate_hc_rmsnorm_f32(bfloat16, bfloat, 256)
 
-// ---- the mix projection ---------------------------------------------------
 
-// `mixes[n, o] = dot(normed[n, :], hc_fn[o, :])` — the per-token mix row the
-// gates below split, projected out of the weightless-RMS-normed stream row by
-// the layer's own `{attn,ffn}_hc.fn` plane (`[2M + M*M, M*H]`).
-//
-// **THIS IS A GEMM AND IT IS NOT `linear.matmul`**, for one reason: both
-// operands are f32 and the dense gemm on this plane instantiates bf16 only.
-// The rectangle is also the smallest a GEMM in this tree ever sees — `2M +
-// M*M` is TWENTY-FOUR columns at the model's `hc_mult 4` — so a tiled point
-// would launch one tile and a vector point would launch twenty-four rows of
-// one; one threadgroup per `(row, column)` reducing `M*H` is the shape this
-// arithmetic actually has. And the sinkhorn downstream is fp32 by this
-// file's own header, which a bf16 detour to reach a bf16 gemm would undo.
 template <int BLOCK>
 [[kernel]] void hc_project(
     const device float* normed  [[buffer(0)]],
@@ -146,10 +100,6 @@ template <int BLOCK>
     uint tg_size    [[threads_per_threadgroup]]) {
   threadgroup float partials[BLOCK / 32];
 
-  // **THE POINT IS ONE-DIMENSIONAL AND THE PAIR IS DERIVED**, not because a
-  // `(column, row)` grid would be wrong but because this plane's position
-  // attributes must all be scalars or all be vectors of one width, and the
-  // three lane indices below are scalars.
   const int o = int(gid) % mix_hc;
   const int n = int(gid) / mix_hc;
 
@@ -161,10 +111,7 @@ template <int BLOCK>
     local += row[d] * w[d];
   }
   local = simd_sum(local);
-  // The cross-simdgroup fold, written so no lane addresses a slot the array
-  // does not have: `partials` is `BLOCK / 32` long and a simdgroup is 32
-  // lanes wide, so the lanes past the group count read a zero they supply
-  // themselves rather than a threadgroup cell out of bounds.
+
   constexpr int GROUPS = BLOCK / 32;
   if (lid < uint(GROUPS)) partials[lid] = 0.0f;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -188,20 +135,7 @@ template <int BLOCK>
 
 instantiate_hc_project(256)
 
-// ---- gates ----------------------------------------------------------------
 
-// Splits the per-token mix row into its three planes, Sinkhorn-normalises the
-// combiner, publishes both gate matrices, and collapses the `M` streams into
-// the sublayer's input under the pre gate. One threadgroup per token.
-//
-// **THE MIX ROW'S STRIDE IS `2M + M*M`**, exactly as the CUDA twin reads it,
-// and it is now also the WIDTH of what the op hands over: `hc_project` above
-// fires `rmsnorm(stream) @ hc_fn` — the `{attn,ffn}_hc.fn` plane the model
-// text used to intern — and lands the `[N, 2M + M*M]` row the reference
-// splits. This entry did not change to accept it; it never had to. What
-// changed is that the leading `2M + M*M` floats of its operand are the mix
-// row rather than the first columns of the `[N, M*H]` normed buffer that
-// stood in for one while no plane produced it.
 template <typename T, int BLOCK>
 [[kernel]] void hc_gates(
     const device float* mixes    [[buffer(0)]],
@@ -221,10 +155,7 @@ template <typename T, int BLOCK>
     uint2 tg2    [[threads_per_threadgroup]]) {
   const uint lid = lid2.x;
   const uint tg_size = tg2.x;
-  // `gid.y` is which `HC_GATES_CHUNK`-wide slice of the hidden width this
-  // threadgroup collapses; every slice recomputes the (tiny) gate matrices,
-  // and slice 0 alone publishes them. One threadgroup per token used to do
-  // the whole row and left the device 15/16ths idle at decode.
+
   const int n = int(gid.x);
   const int tid = int(lid);
 
@@ -251,8 +182,6 @@ template <typename T, int BLOCK>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // The seed: a softmax along each row, then `+ eps` so no entry is exactly
-  // zero going into the alternating normalization.
   if (tid < M) {
     float max_v = -INFINITY;
     for (int j = 0; j < M; ++j) max_v = max(max_v, comb[tid * M + j]);
@@ -265,9 +194,6 @@ template <typename T, int BLOCK>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // The FIRST column normalization, outside the loop — this is the half-sweep
-  // that makes `sinkhorn_iters` iterations cost `sinkhorn_iters - 1` passes
-  // below.
   if (tid < M) {
     float col_sum = 0.0f;
     for (int i = 0; i < M; ++i) col_sum += comb[i * M + tid];
@@ -324,14 +250,7 @@ template <typename T, int BLOCK>
 
 instantiate_hc_gates(bfloat16, bfloat, 256)
 
-// ---- the trunk collapse ---------------------------------------------------
 
-// `y[n, h] = sum_i g_i * streams[n, i*H + h]`, `g_i = sigmoid(mixes[n, i] *
-// scale[0] + base[i]) + hc_eps` — the model's final fold of its `M` residual
-// streams into the one row the final norm reads (`hc_head`). `M` gates and no
-// post, no combiner, no Sinkhorn: the trunk's mix row is `M` wide, which is
-// what `hc_project` lands off the `[M, M*H]` `hc_head.fn` plane. One
-// threadgroup per token; `hc.cuh`'s `hc_head_postprocess`, transcribed.
 template <typename T, int BLOCK>
 [[kernel]] void hc_collapse(
     const device float* mixes    [[buffer(0)]],
@@ -376,15 +295,7 @@ template <typename T, int BLOCK>
 
 instantiate_hc_collapse(bfloat16, bfloat, 256)
 
-// ---- fold -----------------------------------------------------------------
 
-// Mixes the sublayer's output back into the `M` streams under the gate
-// matrices the same token's `hc_gates` published:
-//
-//   y[j][h] = post[j] * x[h] + sum_i comb[i][j] * residual[i][h]
-//
-// One thread per `(token, h)` column, which is what lets the fold be read
-// before it is written even when `y` and `residual` alias.
 template <typename T>
 [[kernel]] void hc_fold(
     const device T* x            [[buffer(0)]],
@@ -431,23 +342,7 @@ template <typename T>
 
 instantiate_hc_fold(bfloat16, bfloat)
 
-// ---- the GATED-RESIDUAL flavor (qwen4) ------------------------------------
-//
-// Same residual-stream algebra as the sinkhorn family above, a different gate:
-// a low-rank GEMM chain produces per-element logits and a sigmoid of them is
-// the whole mixing rule. There is no Birkhoff projection here and no f32 gate
-// plane — the gates arrive in the activation's own dtype, off ordinary linear
-// nodes. Ported organ for organ from `hc.cuh`'s `hc_mix`, `hc_inject` and
-// `ple_gate`.
-//
-// The `win` staged-geometry seat the CUDA twins carry has no counterpart on
-// this plane: nothing here reads a live-rows word, because this shell hands
-// every one of these ops a grid already carved to the fire's rows.
 
-// `y[h] = mean_s( sigmoid(gates[s*H + h]) * normed[s*H + h] )`.
-//
-// One thread per `(row, h)`: the reduction is over the STREAM fan, which is
-// four, so it is a register loop and not a threadgroup one.
 template <typename T>
 [[kernel]] void hc_mix(
     const device T* gates      [[buffer(0)]],
@@ -482,11 +377,6 @@ template <typename T>
 
 instantiate_hc_mix(bfloat16, bfloat)
 
-// `hyper[s*H + h] += 2 * sigmoid(gates[s] / M) * o[h]`, in place.
-//
-// One thread per `(row, h)`, which owns that column of every stream — so the
-// `M` gate logits are read `H` times rather than staged, and at a stream fan
-// of four that is cheaper than a barrier.
 template <typename T>
 [[kernel]] void hc_inject(
     const device T* o          [[buffer(0)]],
@@ -520,10 +410,6 @@ template <typename T>
 
 instantiate_hc_inject(bfloat16, bfloat)
 
-// The PLE gate: one threadgroup per `(row, stream)`, flattened the way the
-// grouped norms flatten — group `b` is row `b / M`, stream `b % M`. The dot
-// over `H` is a threadgroup reduction; the gate is the sigmoid of its SIGNED
-// square root, and `sign(0)` is zero and not the clamp floor.
 template <typename T, int BLOCK>
 [[kernel]] void ple_gate(
     const device T* key        [[buffer(0)]],
@@ -561,8 +447,7 @@ template <typename T, int BLOCK>
   if (simd_group == 0) {
     const float dot = simd_sum(partials[simd_lane]) * precise::rsqrt(float(H));
     if (simd_lane == 0) {
-      // The reference's own damping: the square root of the clamped
-      // magnitude, carrying the dot's SIGN.
+
       float damped = precise::sqrt(fmax(fabs(dot), 1e-6f));
       damped = dot > 0.0f ? damped : (dot < 0.0f ? -damped : 0.0f);
       shared_gate[0] = 1.0f / (1.0f + precise::exp(-damped));

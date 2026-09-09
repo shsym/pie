@@ -1,11 +1,5 @@
-//! Guard conditions over the plan's fact word: `Fact(bit)` names one bit of
-//! the word the model's `Classify` computed, and the engine evaluates each
-//! node's guard against the fire's fact word.
-
 use serde::{Deserialize, Serialize};
 
-/// A boolean formula over fact bits. Kept as a tree, not a truth table, so a
-/// plan prints the same structure the model text stated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Guard {
     Always,
@@ -16,8 +10,6 @@ pub enum Guard {
 }
 
 impl Guard {
-    /// `Always` is the identity, folded here so traces do not accrete
-    /// `And(Always, ..)` wrappers.
     #[must_use]
     pub fn and(a: Guard, b: Guard) -> Guard {
         match (a, b) {
@@ -31,18 +23,6 @@ impl Guard {
         Guard::Or(Box::new(a), Box::new(b))
     }
 
-    /// A value guarded by `outer`, read under `inner`: `and(outer, inner)`
-    /// — spelled as `inner` alone when `inner` already implies `outer`.
-    ///
-    /// **WHY THE SPELLING MATTERS.** The recorder compares guards by
-    /// equality to tell one split's arms apart, so a value read under a
-    /// narrower guard than its producer's must come back spelled the way
-    /// its siblings are. A joint attention runs under `Or(text, image)`
-    /// and its output is then read on the text arm: `And(Or(text, image),
-    /// text)` admits exactly the lanes `text` does, and `text` is how every
-    /// other value on that arm is spelled. Checked by truth table, like
-    /// [`equivalent`](Guard::equivalent); an `inner` that narrows `outer`
-    /// keeps the conjunction, as every split arm always has.
     #[must_use]
     pub fn narrow(outer: Guard, inner: Guard) -> Guard {
         if matches!(outer, Guard::Always) {
@@ -58,7 +38,6 @@ impl Guard {
         Guard::Not(Box::new(a))
     }
 
-    /// Evaluate against a fire's fact word.
     #[must_use]
     pub fn holds(&self, word: u64) -> bool {
         match self {
@@ -82,7 +61,6 @@ impl Guard {
         }
     }
 
-    /// The fact bits this condition reads, sorted and deduplicated.
     #[must_use]
     pub fn referenced_bits(&self) -> Vec<u8> {
         let mut bits = Vec::new();
@@ -92,26 +70,16 @@ impl Guard {
         bits
     }
 
-    /// Whether two guards admit exactly the same lanes — a truth table over
-    /// every fact either of them names, not an algebraic argument.
     #[must_use]
     pub fn equivalent(&self, other: &Guard) -> bool {
         self.agree(other, |mine, theirs| mine == theirs)
     }
 
-    /// Whether every lane this guard admits `outer` admits too — the same
-    /// truth table as [`equivalent`](Guard::equivalent), read one way round.
-    ///
-    /// Streams are one-hot bits with no stated exclusion, so `image` does NOT
-    /// imply `!text`: a caller asking "was this lane certainly touched" gets
-    /// `false` for two arms of one split, which is the safe answer.
     #[must_use]
     pub fn implies(&self, outer: &Guard) -> bool {
         self.agree(outer, |mine, theirs| !mine || theirs)
     }
 
-    /// Truth table over every fact either guard names, `all`-folded through
-    /// `agree`.
     fn agree(&self, other: &Guard, agree: impl Fn(bool, bool) -> bool) -> bool {
         let mut bits = self.referenced_bits();
         for bit in other.referenced_bits() {
@@ -134,8 +102,6 @@ impl Guard {
         })
     }
 
-    /// This guard's conjuncts, flattened; one that is not an `And` is its
-    /// own only conjunct.
     fn conjuncts<'a>(&'a self, out: &mut Vec<&'a Guard>) {
         match self {
             Guard::And(a, b) => {
@@ -146,14 +112,6 @@ impl Guard {
         }
     }
 
-    /// The conjuncts every one of `arms` carries, `And`ed back together —
-    /// [`Always`](Guard::Always) when they share none.
-    ///
-    /// The arms of one split of a value guarded by `G` are each `And(G, pᵢ)`,
-    /// so this recovers `G`. [`Value::merge`](../../model_dsl) needs it
-    /// because a merge is compared to its siblings by EQUALITY: nested in an
-    /// outer split, the join of the arms must come back spelled as that
-    /// outer guard or the next node reading both looks like it mixed arms.
     #[must_use]
     pub fn common(arms: &[Guard]) -> Guard {
         let Some((first, rest)) = arms.split_first() else {
@@ -172,9 +130,6 @@ impl Guard {
             .fold(Guard::Always, |a, b| Guard::and(a, b))
     }
 
-    /// Collapse a tautology to `Always` by exhausting assignments over the
-    /// referenced bits — merges of complementary branches produce these, and
-    /// `Always` is what downstream passes test for.
     #[must_use]
     pub fn simplified(self) -> Guard {
         let bits = self.referenced_bits();

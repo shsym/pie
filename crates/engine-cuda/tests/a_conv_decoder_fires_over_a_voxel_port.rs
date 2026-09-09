@@ -1,30 +1,3 @@
-//! **A HAND-WRITTEN CONV DECODER FIRES THROUGH THE SHELL OVER A VOXEL PORT
-//! AND ANSWERS THE CPU REFERENCE, TWO CLIPS OF DIFFERENT BOXES AT ONCE.**
-//! (design D8, end to end)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_conv_decoder_fires_over_a_voxel_port -- --nocapture
-//! ```
-//!
-//! The decoder is `conv3d(8→16, 3³, bias) → group_norm(4 groups) + silu →
-//! upsample_nearest(1,2,2) → conv3d(16→12, 3³, bias) → pixel_shuffle(1,2,2)`
-//! over a `[Voxels, 8]` bf16 port, its pixels `[VoxelsTimes(16), 3]`. What
-//! runs is the whole serving chain and not a kernel: the text is traced
-//! through the DSL, its weights written to a `.zt` container in the
-//! checkpoint's NATURAL conv order and landed through a `read_own`
-//! contract, the shell loads it against a voxel ladder (relabelling the
-//! conv weights tap-major at load), two lanes submit one clip each — boxes
-//! `[2, 4, 6]` and `[1, 3, 5]` — through `Shell::fire_voxels`, and each
-//! lane's pixels come back through the `pixels` seam with its clip's output
-//! box `[t, 4h, 4w]`.
-//!
-//! The reference is f32 on the host, written from the PyTorch modules the
-//! ops stand for and rounded to bf16 where the device stores a rectangle
-//! (every layer's output), so the two differ by accumulation order alone.
-//!
-//! Skipped at run time with no device, as the other device gates are.
-
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};
@@ -45,7 +18,6 @@ const GROUPS: usize = 4;
 const TAPS: usize = 27;
 const EPS: f32 = 1e-6;
 
-/// Two clips of different boxes, one per lane.
 const BOXES: [[usize; 3]; 2] = [[2, 4, 6], [1, 3, 5]];
 
 struct NoFacts;
@@ -112,10 +84,6 @@ impl ForwardHybrid for Decoder {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Seeded numbers, bf16 the way the loader rounds
-// ─────────────────────────────────────────────────────────────────────────
-
 struct Lcg(u64);
 
 impl Lcg {
@@ -127,7 +95,6 @@ impl Lcg {
         self.0
     }
 
-    /// Uniform on `[-0.5, 0.5)`.
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
@@ -143,7 +110,6 @@ fn bf16_round(value: f32) -> f32 {
     f32::from_bits(u32::from(bf16_bits(value)) << 16)
 }
 
-/// `n` bf16-representable numbers scaled by `scale`, and their bytes.
 fn drawn(lcg: &mut Lcg, n: usize, scale: f32) -> (Vec<f32>, Vec<u8>) {
     let values: Vec<f32> = (0..n).map(|_| bf16_round(lcg.unit() * scale)).collect();
     let bytes = values
@@ -166,9 +132,6 @@ struct Planes {
     b2: Vec<f32>,
 }
 
-/// The checkpoint: every plane seeded, conv weights in the NATURAL
-/// `[C_out, C_in·kt·kh·kw]` order (`weight.reshape(C_out, -1)`), written in
-/// sorted name order as canonical `.zt` form requires.
 fn write_checkpoint(path: &Path) -> Planes {
     let mut lcg = Lcg(0xd8_c0de);
     let (conv1, conv1_bytes) = drawn(
@@ -246,16 +209,10 @@ fn write_checkpoint(path: &Path) -> Planes {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The f32 reference, one clip at a time
-// ─────────────────────────────────────────────────────────────────────────
-
 fn voxels(b: [usize; 3]) -> usize {
     b[0] * b[1] * b[2]
 }
 
-/// `torch.nn.functional.conv3d`, k=3, stride 1, pad 1, over one clip's
-/// `[rows, c_in]`, weights natural `[c_out][c_in][kt][kh][kw]`.
 fn conv3d_ref(
     x: &[f32],
     b: [usize; 3],
@@ -384,8 +341,6 @@ fn pixel_shuffle_ref(
     (y, ob)
 }
 
-/// The decoder on the host over one clip, rounded to bf16 where the device
-/// stores a rectangle.
 fn decode_ref(x: &[f32], b: [usize; 3], p: &Planes) -> (Vec<f32>, [usize; 3]) {
     let round = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(bf16_round).collect() };
     let h = round(conv3d_ref(x, b, C_IN, &p.conv1, C_MID, &p.b1));
@@ -396,10 +351,6 @@ fn decode_ref(x: &[f32], b: [usize; 3], p: &Planes) -> (Vec<f32>, [usize; 3]) {
     (round(y), b2)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The fire
-// ─────────────────────────────────────────────────────────────────────────
-
 fn scratch() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pie-d8-decoder-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -409,6 +360,11 @@ fn scratch() -> PathBuf {
 
 fn classify(_: &model_ir::Request) -> u64 {
     0
+}
+
+fn a_conv_decoder_fires_over_a_voxel_port_every_case() {
+    the_decoder_answers_the_reference_for_two_clips_of_different_boxes();
+    a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot();
 }
 
 #[test]
@@ -449,7 +405,6 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         slots: 4,
         pages: 16,
         ordinal: 0,
-        // The voxel axis is served eagerly this phase.
         graphs: Graphs::Off,
         knobs: Knobs {
             recording: Recording::Off,
@@ -466,7 +421,6 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
 
-    // Each lane's clip, seeded, as bf16 bytes and as the f32 the bytes mean.
     let mut lcg = Lcg(0xc11d);
     let inputs: Vec<(Vec<f32>, Vec<u8>)> = BOXES
         .iter()
@@ -551,18 +505,10 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The causal frame cache, across fires
-// ─────────────────────────────────────────────────────────────────────────
-
-/// The frames a causal conv keeps between tiles: `kt - 1`.
 const FRAMES: usize = 2;
 
-/// The largest plane a clip of the causal text may have (`h·w`).
 const PLANE_MAX: usize = 4 * 6;
 
-/// One causal 3x3x3 convolution over the port, its front frames read from —
-/// and its last frames stored into — the lane's slot.
 struct Causal {
     conv: Weight,
     bias: Weight,
@@ -606,8 +552,6 @@ impl ForwardHybrid for Causal {
     }
 }
 
-/// The causal convolution on the host: front frames from `front`
-/// (`FRAMES · plane` rows, zeros for a first tile), no back padding.
 fn causal_conv3d_ref(
     x: &[f32],
     front: &[f32],
@@ -680,13 +624,6 @@ fn close(lane: &str, got: &[f32], want: &[f32]) {
     );
 }
 
-/// **A CHUNKED CAUSAL DECODE IS THE WHOLE ONE.** Slot 0 decodes a `[4, 4, 6]`
-/// clip as two `[2, 4, 6]` tiles, the second reading the first's last two
-/// frames out of the slot; slot 1 decodes a `[1, 3, 5]` clip beside the
-/// second tile in the same fire, its slot fresh (zero front frames). Each
-/// tile answers the host's causal convolution over the frames it can see,
-/// and reopening slot 0 zeroes its frames again.
-#[test]
 fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     if !engine_cuda::device::present() {
         eprintln!("skipping the causal conv gate: no CUDA device");
@@ -781,7 +718,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         .collect();
     let zeros = vec![0f32; FRAMES * plane * C_IN];
     let want_first = causal_conv3d_ref(&whole[..half], &zeros, tile, C_IN, &conv, C_MID, &bias);
-    // The second tile's front frames are the first tile's last two.
     let want_second = causal_conv3d_ref(
         &whole[half..],
         &whole[..half],
@@ -791,8 +727,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         C_MID,
         &bias,
     );
-    // And the cache matters: a second tile that saw zero front frames would
-    // answer something else, so agreement below is agreement about the slot.
     let cold_second = causal_conv3d_ref(&whole[half..], &zeros, tile, C_IN, &conv, C_MID, &bias);
     assert!(
         want_second
@@ -823,7 +757,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     let tile_box = boxed(tile);
     let small_box = boxed(small);
 
-    // Fire 1: the first tile alone.
     let answered = shell
         .fire_voxels(
             &[lane(0)],
@@ -836,7 +769,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         .expect("the first tile fires");
     close("first tile", &answered[0].0, &want_first);
 
-    // Fire 2: the second tile on slot 0, a fresh clip on slot 1, together.
     let answered = shell
         .fire_voxels(
             &[lane(0), lane(1)],
@@ -857,7 +789,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     close("second tile", &answered[0].0, &want_second);
     close("fresh clip beside it", &answered[1].0, &want_other);
 
-    // Reopening the slot zeroes its frames: the first tile again answers as a first tile.
     shell.open(0).expect("slot 0 reopens");
     let answered = shell
         .fire_voxels(

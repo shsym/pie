@@ -1,4 +1,4 @@
-//#include "common/bf16.inc.wgsl"
+
 
 const PIE_LANES = 32u;
 const PIE_SLICES = 2u;
@@ -104,4 +104,3 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
-// pie:instantiate nvfp4_qmv_bf16

@@ -1,8 +1,6 @@
 """Replay a `diagnostics = "route-dump=<path>"` route trace per slab under LRU, clock, LFU and Belady at several seat counts: `python3 scripts/dsv4_route_replay.py routes.tsv`."""
 import sys, collections
 lines=[l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
-# The dump holds two loads back to back (run-1, run-2); the slab index restarts at 0 each fire.
-# Each cut = one line per token row. Group by slab in order.
 per={}
 for slab, ids in lines:
     ids=[int(x) for x in ids.split() if int(x)>=0]
@@ -12,7 +10,6 @@ def sim(seq, S, policy):
     """seq: list of cuts (list of ids). Returns misses. Initial seats = identity 0..S-1."""
     misses=0
     if policy=="belady":
-        # next-use index per expert
         nxt=collections.defaultdict(list)
         for t,ids in enumerate(seq):
             for e in set(ids): nxt[e].append(t)
@@ -21,11 +18,10 @@ def sim(seq, S, policy):
         for t,ids in enumerate(seq):
             want=set(ids)
             for e in want:
-                ptr[e]+=1  # consumed this use
+                ptr[e]+=1
             for e in want:
                 if e in seats: continue
                 misses+=1
-                # evict the seated expert not wanted now whose next use is farthest
                 cand=[x for x in seats if x not in want]
                 def nextuse(x):
                     l=nxt.get(x,[]); i=ptr.get(x,0)
@@ -34,7 +30,7 @@ def sim(seq, S, policy):
                 seats.remove(victim); seats.add(e)
         return misses
     if policy in ("lru","lfu","lrfu"):
-        seats=collections.OrderedDict((e,0) for e in range(S))  # insertion order = recency
+        seats=collections.OrderedDict((e,0) for e in range(S))
         freq=collections.Counter()
         for t,ids in enumerate(seq):
             want=set(ids)
@@ -46,7 +42,7 @@ def sim(seq, S, policy):
                 cand=[x for x in seats if x not in want]
                 if policy=="lru": victim=cand[0]
                 elif policy=="lfu": victim=min(cand,key=lambda x:(freq[x],list(seats).index(x)))
-                else:  # lrfu: score = freq * decay by recency rank
+                else:
                     order={x:i for i,x in enumerate(seats)}
                     victim=min(cand,key=lambda x: freq[x]*(0.9**(len(seats)-order[x])))
                 del seats[victim]; seats[e]=0

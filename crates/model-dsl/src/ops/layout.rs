@@ -1,14 +1,5 @@
-//! The `Layout` family: the embedding gather and the shape-only splits and
-//! selects that move rows around without touching their values.
-
 use super::*;
 
-/// A gather lands on its ids' axis: `y` carries `ids`' row space, not
-/// `Dim::Tokens`.
-///
-/// `Layout::EmbedConcat`: `y[r] = table[ids[r, 0]] ++ ... ++ table[ids[r,
-/// heads-1]]` — the PLE n-gram read, every hashed head's row side by side.
-/// `ids` is `[rows, heads]` i32; `heads` is read off its width.
 pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
     let r = ids.rec();
     let y = r.fresh(tensor(
@@ -43,12 +34,6 @@ pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
     y
 }
 
-/// The gather that interpolates: `y[r] = sum_t weights[r, t] * table[ids[r, t]]`.
-///
-/// The tower's learned position grid is resampled to each image's grid, so a
-/// patch row reads `taps` rows under `taps` weights (`ids`/`weights` are
-/// `[Dim::Patches, taps]`, `taps` read off their width). The native grid uses
-/// [`embed`] instead, since the resample there is the identity.
 pub fn embed_weighted(ids: &Value, weights: &Value, table: &Weight, vocab: u32) -> Value {
     let r = ids.rec();
     let y = r.fresh(tensor(ids.rows(), table.dim(1), table.compute_dtype()));
@@ -118,8 +103,6 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
-/// `y[i] = x[rows[i]]`: the rows a reader takes, compacted out of the token
-/// rectangle so the head that follows runs over them alone.
 pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(Dim::Readouts, x.width(), x.dtype()));
@@ -149,10 +132,6 @@ pub fn select(table: &Value, layer: u32, width: u32) -> Value {
     y
 }
 
-/// The spatial pool: the mean of every `side * side` consecutive rows of `x`,
-/// one output row each. `side == 1` is the identity. The result carries `x`'s
-/// type and row space, with its leading `rows / side^2` rows written; this
-/// relies on the submission laying each `side * side` square out contiguously.
 pub fn pool_rows(x: &Value, side: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -167,11 +146,6 @@ pub fn pool_rows(x: &Value, side: u32) -> Value {
     y
 }
 
-/// The merging fold: every `side * side` consecutive rows of `x` laid end to
-/// end, one output row of `side^2` times the width. The result is
-/// `[Dim::Patches, side^2 * width]` with its leading `rows / side^2` rows
-/// written; the rest want a `-1` in `patch_routes` (see [`scatter_live_rows`]).
-/// Whether the norm goes before or after this call is checkpoint-specific.
 pub fn merge_rows(x: &Value, side: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(tensor(
@@ -190,11 +164,6 @@ pub fn merge_rows(x: &Value, side: u32) -> Value {
     y
 }
 
-/// The per-row argmax of each of `xs`, side by side: `[rows, xs.len()]` i32.
-/// `argmax(&[&logits])` is the token a draft chain feeds its next step;
-/// `argmax(&[&l0, &l1, &l2])` is the `[rows, depth]` drafts plane
-/// [`seam::MTP_DRAFTS`](crate::seam::MTP_DRAFTS) exports. Every `xs` shares
-/// one row space.
 pub fn argmax(xs: &[&Value]) -> Value {
     let first = xs.first().expect("an argmax over at least one value");
     let r = first.rec();
@@ -209,9 +178,6 @@ pub fn argmax(xs: &[&Value]) -> Value {
     y
 }
 
-/// The `k` largest entries of every row, sorted descending — `(values
-/// [rows, k] f32, indices [rows, k] i32)`. Ties to the lower column, a NaN
-/// never chosen: the argmax rule, so the first column IS [`argmax`].
 pub fn topk(x: &Value, k: u32) -> (Value, Value) {
     let r = x.rec();
     let values = r.fresh(tensor(x.rows(), u64::from(k), Dtype::F32));
@@ -228,12 +194,6 @@ pub fn topk(x: &Value, k: u32) -> (Value, Value) {
     (values, indices)
 }
 
-/// [`scatter_rows`] plus a negative `routes` entry meaning "this row has no
-/// destination" — what a compacting fold ([`pool_rows`], [`merge_rows`])
-/// owes the scatter, since `routes` has one entry per row of the full
-/// rectangle but the fold only writes `rows / side^2` of them. The plain
-/// scatter still refuses a negative route; only a plan declaring this op
-/// admits the sentinel.
 pub fn scatter_live_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     let r = y.rec();
     let y_out = r.fresh(y.ty().clone());
@@ -249,10 +209,6 @@ pub fn scatter_live_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     y_out
 }
 
-/// The tower's rows written into the token rows the image placeholders
-/// occupy. `src` is a patch rectangle, `y` a token one, `routes` says which
-/// token row each tower row lands in. Returns a fresh `Value` aliased onto
-/// `y`'s slot: a scatter writes only some rows, the rest are `layout.embed`'s.
 pub fn scatter_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     let r = y.rec();
     let y_out = r.fresh(y.ty().clone());
@@ -268,10 +224,6 @@ pub fn scatter_rows(src: &Value, routes: &Value, y: &Value) -> Value {
     y_out
 }
 
-/// The gather that packs rows by attention group: `y[i] = x[perm[i]]`,
-/// `perm` being the arm's `Input::row_permutation`. `y` keeps `x`'s type —
-/// same row space, same width, same dtype; only the order changes, so a
-/// group's lanes land contiguous for [`super::attn::ragged`].
 pub fn pack_rows(x: &Value, perm: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it packs");
@@ -287,9 +239,6 @@ pub fn pack_rows(x: &Value, perm: &Value) -> Value {
     y
 }
 
-/// [`pack_rows`] undone: the scatter `y[perm[i]] = x[i]` over the same
-/// permutation, landing packed rows back on their fire rows. `y` keeps
-/// `x`'s type.
 pub fn unpack_rows(x: &Value, perm: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it unpacks");

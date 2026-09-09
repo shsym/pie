@@ -5,43 +5,16 @@
 
 namespace pie::elemwise {
 
-/// **THE MODULATION A DiT BLOCK IS BUILT OUT OF** (`.wiki/imagegen/design.md`
-/// D6). An adaLN block does nothing to a row that is not one of three
-/// shapes: `x·(1+s)+b`, `x·(1+s)`, and `tanh(g)·x`. All three read the same
-/// `m` rectangle and differ only in what they take out of it, so they are one
-/// kernel under a form flag rather than three files.
-///
-/// **WHERE `m`'S ROW COMES FROM IS THE OP'S ONE REAL DECISION.** A modulation
-/// vector is per SAMPLE (`[lanes, k·D]`, the adaLN MLP's output for the
-/// lane's timestep) or per TOKEN (`[rows, k·D]`, Wan-TI2V/LTX per-token
-/// timesteps, MiniMax's modality tags). `lane_of_row` is the difference: a
-/// `[rows]` i32 plane holding each row's lane — `RequestOfToken` — and its
-/// absence means "`m` is indexed by the row itself". The lane it yields is an
-/// ABSOLUTE lane id, so a body replayed above lane zero reads the right
-/// vector without the lane words.
 constexpr int kModScaleShift = 0;
 constexpr int kModScale = 1;
 constexpr int kModTanhGate = 2;
 
-/// Which row of `m` this row reads: the lane the map names, or the row
-/// itself when no map is bound.
 __device__ __forceinline__ int modulation_row(
     const i32* __restrict__ lane_of_row, int row)
 {
     return lane_of_row != nullptr ? lane_of_row[row] : row;
 }
 
-/// `o = x·(1+s)+b` / `x·(1+s)` / `tanh(g)·x`, one block per row.
-///
-/// The scale and the shift are ONE `fmaf` — the fused multiply-add is the
-/// arithmetic this op states, not an accident of `--fmad=true`, so the host
-/// reference is `mul_add` and the two agree to the bit. Everything else is
-/// f32 in, f32 out, one rounding at the store. `o` may alias `x`: every
-/// thread reads its own columns before it writes them.
-/// `TM` is the modulation plane's element: `T` itself, or `float` when the
-/// vector arrives from a lane chain kept in f32 (the timestep embedding's
-/// linear lands f32). The arithmetic is f32 either way; only the read
-/// changes, so `m` in f32 is exact and `m` in `T` rounds once at its store.
 template <class T, class TM, int FORM>
 __global__ void modulate(
     const T* __restrict__ x,
@@ -53,13 +26,9 @@ __global__ void modulate(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (`rmsnorm_row`'s idiom, one block per row): a
-    // replay whose grid was carved at a bucket retires its padded rows here,
-    // off a word the fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `x`, `o` and the `[rows]`
-    // lane map arrive at their plane base. `m` does NOT move — it is keyed by
-    // the lane id that map yields, or by the row in the same frame.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const T* xr = x + static_cast<long long>(row) * width;
@@ -80,13 +49,6 @@ __global__ void modulate(
     }
 }
 
-/// **THE GATED RESIDUAL**: `r_out = r + g·y`, the write every DiT sub-block
-/// ends with (`x += gate_msa · attn`). One `fmaf` and one rounding, so a
-/// chain of them accumulates no more error than the reference's.
-///
-/// `g` reads its row the way `modulate`'s `m` does — per lane through
-/// `lane_of_row`, or per token without it. `r_out` may alias `r`; that is the
-/// in-place form the IR spells by aliasing the output onto the input.
 template <class T, class TM>
 __global__ void gated_residual_add(
     const T* __restrict__ r,
@@ -113,33 +75,10 @@ __global__ void gated_residual_add(
     }
 }
 
-/// Which norm the fused pass runs. `kNormLayer` is LayerNorm with no affine
-/// at all (the modulation IS the affine), `kNormRmsNoScale` the same for the
-/// rms family, `kNormRmsWeight` the rms norm that still carries a weight
-/// bank in front of the modulation (LTX's QK-norm shape).
 constexpr int kNormLayer = 0;
 constexpr int kNormRmsNoScale = 1;
 constexpr int kNormRmsWeight = 2;
 
-/// **NORM THEN MODULATE, ONE ROW REDUCTION AND ONE PASS** — and, when
-/// `GATED`, the residual fold in front of it (the deferred-residual form the
-/// FLUX.2/LTX references write as `x += gate·y; h = norm(x)·(1+s)+b`).
-///
-/// **THE RESIDUAL IS BIT-EQUAL TO THE UNFUSED WRITE AND THE MOMENTS ARE
-/// TAKEN OVER IT** — `residual_add_rmsnorm`'s discipline one file over: the
-/// sum is rounded to `T`, stored, and reduced in that rounded form, so a
-/// trace that fuses lands what the two launches land rather than something
-/// nearby.
-///
-/// The NORMED row, by contrast, stays in f32 all the way to the modulation's
-/// single rounding — `layernorm`'s argument: the intermediate the unfused
-/// chain rounds is a storage type this kernel does not have, and reproducing
-/// its rounding would be reproducing an artifact. The two therefore agree to
-/// about one bf16 ulp on `o`, not to the bit.
-///
-/// LayerNorm reduces TWICE (mean, then centred squares) and not once through
-/// `E[x²]-E[x]²`, for `layernorm_row`'s reason: a row whose mean is large
-/// against its spread cancels catastrophically in f32.
 template <class T, class TM, int BLOCK, int NORM, bool GATED>
 __device__ __forceinline__ void norm_modulate_row(
     const T* __restrict__ src,
@@ -164,8 +103,6 @@ __device__ __forceinline__ void norm_modulate_row(
     const TM* mr = m + static_cast<long long>(mrow) * m_width;
     T* orow = o + static_cast<long long>(row) * width;
 
-    // The normed row's storage: the residual plane when this pass folds one
-    // (it must be written anyway), the source plane otherwise.
     const T* normed = GATED ? residual + static_cast<long long>(row) * width
                             : src + static_cast<long long>(row) * width;
 

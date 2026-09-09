@@ -35,7 +35,6 @@ PROMPTS = [
     ("chat", "<start_of_turn>user\nWhat is 17 times 23?<end_of_turn>\n<start_of_turn>model\n"),
 ]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
@@ -65,11 +64,9 @@ def main():
     for probe in probes:
         name, ids = probe["name"], probe["ids"]
         started = time.time()
-        # Teacher-forced: one forward over the prompt, every position's logits.
         tf = model(mx.array([ids]))[0].astype(mx.float32)
         mx.eval(tf)
         np.asarray(tf).astype(np.float32).tofile(os.path.join(args.out, f"{name}.ref.tf.f32"))
-        # Greedy: the prompt through a cache, then one token a step.
         cache = make_prompt_cache(model)
         out = model(mx.array([ids]), cache=cache)[0, -1].astype(mx.float32)
         mx.eval(out)
@@ -88,7 +85,6 @@ def main():
             open(os.path.join(args.out, f"{name}.ref.json"), "w"),
         )
         print(f"{name}: {len(ids)} tokens, gen={gen[:12]} -> {tokenizer.decode(gen)!r}  ({time.time() - started:.1f}s)")
-
 
 if __name__ == "__main__":
     main()

@@ -4,34 +4,6 @@
 
 namespace pie::attn {
 
-/// **THE RAGGED PREFILL'S SCHEDULE, BUILT ON THE DEVICE** — the work-item
-/// tables `BatchPrefillWithRaggedKVCacheKernel` walks, enumerated from the
-/// group table itself so `attention.ragged` needs no host plan.
-///
-/// The paged prefill arms read their indptrs on the host and stage a
-/// schedule per fire (`sched_prefill`). The ragged arm cannot: its group
-/// tables are device tensors handed to the entry, and the fire path may not
-/// read the device. So one block does the planner's arithmetic here, before
-/// the attention launch on the same stream — a launch, hence capturable.
-///
-/// Work item `i` is one (group, query tile) pair: group `g` with `q_len`
-/// query rows owns `ceil(q_len * group_size / cta_tile_q)` tiles of packed
-/// (row, head) pairs, the same packing FlashInfer's own planner uses. The
-/// kv axis is never split (`partition_kv` is false), so `kv_tile_indices`
-/// is all zeros and `kv_chunk_size` is a sentinel the kernel divides by but
-/// never acts on. Items past the live count up to `padded` — the count the
-/// grid was sized for — are retired through `block_valid_mask`, which the
-/// kernel checks before it reads anything else.
-///
-/// **The seat.** With `win` null, the table's `groups` are all live and
-/// begin at entry 0. With `win` armed (`[rows, row_origin, lanes,
-/// lane_origin]`), `win[2]` groups are live starting at entry `win[3]` of a
-/// table handed over whole: the row values inside `q_indptr` are plane rows
-/// already, so `win[1]` goes unread. That is `Reads::RowsAndLanes`.
-///
-/// Groups are walked in chunks of `blockDim.x`, each chunk's tile counts
-/// scanned in shared memory; a group then writes its own items. The total
-/// is a few hundred to a few thousand entries, so nothing here is tuned.
 __global__ void ragged_schedule(
     const i32* __restrict__ q_indptr,
     int groups,
@@ -72,7 +44,7 @@ __global__ void ragged_schedule(
         }
         scan[tid] = tiles;
         __syncthreads();
-        // Hillis-Steele inclusive scan over this chunk's tile counts.
+
         for (int stride = 1; stride < threads; stride <<= 1) {
             const int left = tid >= stride ? scan[tid - stride] : 0;
             __syncthreads();
@@ -97,7 +69,7 @@ __global__ void ragged_schedule(
         total += chunk_total;
     }
     if (total > padded) total = padded;
-    // The padding: retired items, with tables that name nothing.
+
     for (int item = total + tid; item < padded; item += threads) {
         request_indices[item] = 0;
         qo_tile_indices[item] = 0;

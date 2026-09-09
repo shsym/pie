@@ -29,13 +29,6 @@ __device__ __forceinline__ float block_reduce_sum_exact(float local, float* buf)
     return buf[0];
 }
 
-/// The two-barrier form: warp shuffles, one partial per warp through
-/// `buf[0 .. BLOCK / 32)`, the first warp finishing into `buf[BLOCK / 32]`
-/// (so `buf` is `BLOCK / 32 + 1` floats at least; every caller hands a
-/// `BLOCK`-float buffer). The result slot is apart from the partials so a
-/// second reduction over the same buffer cannot overwrite what a straggler
-/// of the first is still reading. Its summation order differs from the
-/// tree's; nothing here needs a fixed order, only a sum.
 template <int BLOCK>
 __device__ __forceinline__ float block_reduce_sum_fast(float local, float* buf)
 {
@@ -76,19 +69,9 @@ __device__ __forceinline__ void rmsnorm_row(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked. `heads` is how many
-    // blocks stand in one token row — 1 when the launch is one block per row,
-    // and the head count when the PER-HEAD launch flattened `rows x heads`
-    // into `blockIdx.x` — so the row this block stands in is `row / heads`
-    // (`rmsnorm_grouped_plus_one`'s idiom, one file down).
+
     if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: with a stage armed `x` and
-    // `y` arrive at the plane's base, so this block's slice is its block index
-    // shifted by that start — a WHOLE number of heads in the flattened frame;
-    // with none they arrive pre-shifted. `weight` is indexed by column and
-    // never moves, per-head or not: one head-wide plane serves every head.
+
     const int plane_row =
         win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
 
@@ -148,11 +131,6 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
-// The hyper-connection norm: moments per `group`-wide slice, scale by
-// `weight + 1` over the row's FULL width — the weight is indexed by the
-// slice, where the per-head norms share one plane across every head. One
-// block per (row, group), laid out as `rows x groups` consecutive blocks,
-// which is the same flattening `rows_per_head` launches.
 template <class T, int BLOCK = 256>
 __global__ void rmsnorm_grouped_plus_one(
     const T* __restrict__ x,
@@ -164,14 +142,9 @@ __global__ void rmsnorm_grouped_plus_one(
     const u32* __restrict__ win)
 {
     const int b = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): one block per (row,
-    // group), so the row this block stands in is `b / groups` — a replay
-    // carved at a bucket retires its padded rows off the word the fire staged.
+
     if (win != nullptr && b / groups >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those rows start, so the flattened slice this
-    // block owns moves by a WHOLE number of groups. `b % groups` is therefore
-    // unchanged by the shift, which is why the weight index keeps reading `b`:
-    // that plane is per-group, not per-row.
+
     const int gb = win != nullptr ? b + static_cast<int>(win[1]) * groups : b;
 
     const int tid = threadIdx.x;
@@ -261,9 +234,6 @@ __global__ void rmsnorm_vec8(
     }
 }
 
-// `y += x` in place, then `out = rmsnorm(y)`: the same bf16 rounding of the
-// sum `residual_add` lands, and the norm's moments taken over that rounded
-// row, so the pair lands what the two launches land.
 template <class T, int BLOCK, bool WEIGHT_PLUS_ONE>
 __global__ void residual_add_rmsnorm(
     const T* __restrict__ x,
@@ -275,7 +245,7 @@ __global__ void residual_add_rmsnorm(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
-    // The staged-geometry seat (rmsnorm_row's idiom, one block per row).
+
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
     const int tid = threadIdx.x;
@@ -304,8 +274,6 @@ __global__ void residual_add_rmsnorm(
     }
 }
 
-// The eight-wide form: `hidden` is a whole number of vectors and the row
-// planes are 16-byte aligned. One vector per thread per pass.
 template <int BLOCK, bool WEIGHT_PLUS_ONE>
 __global__ void residual_add_rmsnorm_vec8(
     const bf16* __restrict__ x,
@@ -380,17 +348,9 @@ __global__ void rmsnorm_no_scale(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked. `heads` is how many
-    // blocks stand in one token row — 1 for the whole-row launch, the head
-    // count for the PER-HEAD one that flattened `rows x heads` into
-    // `blockIdx.x` — so the row this block stands in is `row / heads`.
+
     if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: with a stage armed `x` and
-    // `y` arrive at the plane's base, so this block's slice is its block index
-    // shifted by that start, a whole number of heads in the flattened frame;
-    // with none they arrive pre-shifted.
+
     const int plane_row =
         win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
 
@@ -463,16 +423,9 @@ __global__ void rmsnorm_gated_f32_in(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked. `heads` is how many
-    // blocks stand in one token row — 1 for the whole-row launch, the head
-    // count for the PER-HEAD one that flattened `rows x heads` into
-    // `blockIdx.x` — so the row this block stands in is `row / heads`.
+
     if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `x`, `gate` and `y` are all
-    // row planes and move together, by a whole number of heads in the
-    // flattened frame; `weight` is indexed by column and stays.
+
     const int plane_row =
         win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
 
@@ -503,16 +456,6 @@ __global__ void rmsnorm_gated_f32_in(
     }
 }
 
-// `t = rmsnorm(x) * w0`, `y += t`, then, as the template says, `scaled = y *
-// s[0]` and `out = rmsnorm(scaled or y) * (w1 [+ 1])`: the launches
-// `rmsnorm`, `residual_add`, `scale` and `rmsnorm` land, from one block per
-// row. Every intermediate is rounded to `T` where its own launch would round
-// it, and both moments are summed in `rmsnorm_row`'s element order, so the
-// chain lands what the separate launches land (a `residual_add_rmsnorm`
-// pair excepted, whose vectorised sum runs another order). The row rides in
-// registers between the phases — `PER_THREAD` elements a thread, `hidden`
-// no wider than `BLOCK * PER_THREAD` — so global memory is read once and
-// written once; the host falls back to the launches themselves past that.
 template <class T, int BLOCK, int PER_THREAD, bool SCALE, bool POST, bool POST_PLUS_ONE>
 __global__ void rmsnorm_residual_add(
     const T* __restrict__ x,
@@ -529,7 +472,7 @@ __global__ void rmsnorm_residual_add(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
-    // The staged-geometry seat, one block per row (`rmsnorm_row`'s idiom).
+
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
     const int tid = threadIdx.x;
@@ -538,7 +481,6 @@ __global__ void rmsnorm_residual_add(
     __shared__ float buf[BLOCK];
     __shared__ float buf2[BLOCK];
 
-    // Phase one: the source row and its moment, the stream row alongside.
     float xv[PER_THREAD];
     float yv[PER_THREAD];
     float local = 0.f;
@@ -555,11 +497,9 @@ __global__ void rmsnorm_residual_add(
     }
     const float sum0 = block_reduce_sum_fast<BLOCK>(local, buf);
     const float inv0 = rsqrtf(sum0 / static_cast<float>(hidden) + eps0);
-    // `scale` reads its one-element plane where it is.
+
     const float sf = SCALE ? Elem<T>::to_f32(s[0]) : 1.f;
 
-    // Phase two: the normed row, the fold, the scale — each rounded as its
-    // own launch rounds it — and the second moment over what the chain made.
     float last[PER_THREAD];
     float local2 = 0.f;
 #pragma unroll
@@ -597,14 +537,6 @@ __global__ void rmsnorm_residual_add(
     }
 }
 
-// The eight-wide form of `rmsnorm_residual_add`: bf16 rows that are a whole
-// number of vectors on 16-byte aligned planes, `CHUNKS` vectors a thread.
-// Same phases and the same per-element rounding as the scalar form; the
-// moments are summed eight elements a thread then across warps by
-// `block_reduce_sum_fast`, so `inv_rms` can differ from the scalar form's in
-// its last bit. 16-byte loads and stores, two barriers a moment instead of
-// five: at 64 rows of 2560 this is the difference between a kernel bound by
-// its own instruction latency and one bound by the memory it moves.
 template <int BLOCK, int CHUNKS, bool SCALE, bool POST, bool POST_PLUS_ONE>
 __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     const bf16* __restrict__ x,
@@ -638,7 +570,6 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     __shared__ float buf[BLOCK / 32 + 1];
     __shared__ float buf2[BLOCK / 32 + 1];
 
-    // Phase one: the source row and its moment, the stream row alongside.
     float xv[CHUNKS][8];
     float yv[CHUNKS][8];
     float local = 0.f;
@@ -671,8 +602,6 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_residual_add_vec8(
     const float inv0 = rsqrtf(sum0 / static_cast<float>(hidden) + eps0);
     const float sf = SCALE ? Elem<bf16>::to_f32(s[0]) : 1.f;
 
-    // Phase two: the normed row, the fold, the scale — each rounded as its
-    // own launch rounds it — and the second moment over what the chain made.
     float last[CHUNKS][8];
     float local2 = 0.f;
 #pragma unroll
@@ -740,18 +669,13 @@ __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n
                              int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `i` is the element already.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr
         ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
         : i;
-    // Both planes are one row per token on the axis the guard counts, so both
-    // read the shifted element.
+
     const float a = Elem<T>::to_f32(y[at]);
     const float b = Elem<T>::to_f32(x[at]);
     y[at] = Elem<T>::from_f32(a + b);
@@ -762,39 +686,29 @@ __global__ void mul_scalar(T* __restrict__ x, float s, usize n,
                            int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `i` is the element already.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr
         ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
         : i;
-    // The scalar is a launch argument and moves with nothing.
+
     const float s_rounded = Elem<T>::to_f32(Elem<T>::from_f32(s));
     x[at] = Elem<T>::from_f32(Elem<T>::to_f32(x[at]) * s_rounded);
 }
 
-// silu(s * x), in place: the scalar sits INSIDE the activation, which is
-// what keeps this from being `mul_scalar` composed with anything.
 template <class T>
 __global__ void silu_scaled(T* __restrict__ x, float s, usize n,
                             int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `i` is the element already.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr
         ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
         : i;
-    // The scalar is a launch argument and moves with nothing.
+
     const float v = Elem<T>::to_f32(x[at]) * s;
     x[at] = Elem<T>::from_f32(v / (1.f + __expf(-v)));
 }
@@ -804,24 +718,17 @@ __global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n,
                       int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `i` is the element already.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr
         ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
         : i;
-    // `s` is a one-element plane, not a row plane, and is read where it is.
+
     const float f = Elem<T>::to_f32(s[0]);
     x[at] = Elem<T>::from_f32(Elem<T>::to_f32(x[at]) * f);
 }
 
-// The bias plane may be narrower than the rows it lands on: an f32 lane
-// vector (a timestep MLP) biased by the checkpoint's bf16 weight. Both are
-// read as f32 and the sum rounds once at the store.
 template <class T, class TB = T>
 __device__ __forceinline__ void add_bias_row(
     T* __restrict__ row,
@@ -842,12 +749,9 @@ __global__ void add_bias(
     const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `out` is a row plane handed
-    // at its base, `bias` is one row wide and indexed by column.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     add_bias_row<T, TB>(out + static_cast<long long>(row) * dim, bias, dim);
@@ -862,10 +766,7 @@ __global__ void standardize(
 {
     T* __restrict__ row = out + static_cast<long long>(blockIdx.x) * dim;
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        // Centred and scaled in f32, as the reference is: the pooler's
-        // sqrt(hidden) scaling has already expanded the magnitude and the
-        // bias subtraction is what brings it back, so the difference is
-        // taken before anything is rounded to T.
+
         const float v = (Elem<T>::to_f32(row[d]) - Elem<T>::to_f32(bias[d]))
                       * Elem<T>::to_f32(scale[d]);
         row[d] = Elem<T>::from_f32(v);
@@ -917,13 +818,9 @@ __global__ void res_blend(
     const u32* __restrict__ win)
 {
     const i32 t = static_cast<i32>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<i32>(win[0])) return;
-    // And `win[1]` is where those live rows START: with a stage armed the
-    // pointers arrive at the plane's base, so the row this block owns is its
-    // block index shifted by that start; with none they arrive pre-shifted.
+
     const i32 row = win != nullptr ? t + static_cast<i32>(win[1]) : t;
 
     __shared__ float scratch[kThreads / 32];
@@ -996,12 +893,9 @@ __global__ void rmsnorm_gated_by(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `o`, `g` and `out` share
-    // one `[rows, H, D]` addressing and move together; `weight` is per-`d`.
+
     const int row = win != nullptr ? t + static_cast<int>(win[1]) : t;
 
     const int h = blockIdx.y;
@@ -1012,8 +906,7 @@ __global__ void rmsnorm_gated_by(
         const float x = o[base + d];
         acc += x * x;
     }
-    // The warps' partials meet in a fixed order (not a float `atomicAdd`,
-    // whose arrival order moved the rounding from fire to fire).
+
     __shared__ float warp_sums[32];
     __shared__ float ssum;
 

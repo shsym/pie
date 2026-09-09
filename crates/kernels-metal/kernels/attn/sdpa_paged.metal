@@ -86,15 +86,6 @@ inline void sdpa_paged_decode_body(
   const int r          = req_of_token[row];
   const int q_pos      = position_ids[row];
 
-  // **THE WINDOW INT CARRIES THE CAUSALITY** (`kernels-metal::attn`'s
-  // `encoded_window`). `None` is 0 and a stated extent is positive, so the
-  // negative half says something else: `-(extent + 1)` means the row's MASK
-  // is authoritative and the causal upper bound must not apply — a
-  // bidirectional read, which a block drafter's full-attention layer needs.
-  // The lower bound is the window's either way.
-  // A ROW'S OWN MASK WORD says the same thing per row: 0 no mask, 1 a mask
-  // under the causal bound, 2 a mask that is authoritative — a bidirectional
-  // lane (a denoiser's canvas) beside causal lanes in one fire.
   const int mask_word  = FAST_FULL ? 0 : int(attention_mask_enabled[row]);
   const bool wide      = window < 0 || mask_word == 2;
   const int  extent    = window < 0 ? (-window - 1) : window;
@@ -140,10 +131,7 @@ inline void sdpa_paged_decode_body(
   };
 
   const int stride = PAGE_SIZE == 0 ? page_size : PAGE_SIZE;
-  // How far the walk runs. Causally that is the row's own position; when the
-  // mask is authoritative it is every cell this request's pages hold, and the
-  // mask does the bounding — which it can, because a non-causal read always
-  // states one, and a cell past the sequence reads a zero there.
+
   const int last_kp = wide
       ? int(kv_page_indptr[r + 1] - uint(page_base)) * stride - 1
       : q_pos;
@@ -425,10 +413,7 @@ inline void sdpa_paged_tiled_body(
   }
 
   const int q_pos     = live ? position_ids[row] : 0;
-  // The window int's negative half says the row's mask is authoritative and
-  // the causal upper bound must not apply; see the decode body above.
-  // Mask word 2: this row's mask is authoritative, no causal upper bound
-  // (a bidirectional lane); see the entry above.
+
   const int mask_word = live ? int(attention_mask_enabled[row]) : 0;
   const bool wide     = window < 0 || mask_word == 2;
   const int  extent   = window < 0 ? (-window - 1) : window;
@@ -444,12 +429,6 @@ inline void sdpa_paged_tiled_body(
     int sub_hi = sub + 1;
     while (sub_hi < QT && row_lo + sub_hi < n_rows && req_of_token[row_lo + sub_hi] == r) sub_hi++;
 
-    // The key range these rows read. Causally it ends at the last row's own
-    // position; when the mask is authoritative it runs to the end of this
-    // request's pages and the mask does the bounding (the decode body above
-    // says why that is safe).
-    // The group's walk runs to the request's page extent when the node reads
-    // wide or any row of the group carries mask word 2.
     bool wide_here = window < 0;
     const int extent_here = window < 0 ? (-window - 1) : window;
     int kp_hi = 0;

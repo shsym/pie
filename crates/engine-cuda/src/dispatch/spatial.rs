@@ -1,17 +1,3 @@
-//! `Spatial` (design D8): the voxel axis's family, one arm per member over
-//! `kernels_cuda::spatial`. Every launch takes the fire's whole clip table
-//! and finds a row's lane itself (`crate::voxels`), so an arm resolves each
-//! operand whole and hands it over; the grid a member reads and the grid
-//! it writes are both plan values (`spatial.grid` derives the second on
-//! the device ahead of the member that reads it).
-//!
-//! The causal convolution's frame cache is three launches: the lanes'
-//! slots gathered into a `[Σ frames·h·w, C_in]` scratch rectangle, the
-//! convolution reading it as its front frames, and this tile's last
-//! `frames` input frames stored back into the slots — so a chunked decode
-//! carries state across fires in the slot the sequence owns, zeroed with
-//! every other state row when the slot is opened fresh.
-
 use kernels_cuda::spatial;
 use kernels_cuda::tensor::Tensor;
 use model_exec::{DispatchSpatial, KernelError};
@@ -25,7 +11,6 @@ impl DispatchSpatial for Run<'_> {
     }
 }
 
-/// The block a spatial attention segments by, in the kernel's spelling.
 fn segment(segment: VoxelSegment) -> spatial::Segment {
     match segment {
         VoxelSegment::Clip => spatial::Segment::Lane,
@@ -62,8 +47,6 @@ fn rule(rule: GridRule) -> spatial::GridRule {
 }
 
 impl Run<'_> {
-    /// Arms in `kernels-cuda`'s error vocabulary, lifted by
-    /// [`kernel`](crate::error::kernel) above the match.
     fn spatial(&mut self, op: &Spatial) -> Result<(), kernels_cuda::Error> {
         match op {
             Spatial::Grid { grid, rule: how, y } => spatial::derive_grid(
@@ -114,7 +97,6 @@ impl Run<'_> {
                         self.tensor(*y_grid),
                     );
                 };
-                // The frame cache: gather, convolve, store.
                 let frames = conv.pad[0];
                 let pool = self.recurrent(*state);
                 let slot_ids = self
@@ -126,8 +108,6 @@ impl Run<'_> {
                              table, which no lane of it staged"
                                 .to_string(),
                     })?;
-                // Bounded above by `frames` copies of the input rectangle;
-                // the kernels read exactly `Σ frames·h·w` rows of it.
                 let rows = x.rows.saturating_mul(frames);
                 let bytes = u64::from(rows) * u64::from(x.width) * 2;
                 let scratch = self.ctx().scratch(
@@ -266,9 +246,6 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
             ),
-            // The store half of a causal convolution's cache with no
-            // convolution around it: this tile's last `frames` frames into
-            // each lane's slot, the answer aliasing the input.
             Spatial::CacheStore {
                 x,
                 grid,
@@ -288,13 +265,6 @@ impl Run<'_> {
                                 .to_string(),
                     })?;
                 let mut slab = pool.slab;
-                // `cache_store` reads its second rectangle only where a clip
-                // is SHORTER than the cache — the frames it cannot take from
-                // this tile it takes from the gathered old one. Nothing
-                // gathered an old cache here (there is no convolution to
-                // gather for), so the input stands in for it; the one caller
-                // stores ONE frame of a clip that has at least one, so that
-                // arm is never taken.
                 spatial::cache_store(
                     self.ctx(),
                     x,

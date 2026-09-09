@@ -1,6 +1,3 @@
-//! Pins `Fallback::Grouped`: one window over the union of the split arm's
-//! rectangles, with a segment list equal to the split arm's own spans.
-
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{CompiledModel, Budget, DeviceProfile, FamilyCosts, compile};
 use model_dsl::Platform;
@@ -9,16 +6,13 @@ use model_exec::fire::{Lane, compose};
 use model_ir::Trace;
 
 fn test_slots() -> engine_cuda::window::Slots {
-    // rows, kv spaces, pages ceilings — generous like the first four args.
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
 }
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-/// The op both profile lists are keyed on.
 const CORRECTION: &str = "linear.lora_correct";
 
-/// Adapter capacity the catalog can seat (32 fails compile for every SKU).
 fn budget() -> Budget {
     Budget {
         max_lanes: 256,
@@ -30,8 +24,6 @@ fn budget() -> Budget {
     }
 }
 
-/// Same withdrawal, two answers: `split` costs the correction cheap, `grouped`
-/// names it groupable, so only the fallback answer differs between the arms.
 fn arms() -> (DeviceProfile, DeviceProfile) {
     let split = DeviceProfile {
         family_us: FamilyCosts {
@@ -56,7 +48,6 @@ fn sku() -> (Trace, CompiledModel, CompiledModel) {
     (trace, split, grouped)
 }
 
-/// The fire's qo boundaries: one entry per lane plus the closing bound.
 fn indptr(rows: &[u32]) -> Vec<i32> {
     let mut out = vec![0i32];
     for &n in rows {
@@ -65,8 +56,6 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
     out
 }
 
-/// One lane per class; decode lanes get 1 row, prefill lanes get 3, to
-/// fragment the adapter window as much as possible.
 fn one_lane_per_class(compiled: &CompiledModel) -> Vec<Lane> {
     compiled
         .classes
@@ -76,8 +65,6 @@ fn one_lane_per_class(compiled: &CompiledModel) -> Vec<Lane> {
         .collect()
 }
 
-/// Segment lists are staged immediately after `indptr` in the same packed
-/// buffer; `packed` writes that layout and `bind` reads it.
 #[test]
 fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let (plan, _, grouped) = sku();
@@ -87,7 +74,6 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let mut windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
 
     let packed = windows.packed();
-    // Nonzero base so a missing offset shows up as wrong, not coincidentally right.
     const BASE: u64 = 0x1000;
     windows.bind(BASE);
 
@@ -130,4 +116,3 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
          layout under test is never exercised",
     );
 }
-

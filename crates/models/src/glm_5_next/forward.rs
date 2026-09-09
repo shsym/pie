@@ -5,10 +5,6 @@ use model_dsl::{
 use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model, Tower};
 use model_dsl::MropeForm;
 
-/// How a DSA mixer's rows are read: the trunk splits them on `qo_one` into
-/// a decode arm and a prefill arm; the draft head reads every row through
-/// the prefill (chunked) forms, since its rows already stand in one split
-/// arm (`drafts`) and a value may not sit in two.
 #[derive(Clone, Copy)]
 enum Arms {
     Split,
@@ -19,7 +15,6 @@ pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
     pub drafts: bool,
-    /// Lanes whose fire carries an image span.
     pub media: bool,
 }
 
@@ -28,13 +23,10 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// Rows whose request routed to a registered adapter; a fire with none
-    /// costs nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
 
-    /// Lanes that want the draft head run over their rows.
     pub fn drafts() -> Predicate {
         Predicate::fact(2)
     }
@@ -71,7 +63,6 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             match &w.mixer {
                 Mixer::Mla(a) => {
-                    // One space per layer: the compressor state is keyed by it.
                     let index = c.kv_space(self.kv);
                     c.kv(
                         kv,
@@ -87,7 +78,6 @@ impl ForwardHybrid for Model {
                         [k.conv_kernel as u64, 3 * width],
                         Dtype::Bf16,
                     );
-                    // The KDA recurrence keeps its state in f32 (`ssm_kda_*`).
                     c.state(
                         k.delta_state.clone(),
                         [k.heads as u64, k.head_dim as u64, k.head_dim as u64],
@@ -96,8 +86,6 @@ impl ForwardHybrid for Model {
                 }
             }
         }
-        // The draft head's rows: its own latent row in the trunk's page-id
-        // space (it attends the same sequence) and its own indexer keys.
         if let Some(mtp) = &self.mtp {
             let index = c.kv_space(self.kv);
             c.kv(
@@ -118,23 +106,15 @@ impl ForwardHybrid for Model {
         let m = self;
         let hy = &m.hyper;
 
-        // plan[0] is the decode schedule, plan[1] the prefill one; the mixer
-        // splits q by the same predicate, so each reader finds its own plan.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan = [
             ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
             ops::attn::mla_plan(&input_p, m.heads, m.kv_lora_rank),
         ];
         let positions = inputs.positions();
-        // Tower nodes must all be emitted before any trunk node, or
-        // `model_compiler` refuses the plan (`Error::UnitsInterleave`).
         let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
         let ids = inputs.tokens();
         let mut narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
-        // Tower rows written over the token rows the image placeholders
-        // occupy, BEFORE the streams fan out. `scatter_live_rows`, not a
-        // plain scatter: `merge_rows` compacts and the tail routes carry a
-        // `-1` sentinel.
         if let Some(t) = &towered {
             let (imaged, _) = narrow.split(&Facts::media());
             narrow =
@@ -155,8 +135,6 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // Must run after all_reduce: a rows-cut partial product would sum
-            // the correction tp times.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -166,8 +144,6 @@ impl ForwardHybrid for Model {
 
             let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
             let x = ops::elemwise::rmsnorm(&x, &w.mlp_norm, w.mlp_norm_eps);
-            // The next layer's router run on THIS layer's pre-MoE streams: a
-            // prediction the streamed tier prefetches by (dsv4's idiom).
             let hint = predict_next(&streams, m.layers.get(l as usize + 1), hy);
             let f = mlp(&x, &w.mlp, hint.as_ref());
             let f = if m.tp > 1 {
@@ -178,7 +154,6 @@ impl ForwardHybrid for Model {
             streams = ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix);
         }
 
-        // No trunk hyper head ships with this checkpoint, so the streams sum.
         let (mut y, mut rest) = ops::layout::split_rows(&streams, m.hidden);
         for _ in 1..hy.streams - 1 {
             let (stream, more) = ops::layout::split_rows(&rest, m.hidden);
@@ -190,18 +165,8 @@ impl ForwardHybrid for Model {
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let logits = ops::linear::lm_head(&x, &m.head);
 
-        // **THE DRAFT HEAD**, over the draft window's rows, off the trunk's
-        // collapsed residual `y` (the official `MTP` block takes the last
-        // layer's output, not the readout). **The head's token is the
-        // trunk's argmax**: the module is trained on `(y_i, t_{i+1}) →
-        // t_{i+2}`, and inside a verify fire the only `t_{i+1}` a row can
-        // name is the token the trunk just chose there — the same argmax the
-        // verifier reads, so the chain at the row it accepts continues its
-        // next window. Row alignment is the runtime's: lane row `r` carries
-        // the token one position past the residual the trunk leaves at `r`.
         if let Some(mtp) = &m.mtp {
             let (input_mtp, _) = inputs.split(&Facts::drafts());
-            // One prefill plan over every draft row (`Arms::Whole`).
             let plan_one = ops::attn::mla_plan(&input_mtp, m.heads, m.kv_lora_rank);
             let plan_mtp = [plan_one.clone(), plan_one];
             let (dy, _) = y.split(&Facts::drafts());
@@ -214,7 +179,6 @@ impl ForwardHybrid for Model {
                 let e = ops::layout::embed(&token, &m.embed, m.vocab);
                 let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
                 let h = ops::elemwise::rmsnorm(&hidden, &mtp.hnorm, mtp.norm_eps);
-                // `eh_proj([e; h])` as its two column halves.
                 let fused = ops::elemwise::residual_add(
                     &ops::linear::matmul(&e, &mtp.e_proj),
                     &ops::linear::matmul(&h, &mtp.h_proj),
@@ -244,8 +208,6 @@ impl ForwardHybrid for Model {
                 hidden = r;
                 chain.push(draft);
             }
-            // The token plane: every step's argmax side by side, `[rows,
-            // depth]`, what `mtp_drafts` reads.
             let steps: Vec<&Value> = chain.iter().collect();
             seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
@@ -253,13 +215,8 @@ impl ForwardHybrid for Model {
     }
 }
 
-/// Experts ranked per row for the streamed tier's prefetch: the top
-/// `PREDICT_K` of the next router's scores, read at the current router's cut.
 const PREDICT_K: u32 = 16;
 
-/// The next layer's routing, predicted off this layer's streams before its
-/// own MoE: the next layer's mlp gate, norm and router applied here. `None`
-/// where there is no next routed layer.
 fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper) -> Option<Value> {
     let next = next?;
     let Mlp::Routed {
@@ -333,8 +290,6 @@ fn mlp(x: &Value, mlp: &Mlp, hint: Option<&Value>) -> Value {
     }
 }
 
-/// `mla_use_nope`: nothing here ropes — `qk_rope_head_dim` is zero, so the
-/// latents, the query and the indexer all read their planes unrotated.
 fn mla_mixer(
     x: &Value,
     inputs: &Input<Facts>,
@@ -424,8 +379,6 @@ fn mla_mixer(
     ops::linear::matmul(&v, &a.o_proj)
 }
 
-/// `index_kpool_compress`: keys are the gated pool of every `kpool` tokens,
-/// so the ranked set is compressed rows, not tokens.
 fn index_select(
     x: &Value,
     q_a: &Value,
@@ -440,8 +393,6 @@ fn index_select(
     let write_offset = inputs.write_offset(&ix.keys);
     let row_valid = inputs.row_valid();
 
-    // GLM normalizes each key before pooling, so the norm runs per token here
-    // and the pooled entry is appended as gathered.
     let state_kv = ops::attn::index_layernorm_rope(
         &ops::linear::matmul(x, &ix.wk),
         positions,
@@ -494,8 +445,6 @@ fn index_select(
     )
 }
 
-/// The three boundary columns, decode and prefill merged: the cell each pooled
-/// entry is cached at, its lane, and the compressed row's position.
 fn boundaries(
     positions: &Value,
     row_valid: &Value,
@@ -544,7 +493,6 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
             )
         },
         {
-            // Chunked: the prefill's conv reads its own rows, not the state.
             let mixed = ops::attn::ssm_causal_conv1d_chunked(&qkv_p, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_chunked(
                 &mixed,
@@ -561,19 +509,13 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
         },
     ]);
 
-    // The output gate is low-rank here (`g_a_proj` then `g_b_proj`), not one plane.
     let g = ops::linear::matmul(&ops::linear::matmul(x, &k.g_a), &k.g_b);
     let o = ops::elemwise::rmsnorm_gated_by(&core, &g, &k.o_norm, k.heads, k.o_norm_eps);
     ops::linear::matmul(&o, &k.o_proj)
 }
 
-/// The vision tower over every patch row of the fire, answering one merged
-/// row per `merge²` patches (`rows / merge²` live rows; the caller scatters
-/// them with `scatter_live_rows` and a `-1`-sentinel route vector).
 fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     let d = t.head_dim;
-    // Pre-unfolded patch vectors, the per-image indptr the bidirectional
-    // attention is block-diagonal over, and each patch's (t, h, w).
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
     let grid = inputs.patch_positions();
@@ -590,9 +532,6 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         );
         let q = ops::elemwise::rmsnorm_per_head(&q, &b.q_norm, d, t.norm_eps);
         let k = ops::elemwise::rmsnorm_per_head(&k, &b.k_norm, d, t.norm_eps);
-        // Two axes and no time: `rotary_pos_emb(head_dim / 2)` over (h, w),
-        // the (h, w) frequencies side by side and the pair repeated across
-        // the head, rotated by `rotate_half` — qwen's tower form.
         let (q, k) = ops::elemwise::rope_mrope(
             &q,
             &k,
@@ -617,8 +556,6 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         );
     }
     let y = ops::elemwise::rmsnorm(&y, &t.post_norm, t.norm_eps);
-    // The 2×2 downsample conv: one merge block's rows side by side, times
-    // the kernel laid out in the same `(kh, kw, c)` order.
     let folded = ops::layout::merge_rows(&y, t.merge);
     let y = ops::elemwise::add_bias(
         &t.downsample_bias,
@@ -633,8 +570,6 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     ops::linear::matmul(&a, &m.down)
 }
 
-/// `hc_gates` splits a `2M + M²` row into pre weights, post weights and the
-/// Sinkhorn combiner, from `rmsnorm(streams)` projected through `hc.fn`.
 fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = ops::elemwise::hc_project(&normed, &mix.dynamic, hy.streams);

@@ -1,11 +1,3 @@
-//! `sinusoid` answers `diffusers.get_timestep_embedding` at
-//! `downscale_freq_shift = 0`: `half = dim/2` frequencies
-//! `exp(−ln(max_period)·i/half)`, angle `scale·(t·freq)`, row `[sin | cos]`
-//! or flipped, odd widths zero-padded — against values transcribed from that
-//! function and against a host reference over a whole rectangle.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_sinusoid_embedding_matches_the_diffusers_formula`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -15,18 +7,10 @@ use dtype::Dtype;
 use kernels_cuda::elemwise::sinusoid;
 use kernels_cuda::tensor::Tensor;
 
-/// f32 in, f32 out through `expf`/`sincosf`: the answer is the reference's to
-/// within the float's own precision, not to a bf16 rounding.
 const TOLERANCE: f32 = 2e-6;
 
-/// The same claim over angles that are not small. The frequency is itself a
-/// transcendental, and the device's `expf` and the host's may differ by an
-/// ulp — which the angle's magnitude multiplies before the sine sees it, at a
-/// derivative of one. Nothing here is the kernel's error; a golden that
-/// pretended otherwise would be measuring two libms against each other.
 const TOLERANCE_AT_ANGLE: f32 = 1e-5;
 
-/// The host's own reading of the reference formula.
 fn reference(t: f32, dim: usize, max_period: f32, flip_sin_cos: bool, scale: f32) -> Vec<f32> {
     let half = dim / 2;
     let angles: Vec<f32> = (0..half)
@@ -76,10 +60,15 @@ fn within(got: &[f32], want: &[f32], tolerance: f32, what: &str) {
     }
 }
 
+fn the_sinusoid_embedding_matches_the_diffusers_formula_every_case() {
+    the_rows_are_the_ones_the_reference_prints();
+    an_odd_width_pads_its_last_column_with_zero();
+    flipping_puts_the_cosines_first_and_the_scale_multiplies_the_angle();
+    a_whole_rectangle_answers_the_host_reference();
+}
+
 #[test]
 fn the_rows_are_the_ones_the_reference_prints() {
-    // `max_period = 10000` over four frequencies makes the ladder exactly
-    // `[1, 1e-1, 1e-2, 1e-3]`, so these are `sin`/`cos` of round numbers.
     let got = run(&[1.0, 500.0], 8, 10_000.0, false, 1.0);
     agrees(
         &got[..8],
@@ -111,7 +100,6 @@ fn the_rows_are_the_ones_the_reference_prints() {
     );
 }
 
-#[test]
 fn an_odd_width_pads_its_last_column_with_zero() {
     let got = run(&[0.5], 5, 10_000.0, false, 1.0);
     agrees(
@@ -121,7 +109,6 @@ fn an_odd_width_pads_its_last_column_with_zero() {
     );
 }
 
-#[test]
 fn flipping_puts_the_cosines_first_and_the_scale_multiplies_the_angle() {
     let got = run(&[3.0], 6, 10_000.0, true, 2.0);
     agrees(
@@ -138,7 +125,6 @@ fn flipping_puts_the_cosines_first_and_the_scale_multiplies_the_angle() {
     );
 }
 
-#[test]
 fn a_whole_rectangle_answers_the_host_reference() {
     const ROWS: usize = 19;
     const DIM: usize = 64;

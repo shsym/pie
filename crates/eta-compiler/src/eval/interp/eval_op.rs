@@ -1,8 +1,3 @@
-//! One op, evaluated against already-evaluated operands. No channel state,
-//! no readiness, no instance: everything `eval_op` needs arrives as an
-//! argument, which is what lets `pareval` fold the same function over
-//! host-known values without a second evaluator.
-
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -48,8 +43,6 @@ pub(crate) fn eval_op(
         Op::Abs(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| a.abs()).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_abs()).collect()),
-            // spelled out rather than a `_ => clone()` wildcard, which would
-            // wrongly answer "abs is the identity" for a signed dtype added later.
             Value::U32(x) => Value::U32(x.clone()),
             Value::Bool(x) => Value::Bool(x.clone()),
         }),
@@ -295,7 +288,7 @@ pub(crate) fn eval_op(
             let src = ty_of(value).shape;
             One(broadcast_value(v(value), src, shape))
         }
-        Op::Reshape { value, .. } => One(v(value).clone()), // metadata only (row-major)
+        Op::Reshape { value, .. } => One(v(value).clone()),
         Op::Transpose(a) => {
             let t = ty_of(a);
             let [m, n] = *t.shape.dims() else {
@@ -310,8 +303,6 @@ pub(crate) fn eval_op(
             let rows = rows_of(ty_of(a).shape);
             let is_sum = matches!(op, Op::CumSum(_));
 
-            // scanned in the input's own dtype, not through f32: a u32
-            // offset scan past 2^24 is not representable in f32.
             match v(a) {
                 Value::I32(x) if is_sum => {
                     One(Value::I32(scan_rows(x, rows, 0, i32::wrapping_add)))
@@ -394,7 +385,6 @@ pub(crate) fn eval_op(
                     Predicate::RankLe(kid) => {
                         let kv = lanes_i64(v(kid));
                         let kk = kv[pick(kv.len(), r)].clamp(0, len as i64);
-                        // pinned: #strictly-greater < k (ties may admit > k)
                         for (i, &xi) in row.iter().enumerate() {
                             if xi.is_nan() {
                                 continue;
@@ -440,7 +430,7 @@ pub(crate) fn eval_op(
                     let base = i as usize * rest;
                     flat.extend(base..base + rest);
                 } else {
-                    flat.extend(std::iter::repeat_n(usize::MAX, rest)); // fill-0
+                    flat.extend(std::iter::repeat_n(usize::MAX, rest));
                 }
             }
             One(gather_flat_fill0(v(src), &flat))
@@ -528,9 +518,6 @@ pub(crate) fn eval_op(
         }
         Op::Iota { len } => One(Value::U32((0..len).collect())),
         Op::MaskApply { logits, mask } => {
-            // per-row over the last axis: the single packed mask broadcasts
-            // across rows; the bit index is the column `j % n`, never the
-            // flat element index. Per-row distinct masks use `select` instead.
             let n = ty_of(logits).shape.last_len().unwrap_or(1) as usize;
             let x = lanes_f32(v(logits));
             let Value::U32(words) = v(mask) else {
@@ -602,8 +589,6 @@ pub(crate) fn eval_op(
             shape,
             kind,
         } => {
-            // ambient-seed form: the per-fire seed is 0 here unless the
-            // harness overrides; ETA programs use rng_keyed instead.
             One(Value::F32(rng_ambient(
                 0,
                 stream,
@@ -686,7 +671,6 @@ pub(super) fn gather_flat(v: &Value, idx: &[usize]) -> Value {
     }
 }
 
-/// Flat gather where `usize::MAX` means fill-0.
 pub(super) fn gather_flat_fill0(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::F32(x) => Value::F32(
@@ -708,7 +692,6 @@ pub(super) fn gather_flat_fill0(v: &Value, idx: &[usize]) -> Value {
     }
 }
 
-/// Left-aligned broadcast replicate (v4-exact), dtype-preserving.
 pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) -> Value {
     let r = target.rank();
     let td = target.dims();

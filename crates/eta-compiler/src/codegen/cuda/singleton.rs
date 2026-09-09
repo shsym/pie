@@ -1,8 +1,3 @@
-//! `emit_singleton_region_cuda` — one launch per op.
-//!
-//! A thin wrapper: validate the entry name and the op tag, then append a
-//! single-thread `__global__` trampoline into the runtime's op switch.
-
 use crate::codegen::error::{EmitError, EmitterKind};
 use alloc::format;
 use alloc::string::String;
@@ -13,8 +8,6 @@ use super::runtime::singleton_runtime_source;
 
 const ENTRY: &str = include_str!("../../../runtime/cuda/ptir_m1_entry.cuh");
 
-/// `detail::valid_identifier` — the emitted entry must be a C identifier,
-/// because it is pasted straight into the generated source.
 pub fn valid_identifier(name: &str) -> bool {
     let alpha = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_';
     let mut bytes = name.bytes();
@@ -25,13 +18,10 @@ pub fn valid_identifier(name: &str) -> bool {
     }
 }
 
-/// `detail::supported_tag` — the C++ switch is generated from `PTIR_OP_LIST`,
-/// so the set is exactly the op table's tags.
 pub fn supported_tag(tag: u8) -> bool {
     OP_TABLE.iter().any(|entry| entry.tag == tag)
 }
 
-/// `emit_singleton_region_cuda`.
 pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
         return Err(EmitError::EntryNameNotCIdentifier(

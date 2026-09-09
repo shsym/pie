@@ -1,14 +1,7 @@
-//! **THE HOST HALF OF THE SPATIAL GOLDENS**: lane tables built from boxes,
-//! and f32 reference implementations of the voxel-axis kernels written the
-//! way the PyTorch modules they stand for are written — `Conv3d` over
-//! `[N, C, T, H, W]` with a lane for `N`, `GroupNorm`, `pixel_shuffle`.
-//! Shared by every `tests/the_*spatial*` sentence through `mod common;`.
-
 #![allow(dead_code)]
 
 use kernels_cuda::spatial::{Conv3d, TimePad};
 
-/// One lane's box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Box3 {
     pub t: usize,
@@ -30,8 +23,6 @@ impl Box3 {
     }
 }
 
-/// The `[lanes, 4]` i32 table for these boxes, lane after lane from row
-/// zero, and the total row count.
 pub fn table(boxes: &[Box3]) -> (Vec<i32>, usize) {
     let mut rows = 0usize;
     let mut out = Vec::with_capacity(boxes.len() * 4);
@@ -42,7 +33,6 @@ pub fn table(boxes: &[Box3]) -> (Vec<i32>, usize) {
     (out, rows)
 }
 
-/// The output boxes a convolution lands, per lane.
 pub fn out_boxes(conv: &Conv3d, boxes: &[Box3]) -> Vec<Box3> {
     boxes
         .iter()
@@ -55,12 +45,6 @@ pub fn out_boxes(conv: &Conv3d, boxes: &[Box3]) -> Vec<Box3> {
         .collect()
 }
 
-/// `torch.nn.functional.conv3d` in f32 over the voxel-row layout.
-///
-/// `x`: `[rows, c_in]`; `w_natural`: `[c_out][c_in][kt][kh][kw]` — the
-/// checkpoint's own order, so the reference never depends on the kernel's
-/// relabelling; `cache`: the causal front frames, `pad[0] * plane` rows per
-/// lane in lane order. Returns `[rows_out, c_out]`.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_ref(
     x: &[f32],
@@ -106,9 +90,6 @@ pub fn conv3d_ref(
                             }
                             if frame.is_none() {
                                 if ti as usize >= b.t {
-                                    // Behind the clip: only a symmetric
-                                    // replicating convolution reads a frame
-                                    // there (the last one).
                                     if conv.causal_t || !replicate {
                                         continue;
                                     }
@@ -148,7 +129,6 @@ pub fn conv3d_ref(
     o
 }
 
-/// `torch.nn.GroupNorm(groups, c)` per lane, in f64, then SiLU when asked.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm_ref(
     x: &[f32],
@@ -200,9 +180,6 @@ pub fn group_norm_ref(
     y
 }
 
-/// einops `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'` per lane, on
-/// `[rows, c * r1*r2*r3]` rows: returns `[rows * r1*r2*r3, c]` and the
-/// output boxes.
 pub fn pixel_shuffle_ref(
     x: &[f32],
     boxes: &[Box3],
@@ -239,12 +216,6 @@ pub fn pixel_shuffle_ref(
     (y, outs)
 }
 
-/// The inverse: `[rows, c]` over boxes into `[rows / vol, c * vol]` over
-/// the boxes divided by `r`.
-/// `AvgDown3D` in f32, written the way the diffusers module is: zero-pad
-/// the time axis IN FRONT to a multiple of `r[0]`, `view` + `permute(0, 1,
-/// 3, 5, 7, 2, 4, 6)` into `C·r1·r2·r3` channels, then
-/// `view(.., out_c, group, ..).mean(dim=2)`.
 pub fn avg_down_ref(
     x: &[f32],
     boxes: &[Box3],
@@ -342,7 +313,6 @@ pub fn pixel_unshuffle_ref(
     (y, outs)
 }
 
-/// Nearest upsample by `f`, with the causal VAEs' first-frame rule.
 pub fn upsample_ref(
     x: &[f32],
     boxes: &[Box3],
@@ -387,9 +357,6 @@ pub fn upsample_ref(
     (y, outs)
 }
 
-/// Relative-plus-absolute closeness for a bf16-rounded output: one bf16
-/// ulp at the value's magnitude (`2^-8`) with room for a different fp32
-/// summation order underneath.
 pub fn near(got: f32, want: f32, rel: f32, abs: f32) -> bool {
     (got - want).abs() <= rel * want.abs() + abs
 }

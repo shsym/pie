@@ -1,8 +1,3 @@
-//! pie:inferlet/system - runtime information (version, instance-id, username).
-//!
-//! Timing is the standard `wasi:clocks/monotonic-clock@0.3` import, not a
-//! host timer of this module's own.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 

@@ -38,9 +38,7 @@ __device__ __forceinline__ float bf16_to_f32(bf16 v) {
 
 __device__ __forceinline__ bf16 f32_to_bf16(float f) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    // One instruction (F2FP), round to nearest even — the same rounding as
-    // the arithmetic below; a NaN comes back canonical rather than with
-    // its payload, which nothing reads.
+
     unsigned short r;
     asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(r) : "f"(f));
     return bf16{r};
@@ -55,8 +53,6 @@ __device__ __forceinline__ bf16 f32_to_bf16(float f) {
 #endif
 }
 
-/// Two floats to one packed `bf16x2` word (`lo` in the low half), round to
-/// nearest even — one instruction on sm_80+.
 __device__ __forceinline__ unsigned int pack_bf16x2(float lo, float hi) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     unsigned int r;
@@ -155,9 +151,6 @@ struct Elem<f16> {
     static __device__ __forceinline__ f16 from_f32(float v) { return f32_to_f16(v); }
 };
 
-/// The identity element: a plane kept in f32 (a lane vector's chain — the
-/// timestep embedding and the adaLN modulation it feeds, design D6) reads
-/// and writes through the same `Elem` idiom the half planes do.
 template <>
 struct Elem<float> {
     static __device__ __forceinline__ float to_f32(float v) { return v; }

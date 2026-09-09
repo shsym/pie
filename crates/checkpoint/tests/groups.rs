@@ -1,12 +1,3 @@
-//! Groups: the loader's claim that a set of tensors is interchangeable.
-//!
-//! Two ways to write a group, and they are the two ways a checkpoint stores a
-//! repeated structure: as one fused bank indexed along an axis
-//! ([`Expr::select`]), or as separately named tensors distinguished by a number
-//! in the name ([`Expr::src_indexed`]). Everything else here is about the one
-//! guarantee the plan makes for both -- that instance `i` differs from instance
-//! 0 only in which bytes it reads.
-
 use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::contract::{Expr, GroupContract, ModelContract, TensorContract};
 use checkpoint::plan::{StorageInstr, StorageTarget, compile};
@@ -54,7 +45,6 @@ fn checkpoint(tensors: Vec<RawTensor>) -> Metadata {
     }
 }
 
-/// One `[E, ROWS, COLS]` bank, the way GPT-OSS and Qwen store their experts.
 fn fused_checkpoint() -> Metadata {
     checkpoint(vec![tensor(
         0,
@@ -64,7 +54,6 @@ fn fused_checkpoint() -> Metadata {
     )])
 }
 
-/// `EXPERTS` separately named tensors, the way DeepSeek and Mixtral store them.
 fn named_checkpoint() -> Metadata {
     let span = (ROWS * COLS) as u64 * DType::Bf16.bytes_ceil();
     checkpoint(
@@ -94,8 +83,6 @@ fn group(expr: Expr) -> GroupContract {
     }
 }
 
-/// The same group, declared at the fused bank's rank: a selected band keeps
-/// the axis it was selected along, with an extent of one.
 fn banded(expr: Expr) -> GroupContract {
     let mut g = group(expr);
     g.tensors[0].shape = Some(vec![1, ROWS, COLS]);
@@ -110,8 +97,23 @@ fn contract(group: GroupContract) -> ModelContract {
     }
 }
 
-/// Selecting index `i` out of a fused bank: the group's expression drops the
-/// bank's leading axis, and the plan says where each instance's slab begins.
+fn groups_every_case() {
+    a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets();
+    an_indexed_source_name_resolves_once_per_instance();
+    both_spellings_of_a_group_compile_to_the_same_program();
+    an_instance_of_a_different_shape_is_rejected();
+    a_missing_instance_names_the_index_and_the_resolved_name();
+    an_arity_wider_than_its_bank_is_rejected();
+    a_template_without_a_placeholder_is_rejected();
+    a_template_with_two_placeholders_is_rejected();
+    an_index_node_outside_a_group_is_rejected();
+    a_group_of_arity_zero_is_rejected();
+    two_groups_of_one_name_are_rejected();
+    every_instance_of_a_group_is_checked();
+    an_instance_that_reads_past_its_file_is_rejected();
+    a_group_composes_with_a_shard();
+}
+
 #[test]
 fn a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets() {
     let expr = Expr::src("experts.bank").select(0, 1, 1);
@@ -124,7 +126,6 @@ fn a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets() {
     assert_eq!(group.arity, EXPERTS);
     assert_eq!(group.bindings.len(), EXPERTS as usize);
 
-    // One read per instance, and the offsets march by exactly one band.
     let band = (ROWS * COLS) as u64 * DType::Bf16.bytes_ceil();
     for (index, binding) in group.bindings.iter().enumerate() {
         assert_eq!(binding.len(), 1, "index {index} reads once");
@@ -132,7 +133,6 @@ fn a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets() {
         assert_eq!(binding[0].file_offset, index as u64 * band);
     }
 
-    // The template is a real plan, and it publishes the group's tensor.
     assert!(
         group
             .plan
@@ -144,9 +144,6 @@ fn a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets() {
     );
 }
 
-/// Naming index `i`: the same group, written against a checkpoint that stores
-/// each instance as its own tensor.
-#[test]
 fn an_indexed_source_name_resolves_once_per_instance() {
     let plan = compile(
         &named_checkpoint(),
@@ -158,15 +155,10 @@ fn an_indexed_source_name_resolves_once_per_instance() {
     let group = &plan.groups[0];
     for (index, binding) in group.bindings.iter().enumerate() {
         assert_eq!(binding.len(), 1);
-        // Each instance reads a *different tensor*, which is the thing a
-        // selected band cannot express and this node exists for.
         assert_eq!(binding[0].tensor_id, TensorId(index as u32));
     }
 }
 
-/// The two spellings of the same group must produce the same program, because
-/// they describe the same load. Only the bindings differ.
-#[test]
 fn both_spellings_of_a_group_compile_to_the_same_program() {
     let fused = compile(
         &fused_checkpoint(),
@@ -181,12 +173,6 @@ fn both_spellings_of_a_group_compile_to_the_same_program() {
     )
     .unwrap();
 
-    // The two contracts declare the SAME tensor at different ranks — a
-    // selected band keeps the axis it was selected along, so `banded` says
-    // `[1, ROWS, COLS]` where `group` says `[ROWS, COLS]` — and a buffer now
-    // carries the type it was declared with. That difference is the contracts'
-    // and not the compiler's, so it is stated here rather than compared away:
-    // everything about the buffer that the LOAD depends on has to match.
     let fused_buffers = &fused.groups[0].plan.buffers;
     let named_buffers = &named.groups[0].plan.buffers;
     assert_eq!(fused_buffers.len(), named_buffers.len());
@@ -223,9 +209,6 @@ fn both_spellings_of_a_group_compile_to_the_same_program() {
     assert_eq!(fused.groups[0].plan.memory, named.groups[0].plan.memory);
 }
 
-/// A group whose instances are not the same shape is not a group. Caught at
-/// compile time, with the index and the name it resolved to.
-#[test]
 fn an_instance_of_a_different_shape_is_rejected() {
     let span = (ROWS * COLS) as u64 * DType::Bf16.bytes_ceil();
     let mut tensors: Vec<RawTensor> = (0..EXPERTS)
@@ -238,7 +221,6 @@ fn an_instance_of_a_different_shape_is_rejected() {
             )
         })
         .collect();
-    // The last one is half as tall.
     tensors[3] = tensor(3, "experts.3.w", 3 * span, &[ROWS / 2, COLS]);
 
     let err = compile(
@@ -252,10 +234,6 @@ fn an_instance_of_a_different_shape_is_rejected() {
     assert!(err.contains("experts"), "{err}");
 }
 
-/// A template that names a tensor the checkpoint does not have reports both
-/// the index and the name it produced -- the name is not in any source file,
-/// so without the index there is nothing to search for.
-#[test]
 fn a_missing_instance_names_the_index_and_the_resolved_name() {
     let mut tensors = named_checkpoint().tensors;
     tensors.retain(|t| t.name != "experts.2.w");
@@ -271,9 +249,6 @@ fn a_missing_instance_names_the_index_and_the_resolved_name() {
     assert!(err.contains("experts.2.w"), "{err}");
 }
 
-/// An `arity` wider than the bank runs off the end, and says so rather than
-/// producing a slot of whatever follows in the file.
-#[test]
 fn an_arity_wider_than_its_bank_is_rejected() {
     let mut group = banded(Expr::src("experts.bank").select(0, 1, 1));
     group.arity = EXPERTS + 1;
@@ -284,9 +259,6 @@ fn an_arity_wider_than_its_bank_is_rejected() {
     assert!(err.contains(&format!("index {EXPERTS}")), "{err}");
 }
 
-/// The template language is one `{}` and nothing else. A template with none is
-/// a constant, and a constant instance is not an instance.
-#[test]
 fn a_template_without_a_placeholder_is_rejected() {
     let err = compile(
         &named_checkpoint(),
@@ -298,7 +270,6 @@ fn a_template_without_a_placeholder_is_rejected() {
     assert!(err.contains("{}"), "{err}");
 }
 
-#[test]
 fn a_template_with_two_placeholders_is_rejected() {
     let err = compile(
         &named_checkpoint(),
@@ -310,9 +281,6 @@ fn a_template_with_two_placeholders_is_rejected() {
     assert!(err.contains("{}"), "{err}");
 }
 
-/// An index node outside a group has nothing to stand for, and the message
-/// says that rather than defaulting to zero.
-#[test]
 fn an_index_node_outside_a_group_is_rejected() {
     let contract = ModelContract {
         alignment: 256,
@@ -330,7 +298,6 @@ fn an_index_node_outside_a_group_is_rejected() {
     assert!(err.contains("group"), "{err}");
 }
 
-#[test]
 fn a_group_of_arity_zero_is_rejected() {
     let mut group = group(Expr::src_indexed("experts.{}.w"));
     group.arity = 0;
@@ -340,7 +307,6 @@ fn a_group_of_arity_zero_is_rejected() {
     assert!(err.contains("arity 0"), "{err}");
 }
 
-#[test]
 fn two_groups_of_one_name_are_rejected() {
     let mut c = contract(group(Expr::src_indexed("experts.{}.w")));
     c.groups.push(c.groups[0].clone());
@@ -350,11 +316,6 @@ fn two_groups_of_one_name_are_rejected() {
     assert!(err.contains("twice"), "{err}");
 }
 
-/// Put the checkpoint on disk, because verification stats the file.
-///
-/// `verify` reads file sizes from the filesystem rather than believing the
-/// plan, which is the whole value of the check. So a test that verifies has to
-/// have a file.
 fn on_disk(mut meta: Metadata, tag: &str) -> (Metadata, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("pie-loader-groups-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -364,14 +325,6 @@ fn on_disk(mut meta: Metadata, tag: &str) -> (Metadata, std::path::PathBuf) {
     (meta, dir)
 }
 
-/// A plan carries its groups, and every instance of every group is verified —
-/// not just the index the template was compiled at.
-///
-/// This used to assert the POD ROUND-TRIP as well: that the plan survived
-/// marshalling with the child plan reachable and the bindings laid out
-/// instance-major. There is no marshalling now, so what is left is the claim
-/// that outlives it — every instance is checked.
-#[test]
 fn every_instance_of_a_group_is_checked() {
     use checkpoint::verify::verify_plan;
 
@@ -395,9 +348,6 @@ fn every_instance_of_a_group_is_checked() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A binding that reads off the end of its file is caught even though the
-/// template -- index 0 -- is perfectly in bounds.
-#[test]
 fn an_instance_that_reads_past_its_file_is_rejected() {
     use checkpoint::verify::verify_plan;
 
@@ -408,8 +358,6 @@ fn an_instance_that_reads_past_its_file_is_rejected() {
         target(),
     )
     .unwrap();
-    // Only the last instance is moved, and only past the end. Index 0 still
-    // verifies, which is exactly the case a template-only check would miss.
     let last = plan.groups[0].bindings.last_mut().unwrap();
     last[0].file_offset = 1 << 40;
 
@@ -423,7 +371,6 @@ fn an_instance_that_reads_past_its_file_is_rejected() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
 fn a_group_composes_with_a_shard() {
     let expr = Expr::src_indexed("experts.{}.w").shard(0);
     let contract = ModelContract {
@@ -435,9 +382,6 @@ fn a_group_composes_with_a_shard() {
             tensors: vec![TensorContract::new(
                 "w",
                 expr,
-                // The whole instance, because a declaration is the whole
-                // tensor's: the `Shard` says the rank takes half of it, and
-                // saying so twice is what a contract stops being able to do.
                 vec![ROWS, COLS],
                 Encoding::Raw(DType::Bf16),
             )],
@@ -450,8 +394,6 @@ fn a_group_composes_with_a_shard() {
     };
     let plan = compile(&named_checkpoint(), &contract, rank1).unwrap();
 
-    // Rank 1 reads the second half of each instance's rows: the instance
-    // chooses the tensor, the rank chooses the offset within it.
     let half = (ROWS / 2 * COLS) as u64 * DType::Bf16.bytes_ceil();
     let span = (ROWS * COLS) as u64 * DType::Bf16.bytes_ceil();
     for (index, binding) in plan.groups[0].bindings.iter().enumerate() {
@@ -460,36 +402,16 @@ fn a_group_composes_with_a_shard() {
     }
 }
 
-/// Which storage shape a group uses decides whether it can be streamed at all,
-/// and the plan is where that shows: the loader states it in the bindings
-/// rather than leaving a reader to infer it from names.
-///
-/// Streaming reads a weight where it lies, through a mapping, so an instance
-/// has to begin on a page of its own. When each instance is its own tensor,
-/// placing that tensor on a page places the instance -- the instance *is* the
-/// tensor. When every instance is a band of one fused bank, placing the bank
-/// places instance 0 and no other: the rest begin at `base + i * stride`, and
-/// the stride is whatever the shape makes it. No choice of where to put the
-/// bank changes that, which is why the two shapes are not interchangeable.
 mod streamability {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
     #[derive(Default)]
     struct Streamable {
-        /// Tensors a group instance reads in full: the instance *is* the
-        /// tensor, so it can begin on a page of its own.
         whole: BTreeSet<String>,
-        /// Fused banks. Every instance reads a slice of one tensor, so
-        /// instance 0 can begin on a page and no other: the rest start at
-        /// `base + i * stride`, and the stride is whatever the shape makes it
-        /// -- in GPT-OSS-20B, 4147200 bytes, which no page size divides.
         banded: BTreeSet<String>,
     }
 
-    /// Reads the distinction off the plan. A binding whose file offset is its
-    /// tensor's own offset reads that tensor whole; one that is displaced from
-    /// it reads a band.
     fn streamable_tensors(
         plan: &checkpoint::plan::LoadPlan,
         metadata: &checkpoint::file::Metadata,
@@ -510,17 +432,18 @@ mod streamability {
                 }
             }
         }
-        // A bank whose instance 0 binds its base looks whole from that one
-        // binding. What settles it is any sibling binding that does not.
         for name in &out.banded {
             out.whole.remove(name);
         }
         out
     }
 
-    /// A bank is reported as a bank. Streaming one would fault in all four
-    /// experts to read one -- correct, slower than not streaming, and with
-    /// nothing on disk to say so.
+    fn groups_1_every_case() {
+        a_fused_bank_cannot_be_paged_by_instance();
+        separately_named_instances_are_each_pageable();
+        a_contract_without_groups_offers_nothing_to_stream();
+    }
+
     #[test]
     fn a_fused_bank_cannot_be_paged_by_instance() {
         let expr = Expr::src("experts.bank").select(0, 1, 1);
@@ -540,10 +463,6 @@ mod streamability {
         );
     }
 
-    /// Separately named instances are each pageable, and every one of them is
-    /// reported -- a reader told about only some would leave the rest streaming
-    /// off pages they share.
-    #[test]
     fn separately_named_instances_are_each_pageable() {
         let expr = Expr::src_indexed("experts.{}.w");
         let metadata = named_checkpoint();
@@ -559,9 +478,6 @@ mod streamability {
         );
     }
 
-    /// A contract with no groups declares nothing interchangeable, so there is
-    /// nothing to stream.
-    #[test]
     fn a_contract_without_groups_offers_nothing_to_stream() {
         let metadata = named_checkpoint();
         let plan = compile(

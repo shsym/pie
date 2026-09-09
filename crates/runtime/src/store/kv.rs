@@ -1,18 +1,3 @@
-//! KV store: WorkingSets, the mapping trie, typed pool access, implicit CoW
-//! allocation, hash lifecycle, and the prepare/commit/abort protocol.
-//!
-//! Layering: [`hash`] is pure hash calculations; [`page_table`] owns
-//! `KvPageTable` (the radix-compressed mapping trie, structural sharing,
-//! reachability, flattening) and never allocates physical ids or calls
-//! engine APIs; [`write`] holds the per-fire prepared operation
-//! (`KvPreparedWrite`); [`KvStore`] (this module) is the single authority
-//! over which `PhysicalKvPageId`s are live — it owns the table and typed
-//! pool, classifies write intents (fresh/in-place/CoW), and commits or
-//! aborts prepared writes on engine completion epochs.
-//!
-//! `#![allow(dead_code)]`: some methods here aren't yet called by the live
-//! fire path but are exercised by this module's tests and reserved for
-//! upcoming work.
 #![allow(dead_code)]
 
 pub mod hash;
@@ -41,8 +26,6 @@ use crate::store::pool::Pool;
 pub enum KvStoreError {
     #[error(transparent)]
     Table(#[from] KvTableError),
-    /// Pool exhaustion. Raised only at forward preparation (`reserve` is
-    /// logical); the scheduler routes this through the contention ladder.
     #[error("kv pool exhausted: requested {requested}, available {available}")]
     OutOfPages { requested: usize, available: usize },
     #[error("invalid write set: {reason}")]
@@ -65,9 +48,6 @@ struct KvTranslationSnapshot {
     pages: Option<Arc<[u32]>>,
 }
 
-/// WorkingSet-owned logical-to-physical translation. Mapping events publish a
-/// new immutable snapshot; fire submission can clone it without taking the
-/// global KV-store lock.
 #[derive(Debug)]
 pub struct KvTranslation {
     snapshot: RwLock<KvTranslationSnapshot>,
@@ -115,9 +95,6 @@ impl Default for FlatEntry {
     }
 }
 
-/// A fresh working set's heap state, built *outside* the global KV lock.
-/// `FlatEntry::default()` allocates, and doing that while holding the store
-/// mutex would block every lane needing the KV store on one slow `malloc`.
 pub struct PreparedWorkingSet {
     entry: FlatEntry,
 }
@@ -219,41 +196,19 @@ impl KvRestoreTxn {
     }
 }
 
-/// The KV store: mapping trie + physical pool + prepared-write protocol.
 pub struct KvStore {
     table: KvPageTable,
     pool: Pool<PhysicalKvPageId>,
     host_pool: Pool<HostKvSlotId>,
-    /// Per-WorkingSet flattened-table cache. Versioned; a version bump means
-    /// the device-shared buffer must be republished. Mutations that do not
-    /// change any logical->physical value (owner compaction, collection) do
-    /// not bump versions.
     flat: HashMap<WorkingSetId, FlatEntry>,
     opaque_nonce: Hash256,
     opaque_counter: u64,
-    /// The pass-wide cache domain folded into every canonical token-slot
-    /// hash (model/weights identity; today boot-scoped via the nonce).
     domain: Hash256,
     #[cfg(test)]
     cas: HashMap<Hash256, CasEntry>,
-    /// Inferlet-owned opaque index. Values carry no token or layout meaning;
-    /// each entry owns one cache-root lease for its snapshot terminal.
     indexes: HashMap<Vec<u8>, KvIndexEntry>,
-    /// Monotonic submission sequence: bumped per prepared write. Freed slots
-    /// are recycled tagged with the current value and retired once the fire
-    /// carrying that sequence completes (FIFO stream order), or immediately
-    /// via [`Self::retire_idle`] when nothing is in flight.
     seq: u64,
     in_flight: u64,
-    /// Sequences of prepared writes that have not settled yet. Freed pages
-    /// tagged at epoch E are safe to reuse once every fire that could still
-    /// name them — those prepared at or before E — has settled, so the pool
-    /// retires through `min(outstanding) - 1` (or `seq` when nothing is in
-    /// flight). Tracking the set rather than a counter is what lets a
-    /// completion's pages return within a wave instead of waiting for a
-    /// moment of GLOBAL quiescence, which at high concurrency never comes:
-    /// that wait was measured as a 4.5 ms per-completion supply drip
-    /// (analysis.md 10.16-10.17).
     outstanding: std::collections::BTreeSet<u64>,
 }
 
@@ -308,29 +263,15 @@ impl KvStore {
         }
     }
 
-    /// The cache domain for canonical token-slot hashing (see
-    /// [`hash::chain_token_slot_hash`]).
     pub fn domain(&self) -> Hash256 {
         self.domain
     }
 
-    /// The epoch to tag frees with right now (see `seq`).
     pub fn current_epoch(&self) -> u64 {
         self.seq
     }
 
-    /// Retire every recycle epoch that no in-flight fire can still name.
-    ///
-    /// A page freed at epoch E may sit in the device translation of a fire
-    /// prepared at or before E, so E is retirable exactly when the oldest
-    /// unsettled sequence is greater than E. With nothing in flight the whole
-    /// pending set retires.
     pub fn retire_idle(&mut self) {
-        // Nothing in flight: everything retires, and the tracking set is
-        // resynced. `settle` and `cancel_prepared` both remove their own
-        // sequence, so `outstanding` should already be empty here; the clear
-        // is belt-and-braces against a future producer of sequences that has
-        // no matching consumer.
         if self.in_flight == 0 {
             self.outstanding.clear();
             self.pool.retire_through(self.seq);
@@ -341,16 +282,10 @@ impl KvStore {
         }
     }
 
-    // ------------------------------------------------------------------
-    // WorkingSet lifecycle (delegates to the table; pool-aware where freeing)
-    // ------------------------------------------------------------------
-
     pub fn create_working_set(&mut self) -> WorkingSetId {
         self.install_working_set(PreparedWorkingSet::new())
     }
 
-    /// Admit a working set whose heap state was built by the caller before it
-    /// took the lock. See [`PreparedWorkingSet`].
     pub fn install_working_set(&mut self, prepared: PreparedWorkingSet) -> WorkingSetId {
         let ws = self.table.create_working_set();
         self.flat.insert(ws, prepared.entry);
@@ -382,9 +317,6 @@ impl KvStore {
         count
     }
 
-    /// Atomically insert or replace an opaque key with a fully mapped
-    /// WorkingSet snapshot. Returns the number of physical pages made
-    /// reclaimable by replacing the previous entry.
     pub fn update_index(&mut self, key: Vec<u8>, ws: WorkingSetId) -> Result<usize, KvStoreError> {
         Self::validate_index_key(&key)?;
         let snapshot = self.table.index_snapshot(ws)?;
@@ -398,8 +330,6 @@ impl KvStore {
         Ok(freed)
     }
 
-    /// Exact lookup of an opaque index key. The returned WorkingSet owns its
-    /// own terminal anchor and remains valid after index replacement/removal.
     #[allow(
         clippy::wrong_self_convention,
         reason = "not a conversion: `from-index` is the WIT name \
@@ -424,7 +354,6 @@ impl KvStore {
         Ok(Some(ws))
     }
 
-    /// Remove only the named index root. Returns `(removed, pages_freed)`.
     pub fn remove_index(&mut self, key: &[u8]) -> Result<(bool, usize), KvStoreError> {
         Self::validate_index_key(key)?;
         let Some(entry) = self.indexes.remove(key) else {
@@ -456,7 +385,6 @@ impl KvStore {
         let parent_chain = self.table.chain_state(ws)?;
         let child = self.table.slice(ws, range.clone())?;
         if range.start == 0 && range.end == parent_mapped {
-            // Identical visible content: continuations must hash identically.
             self.table.set_chain_state(child, parent_chain)?;
         } else {
             self.refresh_chain_after_surgery(child, range.start == 0)?;
@@ -470,9 +398,6 @@ impl KvStore {
         Ok(self.table.reserve(ws, pages)?)
     }
 
-    /// Physically back the missing logical prefix through `end`, without
-    /// changing `page_len`. Existing mappings are untouched; fresh pages carry
-    /// no content identity until an explicit index publication retains them.
     pub fn ensure_backed(&mut self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
         let page_len = self.table.page_len(ws)?;
         if end > page_len {
@@ -512,8 +437,6 @@ impl KvStore {
         Ok(count)
     }
 
-    /// Number of additional physical pages needed to back the logical prefix
-    /// through `end`. Pure demand computation: no pool or mapping mutation.
     pub fn backing_demand(&self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
         let page_len = self.table.page_len(ws)?;
         if end > page_len {
@@ -528,9 +451,6 @@ impl KvStore {
         })
     }
 
-    /// Back the missing logical prefix from caller-owned reserved page IDs.
-    /// Consumes exactly the required prefix of `granted`; surplus remains
-    /// caller-owned.
     pub fn ensure_backed_reserved(
         &mut self,
         ws: WorkingSetId,
@@ -565,18 +485,12 @@ impl KvStore {
         Ok(count)
     }
 
-    /// Freed slots recycle after `epoch` retires (all in-flight users done).
     pub fn discard(
         &mut self,
         ws: WorkingSetId,
         ranges: &[Range<u64>],
         epoch: u64,
     ) -> Result<(), KvStoreError> {
-        // Chain-state bookkeeping, decided pre-mutation: a discard confined
-        // to the mapped TAIL leaves the visible prefix intact (the last
-        // surviving slot hash stays the exact continuation identity); any
-        // front/interior removal changes the visible context and forces a
-        // recompute from the surviving pages' identities.
         let old_mapped = self.table.mapped_len(ws)?;
         let removed: u64 = ranges
             .iter()
@@ -622,10 +536,6 @@ impl KvStore {
         Ok(self.table.privately_writable(ws, index)?)
     }
 
-    /// Forget content-derived identity from `start` through the mapped suffix.
-    /// Explicit indexes retain structure directly and do not consume this
-    /// metadata; this only prevents the transitional implicit CAS from
-    /// reaching a page after it becomes writable.
     pub fn opacify_suffix(&mut self, ws: WorkingSetId, start: u64) -> Result<(), KvStoreError> {
         let mapped = self.table.mapped_len(ws)?;
         let had_chain = self.table.chain_state(ws)?.is_some();
@@ -639,11 +549,6 @@ impl KvStore {
         Ok(())
     }
 
-    /// Recompute a WorkingSet's chain state after mapping surgery. With the
-    /// prefix intact (tail-only edits) the last surviving slot hash IS the
-    /// exact continuation identity; otherwise fold the visible pages'
-    /// identities (path-hash domain), substituting opaque draws for pages
-    /// with nothing recorded so unknown content never matches anything.
     fn refresh_chain_after_surgery(
         &mut self,
         ws: WorkingSetId,
@@ -698,19 +603,6 @@ impl KvStore {
         self.host_pool.release_reserved(swapped);
     }
 
-    // ------------------------------------------------------------------
-    // Prepare / commit / abort
-    // ------------------------------------------------------------------
-
-    /// Classify the fire's KV write intents and allocate physical slots.
-    ///
-    /// `write_indexes` are the WorkingSet-relative page indexes the pass
-    /// writes. Fresh indexes (at or past the mapped end) must be contiguous
-    /// from it. A committed page is written in place when nothing but `ws`
-    /// observes its owning node; otherwise the tail from the lowest shared
-    /// written index is CoW'd: every page in `[cow_start, mapped)` gets a
-    /// fresh slot and a copy plan entry, written or not, because the mapping
-    /// rebase is a growth-boundary edit and cannot skip interior pages.
     pub fn prepare_write(
         &mut self,
         ws: WorkingSetId,
@@ -728,8 +620,6 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, allocated)
     }
 
-    /// Number of fresh/COW pages a write preparation requires. This performs
-    /// classification only and does not allocate, pin, or open a transaction.
     pub fn write_demand(
         &mut self,
         ws: WorkingSetId,
@@ -738,8 +628,6 @@ impl KvStore {
         Ok(self.classify_write(ws, write_indexes)?.required_pages())
     }
 
-    /// Prepare a write from caller-owned reserved pages, consuming exactly the
-    /// required prefix and leaving surplus caller-owned.
     pub fn prepare_write_reserved(
         &mut self,
         ws: WorkingSetId,
@@ -758,7 +646,6 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, allocated)
     }
 
-    /// Prepare using concrete ids reserved by the residency planner.
     pub fn prepare_write_granted(
         &mut self,
         ws: WorkingSetId,
@@ -814,13 +701,10 @@ impl KvStore {
                 cow_start = Some(cow_start.map_or(index, |c| c.min(index)));
             }
         }
-        // A private write inside the rebased region rides the CoW instead:
-        // its in-place result would be shadowed by the copied page.
         if let Some(cs) = cow_start {
             in_place.retain(|&(i, _)| i < cs);
         }
 
-        // Resolve current ids before allocating so no failure path leaks ids.
         let cow_srcs: Vec<PhysicalKvPageId> = match cow_start {
             Some(cs) => visible[cs as usize..mapped as usize].to_vec(),
             None => Vec::new(),
@@ -881,9 +765,6 @@ impl KvStore {
         })
     }
 
-    /// Publish one guest-ordered prepared write into the single table state.
-    /// Physical content arrives later on the same pipeline stream; only CAS
-    /// visibility waits for GPU success.
     pub fn publish_prepared(
         &mut self,
         prepared: KvPreparedWrite,
@@ -934,9 +815,6 @@ impl KvStore {
             None => {}
         }
 
-        // Chain state: the next appended slot chains from this fire's
-        // highest committed slot hash (an opaque draw when the caller
-        // recorded nothing — unknown content must never match anything).
         if let Some((_, commit)) = prepared
             .targets
             .iter()
@@ -986,17 +864,6 @@ impl KvStore {
         self.retire_idle();
     }
 
-    /// Settle `seq`'s fire: publish its CAS intents (or discard them on
-    /// failure), drop it from the in-flight set, and retire every recycle
-    /// epoch it was gating.
-    ///
-    /// `seq` is a parameter rather than a separate `retire_through(seq)` call
-    /// because forgetting the second call is not a visible failure: the stale
-    /// entry pins `retire_idle` at `min(outstanding) - 1` forever, freed pages
-    /// stop reaching the free list, and the only self-heal is a moment of
-    /// GLOBAL quiescence — which at high concurrency never comes (that wait is
-    /// exactly the 4.5 ms per-completion supply drip of analysis.md
-    /// 10.16-10.17). One call, one signature, no discipline to remember.
     pub fn settle(&mut self, seq: u64, intents: Vec<CasIntent>, success: bool) {
         #[cfg(test)]
         if success {
@@ -1024,13 +891,6 @@ impl KvStore {
         self.retire_idle();
     }
 
-    // ------------------------------------------------------------------
-    // Flattened tables
-    // ------------------------------------------------------------------
-
-    /// The WorkingSet's flattened logical->physical table and its version.
-    /// The version bumps exactly when a mapping value could have changed;
-    /// the engine republishes the device-shared buffer on version change.
     pub fn flat_table(
         &mut self,
         ws: WorkingSetId,
@@ -1086,24 +946,16 @@ impl KvStore {
         ))
     }
 
-    // ------------------------------------------------------------------
-    // Hashes, cache roots, and introspection passthroughs
-    // ------------------------------------------------------------------
-
-    /// A fresh opaque token-slot hash (for slots no recipe covers).
     pub fn next_opaque_hash(&mut self) -> Hash256 {
         let counter = self.opaque_counter;
         self.opaque_counter += 1;
         hash::opaque_token_slot_hash(&self.opaque_nonce, counter)
     }
 
-    /// The token-slot hash the next appended slot chains from (`None` =
-    /// empty mapping / chain start).
     pub fn chain_state(&self, ws: WorkingSetId) -> Result<Option<Hash256>, KvStoreError> {
         Ok(self.table.chain_state(ws)?)
     }
 
-    /// Committed page hash of the page at `index`, if valid.
     pub fn page_hash_at(
         &self,
         ws: WorkingSetId,
@@ -1112,9 +964,6 @@ impl KvStore {
         Ok(self.table.page_hash_at(ws, index)?)
     }
 
-    /// Committed token-slot hashes of the page at `index` (per slot; `None`
-    /// = unwritten). The fire path reads this to carry preserved slots
-    /// through in-place and CoW commits.
     pub fn page_token_hashes(
         &self,
         ws: WorkingSetId,
@@ -1123,10 +972,6 @@ impl KvStore {
         Ok(self.table.page_token_hashes(ws, index)?)
     }
 
-    /// The PUBLISHED committed token extent of `ws`: full pages below the
-    /// last mapped page plus the written prefix of the last page (every
-    /// committed slot carries a token-slot hash — chained or opaque — so the
-    /// last `Some` bounds the written prefix).
     pub fn committed_token_len(
         &self,
         ws: WorkingSetId,
@@ -1144,10 +989,6 @@ impl KvStore {
         Ok((mapped - 1) * page_size as u64 + last as u64)
     }
 
-    /// Validated CAS lookup: a canonical full page's boundary chain value ->
-    /// its live trie location. Entries whose location no longer carries that
-    /// content (owner compaction moved locals, collection freed the node)
-    /// are pruned and miss.
     #[cfg(test)]
     pub fn lookup_cached_page(&mut self, key: &Hash256) -> Option<(NodeId, u64)> {
         let entry = *self.cas.get(key)?;
@@ -1172,8 +1013,6 @@ impl KvStore {
         None
     }
 
-    /// Lazy CAS hygiene: when dead entries outnumber any plausible live set,
-    /// sweep by revalidation (lookups already prune what they touch).
     #[cfg(test)]
     fn prune_cas_if_bloated(&mut self) {
         let cap = (self.pool.capacity() as usize).saturating_mul(4).max(1024);
@@ -1204,12 +1043,6 @@ impl KvStore {
         self.recycle_backings(freed, epoch);
     }
 
-    /// Contention-ladder rung 1: drop every cache-root lease no live
-    /// WorkingSet or in-flight fire reaches, then sweep all unreachable
-    /// backings. The sweep also recovers old CoW owners whose final snapshot
-    /// pin retired on an in-place commit, where steady-state collection is
-    /// intentionally deferred. Returns the number of pages recycled
-    /// (allocatable once `epoch` retires).
     pub fn drop_unused_cache_leases(&mut self, epoch: u64) -> usize {
         let (dropped, freed) = self.table.drop_unused_cache_leases();
         if dropped != 0 {
@@ -1226,14 +1059,6 @@ impl KvStore {
         count
     }
 
-    /// Prefix-cache graft: adopt the cached canonical prefix whose boundary
-    /// chain value is `key` into the EMPTY WorkingSet `ws`. On a hit the
-    /// matched pages become the WS's visible mapping (structurally shared —
-    /// writes CoW like any shared path) and the chain state continues from
-    /// `key`, so appends hash exactly like the original continuation.
-    /// `expected_pages` cross-checks the structural path length against the
-    /// probe's chain position; a mismatch misses rather than grafting wrong
-    /// content. Returns the adopted page count.
     pub fn adopt_cached_prefix(
         &mut self,
         ws: WorkingSetId,
@@ -1315,10 +1140,6 @@ impl KvStore {
         Ok(page_count)
     }
 
-    /// Victim sizing for the residency planner: what suspending each group
-    /// of WorkingSets would ACTUALLY free, answered by the same rule
-    /// `prepare_suspend` applies — with a typed reason when the answer is
-    /// zero. Batched: the shared exclusions cost one pass for the whole set.
     pub fn reclaim_quotes(
         &self,
         groups: &[HashSet<WorkingSetId>],
@@ -1466,8 +1287,6 @@ impl KvStore {
         Ok(self.table.swapped_pages(working_sets)?.len())
     }
 
-    /// Total pages held by `working_sets`, resident and swapped alike —
-    /// see [`PageTable::held_pages`]. For liveness predicates only.
     pub fn held_page_count(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1475,10 +1294,6 @@ impl KvStore {
         Ok(self.table.held_pages(working_sets)?)
     }
 
-    /// Prepare a restore from caller-owned reserved pages, consuming exactly
-    /// the required prefix of `granted` (lend semantics: failure consumes
-    /// nothing, and surplus stays caller-owned — the caller's grant guard is
-    /// the single return path).
     pub fn prepare_restore(
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1577,10 +1392,6 @@ impl KvStore {
         Ok(self.table.page_len(ws)?)
     }
 
-    /// The lock-free `page_len` mirror for `ws`. Handed to the
-    /// [`KvWorkingSet`](crate::store::kv::working_set::KvWorkingSet) handle
-    /// at construction so the hot readers never take this store's mutex to
-    /// load one integer.
     pub fn page_len_mirror(
         &self,
         ws: WorkingSetId,

@@ -1,10 +1,3 @@
-//! A denoiser's epilogue over `[rows, vocab]` — temperature, softmax,
-//! entropy, Gumbel, argmax, acceptance — used to be one loop per op over the
-//! row, each a round trip through scratch. On CUDA a row-parallel region now
-//! fuses the elementwise run into streams: one pass per reduction boundary,
-//! intermediates in registers, a value stored only if something outside the
-//! stream reads it.
-
 use eta_compiler::codegen::cuda::fused::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -37,69 +30,45 @@ fn rows_out(dtype: Dtype) -> ChannelDecl {
     }
 }
 
-/// `scaled = logits / t; p = softmax(scaled); h = -Σ p·log p; argmax(scaled);
-/// gumbel = scaled + g; sampled = argmax(gumbel); accept = h < bound`.
 fn subject() -> TraceContainer {
-    // The temperature first, as the DSL emits it: a scalar op after the
-    // logits would end the row run before the arithmetic joins it.
     let ops = vec![
-        // 0: the temperature, a host-set scalar channel; 1: as a rank-0 scalar
         Op::ChanRead(0),
         Op::Reshape {
             value: 0,
             shape: Shape::new(&[]).unwrap(),
         },
-        // 2: logits [rows, vocab]
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
-        // 3: scaled = logits / t   (a scalar operand broadcasts)
         Op::Div(2, 1),
-        // 4: row max [rows]
         Op::ReduceMax(3),
-        // 5: [rows, vocab] of the max — the DSL's broadcast
         Op::Broadcast {
             value: 4,
             shape: Shape::matrix(ROWS, VOCAB),
         },
-        // 6: centred
         Op::Sub(3, 5),
-        // 7: e = exp(centred)
         Op::Exp(6),
-        // 8: z = Σ e
         Op::ReduceSum(7),
-        // 9: z broadcast
         Op::Broadcast {
             value: 8,
             shape: Shape::matrix(ROWS, VOCAB),
         },
-        // 10: p = e / z
         Op::Div(7, 9),
-        // 11: log p
         Op::Log(10),
-        // 12: p log p
         Op::Mul(10, 11),
-        // 13: Σ p log p
         Op::ReduceSum(12),
-        // 14: h = -Σ
         Op::Neg(13),
-        // 15: argmax of the scaled row
         Op::ReduceArgmax(3),
-        // 16: gumbel noise
         Op::Rng {
             stream: 7,
             shape: Shape::matrix(ROWS, VOCAB),
             kind: RngKind::Gumbel,
         },
-        // 17: noisy = scaled + g
         Op::Add(3, 16),
-        // 18: sampled = argmax(noisy)
         Op::ReduceArgmax(17),
-        // 19: the bound
         Op::Const(Literal::F32(0.1)),
-        // 20: accept = h < bound
         Op::Lt(14, 19),
         Op::ChanPut { chan: 1, value: 15 },
         Op::ChanPut { chan: 2, value: 18 },
@@ -130,14 +99,17 @@ fn profile() -> ModelProfile {
     profile
 }
 
+fn the_epilogue_streams_through_registers_every_case() {
+    the_row_parallel_epilogue_fuses_into_streams();
+    a_reshaped_row_vector_broadcasts_through_the_stream();
+    a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing();
+}
+
 #[test]
 fn the_row_parallel_epilogue_fuses_into_streams() {
     let bound = bind(subject(), profile()).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
-    // Every row-parallel generated region of the stage, emitted; the chain
-    // may be cut over several by the partitioner, the streams are counted
-    // across them all.
     let mut source = String::new();
     for (index, region) in stage.fused.regions.iter().enumerate() {
         if region.row_value.is_none() {
@@ -148,8 +120,6 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
         if std::env::var_os("PTIR_SHOW").is_some() {
             eprintln!("{emitted}");
         }
-        // The body after the row-view preamble: the runtime text above it
-        // defines the helpers this test asserts are not CALLED.
         let body = emitted
             .split("descriptors = ptir_rowdesc;")
             .nth(1)
@@ -158,15 +128,10 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
     }
     assert!(!source.is_empty(), "no row-parallel region");
     let streams = source.matches("// stream of ").count();
-    // The pass boundaries are the reductions something later reads: the row
-    // max, the sum, the entropy sum — four passes at most for this chain,
-    // never one loop per op.
     assert!(
         (2..=5).contains(&streams),
         "{streams} streams for a chain of a dozen elementwise ops; the emitter fell back to a loop per op or fused across a reduction"
     );
-    // The two elementwise ops left to the helper are the per-row scalar
-    // ones (`h = -Σ`, `h < bound`): one element a block, not the row.
     let helper_loops = source.matches("ptir_parallel_elementwise(").count();
     assert!(
         helper_loops <= 2,
@@ -184,10 +149,6 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
         !source.contains("offsets[2]"),
         "the logits value (2) never touches scratch"
     );
-    // `centred` (6), `log p` (11) and `p log p` (12) are read only inside
-    // their streams: no store lands them. `scaled` (3) is read by three
-    // passes, each of which recomputes `logits / t` from the intrinsic
-    // rather than loading a stored plane.
     for spent in [3u32, 6, 11, 12] {
         assert!(
             !source.contains(&format!("offsets[{spent}]")),
@@ -196,10 +157,6 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
     }
 }
 
-/// The DSL spells a row's scalar as `broadcast(reshape(m, [rows, 1]),
-/// [rows, vocab])`. The reshape must fold away in normalization, or the
-/// broadcast lands a whole `[rows, vocab]` plane in scratch per fire.
-#[test]
 fn a_reshaped_row_vector_broadcasts_through_the_stream() {
     let ops = vec![
         Op::ChanRead(0),
@@ -214,7 +171,6 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
         },
         Op::Div(2, 1),
         Op::ReduceMax(3),
-        // 5: the row max as a column, as the DSL emits it
         Op::Reshape {
             value: 4,
             shape: Shape::matrix(ROWS, 1),
@@ -260,10 +216,6 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
     );
 }
 
-/// A `top_k` of the scaled logits (a sampler's taps) is a library region
-/// reading the streams' `scaled`; it ranks the intrinsic plane straight, so
-/// `scaled` still lands nowhere.
-#[test]
 fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
     let ops = vec![
         Op::ChanRead(0),
@@ -276,7 +228,6 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
-        // 3: scaled
         Op::Div(2, 1),
         Op::ReduceMax(3),
         Op::Reshape {
@@ -290,7 +241,6 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         Op::Sub(3, 6),
         Op::Exp(7),
         Op::ReduceSum(8),
-        // 10, 11: the taps
         Op::TopK { input: 3, k: 8 },
         Op::ChanPut { chan: 1, value: 9 },
         Op::ChanPut { chan: 2, value: 11 },
@@ -339,8 +289,6 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         order.contains("kDirectDivisor = 1u"),
         "the divisor is not the value the divide names (the reshaped temperature, 1)"
     );
-    // The divide's own region was the divisor's last reader as far as the op
-    // graph knows; the plan names it across to the top_k so it stays alive.
     let one_element = |value: &u32| {
         stage.normalized.value_types[*value as usize]
             .dims

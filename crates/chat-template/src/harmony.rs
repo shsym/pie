@@ -1,9 +1,3 @@
-//! Harmony: gpt-oss's channelled turn format.
-//!
-//! `<|start|>{role}<|message|>{text}<|end|>`, with the assistant's output split
-//! across named channels — `analysis` for reasoning, `final` for the reply,
-//! `commentary to=functions.{name}` for a tool call.
-
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -256,10 +250,6 @@ impl Instruct for Harmony {
     }
 }
 
-/// Reads the commentary channel's tool calls back out of generated text.
-/// The span read is
-/// `<|channel|>commentary to=functions.{name}<|message|>{json}<|call|>`,
-/// with harmony's optional `<|constrain|>json` between name and message.
 struct HarmonyToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,

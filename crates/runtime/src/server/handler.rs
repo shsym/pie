@@ -1,5 +1,3 @@
-//! Command handlers for client sessions: program upload, instance launch, etc.
-
 use bytes::Bytes;
 use client::message::ServerMessage;
 
@@ -11,10 +9,6 @@ use crate::model;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 use super::inbox;
 use super::{MAX_INFLIGHT_UPLOADS, Session, UploadKey};
-
-// =============================================================================
-// Query Handlers
-// =============================================================================
 
 impl Session {
     pub(super) async fn handle_check_program(&self, corr_id: u32, name: String, version: String) {
@@ -37,8 +31,6 @@ impl Session {
 
                 {
                     let model_name = model::model().name().to_string();
-                    // KV page pool stats summed across the single model's
-                    // engines' typed stores.
                     let (used, total) = {
                         let (mut u, mut t) = (0u64, 0u64);
                         for stores in crate::store::registry::all_for_model(0) {
@@ -60,7 +52,6 @@ impl Session {
                         serde_json::Value::from(total),
                     );
 
-                    // Inference stats (throughput, latency, batch count)
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),
@@ -94,9 +85,6 @@ impl Session {
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
-                    // Fire-domain probes. Dotted keys mirror the
-                    // `AggregateStats.fire.*` hierarchy. All-zero when the
-                    // binary is built without `--features profile-fire`.
                     stats.insert(
                         format!("{}.fire.inter_fire_us", model_name),
                         serde_json::Value::from(inf.fire.avg_inter_fire_us),
@@ -233,8 +221,6 @@ impl Session {
                         format!("{}.fire.quorum.wave_fires", model_name),
                         serde_json::Value::from(inf.fire.quorum.wave_fires),
                     );
-                    // Chain engagement and sealed-queue head-of-line hold;
-                    // populated in every build.
                     stats.insert(
                         format!("{}.fire.quorum.seal_events", model_name),
                         serde_json::Value::from(inf.fire.quorum.seal_events),
@@ -311,7 +297,6 @@ impl Session {
                             serde_json::Value::from(value),
                         );
                     }
-                    // Guest-side bring-up cost.
                     let proc = process::get_runtime_stats();
                     for (key, value) in [
                         ("process.completed", proc.completed),
@@ -342,10 +327,6 @@ impl Session {
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
                     .await;
             }
-            // Every request that carries a `corr_id` MUST be answered: the
-            // client correlates on it and waits, and `pie-client`'s
-            // `_send_msg_and_wait` has no timeout — so a silent arm here hung
-            // the caller forever and leaked its pending entry.
             _ => {
                 self.send_response(
                     corr_id,
@@ -374,10 +355,6 @@ impl Session {
     }
 }
 
-// =============================================================================
-// Program Upload Handler
-// =============================================================================
-
 impl Session {
     #[allow(
         clippy::too_many_arguments,
@@ -397,8 +374,6 @@ impl Session {
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
-        // Keyed by correlation id, not program hash, so two clients
-        // installing the same program at once don't share one entry.
         let key = UploadKey::Program(corr_id);
         if !self.inflight_uploads.contains_key(&key) {
             if chunk_index != 0 {
@@ -443,7 +418,6 @@ impl Session {
                 drop(inflight);
                 self.inflight_uploads.remove(&key);
 
-                // The bytes are what the sender said they were.
                 let uploaded_hash = blake3::hash(&buffer).to_hex().to_string();
                 if uploaded_hash != program_hash {
                     self.send_response(
@@ -496,10 +470,6 @@ impl Session {
     }
 }
 
-// =============================================================================
-// Process Launch Handlers
-// =============================================================================
-
 impl Session {
     pub(super) async fn handle_launch_process(
         &mut self,
@@ -516,8 +486,6 @@ impl Session {
             }
         };
 
-        // Repeated hot launches skip the program-manager round trip once
-        // installed (uploaded programs are installed during add_program).
         if !self.installed_programs.contains(&program_name) {
             if let Err(e) = program::install(&program_name).await {
                 self.send_response(corr_id, false, e.to_string()).await;
@@ -537,7 +505,6 @@ impl Session {
         ) {
             Ok(process_id) => {
                 if capture_outputs {
-                    // Client mapping was pre-registered by process::spawn
                     self.attached_processes.push(process_id);
                     self.send_response(corr_id, true, process_id.to_string())
                         .await;
@@ -551,10 +518,6 @@ impl Session {
         }
     }
 }
-
-// =============================================================================
-// Process Management Handlers
-// =============================================================================
 
 impl Session {
     fn parse_process_id(uuid_str: &str) -> Option<ProcessId> {
@@ -571,7 +534,6 @@ impl Session {
             }
         };
 
-        // Authorization: only the same user can attach
         match process::get_username(process_id).await {
             Ok(owner) if owner != self.username => {
                 self.send_response(corr_id, false, "Permission denied".to_string())
@@ -592,12 +554,6 @@ impl Session {
                 self.send_response(corr_id, true, "Process attached".to_string())
                     .await;
             }
-            // Say which refusal this was. Collapsing every failure into
-            // "Process not found" made the common one unreadable: a process
-            // launched with `capture_outputs` already holds its launching
-            // client, so `AttachClient` answers "already attached" — and a
-            // caller told the process does not exist has no way to learn that
-            // it does, and that it is simply spoken for.
             Err(why) => {
                 self.send_response(corr_id, false, format!("Cannot attach: {why}"))
                     .await;
@@ -619,8 +575,6 @@ impl Session {
             return;
         }
 
-        // A restarted request keeps its original id on the client side; the
-        // inbox belongs to whichever process is currently running that work.
         let target = crate::inferlet::process::resolve(process_id);
         if let Err(err) = inbox::send(target.to_string(), message) {
             tracing::error!(
@@ -641,7 +595,6 @@ impl Session {
             }
         };
 
-        // Authorization: only the same user can terminate
         match process::get_username(process_id).await {
             Ok(owner) if owner != self.username => {
                 self.send_response(corr_id, false, "Permission denied".to_string())
@@ -662,12 +615,7 @@ impl Session {
     }
 }
 
-// =============================================================================
-// File Transfer Handlers
-// =============================================================================
-
 impl Session {
-    /// Handle incoming file transfer from client (fire-and-forget, no corr_id).
     pub(super) async fn handle_transfer_file(
         &mut self,
         process_id_str: String,
@@ -692,8 +640,6 @@ impl Session {
             return;
         }
 
-        // Keyed by process and hash: destination distinguishes two
-        // concurrent transfers of the same bytes.
         let key = UploadKey::File(process_id, file_hash.clone());
         if !self.inflight_uploads.contains_key(&key) {
             if chunk_index != 0 {
@@ -750,7 +696,6 @@ impl Session {
         }
     }
 
-    /// Send file chunks from server to client (inferlet → client download).
     pub(super) async fn send_file_download(
         &mut self,
         process_id: ProcessId,

@@ -14,7 +14,6 @@ import sys
 
 import mlx.core as mx
 
-
 def main():
     src, out = sys.argv[1], sys.argv[2]
     os.makedirs(out, exist_ok=True)
@@ -33,7 +32,6 @@ def main():
         if extra.endswith(".json") and extra != "model.safetensors.index.json":
             shutil.copy(os.path.join(src, extra), out)
     print(f"{len(out_w)} tensors -> {out} (fc split at column {hidden})")
-
 
 if __name__ == "__main__":
     main()

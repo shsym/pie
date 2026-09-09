@@ -1,11 +1,3 @@
-//! Inkling's message format: `<|message_{role}|><|content_text|>{text}<|end_message|>`
-//! per message, a `<|message_system|>` line stating the thinking effort
-//! before the first non-system message, and an assistant turn closed by
-//! `<|content_model_end_sampling|>`. The model opens a reasoning block with
-//! `<|content_thinking|>` and closes it with `<|end_message|>` before its
-//! reply's own `<|message_model|><|content_text|>`. No token opens a
-//! conversation.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -13,12 +5,8 @@ use tokenizer::Tokenizer;
 use crate::decode::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
-/// What ends a turn: the model's own end-of-sampling mark, and the
-/// vocabulary's end of text. `<|end_message|>` is NOT one: it closes a
-/// message inside a turn that continues.
 pub const STOP_TOKENS: &[&str] = &["<|content_model_end_sampling|>", "<|endoftext|>"];
 
-/// Every other marker the format spells, for a tokenizer contract to check.
 pub const MARKERS: &[&str] = &[
     "<|message_user|>",
     "<|message_model|>",
@@ -29,7 +17,6 @@ pub const MARKERS: &[&str] = &[
     "<|end_message|>",
 ];
 
-/// The reference template's default when a request states none.
 const THINKING_EFFORT: &str = "0.9";
 
 pub struct Inkling {
@@ -43,7 +30,6 @@ pub struct Inkling {
     end_message: u32,
     end_sampling: u32,
     stop_ids: Vec<u32>,
-    /// The effort line the first non-system message is preceded by.
     effort: Vec<u32>,
 }
 
@@ -88,8 +74,6 @@ impl Instruct for Inkling {
         self.message(&self.system_prefix, msg)
     }
 
-    /// The first user message carries the effort line in front of it, as
-    /// the reference template writes it before the first non-system message.
     fn first_user(&self, msg: &str) -> Vec<u32> {
         let mut tokens = self.effort.clone();
         tokens.extend(self.user(msg));

@@ -2,9 +2,6 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A launch program this host half cannot interpret. A struct rather than a
-/// one-variant enum: no discriminant nobody reads, no forced `match` arm,
-/// and room to grow a second field without changing kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     pub message: String,

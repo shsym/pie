@@ -26,7 +26,6 @@ from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.speculative import mtp as mtp_mod
 from mlx_vlm.models import cache as cache_mod
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -55,8 +54,6 @@ def main():
     prompt_cache = cache_mod.make_prompt_cache(lm)
     out = lm(ids, cache=prompt_cache, return_hidden=True, return_shared_kv=True)
     bonus = int(mx.argmax(out.logits[:, -1, :], axis=-1).item())
-    # The recorded hidden is the last layer's output before the final norm;
-    # the drafter is fed it normed (`speculative_draft_hidden`).
     hidden = mtp_mod._mtp_draft_hidden(lm, out.hidden_states[-1][:, -1:, :])
     shared = out.shared_kv_states
 
@@ -102,7 +99,6 @@ def main():
     print(repr(text[:200]))
     if args.out:
         json.dump({"ids": ids[0].tolist(), "tokens": committed, "rounds": rounds, "text": text}, open(args.out, "w"))
-
 
 if __name__ == "__main__":
     main()

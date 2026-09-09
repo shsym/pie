@@ -1,9 +1,3 @@
-//! Kimi's turn format. It looks like ChatML from a distance and is not one:
-//! the role is announced by its own marker (`<|im_user|>`, `<|im_system|>`,
-//! `<|im_assistant|>`) rather than a shared opener plus role word, the
-//! header closes with `<|im_middle|>`, the turn ends without a trailing
-//! newline, and every assistant turn carries an explicit thinking block.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -59,9 +53,6 @@ impl Kimi {
         tokens
     }
 
-    /// Every assistant turn opens with a thinking block, so a replayed reply
-    /// that has none is given the empty one. Checks the start of the message
-    /// only — a reply that merely quotes the marker mid-prose stays bodiless.
     fn assistant_body(msg: &str) -> String {
         if msg.trim_start().starts_with(THINK_OPEN) {
             msg.to_string()

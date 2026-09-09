@@ -1,5 +1,3 @@
-//! gpt-oss tokenizer contract (stop tokens from Harmony).
-
 use ::tokenizer::contract::Contract;
 
 pub const CONTRACT: Contract = Contract {

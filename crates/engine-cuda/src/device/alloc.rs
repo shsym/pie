@@ -1,15 +1,11 @@
-//! One owned device allocation, plus the host/device transfers a shell needs. Every offset is bounds-checked here before it becomes a raw device pointer.
-
 use crate::error::{Fault, Result};
 
-/// A device allocation of a stated size.
 #[derive(Debug)]
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
 }
 
-/// Translates `cudaErrorMemoryAllocation` into `Fault::OutOfMemory` with the bytes asked and `cudaMemGetInfo`'s free bytes measured after the failure; every other status passes through unchanged.
 #[cfg(feature = "cuda")]
 fn out_of_room(fault: Fault, bytes: usize) -> Fault {
     use cudarc::runtime::sys as rt;
@@ -34,7 +30,6 @@ fn out_of_room(fault: Fault, bytes: usize) -> Fault {
 }
 
 impl Buffer {
-    /// Allocate `bytes`, zeroed — `cudaMalloc` hands back whatever the last tenant left, so unwritten bytes would read as data. A zero-byte request returns a null handle rather than an error. # Errors: [`Fault::Ceiling`] for a request the device has no room for, [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer { ptr: 0, bytes: 0 });
@@ -65,17 +60,6 @@ impl Buffer {
         }
     }
 
-    /// [`Buffer::zeroed`] with the fill ordered on `stream` instead of
-    /// against the whole device.
-    ///
-    /// `cudaMemset` is synchronous: it waits for everything already queued,
-    /// which on a host running frames ahead of the device is tens of
-    /// milliseconds — and a buffer a boundary is about to write and then
-    /// read on one stream needs no more order than that stream's.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`] for the allocation or the fill.
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer { ptr: 0, bytes: 0 });
@@ -112,19 +96,16 @@ impl Buffer {
         }
     }
 
-    /// The base address.
     #[must_use]
     pub fn ptr(&self) -> u64 {
         self.ptr
     }
 
-    /// How many bytes it holds.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The address `offset` bytes in, checked against the length. # Errors: [`Fault::Ceiling`] for an offset past the end.
     pub fn at(&self, offset: u64) -> Result<u64> {
         if offset > self.bytes as u64 {
             return Err(Fault::Ceiling {
@@ -136,7 +117,6 @@ impl Buffer {
         Ok(self.ptr + offset)
     }
 
-    /// Copy `bytes` in at `offset`, and wait. Synchronous: a caller must see the bytes landed before it launches anything that reads them. # Errors: [`Fault::Ceiling`] for a write past the end, [`Fault::Device`] for the copy.
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.span(offset, bytes.len())?;
         if bytes.is_empty() {
@@ -165,7 +145,6 @@ impl Buffer {
         }
     }
 
-    /// Zero `len` bytes at `offset`, and wait. Synchronous, like [`Buffer::write`]. # Errors: [`Fault::Ceiling`] for a span past the end, [`Fault::Device`] for the fill.
     pub fn zero_span(&mut self, offset: u64, len: usize) -> Result<()> {
         self.span(offset, len)?;
         if len == 0 {
@@ -189,7 +168,6 @@ impl Buffer {
         }
     }
 
-    /// Copy `bytes` in at `offset` on `stream`, ordered with the fire. Async, not synchronous, since a synchronous copy would order against every stream in the process. # Errors: [`Fault::Ceiling`] or [`Fault::Device`].
     pub fn stage(&mut self, stream: *mut core::ffi::c_void, offset: u64, bytes: &[u8]) -> Result<()> {
         self.span(offset, bytes.len())?;
         if bytes.is_empty() {
@@ -220,17 +198,6 @@ impl Buffer {
         }
     }
 
-    /// [`Buffer::stage_from`] for several spans in ONE runtime call
-    /// (`cudaMemcpyBatchAsync`), falling back to one call per span where the
-    /// runtime refuses the batch. A frame stages its fifteen input vectors
-    /// off one pinned slot, and fifteen `cudaMemcpyAsync` calls cost ~3 us
-    /// of host time each on the engine thread's critical path.
-    ///
-    /// # Safety
-    ///
-    /// Every `src .. src + len` must be a live, page-locked host allocation
-    /// that stays unwritten until the copies complete on `stream`.
-    /// # Errors: [`Fault::Ceiling`] for a span past this allocation, [`Fault::Device`] for a copy.
     pub unsafe fn stage_batch_from(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -244,7 +211,6 @@ impl Buffer {
             use cudarc::runtime::sys as rt;
             use std::sync::atomic::{AtomicBool, Ordering};
 
-            /// Set once the runtime refuses a batch: every later call goes span by span.
             static REFUSED: AtomicBool = AtomicBool::new(false);
 
             let live: Vec<(u64, *const u8, usize)> = spans
@@ -295,7 +261,6 @@ impl Buffer {
                 if status == rt::cudaError::cudaSuccess {
                     return Ok(());
                 }
-                // Clear the sticky error and take the span-by-span road from now on.
                 let _ = unsafe { rt::cudaGetLastError() };
                 REFUSED.store(true, Ordering::Relaxed);
             }
@@ -312,14 +277,6 @@ impl Buffer {
         }
     }
 
-    /// Copy `len` bytes from a host address on `stream` — [`Buffer::stage`]'s
-    /// twin, but genuinely asynchronous since the source is pinned memory.
-    ///
-    /// # Safety
-    ///
-    /// `src .. src + len` must be a live, page-locked host allocation that
-    /// stays unwritten until the copy completes on `stream`.
-    /// # Errors: [`Fault::Ceiling`] for a span past this allocation, [`Fault::Device`] for the copy.
     pub unsafe fn stage_from(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -356,7 +313,6 @@ impl Buffer {
         }
     }
 
-    /// Zero a span on `stream`, ordered with the fire — [`Buffer::zero_span`]'s asynchronous twin; `cudaMemset` itself is synchronous and would drain everything in flight. # Errors: [`Fault::Ceiling`] for a span past this allocation, [`Fault::Device`] for the memset.
     pub fn zero_span_on(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -391,7 +347,6 @@ impl Buffer {
         }
     }
 
-    /// Zero the whole allocation on `stream` — the fire-path counterpart of [`Buffer::zeroed`], for allocations reused across fires. # Errors: [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn clear(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
         if self.bytes == 0 {
             return Ok(());
@@ -420,7 +375,6 @@ impl Buffer {
         }
     }
 
-    /// Copy `into.len()` bytes out from `offset`, and wait. # Errors: [`Fault::Ceiling`] or [`Fault::Device`].
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.span(offset, into.len())?;
         if into.is_empty() {
@@ -474,22 +428,17 @@ impl Drop for Buffer {
     }
 }
 
-/// One mapped pinned allocation: the same address on host and device under UVA. Unlike [`Buffer`], two agents address it concurrently, so there is no write/read pair.
 #[derive(Debug)]
 pub struct Pinned {
     host: *mut u8,
     device: u64,
     bytes: usize,
-    /// Which allocator made these bytes, so `Drop` frees them the matching way: `cudaFreeHost` on a self-registered mapping faults, and `munmap` on a `cudaHostAlloc` leaks the driver's bookkeeping.
     origin: Origin,
 }
 
-/// How a [`Pinned`] came to be page-locked, for `Drop` to free it correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
-    /// `cudaHostAlloc` made the allocation and page-locked it in one call.
     Allocated,
-    /// This process mapped the pages and `cudaHostRegister` locked them ([`Pinning`]). Unreachable without a runtime.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     Registered,
 }
@@ -500,17 +449,14 @@ unsafe impl Send for Pinned {}
 unsafe impl Sync for Pinned {}
 
 impl Pinned {
-    /// Allocate `bytes` of zeroed mapped pinned memory. A zero-byte request returns a null allocation. # Errors: [`Fault::Runtimeless`] without a CUDA runtime, [`Fault::Device`] for whatever `cudaHostAlloc` said.
     pub fn mapped(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, true)
     }
 
-    /// Same as [`Pinned::mapped`] without the zeroing memset; caller must overwrite the whole length (padding included) before any read. # Errors: as [`Pinned::mapped`].
     pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, false)
     }
 
-    /// The memset [`Pinned::mapped_uninit`] skipped, done late (e.g. to restore zeroed state before a fallback writes only part of it). Sound where [`Pinned::write`] is sound.
     pub fn zero(&self) {
         if self.host.is_null() || self.bytes == 0 {
             return;
@@ -540,8 +486,6 @@ impl Pinned {
                     rt::cudaHostAlloc(
                         &raw mut host,
                         bytes,
-                        // Portable: a tensor-parallel follower's device reads
-                        // rank 0's channel rings through this mapping.
                         rt::cudaHostAllocMapped | rt::cudaHostAllocPortable,
                     ),
                 )?;
@@ -571,25 +515,21 @@ impl Pinned {
         }
     }
 
-    /// The address the host stores through.
     #[must_use]
     pub fn host(&self) -> *mut u8 {
         self.host
     }
 
-    /// The address a kernel dereferences. Equal to [`Pinned::host`] under UVA, asked rather than assumed.
     #[must_use]
     pub fn device(&self) -> u64 {
         self.device
     }
 
-    /// How many bytes it holds.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The bytes, as the host sees them right now — a snapshot of something another thread may be writing. Sound only where the channel's SPSC discipline says this span is the caller's.
     #[must_use]
     pub fn read(&self, offset: usize, len: usize) -> Vec<u8> {
         if len == 0 || self.host.is_null() || offset + len > self.bytes {
@@ -599,7 +539,6 @@ impl Pinned {
         unsafe { core::slice::from_raw_parts(self.host.add(offset).cast_const(), len).to_vec() }
     }
 
-    /// Borrow a span without copying, or `None` for one this allocation does not hold. Same SPSC soundness rule as [`Pinned::read`], held for the life of the borrow.
     #[must_use]
     pub fn view(&self, at: u64, len: u64) -> Option<&[u8]> {
         if len == 0 {
@@ -614,7 +553,6 @@ impl Pinned {
         Some(unsafe { core::slice::from_raw_parts(self.host.add(at).cast_const(), len) })
     }
 
-    /// Store `bytes` at `offset`, answering `false` when they would not fit. As [`Pinned::read`]: sound where the discipline says the span is the caller's.
     pub fn write(&self, offset: usize, bytes: &[u8]) -> bool {
         if self.host.is_null() || offset + bytes.len() > self.bytes {
             return false;
@@ -638,7 +576,6 @@ impl Drop for Pinned {
                     let _ = cudarc::runtime::sys::cudaFreeHost(self.host.cast());
                 }
             }
-            // Unregister before unmap: the page-lock claims pages this process owns, and dropping them first leaves that claim dangling.
             Origin::Registered => {
                 #[cfg(feature = "cuda")]
                 // SAFETY: the span is the one this structure registered.
@@ -656,7 +593,6 @@ impl Drop for Pinned {
     }
 }
 
-/// A pinned allocation filled first and page-locked last: mmap'd and advised into huge pages upfront, then locked with one `cudaHostRegister` at the end, avoiding `cudaHostAlloc`'s process-wide lock for the whole allocation.
 #[derive(Debug)]
 pub struct Pinning {
     host: *mut u8,
@@ -667,7 +603,6 @@ pub struct Pinning {
 unsafe impl Send for Pinning {}
 
 impl Pinning {
-    /// Map `bytes` of pages nothing has written yet, advised into huge pages for a cheap page-lock later. Uninitialized: caller must overwrite every byte first. # Errors: [`Fault::Device`] naming `mmap`, for a mapping the kernel refused.
     pub fn uninit(bytes: usize) -> Result<Pinning> {
         // SAFETY: a fresh private anonymous mapping of a stated length; no fd and no offset are involved, and the pages belong to nobody else.
         let at = unsafe {
@@ -686,21 +621,21 @@ impl Pinning {
                 code: -1,
             });
         }
-        // Advisory: a kernel that refuses huge pages falls back to per-page locking silently, not a failure. SAFETY: the range is the mapping this call just made.
-        unsafe { libc::madvise(at, bytes.max(1), libc::MADV_HUGEPAGE) };
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(at, bytes.max(1), libc::MADV_HUGEPAGE)
+        };
         Ok(Pinning {
             host: at.cast(),
             bytes,
         })
     }
 
-    /// The base of the mapping, for the reader that fills it.
     #[must_use]
     pub fn host(&self) -> *mut u8 {
         self.host
     }
 
-    /// Page-lock the finished image: one `cudaHostRegister` over the whole mapping, and the device address asked for rather than assumed. # Errors: [`Fault::Runtimeless`] without a CUDA runtime, [`Fault::Device`] for `cudaHostRegister`/`cudaHostGetDevicePointer`; the mapping returns to the kernel on any failure.
     pub fn lock(self) -> Result<Pinned> {
         #[cfg(feature = "cuda")]
         {
@@ -732,7 +667,6 @@ impl Pinning {
             }
             let host = self.host;
             let bytes = self.bytes;
-            // Ownership passes to the returned `Pinned`; its `Drop` unregisters and unmaps.
             core::mem::forget(self);
             Ok(Pinned {
                 host,
@@ -757,7 +691,6 @@ impl Drop for Pinning {
     }
 }
 
-/// Copy `bytes` to a resolved, bounds-checked device address, and wait. [`Buffer::write`]'s free-function twin, for an owner with only `&self`. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime selected.
 pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -786,12 +719,6 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// One device-to-device copy, on `stream`. A free function since callers hold only resolved device addresses, not an owned [`Buffer`]; always async since synchronous would order against every stream in the process. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime selected.
-/// Copy host `bytes` to device address `dst` on `stream` — [`Buffer::stage`] for a span the caller addresses itself. Async on the stream; a pageable source is staged before the call returns.
-///
-/// # Errors
-///
-/// [`Fault::Device`] for a refused copy.
 pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
@@ -855,7 +782,6 @@ pub fn copy_d2d(
     }
 }
 
-/// Copy `bytes` between addresses of any kind, on `stream`, via `cudaMemcpyDefault` since direction may not be device-to-device — [`copy_d2d`]'s twin for that pair. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime selected.
 pub fn copy_any(
     stream: *mut core::ffi::c_void,
     dst: u64,
@@ -890,7 +816,6 @@ pub fn copy_any(
     }
 }
 
-/// Zero `len` bytes at a device address, and wait. [`Buffer::zero_span`]'s free-function twin; bounds are checked by the caller (e.g. against an [`Arena`](crate::device::Arena)'s committed length, not a fixed size). # Errors: [`Fault::Device`] for the fill, [`Fault::Runtimeless`] with no runtime.
 pub fn zero_span(at: u64, len: usize) -> Result<()> {
     if len == 0 {
         return Ok(());
@@ -914,7 +839,6 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
     }
 }
 
-/// Zero `len` bytes at a device address on `stream`, ordered with the fire — [`Buffer::zero_span_on`]'s free-function twin. # Errors: as [`zero_span`].
 pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Result<()> {
     if len == 0 {
         return Ok(());
@@ -938,7 +862,6 @@ pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Resu
     }
 }
 
-/// Copy `into.len()` bytes back from a device address, and wait — [`Buffer::read`]'s free-function twin. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime.
 pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
     if into.is_empty() {
         return Ok(());
@@ -967,7 +890,6 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
     }
 }
 
-/// What the card says is free, in bytes, or `None` with no runtime. Not on any serving path — the only production caller is [`PhysicalPool`](crate::device::PhysicalPool)'s budget check, at load and when a commit grows.
 #[must_use]
 pub fn free_bytes() -> Option<u64> {
     #[cfg(feature = "cuda")]
@@ -985,8 +907,6 @@ pub fn free_bytes() -> Option<u64> {
     }
 }
 
-/// Whether `at` names host memory (pinned or registered), as the runtime
-/// classifies it — `false` for device, managed and unknown addresses.
 #[must_use]
 pub fn is_host_pointer(at: u64) -> bool {
     #[cfg(feature = "cuda")]
@@ -1004,7 +924,6 @@ pub fn is_host_pointer(at: u64) -> bool {
     }
 }
 
-/// Whether `stream` is inside a graph capture; host work is illegal there.
 #[must_use]
 pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
     #[cfg(feature = "cuda")]
@@ -1022,8 +941,6 @@ pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
     }
 }
 
-/// A bare device allocation, `None` when the runtime refuses; the caller
-/// owns it and frees it with [`raw_free`].
 #[must_use]
 pub fn raw_alloc(bytes: usize) -> Option<u64> {
     #[cfg(feature = "cuda")]
@@ -1041,7 +958,6 @@ pub fn raw_alloc(bytes: usize) -> Option<u64> {
     }
 }
 
-/// Frees an allocation [`raw_alloc`] made; a failure is ignored.
 pub fn raw_free(at: u64) {
     #[cfg(feature = "cuda")]
     {

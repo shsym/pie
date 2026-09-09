@@ -1,41 +1,3 @@
-//! **THE MINIMAX H3 IMPORT SPELLS EVERY PLANE THE `FL2VA/` PARTITION
-//! HOLDS, CUTS THE THREE MODALITY BLOCKS OUT OF THE adaLN BANK AND THE
-//! THREE PROJECTIONS OUT OF THE INTERLEAVED `qkv_proj`, AND READS THE
-//! ENCODER'S FIRST FIFTY LAYERS AND NOTHING ELSE.**
-//!
-//! ```text
-//! cargo test -p models --test the_minimax_h3_import_reads_the_fl2va_index
-//! ```
-//!
-//! The repository is a container of two pipelines, not a pipeline: the
-//! import target is `FL2VA/`, which opens as one prefixed name space
-//! (`dit.<transformer>`, `te.<text_encoder>`, `vae.<video_vae>`,
-//! `avae.<audio_vae>`). What is asserted:
-//!
-//! ```text
-//! (a) over a SYNTHETIC source shaped like the flagship's own state_dicts
-//!     (no bytes): the flagship reads every plane it declares, ONCE
-//!     except where a cut names it again — the fused `qkv_proj` three
-//!     times (one stride per projection), a block's adaLN bank eighteen
-//!     (three modality row blocks, six slices each) and the final layer's
-//!     two — and every plane types to its extents and lowers to a load
-//!     plan
-//! (b) over the REAL snapshot's `transformer/model.safetensors.index.json`
-//!     and `text_encoder/model.safetensors.index.json`, when the
-//!     HuggingFace cache holds them: the synthetic transformer's names ARE
-//!     the index's, name for name; every encoder plane the contract reads
-//!     is in the encoder's index; and the planes it does NOT read are the
-//!     ones the reference drops — layers 50..63, the final norm, the head
-//!     and the whole vision tower
-//! (c) over the golden's own `h3_mini.safetensors`, when present: the
-//!     miniature reads its file and types
-//! ```
-//!
-//! (b) and (c) are skipped by name where their files are absent. (b) is
-//! gated on the INDEX rather than on the shards, because the partition is
-//! 66 GB of transformer beside 67 GB of encoder and a test may not wait
-//! for them.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -50,13 +12,8 @@ use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 const FLAGSHIP: &str = "minimax-h3-fl2va-bf16-kv-bf16";
 const MINI: &str = "minimax-h3-mini-bf16-kv-bf16";
 
-/// One tensor of a checkpoint: its name, its shape, its element.
 type Named = (String, Vec<u64>, Leaf);
 
-/// The transformer's `state_dict`, as `FL2VA/transformer`'s index spells
-/// it, at one [`Dims`]. `bf16` throughout except the reference's fp32
-/// islands — the patch projections, the timestep embedder, the two output
-/// heads and the rope buffer.
 fn transformer(d: &Dims) -> Vec<Named> {
     let dim = u64::from(d.dim);
     let inner = u64::from(d.inner());
@@ -189,10 +146,6 @@ fn transformer(d: &Dims) -> Vec<Named> {
     out
 }
 
-/// The encoder's `state_dict`, as `FL2VA/text_encoder`'s index spells it:
-/// Qwen3-VL's `model.language_model.*`, its `lm_head` and its
-/// `model.visual.*` tower — of which this row reads only the first
-/// [`model::TE_LAYERS`] layers' planes and the embedding.
 fn text_encoder(depth: u32) -> Vec<Named> {
     let hidden = u64::from(model::TE_HIDDEN);
     let hd = u64::from(model::TE_HEAD_DIM);
@@ -250,9 +203,6 @@ fn bytes_of(leaf: Leaf) -> u64 {
     }
 }
 
-/// A source of these names and shapes over a sparse file holding no
-/// bytes: enough for a contract to build and type-check, which never
-/// reads a value.
 fn synthetic(dir: &Path, tensors: &[Named]) -> ztensor::Source {
     let path = dir.join("synthetic.bin");
     let mut catalog = Catalog::new();
@@ -294,7 +244,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// The checkpoint's types, for the contract type checker.
 struct Types<'a>(&'a ztensor::Source);
 
 impl CheckpointTypes for Types<'_> {
@@ -308,7 +257,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-/// How many times each checkpoint tensor is named by the contract.
 fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -319,23 +267,17 @@ fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     counts
 }
 
-/// How often the flagship names each plane: once, except where a cut
-/// names it again.
 fn expected_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
     let mut want: BTreeMap<String, usize> = BTreeMap::new();
     for (name, ..) in transformer(d) {
-        // `rope.inv_freq` is a table this text states as a constant.
         if name == "rope.inv_freq" {
             continue;
         }
         let count = if name.ends_with("attn.qkv_proj.weight") {
-            // One stride per projection.
             3
         } else if name.starts_with("blocks.") && name.contains(".adaln_proj.linear.") {
-            // Three modality row blocks, six slices each.
             (model::MODALITIES * model::ADALN_SLICES) as usize
         } else if name.starts_with("final_layer.adaln_proj.linear.") {
-            // One `(shift, scale)` pair, read as `[scale | shift]`.
             model::FINAL_SLICES as usize
         } else {
             1
@@ -373,7 +315,13 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     assert!(!plan.instrs.is_empty());
 }
 
-/// (a)
+fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
+    the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply();
+    the_flagship_refuses_a_bare_transformer();
+    the_flagships_names_are_the_partitions_index();
+    the_miniature_reads_its_golden_fixture();
+}
+
 #[test]
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     let dir = scratch();
@@ -395,8 +343,6 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
         .collect();
     assert_eq!(dit, expected_reads("dit.", &d));
 
-    // The encoder: the embedding and the first `TE_LAYERS` layers, once
-    // each; nothing past the cut, no final norm, no head.
     let te_read: BTreeSet<String> = counts
         .keys()
         .filter(|n| n.starts_with("te."))
@@ -410,8 +356,6 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
         })
         .collect();
     assert_eq!(te_read, te_want, "the encoder planes read are the cut's");
-    // `mlp.gate_proj` and `mlp.up_proj` fuse into one bank, and every
-    // other encoder plane is read once.
     for (name, count) in counts.iter().filter(|(n, _)| n.starts_with("te.")) {
         assert_eq!(*count, 1, "`{name}` is read {count} times");
     }
@@ -420,9 +364,6 @@ fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A checkpoint the flagship must refuse: the miniature's bare
-/// transformer, which carries no encoder.
-#[test]
 fn the_flagship_refuses_a_bare_transformer() {
     let dir = scratch();
     let src = synthetic(&dir, &transformer(&Dims::mini()));
@@ -444,8 +385,6 @@ fn the_flagship_refuses_a_bare_transformer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The repo directory in the HuggingFace cache, honoring the same
-/// precedence `huggingface_hub` uses.
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -456,7 +395,6 @@ fn hub() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
 }
 
-/// The `FL2VA/` partition of the snapshot, if the cache holds one.
 fn partition() -> Option<PathBuf> {
     let snapshots = hub().join("models--MiniMaxAI--MiniMax-H3/snapshots");
     std::fs::read_dir(snapshots)
@@ -466,7 +404,6 @@ fn partition() -> Option<PathBuf> {
         .find(|path| path.join("model_index.json").is_file())
 }
 
-/// The tensor names one component's `*.index.json` lists.
 fn index_names(component: &Path) -> Option<BTreeSet<String>> {
     let mut found: Option<BTreeSet<String>> = None;
     for stem in ["diffusion_pytorch_model", "model"] {
@@ -482,8 +419,6 @@ fn index_names(component: &Path) -> Option<BTreeSet<String>> {
     found
 }
 
-/// (b)
-#[test]
 fn the_flagships_names_are_the_partitions_index() {
     let Some(root) = partition() else {
         eprintln!("skipping: no MiniMaxAI/MiniMax-H3 FL2VA partition in the HuggingFace cache");
@@ -505,7 +440,6 @@ fn the_flagships_names_are_the_partitions_index() {
         eprintln!("skipping the encoder half: no shard index yet");
         return;
     };
-    // Every plane this row reads is in the index...
     let read: BTreeSet<String> = text_encoder(model::TE_LAYERS)
         .into_iter()
         .map(|(name, ..)| name)
@@ -518,8 +452,6 @@ fn the_flagships_names_are_the_partitions_index() {
         missing.is_empty(),
         "the encoder index holds none of {missing:?}"
     );
-    // ...and what it leaves is what the reference drops: the layers past
-    // the cut, the final norm, the head, and the whole vision tower.
     let left: BTreeSet<&String> = te_index.difference(&read).collect();
     for name in &left {
         let past_the_cut = (model::TE_LAYERS..model::TE_DEPTH)
@@ -547,17 +479,12 @@ fn golden(file: &str) -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// (c)
-#[test]
 fn the_miniature_reads_its_golden_fixture() {
     let Some(path) = golden("h3_mini.safetensors") else {
         eprintln!("skipping: no h3_mini.safetensors; run `h3_golden.py --mini`");
         return;
     };
     let src = ztensor_compat::open(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    // The fixture IS the miniature's state_dict, name for name — the
-    // official spellings, `qkv_proj` interleaved per head like the
-    // flagship's — so the same import path reads both.
     let index: BTreeSet<String> = src.names().map(str::to_string).collect();
     let want: BTreeSet<String> = transformer(&Dims::mini())
         .into_iter()

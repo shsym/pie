@@ -1,6 +1,3 @@
-//! DFlash2's candidate selector, walked (`attention.selector_walk`): one
-//! block per request span, the pick at every slot row.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -13,10 +10,6 @@ const THREADS: u32 = 256;
 
 const MAX_K: u32 = THREADS / 16;
 
-/// Walk every request's span: from the anchor's token, slot by slot, pick
-/// `argmax_c unary[row, c] + ⟨pred[prev] (⊙ hp[row]), succ[cand[row, c]]⟩`
-/// and make the pick the next slot's predecessor. `picks` is one i32 per
-/// candidate row; the anchor row's is its first candidate when `first == 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn walk(
     ctx: &Ctx,
@@ -90,8 +83,6 @@ pub fn walk(
     {
         return Err(refuse(OP, "hp, tokens and picks carry one row per candidate row"));
     }
-    // With no hidden term the seat is bound to the codebook (never read: the
-    // kernel branches on `has_hp`), so the binding is never nil.
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         OP,

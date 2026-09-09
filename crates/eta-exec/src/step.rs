@@ -16,10 +16,6 @@ use crate::{Error, Result, shape_numel};
 pub struct PassInputs<'a> {
     pub logits: Option<&'a [f32]>,
 
-    /// The draft head's own readout, when the fire has one: a rectangle of
-    /// its own, bound at [`IntrinsicId::MtpLogits`]. Leaving this `None`
-    /// falls back to rows `mtp_draft_row ..` of the trunk buffer (the layout
-    /// [`super::plan::bounded_mtp_row_base`] computes).
     pub mtp_logits: Option<&'a [f32]>,
 
     pub rows: u32,
@@ -28,11 +24,6 @@ pub struct PassInputs<'a> {
 
     pub mtp_draft_row: Option<u32>,
 
-    /// The fire's per-key attention rectangle, `[planes, ATTN_SCORE_KV_MAX]`
-    /// F32 row-major, read by [`IntrinsicId::AttnScore`] at the epilogue.
-    /// Not logits-shaped, so it gets its own field. `None` means no lane
-    /// captured anything, and reading the intrinsic against it faults rather
-    /// than returning a row of zeros.
     pub attn_score: Option<&'a [f32]>,
 }
 
@@ -94,8 +85,6 @@ fn bind_intrinsic(
     root_numel: u64,
     inputs: &PassInputs,
 ) -> Result<Value> {
-    // the score rectangle is its own buffer: nothing about the logits family
-    // below describes it (no vocabulary, no readout row, no draft base).
     if root_intr == Some(IntrinsicId::AttnScore) {
         let Some(scores) = inputs.attn_score else {
             return Err(Error {
@@ -121,8 +110,6 @@ fn bind_intrinsic(
             message: "unresolved value root (unsupported intrinsic) reached execution".to_owned(),
         });
     }
-    // a draft intrinsic reads the draft column when bound, else falls back
-    // to rows `mtp_draft_row ..` of the trunk's; both index by the same row.
     let drafts_column = matches!(
         root_intr,
         Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
@@ -156,8 +143,6 @@ fn bind_intrinsic(
     } else {
         0
     };
-    // A column of its own is measured by its own height, and the trunk's rows
-    // say nothing about it.
     let held_rows = if own {
         (logits.len() as u64) / vocab.max(1)
     } else {
@@ -183,26 +168,7 @@ fn bind_intrinsic(
     }
 }
 
-/// **WHAT RUNS ONE STAGE'S ARITHMETIC, AND NOTHING ELSE.**
-///
-/// The host's implementation is the interpreter; a backend's is its device
-/// form. Everything AROUND a stage stays in [`step`]: the readiness check, the
-/// order the stages run in, the port takes between prologue and epilogue, and
-/// the commit that advances the rings. A backend that restated any of that
-/// would be a second spelling of a sequence, free to drift from this one
-/// silently — so it supplies arithmetic and never sequencing.
-///
-/// The roots are resolved before this is called and are already in `vals`,
-/// because resolving them means reading a ring or binding an intrinsic, and
-/// neither is a thing a device does.
 pub trait StageRunner {
-    /// Run stage `sp`, whose roots are `roots` (global ids, already in
-    /// `vals`). Every value in `wanted` must be in `vals` when this returns;
-    /// so must anything a later op of this same stage reads.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the stage's arithmetic refused, in words.
     fn run(
         &mut self,
         plan: &ExecPlan,
@@ -212,24 +178,11 @@ pub trait StageRunner {
         vals: &mut [Value],
     ) -> Result<()>;
 
-    /// **WHETHER THIS RUNNER BINDS `id` ITSELF, FROM WHERE IT ALREADY LIVES.**
-    ///
-    /// The default is no, and the host binds it: `bind_intrinsic` slices the
-    /// fire's readout into a `Value` and the runner reads that. A device
-    /// runner answers yes for the logits, because the readout is already in
-    /// device memory and a device-to-device copy into the guest heap is the
-    /// whole reason to run there — binding it here would first drag a
-    /// vocabulary-wide row back to the host, which is the cost the exercise
-    /// exists to remove.
-    ///
-    /// Saying yes makes the runner responsible for the value: it is left
-    /// empty in `vals`, so anything that reads it on the host reads nothing.
     fn binds(&self, _id: Option<IntrinsicId>) -> bool {
         false
     }
 }
 
-/// The oracle: `eval_op` over the stage's ops, in the plan's own order.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Interpreted;
 
@@ -262,9 +215,6 @@ fn exec_stage(
     runner: &mut dyn StageRunner,
 ) -> Result<()> {
     let stage = &plan.package.stages[sp.stage_index];
-    // ── The roots first: every value that crosses the host line, in the
-    //    stage's own order, because a take CONSUMES and two takes of one
-    //    channel are not the same as one.
     let mut roots = Vec::new();
     for &id in &sp.value_ids {
         if sp.op_by_result.contains_key(&id) {
@@ -275,9 +225,6 @@ fn exec_stage(
             ValueOrigin::Const => const_root_value(root),
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
-            // A root the runner binds itself is left empty here: it never
-            // reaches the host, and filling it would be the copy this exists
-            // to avoid.
             ValueOrigin::Intrinsic if runner.binds(root.intrinsic) => Value::F32(Vec::new()),
             ValueOrigin::Intrinsic => {
                 bind_intrinsic(root.intrinsic, shape_numel(&root.shape), inputs)?
@@ -292,7 +239,6 @@ fn exec_stage(
         vals[id as usize] = cell;
         roots.push(id);
     }
-    // ── Then the arithmetic, wherever it runs.
     let wanted: Vec<u32> = stage.puts.iter().map(|put| put.value).collect();
     runner.run(plan, sp, &roots, &wanted, vals)?;
     for put in &stage.puts {
@@ -314,18 +260,11 @@ fn const_root_value(root: &eta_compiler::codegen::launch::LaunchValue) -> Value 
     }
 }
 
-/// One pass, interpreted on the host — the oracle every backend is diffed
-/// against.
 #[must_use]
 pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> StepOutcome {
     step_with(inst, plan, inputs, &mut Interpreted)
 }
 
-/// One pass, with `runner` doing each stage's arithmetic.
-///
-/// This is [`step`] with the one seam a backend needs: the sequence below —
-/// readiness, prologue, port takes, epilogue, commit — is the same sequence
-/// for every backend, and is spelled here once.
 #[must_use]
 pub fn step_with(
     inst: &mut InterpInstance,

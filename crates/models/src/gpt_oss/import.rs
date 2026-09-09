@@ -10,25 +10,13 @@ use model_dsl::Platform;
 
 const BANK_ROWS: u8 = 1;
 
-/// How this family spells its expert banks; every name outside the MoE is
-/// shared between the two spellings. `mlx_lm` un-fuses the row-interleaved
-/// `gate_up_proj` into two contiguous tensors (gate first) joined by
-/// `concat`, and its codes container is `Raw(U32)` instead of `Raw(U8)` —
-/// same bytes, reinterpreted ([`Expr::transmute`]). `_bias` splits the same
-/// way; `down_proj` only renames.
 #[derive(Clone, Copy)]
 enum Layout {
-    /// `mlp.experts.gate_up_proj_blocks` / `_scales` / `_bias`, fused and
-    /// row-interleaved, codes in `u8` — transformers.
     Transformers,
-    /// `mlp.experts.{gate,up,down}_proj.{weight,scales,bias}`, split, codes in
-    /// `u32` — `mlx_lm`.
     Mlx,
 }
 
 impl Layout {
-    /// The container the expert code planes arrive in. Scales are `u8` in
-    /// both spellings: one E8M0 exponent byte per block.
     fn codes(self) -> DType {
         match self {
             Self::Transformers => DType::U8,
@@ -43,8 +31,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // `load` fails on the first plane not found under this contract's
-        // own names, which is how a foreign file is detected.
         let mut refusals: Vec<String> = Vec::new();
         for (what, layout) in [
             ("transformers", Layout::Transformers),
@@ -71,9 +57,6 @@ impl Model {
         platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        // How many tensors one `read` covers depends on the weight's dtype,
-        // not the layout: bf16 reads one `.weight`, u4g64 reads the
-        // `.weight`/`.scales`/`.biases` triplet.
         let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, "model.embed_tokens.weight")?;
         b.read(&self.final_norm, "model.norm.weight")?;
@@ -94,13 +77,9 @@ impl Model {
             b.read(&attn.o_proj, ck("self_attn.o_proj.weight"))?;
             b.read(&attn.o_bias, ck("self_attn.o_proj.bias"))?;
             b.read(&attn.sinks, ck("self_attn.sinks"))?;
-            // `Moe::router` is declared `U8g64` wherever the stack is
-            // `U4g64` (`gpt_oss.py`'s `quant_predicate`, read at
-            // `Model::new`).
             b.read(&mlp.router, ck("mlp.router.weight"))?;
             b.read(&mlp.router_bias, ck("mlp.router.bias"))?;
 
-            // The one place the two spellings part — see [`Layout`].
             match layout {
                 Layout::Transformers => {
                     let rows = i64::from(mlp.inter);
@@ -139,8 +118,6 @@ impl Model {
                             layout,
                         )
                     }?);
-                    // Halves of the declared `[experts, 2*inter]` bias,
-                    // joined gate-first, same axis as `deinterleaved` above.
                     b.read_concat(
                         &mlp.gate_up_bias,
                         [
@@ -156,10 +133,6 @@ impl Model {
                 }
             }
         }
-        // The block drafter, `--aux`-imported (published on its own); its
-        // planes are the drafter's (`drafter::dflash`) and its norms a
-        // Qwen3-style stack's, read down by one for the `+1` op as the other
-        // families read theirs.
         if let Some(dflash) = &self.dflash {
             dflash.bind_aux(&mut b, src, &|from| Expr::src(from).bias(-1.0))?;
         }
@@ -190,11 +163,6 @@ fn banked_interleaved(
     })
 }
 
-/// A declared bank from `mlx_lm`'s split stems (`gate_up` = 2 tensors,
-/// `down` = 1). Each stem gives a `<stem>.weight` of codes and a
-/// `<stem>.scales` of E8M0 exponents; legs join on [`BANK_ROWS`], the axis
-/// `Weight::bank` cut. Leg extents are the bank's with that axis divided by
-/// the stem count; a mismatched byte count is caught by `infer_transmute`.
 fn banked_split(
     src: &ztensor::Source,
     w: &Weight,
@@ -242,8 +210,6 @@ fn banked_split(
     ])
 }
 
-/// The plane is on disk in the container this spelling promises, or the
-/// refusal names both.
 fn stored_as(src: &ztensor::Source, w: &Weight, plane: &str, want: DType) -> Result<(), Error> {
     let stored = stored_encoding(src, plane)?;
     if stored == Encoding::Raw(want) {

@@ -1,8 +1,3 @@
-//! `pie.serving/1`: the serving-artifact format layer — a stamp in the
-//! file's attributes and a placement policy, over an ordinary zTensor v3 file.
-//! Every object states its own type and carries its own block digests; the
-//! stamp says only which deployment the placement was chosen for.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
@@ -15,38 +10,20 @@ use crate::error::Error;
 use crate::file::meta::META_PREFIX;
 pub use crate::term::{plane_name, MMA_TILED};
 
-/// The file profile id and version this build implements: the attribute key
-/// the stamp lives under. Its presence is what makes a `.zt` a serving
-/// artifact rather than an ordinary checkpoint.
 pub const PROFILE: &str = "pie.serving/1";
 
-/// Shared prefix of every version of this profile.
 pub const PROFILE_FAMILY: &str = "pie.serving/";
 
-/// The revision a human bumps by hand — [`Stamp::layout_revision`]'s value
-/// for artifacts this build writes. Bumped when a change to an authored
-/// contract or compiled plan moves bytes without moving [`PROFILE`].
 pub const LAYOUT_REVISION: u64 = 1;
 
-/// The block this build's digests tile, 64 MiB: the unit a refill reads and
-/// hashes. A writer policy, read back per blob from the file.
 pub const BLOCK_BYTES: u64 = 64 << 20;
 
-/// The file-level serving facts, as one value (on disk: one attribute,
-/// keyed [`PROFILE`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stamp {
-    /// The profile id this file states — on disk, the key these live under.
     pub serving: String,
-    /// The engine whose kernels these bytes are landed for.
     pub backend: String,
-    /// The recipe the planes were compiled under. Object names in the file
-    /// are this SKU's weight names.
     pub sku: String,
-    /// A judgement a human moves, see [`LAYOUT_REVISION`].
     pub layout_revision: u64,
-    /// Every plane this SKU declares a registered adapter bank is absent
-    /// from the file, served as `Buffer::zeroed`.
     pub adapters_zeroed: bool,
 }
 
@@ -131,7 +108,6 @@ pub fn rebuild(source: Option<&str>) -> String {
 }
 
 impl Stamp {
-    /// The file's [`PROFILE`] attribute: the stamp's members under its key.
     #[must_use]
     pub fn encode(&self) -> Value {
         Value::Map(vec![(
@@ -223,9 +199,6 @@ impl Stamp {
     }
 }
 
-/// `pie.mma_tiled/1`: the canonical planes of a band-padded affine weight,
-/// in mma fragment order. The object's shape is the padded rectangle, so the
-/// size equation is the canonical one.
 struct MmaTiled;
 
 impl ztensor::vocab::Layout for MmaTiled {
@@ -275,14 +248,11 @@ impl ztensor::vocab::Layout for MmaTiled {
     }
 }
 
-/// The registry a pie reader opens files under: the standard one plus
-/// `MmaTiled`.
 #[must_use]
 pub fn vocabulary() -> ztensor::Vocabulary {
     ztensor::Vocabulary::standard().with_layout(MmaTiled)
 }
 
-/// One object's block digests, borrowed from its manifest entry.
 #[derive(Debug, Clone, Copy)]
 pub struct Blocks<'a> {
     algorithm: DigestAlgorithm,
@@ -291,7 +261,6 @@ pub struct Blocks<'a> {
 }
 
 impl<'a> Blocks<'a> {
-    /// The blocks an object states, or why it states none this build reads.
     pub fn of(name: &str, object: &'a Object) -> Result<Blocks<'a>, Error> {
         let Some(digest) = &object.blob.digest else {
             return Err(Error::Checkpoint(format!(
@@ -322,7 +291,6 @@ impl<'a> Blocks<'a> {
         self.blocks.size
     }
 
-    /// The object's decoded size, which the blocks tile exactly.
     #[must_use]
     pub fn size(&self) -> u64 {
         self.size
@@ -346,14 +314,11 @@ impl<'a> Blocks<'a> {
         self.blocks.span(which, self.size)
     }
 
-    /// Every block, as its blob-local range and its stated digest.
     pub fn iter(&self) -> impl Iterator<Item = (Range<u64>, &'a [u8])> + '_ {
         (0..self.count()).filter_map(|which| Some((self.span(which)?, self.digest(which)?)))
     }
 }
 
-/// A block digest computed piecewise, for a reader whose block lands in
-/// several destinations.
 pub enum Digesting {
     Xxh3(Box<xxhash_rust::xxh3::Xxh3>),
     Sha256(Box<sha2::Sha256>),
@@ -384,7 +349,6 @@ impl Digesting {
     }
 }
 
-/// One serving object's blob: where it is and how long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span<'a> {
     pub object: &'a str,
@@ -400,20 +364,16 @@ impl Span<'_> {
     }
 }
 
-/// Whether an object name is a serving object rather than a metadata one.
 #[must_use]
 pub fn is_serving(name: &str) -> bool {
     !name.starts_with(META_PREFIX)
 }
 
-/// The serving sequence, derived by sorting: `(shard index, blob offset)`,
-/// ties by name. Position *i* is hotter than *i + 1*.
 #[must_use]
 pub fn sequence(manifest: &Manifest) -> Vec<&str> {
     spans(manifest).into_iter().map(|span| span.object).collect()
 }
 
-/// Every serving object, in sequence order.
 #[must_use]
 pub fn spans(manifest: &Manifest) -> Vec<Span<'_>> {
     let shards: BTreeMap<&str, usize> = manifest
@@ -445,8 +405,6 @@ pub fn spans(manifest: &Manifest) -> Vec<Span<'_>> {
     out.into_iter().map(|(_, _, span)| span).collect()
 }
 
-/// The alignment a writer used, read off the offsets: the largest power of
-/// two dividing their gcd. `0` with no serving spans.
 #[must_use]
 pub fn alignment(spans: &[Span<'_>]) -> u64 {
     let mut gcd = 0u64;
@@ -459,7 +417,6 @@ pub fn alignment(spans: &[Span<'_>]) -> u64 {
     1u64 << gcd.trailing_zeros()
 }
 
-/// What a sequence of spans got wrong; gap and overlap are distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     Gap {
@@ -505,9 +462,6 @@ impl fmt::Display for Fault {
     }
 }
 
-/// The tiling check: at or after the reached point (up to `align` bytes of
-/// padding) is fine, an exact alias is fine, a partial overlap or a larger
-/// gap is a fault.
 #[must_use]
 pub fn tiling_fault(spans: &[Span<'_>], align: u64) -> Option<Fault> {
     let step = align.max(1);
@@ -545,7 +499,6 @@ pub fn tiling_fault(spans: &[Span<'_>], align: u64) -> Option<Fault> {
     None
 }
 
-/// A serving artifact's filename, taken apart: `<model-slug>.<sku>.<backend>.zt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Name {
     pub slug: String,
@@ -627,7 +580,6 @@ fn is_field(field: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
-/// Which `pie.serving/<n>` key a file states, if any.
 #[must_use]
 pub(crate) fn stated_profile(attributes: &Value) -> Option<&str> {
     let Value::Map(entries) = attributes else {

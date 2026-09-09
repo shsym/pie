@@ -251,10 +251,6 @@ pub fn host_put(inst: &InterpInstance, plan: &ExecPlan, chan: u32, value: &Value
         return HostOp::Poisoned;
     }
     let decl = &plan.package.channels[chan as usize];
-    // Was `host_visible(flags) && !host_reader(flags)` over two bits. The
-    // three states those two bits encoded are exactly `HostRole`'s variants,
-    // and the fourth bit pattern — reader without visible — was reachable and
-    // meant nothing.
     if decl.host_role != HostRole::Writer {
         return HostOp::WrongRole;
     }

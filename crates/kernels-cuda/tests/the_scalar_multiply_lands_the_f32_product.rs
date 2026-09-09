@@ -1,10 +1,3 @@
-//! `elemwise::norm::mul_scalar` over an f32 plane — a `[Lanes, 1]` timestep
-//! scaled in its lane chain — lands `x · s` exactly as the host computes it
-//! in f32 (no rounding through a half element on the way), and the bf16 arm
-//! still lands the bf16-rounded product.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_scalar_multiply_lands_the_f32_product`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,6 +10,11 @@ use kernels_cuda::tensor::Tensor;
 const ROWS: usize = 7;
 const WIDTH: usize = 5;
 const SCALE: f32 = 1000.0 / 3.0;
+
+fn the_scalar_multiply_lands_the_f32_product_every_case() {
+    an_f32_plane_scales_exactly();
+    a_bf16_plane_scales_to_the_rounded_product();
+}
 
 #[test]
 fn an_f32_plane_scales_exactly() {
@@ -43,7 +41,6 @@ fn an_f32_plane_scales_exactly() {
     }
 }
 
-#[test]
 fn a_bf16_plane_scales_to_the_rounded_product() {
     let mut rng = Lcg::seeded(43);
     let (bits, x) = rng.row(ROWS * WIDTH);

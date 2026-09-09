@@ -1,6 +1,3 @@
-//! Compile cache for guest MSL: two tiers (memory, negative), keyed after
-//! splicing in the RNG include. Fast math is disabled for determinism.
-
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
@@ -23,23 +20,12 @@ use objc2::runtime::ProtocolObject;
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
 
-/// The single-lane kernel kind, whose channels are argument slots.
 const KERNEL_FUSED: KernelKind = KernelKind::Fused;
 
-/// The grouped kernel kind, over a lane table. Handles what the single-lane
-/// form cannot: more than twelve channels (Metal's last argument index
-/// is 30), and vocabulary-width gathers split across a threadgroup.
 const KERNEL_GROUPED: KernelKind = KernelKind::Grouped;
 
-/// A region holding a value this wide goes to the grouped form even without
-/// an intrinsic gather: the runtime partitions every element-independent op
-/// and both fixed-tree reductions across the lane's threadgroup
-/// (`ptir_m1_execute_part`), so a vocabulary-wide softmax, mask or sum no
-/// longer walks its row on one thread. Below this width the single-lane form
-/// is as fast and skips the lane table.
 const WIDE_REGION_ELEMENTS: u32 = 256;
 
-/// How many elements an op's result holds; a scalar is one.
 fn op_width(op: &eta_compiler::codegen::launch::LaunchOp) -> u32 {
     op.shape
         .iter()
@@ -47,14 +33,12 @@ fn op_width(op: &eta_compiler::codegen::launch::LaunchOp) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-/// How many ops a fused region holds.
 fn region_ops(plan: &LaunchStagePlan, region_index: u32) -> usize {
     plan.fused
         .get(region_index as usize)
         .map_or(0, |region| region.nodes.len())
 }
 
-/// The op tags of a fused region, in order, as the wire spells them.
 fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
     plan.fused
         .get(region_index as usize)
@@ -73,7 +57,6 @@ fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
         .unwrap_or_default()
 }
 
-/// The widest value a fused region computes, in elements.
 fn region_widest(plan: &LaunchStagePlan, region_index: u32) -> u32 {
     plan.fused
         .get(region_index as usize)
@@ -88,64 +71,34 @@ fn region_widest(plan: &LaunchStagePlan, region_index: u32) -> u32 {
         })
 }
 
-/// `region-trace`: one line per compiled region naming the form it took, and
-/// why the grouped one was declined when it was. The decline reason otherwise
-/// reaches nobody: the shell falls back to the single-lane kernel and nothing
-/// says so.
 fn region_trace() -> bool {
     crate::diag::on().region_trace
 }
 
-/// Which emitted form a compiled region is; fixed at compile time, since the
-/// pipeline was built for one of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
-    /// Single-lane: status at buffer 0, each channel's cells at `7 + 2k` /
-    /// `8 + 2k`, one thread.
     Fused,
-    /// Grouped kernel over the lane table, a threadgroup per lane.
     Grouped,
-    /// Grouped library sampler (nucleus/top-k): same eleven bindings, one
-    /// threadgroup per (lane, row), requires exactly 256 threads.
     GroupedLibrary,
-    /// Streamed: the grouped bindings plus a step word at 11, dispatched once
-    /// per entry of [`Region::steps`] over a grid of (element blocks × lanes).
     Streamed,
 }
 
-/// One dispatch of a streamed region, resolved from the emitted step table
-/// against the plan's ops: which op, how it runs, and the values whose
-/// descriptors size its grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedStep {
-    /// The value the emitter sized this step by; `M4Step::index` is the
-    /// step's position in the table.
     pub node: u32,
     pub kind: eta_compiler::codegen::metal::StepKind,
-    /// The value whose length sizes a `Wide` grid: the op's result, or its
-    /// first operand for an op with none (a put).
     pub result: u32,
-    /// The value a reduction folds, whose row width fixes its levels.
     pub input: u32,
 }
 
-/// The include line every emitted kernel carries.
 const RNG_INCLUDE: &str = "#include \"ptir_rng.generated.metal\"";
 
-/// Device identity for the cache key: MSL compiles per-device, so no
-/// separate architecture/toolkit version is needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// The device's registry id, as `cache_identity` takes it.
     pub device: u64,
 }
 
 impl Target {
-    /// Read the bound device's identity.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Deviceless`](crate::Fault::Deviceless) off Apple.
     pub fn of(context: &Context) -> Result<Target> {
         #[cfg(target_vendor = "apple")]
         {
@@ -161,11 +114,7 @@ impl Target {
     }
 }
 
-/// One compiled entrypoint: the library and the pipeline state a dispatch
-/// binds. No `Drop`; ARC releases both when the last `Arc<Module>` goes.
 pub struct Module {
-    /// Kept alive so a symbolicated GPU error names the function, not an
-    /// address.
     #[cfg(target_vendor = "apple")]
     #[allow(dead_code)]
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
@@ -186,34 +135,26 @@ impl std::fmt::Debug for Module {
 }
 
 impl Module {
-    /// The entrypoint this module was built for.
     #[must_use]
     pub fn entry(&self) -> &str {
         &self.entry
     }
 
-    /// The pipeline a dispatch binds.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn pipeline(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.pipeline
     }
 
-    /// The widest threadgroup this pipeline will accept; a property of the
-    /// compiled kernel (register pressure), not of the device.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn max_threads(&self) -> usize {
         self.pipeline.maxTotalThreadsPerThreadgroup()
     }
 
-    /// The SIMD width this pipeline executes at.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn execution_width(&self) -> usize {
         self.pipeline.threadExecutionWidth()
     }
 
-    /// Compile one owned MSL source and build the pipeline for `entry`. A
-    /// rejected source is remembered in the negative tier; any other failure
-    /// is not.
     #[cfg(target_vendor = "apple")]
     fn build(
         device: &ProtocolObject<dyn MTLDevice>,
@@ -223,11 +164,7 @@ impl Module {
         use objc2_metal::MTLCompileOptions;
 
         let options = MTLCompileOptions::new();
-        // Metal defaults fast math on; turn it off for determinism.
         set_safe_math(&options);
-        // `kernel-dump=<dir>`: every generated source, as `<entry>.metal`, for
-        // a standalone harness to time or inspect. A failed write is not a
-        // compile failure.
         if let Some(dir) = crate::diag::on().kernel_dump.as_deref() {
             let path = dir.join(format!("{entry}.metal"));
             let _ = std::fs::write(path, source);
@@ -245,8 +182,6 @@ impl Module {
                      engine disagree about this region's entry name"
                 ),
             })?;
-        // The source already compiled, so a pipeline build failure is not a
-        // permanent rejection.
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|error| classify(entry, &error))?;
@@ -258,9 +193,6 @@ impl Module {
     }
 }
 
-/// Turn fast math off. `setMathMode:` only exists from macOS 15 / Metal 3.2;
-/// an unrecognised selector aborts the process, so `respondsToSelector:` is
-/// checked first and the deprecated `setFastMathEnabled:` is the fallback.
 #[cfg(target_vendor = "apple")]
 fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
     use objc2::runtime::NSObjectProtocol as _;
@@ -268,7 +200,6 @@ fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
     if options.respondsToSelector(objc2::sel!(setMathMode:)) {
         options.setMathMode(objc2_metal::MTLMathMode::Safe);
     } else {
-        // Older fallback selector; turns off both halves.
         #[allow(deprecated)]
         options.setFastMathEnabled(false);
     }
@@ -278,9 +209,6 @@ fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
     }
 }
 
-/// An `NSError` from the shader compiler, split into the shared vocabulary.
-/// Only `Internal` is `Retryable`; everything else, including a syntax
-/// error's `MTLLibraryError::Unsupported`, is treated as `Deterministic`.
 #[cfg(target_vendor = "apple")]
 fn classify(entry: &str, error: &objc2_foundation::NSError) -> Failure {
     use objc2_metal::MTLLibraryError;
@@ -298,9 +226,6 @@ fn classify(entry: &str, error: &objc2_foundation::NSError) -> Failure {
     }
 }
 
-/// The emitted source with its one unresolved include spliced in:
-/// `newLibraryWithSource:` has no header search path, so the include cannot be
-/// left for the compiler.
 fn expand(source: &str) -> String {
     if !source.contains(RNG_INCLUDE) {
         return source.to_string();
@@ -308,49 +233,33 @@ fn expand(source: &str) -> String {
     source.replace(RNG_INCLUDE, &eta_compiler::codegen::rng::generate_msl_preamble())
 }
 
-/// One compiled region: the module that holds it, and which region it is.
 #[derive(Debug)]
 pub struct Region {
-    /// Index into the plan's fused partition. The grouped emitter names its
-    /// fused-region kernels at `singleton.len() + region_index`.
     pub region_index: u32,
-    /// The streamed form's dispatch table, in order; empty for every other form.
     pub steps: Arc<Vec<StreamedStep>>,
-    /// Which emitted form this region's pipeline was built from.
     pub form: Form,
-    /// The compiled library and its pipeline.
     pub module: Arc<Module>,
 }
 
 impl Region {
-    /// The pipeline a dispatch binds.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn pipeline(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         self.module.pipeline()
     }
 }
 
-/// What the grouped form answered for one region.
 enum GroupedAnswer {
-    /// The grouped kernel compiled; this is it.
     Served(Region),
-    /// It did not; the clause the caller's refusal message appends.
     Declined(String),
 }
 
-/// One compiled stage: every generated region it declares, in region order.
-/// Shared: two programs naming the same stage share one compiled library;
-/// ARC keeps the pipeline alive for as long as any holder does.
 #[derive(Debug, Clone)]
 pub struct Stage {
-    /// The stage's signature hash, as its plan states it.
     pub signature_hash: u64,
-    /// The generated regions, in ascending `region_index`.
     pub regions: Arc<Vec<Region>>,
 }
 
 impl Stage {
-    /// The region with this index, if it was compiled.
     #[must_use]
     pub fn region(&self, region_index: u32) -> Option<&Region> {
         self.regions
@@ -359,28 +268,20 @@ impl Stage {
     }
 }
 
-/// A registered program's compiled form: one [`Stage`] per stage plan.
 #[derive(Debug, Clone)]
 pub struct Compiled {
-    /// The stages, in plan order.
     pub stages: Arc<Vec<Stage>>,
-    /// The stage plans these were compiled from, in the same order, so a
-    /// compiled program cannot drift from its plan.
     pub plans: Arc<Vec<LaunchStagePlan>>,
-    /// Each stage's attachment point (`LaunchStage::kind`); `LaunchStagePlan`
-    /// itself carries no `kind`.
     pub kinds: Arc<Vec<Attach>>,
 }
 
 impl Compiled {
-    /// The index of the first stage with this attachment point.
     #[must_use]
     pub fn stage_of_kind(&self, kind: Attach) -> Option<usize> {
         self.kinds.iter().position(|&k| k == kind)
     }
 }
 
-/// The compile cache: the only thing in this crate that compiles guest MSL.
 #[derive(Debug)]
 pub struct Cache {
     programs: Bounded<u64, Compiled>,
@@ -396,7 +297,6 @@ impl Default for Cache {
 }
 
 impl Cache {
-    /// An empty cache.
     #[must_use]
     pub fn new() -> Cache {
         Cache {
@@ -407,22 +307,11 @@ impl Cache {
         }
     }
 
-    /// What the tiers have been doing.
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    /// Compile `plan`'s generated regions, or answer from a tier.
-    ///
-    /// `versions` carries the identity's version numbers, so a host-side
-    /// bump misses rather than reusing a stale pipeline.
-    ///
-    /// # Errors
-    ///
-    /// [`Failure::Deterministic`] when the program cannot compile here —
-    /// only these are remembered — and [`Failure::Retryable`] when the
-    /// machine could not.
     pub fn compile(
         &mut self,
         context: &Context,
@@ -458,7 +347,6 @@ impl Cache {
                 Ok(compiled)
             }
             Err(failure) => {
-                // No half-stage is left behind on failure.
                 self.stages.abandon();
                 if let Failure::Deterministic { reason } = &failure {
                     self.negative.insert(program_key, reason.clone());
@@ -468,12 +356,10 @@ impl Cache {
         }
     }
 
-    /// Forget `program_hash`, dropping this cache's share of its modules.
     pub fn forget(&mut self, program_hash: u64) {
         self.programs.remove(&program_hash);
     }
 
-    /// The compile proper. Installs nothing; the caller commits or abandons.
     fn build(
         &mut self,
         context: &Context,
@@ -501,8 +387,6 @@ impl Cache {
                 stage_plan.signature_hash,
                 versions,
             );
-            // Nothing folded in beside the identity: on this plane the
-            // device is the toolchain.
             let key = eta_ir::fnv1a64(identity.as_bytes());
             let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
             match lookup {
@@ -513,8 +397,6 @@ impl Cache {
                         continue;
                     }
                 }
-                // A signature collision builds the stage unshared: two stages
-                // that hash alike are still two valid stages.
                 Lookup::Collided | Lookup::Miss => {}
             }
 
@@ -528,12 +410,10 @@ impl Cache {
         Ok(Compiled {
             stages: Arc::new(stages),
             plans: Arc::new(plan.package.plans.clone()),
-            // `plans` is parallel to `package.stages`, so kinds index the same way.
             kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
         })
     }
 
-    /// Every generated region of one stage.
     fn build_stage(
         &mut self,
         context: &Context,
@@ -546,8 +426,6 @@ impl Cache {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than four billion regions is not a stage".into(),
             })?;
-            // A second-party region has no generated kernel; that is not a
-            // compile failure.
             if plan.fused.get(region_index as usize).is_some_and(|region| {
                 region.kind == RegionKind::Library(LibraryOp::SecondParty)
             }) {
@@ -598,8 +476,6 @@ impl Cache {
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry, .. } => (source, entry),
-                // A declined region has no fallback path; skipping it would
-                // silently run with the fire's memset zeros.
                 Slot::Refused(why) => {
                     return Err(Failure::Deterministic {
                         reason: format!(
@@ -643,15 +519,6 @@ impl Cache {
         })
     }
 
-    /// The grouped kernel for one fused region, when it is used: the
-    /// single-lane emitter refused it, it is a library sampler (nucleus/top-k,
-    /// needing 256 threads), or it walks the vocabulary through an intrinsic
-    /// gather. Otherwise the region stays on the single-lane kernel.
-    ///
-    /// # Errors
-    ///
-    /// A decline is not an error: it answers [`GroupedAnswer::Declined`] and
-    /// the caller falls back to the single-lane path.
     fn grouped_region(
         &mut self,
         context: &Context,
@@ -703,7 +570,6 @@ impl Cache {
                  to split across the threadgroup. This region is none of the four"
             )));
         }
-        // The grouped table names a fused region at `singleton.len() + i`.
         let slot = match u32::try_from(plan.singleton.len())
             .ok()
             .and_then(|offset| offset.checked_add(region_index))
@@ -742,7 +608,6 @@ impl Cache {
         let module = self.region_module(context, entry, source)?;
         #[cfg(target_vendor = "apple")]
         if library && module.max_threads() < super::launch::LIBRARY_SAMPLER_THREADS {
-            // Compiled and dropped; the caller falls back to the single-lane form.
             return Ok(GroupedAnswer::Declined(format!(
                 "the grouped library sampler opens by declining any width but \
                  {}, and this pipeline's own limit is {}",
@@ -762,14 +627,6 @@ impl Cache {
         }))
     }
 
-    /// The streamed kernel for one fused region, when it applies: the region
-    /// is not a library sampler (those keep their hand-written kernels), the
-    /// plan's grouped path covers the stage (the streamed form shares its
-    /// tables), and the emitter answered a kernel with a step table.
-    /// Otherwise `None`, and the caller tries the grouped and single-lane
-    /// forms as before. Width is no longer a condition: a 64-element region
-    /// of eighteen ops was a millisecond on the single-lane form's one
-    /// thread and is a few dispatches of a few microseconds here.
     fn streamed_region(
         &mut self,
         context: &Context,
@@ -796,8 +653,6 @@ impl Cache {
             };
         let mut steps = Vec::with_capacity(table.len());
         for &word in table {
-            // The emitter names the value that sizes each dispatch outright:
-            // a wide pass's result, a reduction's input.
             let value = eta_compiler::codegen::metal::step_value(word);
             let Some(kind) = eta_compiler::codegen::metal::step_kind(word) else {
                 return Ok(None);
@@ -812,8 +667,6 @@ impl Cache {
         let module = self.region_module(context, entry, source)?;
         #[cfg(target_vendor = "apple")]
         if module.execution_width() != 32 {
-            // The streamed reductions fold a chunk across a SIMD group of
-            // exactly 32 lanes; the grouped forms make no such assumption.
             if region_trace() {
                 eprintln!(
                     "region: stage {stage_index} region {region_index} declines the Streamed \
@@ -831,7 +684,6 @@ impl Cache {
         }))
     }
 
-    /// One region: expand its include, compile it, build its pipeline.
     fn region_module(
         &mut self,
         context: &Context,
@@ -859,6 +711,12 @@ impl Cache {
 mod tests {
     use super::*;
 
+    fn compile_every_case() {
+        expansion_replaces_the_include_and_leaves_everything_else();
+        a_source_with_no_include_is_handed_over_unchanged();
+        the_two_emitters_never_share_a_cache_identity();
+    }
+
     #[test]
     fn expansion_replaces_the_include_and_leaves_everything_else() {
         let source = format!("// head\n{RNG_INCLUDE}\n// tail\n");
@@ -874,15 +732,11 @@ mod tests {
         );
     }
 
-    #[test]
     fn a_source_with_no_include_is_handed_over_unchanged() {
         let source = "kernel void nothing() {}\n";
         assert_eq!(expand(source), source);
     }
 
-    /// The identity separates the two backends and the two emitters, which
-    /// version independently.
-    #[test]
     fn the_two_emitters_never_share_a_cache_identity() {
         use eta_compiler::codegen::program::Backend as Emitter;
 

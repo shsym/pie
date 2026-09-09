@@ -1,13 +1,3 @@
-//! The schedulers' shared surface: the aligned bump allocator that carves
-//! offsets out of a granted workspace, the staging buffer whose bytes become
-//! a plan's `int_upload`, the host-table validators every planner opens
-//! with, and the cost heap the load balancers ride.
-//!
-//! The planners themselves are native reimplementations of FlashInfer's host
-//! scheduling: valid and deterministic, but not byte-identical to the C++
-//! reference. Only the staged encoding (i32 little-endian vectors at
-//! 16-byte-aligned offsets) is part of the contract.
-
 use core::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
@@ -15,9 +5,6 @@ use crate::error::Error;
 
 use crate::jit::refuse;
 
-/// An aligned bump allocator that carves offsets out of a granted
-/// workspace. It carries the plan op's name so an overflow refuses with
-/// attribution instead of a bare capacity number.
 #[derive(Clone, Copy, Debug)]
 pub struct AlignedAllocator {
     op: &'static str,
@@ -35,8 +22,6 @@ impl AlignedAllocator {
         }
     }
 
-    /// The offset lands as the `u32` the info tables carry — a schedule
-    /// table past 4 GiB is refused here, once, not at every site.
     pub fn alloc(
         &mut self,
         size: usize,
@@ -71,8 +56,6 @@ impl AlignedAllocator {
     }
 }
 
-/// The host image of the int workspace, written at the offsets a layout
-/// pass assigned and handed off as the plan's `int_upload`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Staging {
     op: &'static str,
@@ -143,9 +126,6 @@ impl Staging {
     }
 }
 
-/// Walks a host indptr once and hands back the per-request span widths it
-/// spells. Indptrs are engine-bound host twins, so a short or non-monotone
-/// table is refused, not asserted.
 pub fn spans(
     op: &'static str,
     which: &'static str,
@@ -167,13 +147,11 @@ pub fn spans(
         if width < 0 {
             return Err(refuse(op, format!("the host {which} is not monotone")));
         }
-        // Two i32 endpoints bound the difference under 2^32.
         widths.push(width as u32);
     }
     Ok(widths)
 }
 
-/// A per-request length table: one non-negative entry per request.
 pub fn lengths(
     op: &'static str,
     which: &'static str,
@@ -198,21 +176,16 @@ pub fn lengths(
         .collect()
 }
 
-/// A laid-out offset at its stage write. The layout pass in the same
-/// builder assigned it lines above, so `None` is a builder bug — an
-/// invariant, not an input.
 #[must_use]
 pub fn at(offset: Option<u32>) -> usize {
     offset.expect("the layout pass assigned this offset") as usize
 }
 
-/// Narrows a host-computed schedule value to the i32 the device text reads.
 pub fn narrow(op: &'static str, what: &'static str, value: i64) -> Result<i32, Error> {
     i32::try_from(value)
         .map_err(|_| refuse(op, format!("`{what}` reaches {value}, past the device's i32")))
 }
 
-/// [`narrow`], over a whole staged vector.
 pub fn narrow_all(op: &'static str, what: &'static str, values: &[i64]) -> Result<Vec<i32>, Error> {
     values.iter().map(|&v| narrow(op, what, v)).collect()
 }
@@ -245,16 +218,12 @@ impl Ord for Lane {
     }
 }
 
-/// The load balancer's min-heap over `(accumulated cost, lane)`: `pop`
-/// hands back the least-loaded lane. Ties resolve to the lower lane id, so
-/// a fixed input always balances the same way.
 #[derive(Clone, Debug)]
 pub struct CostHeap {
     heap: BinaryHeap<Reverse<Lane>>,
 }
 
 impl CostHeap {
-    /// One lane per CTA (or cluster), all starting unloaded.
     #[must_use]
     pub fn new(lanes: u32) -> Self {
         Self {
@@ -262,7 +231,6 @@ impl CostHeap {
         }
     }
 
-    /// The least-loaded lane and its accumulated cost.
     pub fn pop(&mut self) -> (u32, f32) {
         let Reverse(lane) = self.heap.pop().expect("CostHeap::pop on an empty heap");
         (lane.id, lane.cost)
@@ -273,13 +241,11 @@ impl CostHeap {
     }
 }
 
-/// The load balancer's cost of one work item.
 #[must_use]
 pub fn cost_function(qo_len: u32, kv_len: u64) -> f32 {
     2.0 * (qo_len as f32) + (kv_len as f32)
 }
 
-/// Where a causal tile's kv walk ends, in packed coordinates.
 #[must_use]
 pub fn packed_causal_kv_end(
     qo_len: u32,
@@ -295,6 +261,5 @@ pub fn packed_causal_kv_end(
     let init = i64::from(kv_len) - i64::from(qo_len);
     let walked = (i64::from(qo_tile_idx) + 1) * i64::from(cluster_tile_q);
     let end = init + (walked + i64::from(group_size) - 1) / i64::from(group_size);
-    // Clamped into [0, kv_len], so the u32 round trip is exact.
     end.clamp(0, i64::from(kv_len)) as u32
 }

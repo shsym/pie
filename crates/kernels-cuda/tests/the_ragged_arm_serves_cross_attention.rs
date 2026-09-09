@@ -1,11 +1,3 @@
-//! `attention.ragged` with two different group tables — a group's query
-//! rows and its key rows counted apart, on two rectangles of different
-//! heights — lands what an f32 host reference lands: cross-attention, with
-//! a group that has no keys (its rows land zeros) and one that has no
-//! queries (nothing of it is read), at grouped heads.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_serves_cross_attention`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -104,9 +96,7 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, q_sizes: &[u32], kv_sizes: &[u32]
     let v_at = gpu.up(&v_raw);
     let q_table_at = gpu.up(&q_table);
     let kv_table_at = gpu.up(&kv_table);
-    // Pre-filled with a sentinel, so a zero-key group is seen to land zeros
-    // rather than to be skipped.
-    let sentinel = vec![0x3f80u16; q_rows * qw]; // bf16 1.0
+    let sentinel = vec![0x3f80u16; q_rows * qw];
     let o_at = gpu.up(&sentinel);
     let ctx = gpu.ctx();
     let q = Tensor::new(q_at, q_rows as u32, qw as u32, Dtype::Bf16);
@@ -148,12 +138,18 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, q_sizes: &[u32], kv_sizes: &[u32]
     );
 }
 
+fn the_ragged_arm_serves_cross_attention_every_case() {
+    the_ragged_arm_serves_cross_attention_at_head_width_64();
+    the_ragged_arm_serves_cross_attention_at_head_width_128();
+    the_ragged_arm_serves_cross_attention_at_head_width_256();
+    the_ragged_arm_refuses_tables_of_two_lengths();
+}
+
 #[test]
 fn the_ragged_arm_serves_cross_attention_at_head_width_64() {
     check(64, 4, 2, &[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1], 0x64);
 }
 
-#[test]
 fn the_ragged_arm_serves_cross_attention_at_head_width_128() {
     check(
         128,
@@ -165,7 +161,6 @@ fn the_ragged_arm_serves_cross_attention_at_head_width_128() {
     );
 }
 
-#[test]
 fn the_ragged_arm_serves_cross_attention_at_head_width_256() {
     check(
         256,
@@ -177,7 +172,6 @@ fn the_ragged_arm_serves_cross_attention_at_head_width_256() {
     );
 }
 
-#[test]
 fn the_ragged_arm_refuses_tables_of_two_lengths() {
     let mut gpu = Gpu::open();
     let q_at = gpu.zeros(8 * 128 * 2);

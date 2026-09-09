@@ -1,49 +1,3 @@
-//! **THE WAN 2.2 ROWS TRACE, CLASSIFY AND BAKE: FOUR ARMS UNDER ONE PLAN,
-//! A CACHELESS ENCODER WITH A RELATIVE BIAS, A VIDEO DENOISER WHOSE
-//! CROSS-ATTENTION SPANS TWO STREAMS, AND A CAUSAL-CONV DECODER WITH A
-//! FRAME CACHE PER CONV.**
-//!
-//! ```text
-//! cargo test -p models --test the_wan_2_rows_bake
-//! ```
-//!
-//! `wan22-ti2v-5b` is the first catalog row whose plan carries a text
-//! encoder with NO kv space (umT5 is bidirectional), a denoiser reading
-//! its context from a second stream, and a voxel arm holding
-//! `CacheRow::State` slabs (design D5, D8). `wan22-mini-d128` /
-//! `wan22-mini-nano` are the parity fixtures `scripts/imagegen/wan22_golden.py
-//! --mini` writes. What is asserted:
-//!
-//! ```text
-//! (a) every row traces on every platform; the flagship declares one
-//!     state slab per causal conv of the decoder (32) and no kv row, the
-//!     miniatures nothing
-//! (b) the flagship's seams are `hidden`, `velocity` and `pixels` (twice:
-//!     the first-frame arm and the later-frames arm) and never `out`; the
-//!     miniatures' is `velocity` alone
-//! (c) the ports the trace reads are the ports the facts declare, at the
-//!     facts' widths and kind-relative indices, and the named ports
-//!     resolve to `model::port`
-//! (d) the (reading, stream) lanes the facts list classify into distinct
-//!     classes where every merge resolves
-//! (e) two ragged reads per block — the self-attention self-paired over
-//!     the video selection's group CSR, the cross-attention over the
-//!     video CSR against the context CSR under an `Or` guard — and one
-//!     per encoder layer, self-paired over the lane CSR at `sm_scale = 1`
-//!     under its own `RelativeBias` table
-//! (f) every rope turns the row's `[d − 4⌊d/6⌋, 2⌊d/6⌋, 2⌊d/6⌋]` split of
-//!     the whole head, interleaved, at θ 10 000 — `[44, 42, 42]` at 128,
-//!     `[8, 8, 8]` at 24 — and only the self-attentions turn
-//! (g) every row bakes on every platform under a voxel ladder; the
-//!     flagship refuses a budget with none
-//! (h) the generative facts: readings dense from 0, `text` embedding
-//!     tokens with no kv, the latent space `(48, 1×2×2, /16, /4)` and the
-//!     static shift 5.0
-//! (i) the modulation is a per-lane f32 vector over a bf16 trunk — two
-//!     scale-shift pairs per block and one at the head — and every gated
-//!     fold aliases its residual
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
@@ -91,7 +45,6 @@ fn is_flagship(sku: &str) -> bool {
     sku == TI2V
 }
 
-/// The reading codes `(text, denoise)` of a row.
 fn codes(sku: &str) -> (Option<u8>, u8) {
     if is_flagship(sku) {
         (Some(0), 1)
@@ -105,7 +58,17 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
-/// (a), (b)
+fn the_wan_2_rows_bake_every_case() {
+    every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
+    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_lane_the_facts_list_classifies_into_its_own_class();
+    the_attentions_pair_as_the_architecture_says();
+    every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved();
+    every_row_bakes_on_every_platform_under_a_voxel_ladder();
+    the_generative_facts_state_the_readings_the_latent_and_the_schedule();
+    the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
+}
+
 #[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
@@ -119,7 +82,6 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 .count();
             let kvs = plan.caches.len() - states;
             assert_eq!(kvs, 0, "{sku} {platform:?}: no kv space anywhere");
-            // 32 causal convs in the decoder, 24 in the encoder.
             let want = if is_flagship(sku) { 32 + 24 } else { 0 };
             assert_eq!(
                 states, want,
@@ -147,8 +109,6 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                     "{sku}: the voxel-axis readout on all four VAE arms"
                 );
             } else {
-                // Of the float readouts, the velocity alone (the `in` seam
-                // `trace_hybrid` plants on the embed input is not one).
                 for other in [seam::HIDDEN.name, seam::PIXELS.name] {
                     assert!(
                         !seams.contains_key(other),
@@ -178,8 +138,6 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
     traced
 }
 
-/// (c)
-#[test]
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -246,9 +204,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, d.patch_out());
-        // ONE voxel declaration, read under BOTH decoder arms: the two
-        // readings state the same `(kind, index)` at the same width, which
-        // is what lets the engine seat one rectangle for the whole plan.
         for name in ["vae.decode.head", "vae.decode"] {
             let Some(arm) = facts.readings.iter().find(|r| r.name == name) else {
                 assert!(!is_flagship(sku), "{sku}: a VAE row declares `{name}`");
@@ -275,9 +230,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             .iter()
             .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
             .count();
-        // TWO voxel ports on the flagship: the decode arms' 48-wide latent
-        // clip at index 0 and the encode arms' 3-wide pixel clip at index 1
-        // (the engine seats one rectangle per `(kind, index)`).
         assert_eq!(
             voxels,
             if is_flagship(sku) { 2 } else { 0 },
@@ -286,8 +238,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     }
 }
 
-/// (d)
-#[test]
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -315,15 +265,11 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             seen.len(),
             "{sku}: two lanes share a class: {seen:?}"
         );
-        // text/Text, denoise/Video, denoise/Context, and one Video lane
-        // for each of the two decoder and two encoder arms.
         let want = if is_flagship(sku) { 7 } else { 2 };
         assert_eq!(seen.len(), want, "{sku}: the lanes the facts list");
     }
 }
 
-/// (e)
-#[test]
 fn the_attentions_pair_as_the_architecture_says() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -382,11 +328,6 @@ fn the_attentions_pair_as_the_architecture_says() {
                     } else {
                         crossed += 1;
                         assert!(kv_sel.holds(context) && !kv_sel.holds(video));
-                        // The node spans both arms: video and context are
-                        // the two halves of the reading, so the `Or` of
-                        // their guards folds to the reading's own arm,
-                        // which holds for both lanes and for no other
-                        // reading's.
                         let spans = Selection::of(&node.guard).unwrap_or_else(|| {
                             panic!(
                                 "{sku}: a cross attention under a guard that is no selection: {:?}",
@@ -422,8 +363,6 @@ fn the_attentions_pair_as_the_architecture_says() {
     }
 }
 
-/// (f)
-#[test]
 fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -443,8 +382,6 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
                 _ => None,
             })
             .collect();
-        // q and k of every self-attention; the cross-attentions and the
-        // encoder turn nothing.
         assert_eq!(ropes.len(), 2 * d.layers as usize, "{sku}");
         let want_dims = match sku {
             NANO => [8, 8, 8, 0],
@@ -484,8 +421,6 @@ fn budget() -> model_compiler::Budget {
     }
 }
 
-/// (g)
-#[test]
 fn every_row_bakes_on_every_platform_under_a_voxel_ladder() {
     for platform in PLATFORMS {
         for sku in ROWS {
@@ -522,8 +457,6 @@ fn every_row_bakes_on_every_platform_under_a_voxel_ladder() {
     );
 }
 
-/// (h)
-#[test]
 fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for sku in ROWS {
         let facts = row(sku).generative.as_ref().expect("facts");
@@ -587,8 +520,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     }
 }
 
-/// What the runtime's `validate_generative` demands, restated here so the
-/// facts are checked where they are written.
 fn validate(facts: &models::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
@@ -604,8 +535,6 @@ fn validate(facts: &models::Generative) {
     }
 }
 
-/// (i)
-#[test]
 fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -663,7 +592,6 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
                 "{sku}: a gated fold is in place on its residual"
             );
         }
-        // The two tables are f32 planes added to f32 lane vectors.
         let f32_tables = plan
             .values
             .iter()
@@ -672,12 +600,6 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
                     && matches!(&decl.ty, Ty::Tensor { dtype: Dtype::F32, shape } if shape.len() == 1)
             })
             .count();
-        // The decoder's 38 convs: `post_quant`, `conv_in`, four in the mid
-        // block, twenty-four in the twelve resnets plus two shortcuts,
-        // two time convs, three resamples, `conv_out`. And the encoder's
-        // 30: `conv_in`, sixteen in the eight resnets plus two shortcuts,
-        // three resamples, two time convs, four in the mid block,
-        // `conv_out`, `quant`.
         const VAE_CONV_BIASES: usize = 38 + 30;
         assert_eq!(
             f32_tables,

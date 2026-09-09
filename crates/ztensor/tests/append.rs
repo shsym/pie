@@ -1,11 +1,3 @@
-//! Adding to a finished `.zt` without rewriting it.
-//!
-//! The interesting cases are not "does it round-trip" but the ones where the
-//! file ends up subtly wrong: an original byte moved, an alignment quietly
-//! dropped, an append onto an append, a name already taken. The first two are
-//! bugs this code shipped with, and both are invisible on the machine that
-//! wrote the file.
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -24,12 +16,18 @@ fn offset_of(src: &Source, name: &str) -> u64 {
     src.tensor(name).unwrap().locate().unwrap().offset
 }
 
-/// Spec §2.5: "Writers MUST NOT truncate or overwrite existing bytes."
-///
-/// The strong form of that is what this checks: the original file is a
-/// *prefix* of the appended one, byte for byte, including its old manifest and
-/// old footer. Anything weaker would let an append reclaim the old manifest,
-/// which is what makes a crashed append unrecoverable.
+fn append_every_case() {
+    the_original_file_is_a_prefix_of_the_appended_one();
+    a_half_finished_append_is_undone_by_truncating();
+    an_append_keeps_the_files_alignment();
+    the_footer_still_ends_the_file();
+    appends_compose();
+    a_shard_can_be_added_to_a_finished_file();
+    a_name_already_in_the_file_is_refused();
+    canonical_form_cannot_be_appended_to();
+    a_data_shard_has_nothing_to_append_to();
+}
+
 #[test]
 fn the_original_file_is_a_prefix_of_the_appended_one() {
     let path = tmp("append-basic.zt");
@@ -61,9 +59,6 @@ fn the_original_file_is_a_prefix_of_the_appended_one() {
     assert_eq!(offset_of(&src, "a"), a_off);
 }
 
-/// A crashed append is undone by truncating back to the old length, which only
-/// works because the old footer is still sitting there untouched.
-#[test]
 fn a_half_finished_append_is_undone_by_truncating() {
     let path = tmp("append-crash.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
@@ -71,10 +66,9 @@ fn a_half_finished_append_is_undone_by_truncating() {
     w.finish().unwrap();
     let original = fs::read(&path).unwrap();
 
-    // Simulate a crash: bytes written, no footer.
     let mut w = Writer::append(&path).unwrap();
     w.add("b", [4096u64], Leaf::F32, &vec![9u8; 16384]).unwrap();
-    drop(w); // never finished
+    drop(w);
 
     fs::OpenOptions::new()
         .write(true)
@@ -88,16 +82,9 @@ fn a_half_finished_append_is_undone_by_truncating() {
     assert_eq!(src.names().collect::<Vec<_>>(), vec!["a"]);
 }
 
-/// The alignment the file was written at is carried forward.
-///
-/// Without this a 64 KiB file silently becomes a mixed file: the tensors added
-/// later land on 4 KiB boundaries and lose page exclusivity on any host whose
-/// pages are larger than that, which is every Apple Silicon machine and some
-/// ARM servers. The writer that made the file would never see it.
-#[test]
 fn an_append_keeps_the_files_alignment() {
     let path = tmp("append-align.zt");
-    let mut w = Writer::create(&path).unwrap(); // canonical: 64 KiB
+    let mut w = Writer::create(&path).unwrap();
     w.add("a", [1024u64], Leaf::F32, &vec![1u8; 4096]).unwrap();
     w.finish().unwrap();
 
@@ -116,7 +103,6 @@ fn an_append_keeps_the_files_alignment() {
         );
     }
 
-    // And an explicit request still wins.
     let coarse = tmp("append-align-explicit.zt");
     let mut w = Writer::options()
         .canonical(false)
@@ -136,13 +122,9 @@ fn an_append_keeps_the_files_alignment() {
     assert_eq!(offset_of(&src, "b") % 65536, 0);
 }
 
-/// The footer ends the file. A reader finds the manifest no other way, so
-/// this is the property every append has to leave standing.
-#[test]
 fn the_footer_still_ends_the_file() {
     let path = tmp("append-shorter.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
-    // Many long names make the first manifest large.
     for i in 0..64 {
         let name = format!("a.very.long.tensor.name.that.pads.the.manifest.{i:04}");
         w.add(&name, [2u64], Leaf::F32, &f32s(&[1.0, 2.0])).unwrap();
@@ -165,8 +147,6 @@ fn the_footer_still_ends_the_file() {
     assert!(bytes.len() as u64 > big_manifest - 4096);
 }
 
-/// Appending twice: the second append reads what the first wrote.
-#[test]
 fn appends_compose() {
     let path = tmp("append-twice.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
@@ -186,8 +166,6 @@ fn appends_compose() {
     }
 }
 
-/// A shard table survives the trip, and a shard can be added by appending.
-#[test]
 fn a_shard_can_be_added_to_a_finished_file() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let shard = dir.join("append-shard-data.zt");
@@ -227,7 +205,6 @@ fn a_shard_can_be_added_to_a_finished_file() {
     s.verify_shards().unwrap();
 }
 
-#[test]
 fn a_name_already_in_the_file_is_refused() {
     let path = tmp("append-dup.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
@@ -239,11 +216,9 @@ fn a_name_already_in_the_file_is_refused() {
     assert!(matches!(err, Error::InvalidInput(_)), "{err}");
     w.abandon();
 
-    // The failed attempt did not damage the file.
     assert_eq!(Source::open(&path).unwrap().len(), 1);
 }
 
-#[test]
 fn canonical_form_cannot_be_appended_to() {
     let path = tmp("append-canonical.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -255,11 +230,8 @@ fn canonical_form_cannot_be_appended_to() {
     assert!(message.contains("canonical(false)"), "{message}");
 }
 
-#[test]
 fn a_data_shard_has_nothing_to_append_to() {
     let path = tmp("append-datashard.zt");
-    // Manifest-less (spec §7.2). zTensor reads these but does not write them,
-    // so the test builds one the way another producer would.
     let mut bytes = vec![0u8; 4160];
     bytes[..8].copy_from_slice(&ztensor::format::MAGIC);
     bytes[4096..4160].copy_from_slice(&[1u8; 64]);

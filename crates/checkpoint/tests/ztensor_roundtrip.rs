@@ -1,6 +1,3 @@
-//! Reads real files through the zTensor checkpoint reader, checking every
-//! tensor's `(file_offset, span_bytes)` against the bytes on disk.
-
 use std::path::{Path, PathBuf};
 
 use checkpoint::file::Metadata;
@@ -19,7 +16,6 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Reads the bytes a tensor's plan coordinates point at.
 fn bytes_at(metadata: &Metadata, name: &str) -> Vec<u8> {
     use std::io::{Read, Seek, SeekFrom};
     let tensor = metadata.tensor_by_name(name).expect("tensor present");
@@ -41,6 +37,14 @@ fn write_zt(path: &Path, tensors: &[(&str, Vec<u64>, ztensor::Leaf, Vec<u8>)]) {
         writer.add(*name, shape.to_vec(), *leaf, data).unwrap();
     }
     writer.finish().unwrap();
+}
+
+fn ztensor_roundtrip_every_case() {
+    zt_offsets_address_the_right_bytes();
+    safetensors_and_zt_agree_on_the_model();
+    zt_reader_matches_the_native_safetensors_reader();
+    a_sharded_root_addresses_bytes_in_its_shards();
+    a_zt_checkpoint_says_it_is_zt();
 }
 
 #[test]
@@ -65,21 +69,16 @@ fn zt_offsets_address_the_right_bytes() {
     let tensor = metadata.tensor_by_name("a.weight").unwrap();
     assert_eq!(tensor.shape, vec![2, 2]);
     assert_eq!(tensor.encoding, Encoding::Raw(DType::F32));
-    // Canonical placement: every tensor starts on a 64 KiB boundary.
     assert_eq!(tensor.file_offset % 65536, 0);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The same tensors, written as safetensors and as `.zt`, must describe the
-/// same model; only the offsets differ.
-#[test]
 fn safetensors_and_zt_agree_on_the_model() {
     let dir = tmpdir("agree");
     let a = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let b: Vec<u8> = (0..16).collect();
 
-    // safetensors, written by hand: header length, JSON, then the payloads.
     let header = format!(
         r#"{{"a.weight":{{"dtype":"F32","shape":[2,3],"data_offsets":[0,{}]}},"b.weight":{{"dtype":"U8","shape":[16],"data_offsets":[{},{}]}}}}"#,
         a.len(),
@@ -126,9 +125,6 @@ fn safetensors_and_zt_agree_on_the_model() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The zTensor reader accepts the same safetensors file the native reader
-/// does, and describes it identically.
-#[test]
 fn zt_reader_matches_the_native_safetensors_reader() {
     let dir = tmpdir("parity");
     let a = f32_bytes(&[0.5; 12]);
@@ -156,7 +152,6 @@ fn zt_reader_matches_the_native_safetensors_reader() {
             .unwrap_or_else(|| panic!("{} missing from the zTensor read", tensor.name));
         assert_eq!(tensor.shape, other.shape, "{}: shape", tensor.name);
         assert_eq!(tensor.encoding, other.encoding, "{}: encoding", tensor.name);
-        // offsets must agree exactly, not merely address equal bytes.
         assert_eq!(
             tensor.file_offset, other.file_offset,
             "{}: offset",
@@ -168,16 +163,11 @@ fn zt_reader_matches_the_native_safetensors_reader() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A sharded `.zt` root: the manifest names shards, the tensors live in
-/// other files, and the loader must end up with coordinates that address
-/// the right bytes in the right file.
-#[test]
 fn a_sharded_root_addresses_bytes_in_its_shards() {
     let dir = tmpdir("sharded");
     let payload = f32_bytes(&[1.5, 2.5, 3.5, 4.5]);
     let local = f32_bytes(&[7.0, 8.0]);
 
-    // positional convention: `model.zt` finds a shard named `00001` at `model-00001.zt`.
     let shard_path = dir.join("model-00001.zt");
     write_zt(
         &shard_path,
@@ -202,7 +192,6 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
         .canonical(false)
         .create(&root)
         .unwrap();
-    // one tensor of its own, so the root exercises both a local and a foreign part.
     writer
         .add("norm.weight", vec![2], ztensor::Leaf::F32, &local)
         .unwrap();
@@ -215,7 +204,6 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
     assert_eq!(bytes_at(&metadata, "embed.weight"), payload);
     assert_eq!(bytes_at(&metadata, "norm.weight"), local);
 
-    // the foreign tensor must be attributed to the shard, not the root.
     let embed = metadata.tensor_by_name("embed.weight").unwrap();
     let norm = metadata.tensor_by_name("norm.weight").unwrap();
     assert_ne!(embed.file_id, norm.file_id);
@@ -231,8 +219,6 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
     assert_eq!(file_of(norm.file_id), root.display().to_string());
 }
 
-/// A `.zt` checkpoint reports itself as `.zt`, including when reached as a shard.
-#[test]
 fn a_zt_checkpoint_says_it_is_zt() {
     use checkpoint::types::CheckpointFormat;
 

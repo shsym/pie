@@ -1,11 +1,3 @@
-//! The model-state bytes: paged kv pages and recurrent slabs, one allocation
-//! per cache row, alive for the model's whole load. Owns reservation and the
-//! [`KvPool`]/[`RecurrentPool`] rows a cache id resolves to (page/cell
-//! arithmetic is [`kv`]'s); also implements [`engine::frame::Supply`].
-//!
-//! [`Handles`]: crate::device::Handles
-//! [`Context`]: crate::device::Context
-
 pub mod accounting;
 pub mod kv;
 
@@ -19,7 +11,6 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
 
-/// The neutral store's refusals, in this shell's vocabulary.
 impl From<model_exec::store::Fault> for Fault {
     fn from(fault: model_exec::store::Fault) -> Fault {
         match fault {
@@ -42,14 +33,8 @@ impl From<model_exec::store::Fault> for Fault {
     }
 }
 
-/// The element the ssm entries hold their recurrent state at. `CacheRow::State`
-/// carries no dtype, so each shell states its own; the Metal shaders read
-/// `device float*`, unlike the CUDA plane's bf16.
 const STATE_DTYPE: Dtype = Dtype::F32;
 
-/// The element one state row lands at on this plane: f32 for any float
-/// element (the shaders' own width), but an integer state (e.g. qwen4's
-/// n-gram window, holding token ids) is honored as declared.
 fn state_dtype(declared: Dtype) -> Dtype {
     match declared {
         Dtype::I32 => Dtype::I32,
@@ -57,103 +42,49 @@ fn state_dtype(declared: Dtype) -> Dtype {
     }
 }
 
-/// How one cache row is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
-    /// A paged kv space: which geometry space it belongs to, and the row the
-    /// pages are cut at.
     Kv {
         space: u32,
         head_dim: u32,
         kv_heads: u32,
         dtype: Dtype,
-        /// The key plane's length in bytes, and therefore the length its
-        /// handle is minted at.
         plane_bytes: u64,
-        /// Bytes from the front of the allocation to the value pages:
-        /// [`plane_bytes`](Shape::Kv::plane_bytes) for the two-plane form,
-        /// zero for the one-plane shared form (key and value reader address
-        /// the same cells) and for an empty value plane (MLA with no rope
-        /// plane: the handle aliases the key plane at width zero).
         values_at: u64,
-        /// The value plane's row width in elements (the key plane's is
-        /// `kv_heads * head_dim`), and its length in bytes: MLA keeps its
-        /// latent in the key plane and its rope in the value plane, at
-        /// different widths.
         values_width: u64,
         values_bytes: u64,
     },
-    /// A recurrent slab: elements per slot.
     State { stride: u64, dtype: Dtype },
 }
 
-/// The per-fire handles a pool row borrows: the geometry vectors this fire
-/// wrote, and the graph-padding mask beside them. Rebuilt each fire from
-/// long-lived storage and short-lived geometry.
-///
-/// `page_indptr`/`page_indices` bind into `kernels_metal::KvPool` directly;
-/// `last_page_lens`/`row_valid` arrive as `RuntimeInput::Geometry` via
-/// [`CacheGeometry`](crate::run::CacheGeometry) and are kept here anyway for
-/// a single fill-once, read-twice struct.
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceSeat {
-    /// `i32`, `[lanes + 1]`: this space's page-list bounds.
     pub page_indptr: Tensor,
-    /// `i32`: the flat page-id list.
     pub page_indices: Tensor,
-    /// `i32`, `[lanes]`: each lane's last-page fill.
     pub last_page_lens: Tensor,
-    /// `u8`, `[rows]`: the padding mask the writers read.
     pub row_valid: Tensor,
 }
 
-/// What a fire lends the pools.
 #[derive(Debug, Clone)]
 pub struct Seats {
-    /// This fire's lanes.
     pub lanes: u32,
-    /// This fire's token rows.
     pub rows: u32,
-    /// How many pages its geometry named.
     pub pages: u32,
-    /// One seat per kv geometry space.
     pub spaces: Vec<SpaceSeat>,
-    /// `i32`, `[lanes]`: which recurrent slot each lane owns. Kept for the
-    /// readers that think in lanes; the ssm scans do not.
     pub slot_ids: Tensor,
-    /// `i32`, one per token ROW: which recurrent slot that row's lane owns.
-    /// The ssm shaders index this by token row (unlike the CUDA sibling,
-    /// which indexes by lane); the two coincide for a fire of one lane.
     pub slot_of_row: Tensor,
 }
 
-/// One span of kv cells moved inside this load's own pools; the only shape
-/// [`Pools::copy_kv`] takes. A whole-page copy and a single-token move are
-/// both a run of `tokens` cells starting at `(page, token)`; [`Move::plan`]
-/// flattens `KvCopy`'s two spellings into this one shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Move {
-    /// The page read.
     pub src_page: u32,
-    /// The first token slot read in it.
     pub src_token: u32,
-    /// The page written.
     pub dst_page: u32,
-    /// The first token slot written in it.
     pub dst_token: u32,
-    /// How many consecutive token slots move. `page_size` is a whole page.
     pub tokens: u32,
 }
 
 impl Move {
-    /// The contract's `copy_kv` argument, flattened into runs. Consecutive
-    /// per-token moves are coalesced into one blit per plane where the pages
-    /// match and the offsets are contiguous.
-    ///
-    /// # Errors
-    ///
-    /// Page lists that are not parallel, an offset past the page, or a run
-    /// whose two ends overlap.
     pub fn plan(copy: &KvCopy, page_size: u32) -> std::result::Result<Vec<Move>, String> {
         if copy.src_page_ids.len() != copy.dst_page_ids.len() {
             return Err(format!(
@@ -164,7 +95,6 @@ impl Move {
         }
         let mut moves: Vec<Move> =
             Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
-        // Whole-page half: every token slot moves, both sides at offset zero.
         for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
             moves.push(Move {
                 src_page: *src,
@@ -174,7 +104,6 @@ impl Move {
                 tokens: page_size,
             });
         }
-        // Token-granular half, coalesced into runs.
         for (at, cell) in copy.moves.iter().enumerate() {
             if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
                 return Err(format!(
@@ -182,7 +111,6 @@ impl Move {
                     cell.src_token_offset, cell.dst_token_offset
                 ));
             }
-            // A cell naming one place twice is dropped, not refused.
             if cell.src_page_id == cell.dst_page_id
                 && cell.src_token_offset == cell.dst_token_offset
             {
@@ -227,31 +155,15 @@ impl Move {
     }
 }
 
-/// Every cache space's bytes, one allocation per row.
 #[derive(Debug)]
 pub struct Pools {
     slabs: Vec<Buffer>,
     shapes: Vec<Shape>,
     paging: Paging,
-    /// The highest demand any admitted frame has stated, per arena. Not a
-    /// physical commitment (the reservation is fixed at load); read by
-    /// `pool_high_water_bytes` to see whether a load was carved too large.
     watermark: engine::frame::Demand,
 }
 
 impl Pools {
-    /// Reserve the pools one plan needs at one deployment's budget.
-    ///
-    /// `facts` is indexed by cache row, not by geometry space: a page id
-    /// says which page, never how wide the row it addresses is.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a cache row this shell cannot size — a kv row
-    /// no attention op reads, or one whose declared row is not `k|v` by a
-    /// head-multiple — [`Fault::Ceiling`] for a pool past `maxBufferLength`,
-    /// [`Fault::Device`] when the device declined a length, and
-    /// [`Fault::Deviceless`] for a non-Apple build.
     pub fn reserve(
         device: &Context,
         trace: &Trace,
@@ -271,9 +183,6 @@ impl Pools {
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;
-                    // A restatement (kv_heads != 0) exists only where a paged
-                    // launch made one; its absence is not an error, since some
-                    // consumers take their widths from their own operands.
                     let restated = facts
                         .rows
                         .get(index)
@@ -292,7 +201,6 @@ impl Pools {
                             });
                         }
                     }
-                    // One head of the whole plane where no head width was stated.
                     let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let element = elem_bytes(name, *dtype)?;
@@ -312,9 +220,6 @@ impl Pools {
                         plane_bytes: plane,
                         values_at: if own_values { plane } else { 0 },
                         values_width: planes.values,
-                        // An empty value plane aliases the key plane's bytes:
-                        // a zero-length handle has no seat, and no reader
-                        // touches it at width zero.
                         values_bytes: if planes.values == 0 { plane } else { values_bytes },
                     });
                 }
@@ -336,9 +241,6 @@ impl Pools {
         })
     }
 
-    /// Bytes one recurrent slot occupies across every state row — what the
-    /// contract publishes as `PoolFacts::state_slot_bytes`, and what tells the
-    /// runtime this model folds a recurrent state at all.
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.shapes
@@ -350,12 +252,6 @@ impl Pools {
             .sum()
     }
 
-    /// One slot's recurrent banks, read back — every state row's span for
-    /// `slot`, in cache-row order. A gate's instrument, not a fire-path verb.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a slot past the pool.
     pub fn read_slot(&self, slot: u32) -> Result<Vec<u8>> {
         if slot >= self.paging.slots {
             return Err(Fault::Ceiling {
@@ -377,9 +273,6 @@ impl Pools {
         Ok(out)
     }
 
-    /// Does any cache row carry recurrent state? Lets the fire path skip the
-    /// drain-before-clear ordering cost for attention-only plans, which have
-    /// nothing to clear.
     #[must_use]
     pub fn has_state(&self) -> bool {
         self.shapes
@@ -387,32 +280,21 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::State { .. }))
     }
 
-    /// The highest demand admission has committed. See the field.
     #[must_use]
     pub fn watermark(&self) -> engine::frame::Demand {
         self.watermark
     }
 
-    /// How the pages are handed out.
     #[must_use]
     pub fn paging(&self) -> Paging {
         self.paging
     }
 
-    /// Every byte these pools hold.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.slabs.iter().map(Buffer::bytes).sum()
     }
 
-    /// The cache table one fire resolves its cache ids through. The pools'
-    /// bytes are load-lived; the views into them are rebuilt each fire.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a kv row whose space this fire seated no
-    /// geometry for, [`Fault::Ceiling`] for a plane that leaves its own
-    /// reservation or a full handle table.
     pub fn table(&self, handles: &Handles, seats: &Seats) -> Result<CacheTable> {
         let mut rows = Vec::with_capacity(self.shapes.len());
         for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
@@ -452,8 +334,6 @@ impl Pools {
                         page_indices: seat.page_indices,
                         page_indptr: seat.page_indptr,
                         page_size: narrow(u64::from(self.paging.page_size)),
-                        // NHD layout: one token row is `kv_heads * head_dim`
-                        // elements, one head plane is `head_dim`.
                         seq_stride: u64::from(kv_heads) * u64::from(head_dim),
                         head_stride: u64::from(head_dim),
                     })
@@ -461,9 +341,6 @@ impl Pools {
                 Shape::State { stride, dtype } => {
                     let bytes =
                         stride * u64::from(self.paging.slots) * u64::from(elem_size(dtype));
-                    // One handle, read three times: `CacheRow::State` is one
-                    // slab, and `new_conv_state` aliases it because the
-                    // rolling update is in place.
                     let bank = Tensor::new(
                         handles.bind(slab, 0, bytes)?,
                         self.paging.slots,
@@ -482,17 +359,7 @@ impl Pools {
         Ok(CacheTable(rows))
     }
 
-    /// Clear one slot's recurrent state. Needed because a recurrent slot is
-    /// its history: opening a sequence in a slot another one used must zero
-    /// what that one left (unlike a kv page, overwritten before it is read).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a slot past the pool or a span past a slab,
-    /// [`Fault::Deviceless`] for a non-Apple build.
     pub fn clear(&mut self, slot: u32) -> Result<()> {
-        // Nothing to zero on an attention-only plan, and no bank the seat
-        // could be past — the ceiling below is the banks' own.
         if !self.has_state() {
             return Ok(());
         }
@@ -513,25 +380,6 @@ impl Pools {
         Ok(())
     }
 
-    /// Copy kv cells between pages of these pools, into `frame`'s command
-    /// buffer. The device half of a prefix-tree fork: a shared page run is
-    /// grafted onto fresh ids. Loops over every plane of every row, since a
-    /// page id names all of them.
-    ///
-    /// Encoded as a blit rather than a host `Buffer::write`: a host store
-    /// isn't ordered against a command buffer already queued, so encoding is
-    /// what lets the copy inherit queue order without a drain.
-    ///
-    /// Two passes: the first checks every span fits a page and commits the
-    /// frame's demand; the second encodes. A refused plan leaves an empty,
-    /// uncommitted command buffer.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a run past a page's tokens or a page past the
-    /// pool, [`Fault::Device`] when the command buffer would not open a blit
-    /// pass, [`Fault::Deviceless`] off Apple. An overlapping move is refused
-    /// earlier, by [`Move::plan`].
     pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[Move]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
@@ -554,8 +402,6 @@ impl Pools {
                 highest = highest.max(page.saturating_add(1));
             }
         }
-        // Both ends have to be admitted; a fork names its destination page
-        // before any frame's demand has covered it.
         engine::frame::Supply::commit(
             self,
             engine::frame::Demand {
@@ -578,9 +424,6 @@ impl Pools {
             };
             let element = u64::from(elem_size(dtype));
             let keys_cell = u64::from(kv_heads) * u64::from(head_dim) * element;
-            // A shared row has one plane base: copying it twice would be a
-            // self-overlapping blit (device fault). So does an empty value
-            // plane, which aliases the key plane.
             let bases = [(0, keys_cell), (values_at, values_width * element)];
             let bases = if values_at == 0 { &bases[..1] } else { &bases[..] };
             for &(plane, cell) in bases {
@@ -599,8 +442,6 @@ impl Pools {
                     if src == dst {
                         continue;
                     }
-                    // The blit itself has no bounds check; a copy past a
-                    // reservation is a device fault.
                     slab.span(src, bytes)?;
                     slab.span(dst, bytes)?;
                     frame.copy(slab.slab(), src, slab.slab(), dst, bytes)?;
@@ -610,30 +451,6 @@ impl Pools {
         Ok(())
     }
 
-    /// Copy whole recurrent slots between seats of these pools, into
-    /// `frame`'s command buffer — the device half of a recurrent fork. Each
-    /// `(src, dst)` pair moves every state row's span for `src` onto `dst`; a
-    /// recurrent bank is a folded summary of a prefix, not per-token entries,
-    /// so there is no narrower unit to move. Buffered activations
-    /// (`crate::rs`) are not touched: a fork's buffer is the runtime's to
-    /// re-derive or abandon.
-    ///
-    /// Encoded as a blit for the reason [`Pools::copy_kv`] gives: a host
-    /// `Buffer::write` is not ordered against a command buffer already on
-    /// the queue, and a blit inherits queue order without a drain.
-    ///
-    /// Two passes, like `copy_kv`: the first refuses a seat past the pool and
-    /// commits the frame's demand; the second encodes. A refused plan leaves
-    /// an empty, uncommitted command buffer. An attention-only plan has no
-    /// bank to move and answers `Ok` without encoding — and without a
-    /// ceiling, since the slot ceiling belongs to the banks alone (see
-    /// [`Supply::commit`](engine::frame::Supply::commit)).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a slot past the pool, [`Fault::Device`] when
-    /// the command buffer would not open a blit pass, [`Fault::Deviceless`]
-    /// off Apple.
     pub fn copy_state(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
         if moves.is_empty() || !self.has_state() {
             return Ok(());
@@ -651,8 +468,6 @@ impl Pools {
                 highest = highest.max(slot.saturating_add(1));
             }
         }
-        // Both ends have to be admitted; a fork names its destination seat
-        // before any frame's demand has covered it.
         engine::frame::Supply::commit(
             self,
             engine::frame::Demand {
@@ -671,8 +486,6 @@ impl Pools {
                     continue;
                 }
                 let (from, to) = (u64::from(src) * bytes, u64::from(dst) * bytes);
-                // The blit itself has no bounds check; a copy past a
-                // reservation is a device fault.
                 slab.span(from, bytes)?;
                 slab.span(to, bytes)?;
                 frame.copy(slab.slab(), from, slab.slab(), to, bytes)?;
@@ -682,21 +495,10 @@ impl Pools {
     }
 }
 
-/// The engine's half of memory, on a plane whose reservation is fixed.
-/// `commit` is a ceiling check raised before any command buffer opens, so a
-/// refused frame leaves nothing to undo.
 impl engine::frame::Supply for Pools {
     type Error = Fault;
 
     fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        // THE SLOT CEILING BELONGS TO THE RECURRENT BANKS, AND ONLY TO THEM.
-        // `demand.state_slots` is the fire's highest seat plus one, and a seat
-        // is a bank row — on a plan that folds no state there is no bank for
-        // it to be past. `slots` reserves nothing there either (`pool_demand`
-        // charges bytes per slot for `CacheRow::State` alone), so enforcing it
-        // refuses a fire over a resource this load never held: an
-        // attention-only deployment would seat `max_state_slots` sequences and
-        // kill the next one with a recurrent-slot refusal it cannot act on.
         if self.has_state() && demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -712,7 +514,6 @@ impl engine::frame::Supply for Pools {
                 have: pages,
             });
         }
-        // This plane grants no per-fire workspace, so any nonzero demand is refused.
         if demand.workspace > 0 {
             return Err(Fault::Ceiling {
                 what: "pool workspace bytes",
@@ -724,8 +525,6 @@ impl engine::frame::Supply for Pools {
         Ok(())
     }
 
-    /// Nothing is unmapped (a fixed reservation has no tail to give back);
-    /// the hint only stops the watermark from being a stale ratchet.
     fn trim(&mut self, hint: engine::frame::Demand) {
         self.watermark = engine::frame::Demand {
             kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
@@ -735,14 +534,6 @@ impl engine::frame::Supply for Pools {
     }
 }
 
-/// The kv pool's resident bytes, off the trace's cache rows and paging
-/// alone, read before a byte is reserved. Matches [`Pools::reserve`]'s
-/// arithmetic without needing a device or `Facts`.
-///
-/// # Errors
-///
-/// [`Fault::Unbound`] for a cache row whose planes this shell cannot cut or
-/// whose element has no byte size — the same two refusals `reserve` raises.
 pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -773,11 +564,6 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(bytes)
 }
 
-/// A kv row's planes: how wide the key plane and the value plane are, and
-/// whether they are one shared plane. Forms served: `[w]` (a shared latent,
-/// read as both k and v), `[w, w]` (key/value halves), and `[k, v]` at
-/// different widths (MLA's latent beside its rope plane; `v` may be zero
-/// for a nope-only mixer).
 struct Planes {
     keys: u64,
     values: u64,
@@ -825,7 +611,6 @@ fn narrow(n: u64) -> i32 {
 mod tests {
     use super::*;
 
-    /// A state slab of `slots` seats at `stride` f32 each, and nothing else.
     fn state_pools(device: &Context, slots: u32, stride: u64) -> Pools {
         let bytes = stride * u64::from(slots) * u64::from(elem_size(STATE_DTYPE));
         Pools {
@@ -856,8 +641,12 @@ mod tests {
         Some(Context::bind().expect("the system device"))
     }
 
-    /// After `copy_state`, the destination reads back as the source did,
-    /// and a seat the plan did not name is left as it was.
+    fn store_every_case() {
+        a_copied_slot_reads_back_as_its_source();
+        a_slot_past_the_pool_is_a_ceiling();
+        an_attention_only_plan_answers_ok();
+    }
+
     #[test]
     fn a_copied_slot_reads_back_as_its_source() {
         let Some(device) = device() else { return };
@@ -882,8 +671,6 @@ mod tests {
         assert_eq!(pools.watermark().state_slots, 4);
     }
 
-    /// A seat past the pool is a ceiling, on either end.
-    #[test]
     fn a_slot_past_the_pool_is_a_ceiling() {
         let Some(device) = device() else { return };
         let mut pools = state_pools(&device, 2, 4);
@@ -904,9 +691,6 @@ mod tests {
         }
     }
 
-    /// An attention-only plan has no bank to move and no ceiling to be past:
-    /// the copy is a no-op, never a refusal.
-    #[test]
     fn an_attention_only_plan_answers_ok() {
         let Some(device) = device() else { return };
         let mut pools = Pools {

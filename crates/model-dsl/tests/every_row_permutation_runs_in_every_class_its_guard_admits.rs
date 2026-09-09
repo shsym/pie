@@ -1,30 +1,3 @@
-//! **A `layout.pack_rows` / `layout.unpack_rows` RUNS IN EVERY CLASS ITS
-//! GUARD ADMITS, EVEN WHEN ONE CLASS ALONE READS ITS ANSWER.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test every_row_permutation_runs_in_every_class_its_guard_admits
-//! ```
-//!
-//! The two permutations are launched over the window of the classes they are
-//! demanded in, and their permutation vector is fire-absolute over the whole
-//! selection (`model_exec::fire::packing`). Narrow that window to one class
-//! and the launch still walks packed rows `[start, start + rows)` — packed
-//! rows, not that class's rows — so it writes another class's rows and
-//! leaves its own tail carrying whatever was there before.
-//!
-//! A DiT's LAST joint block is exactly this shape: the head reads the image
-//! rows alone (`pred[:, :S_img]`), so per-class demand would run that
-//! block's unpack over the image window only. On FLUX.2-klein at 1024²
-//! (512 text rows packed after 4096 image rows) that left the last 512 image
-//! rows carrying the block's input and cost the step-0 velocity a cosine of
-//! 0.9948 against the diffusers golden; rooting the node in both classes
-//! (`model_ir::check::classes::spans_classes`) puts it at 0.99955, the bf16
-//! floor.
-//!
-//! The claim: with a joint attention whose answer is split and only the
-//! image arm read, both the packs and the unpack are demanded in the text
-//! class as well as the image one.
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request,
     Stream, Value, Weight, ops, seam, trace_hybrid,
@@ -51,8 +24,6 @@ impl Classify for StreamFacts {
 const WIDTH: u32 = 32;
 const HEAD_DIM: u32 = 8;
 
-/// One joint block whose answer only the image arm reads — the head of a
-/// FLUX-shaped denoiser.
 struct LastJointBlock;
 
 impl ForwardHybrid for LastJointBlock {
@@ -87,8 +58,6 @@ impl ForwardHybrid for LastJointBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::layout::unpack_rows(&o, &perm);
-        // The head: the text rows are dropped, so nothing downstream of here
-        // is demanded in the text class.
         let (_, o_img) = o.split(&StreamFacts::on(Stream::Text));
         let out = ops::linear::matmul(&o_img, &w("img.o"));
         seam::at(seam::VELOCITY, &[&out]);

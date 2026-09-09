@@ -1,15 +1,3 @@
-//! Backend registry — binds an engine-exported handle to a transfer backend and dispatches
-//! the data-plane lifecycle to it.
-//!
-//! This is the single entry point the runtime drives. It receives the
-//! controller's pairing decision ("send A's pages to B") already made and only
-//! *executes* it — no routing or scheduling lives here.
-//!
-//! The caller picks the backend for a handle at [`register`](Registry::register)
-//! time (informed by the pairing — co-located → `local`, cross-node → `nixl`).
-//! The registry mints a globally-unique [`TransferId`] per transfer and routes
-//! `poll` back to the issuing backend, so ids never collide across backends.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,27 +9,21 @@ use crate::core::{
 use crate::error::{Result, TransportError};
 use engine::KvHandle;
 
-/// Where an outward [`TransferId`] was issued: which backend, and that backend's
-/// own (per-backend) transfer id.
 #[derive(Clone, Copy)]
 struct Route {
     kind: BackendKind,
     inner: TransferId,
 }
 
-/// Binds engine-exported handles to transfer backends and dispatches transfers.
 pub struct Registry {
     local: LocalBackend,
     #[cfg(feature = "nixl")]
     nixl: Option<crate::backends::nixl::NixlBackend>,
-    /// Outward transfer id → the backend + inner id that issued it. The registry
-    /// owns id assignment so per-backend counters can't collide.
     routes: Mutex<HashMap<u64, Route>>,
     next_id: AtomicU64,
 }
 
 impl Registry {
-    /// Build a registry with only the local backend — the minimal start.
     pub fn local_only(copier: Box<dyn D2dCopier>) -> Self {
         Self {
             local: LocalBackend::new(copier),
@@ -52,7 +34,6 @@ impl Registry {
         }
     }
 
-    /// Build a registry with both the local backend and a cross-node NIXL backend.
     #[cfg(feature = "nixl")]
     pub fn with_nixl(copier: Box<dyn D2dCopier>, nixl: crate::backends::nixl::NixlBackend) -> Self {
         Self {
@@ -84,8 +65,6 @@ impl Registry {
         }
     }
 
-    /// Mint a globally-unique outward id for a backend's inner transfer id, so
-    /// per-backend counters can never collide.
     fn route(&self, kind: BackendKind, inner: TransferId) -> TransferId {
         let out = TransferId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.routes
@@ -95,9 +74,6 @@ impl Registry {
         out
     }
 
-    /// Register an engine-exported handle owned by `owner` with `backend` (the
-    /// caller picks it from the pairing — co-located → `Local`, cross-node →
-    /// `Nixl`).
     pub fn register(
         &self,
         owner: WorkerId,
@@ -107,17 +83,14 @@ impl Registry {
         self.backend(backend)?.register(owner, handle)
     }
 
-    /// Register a remote peer's connection info with `backend`.
     pub fn connect(&self, backend: BackendKind, peer: &crate::core::PeerConn) -> Result<()> {
         self.backend(backend)?.connect(peer)
     }
 
-    /// This worker's connect metadata for `backend`, to advertise to peers.
     pub fn local_metadata(&self, backend: BackendKind) -> Result<Vec<u8>> {
         self.backend(backend)?.local_metadata()
     }
 
-    /// Start sending `pages` of `handle` to worker `dst`.
     pub fn send(
         &self,
         handle: &RegisteredHandle,
@@ -143,7 +116,6 @@ impl Registry {
         Ok(self.route(kind, inner))
     }
 
-    /// Start receiving `pages` into the local `slot` from worker `src`.
     pub fn recv(
         &self,
         slot: &RegisteredHandle,
@@ -155,7 +127,6 @@ impl Registry {
         Ok(self.route(kind, inner))
     }
 
-    /// Poll an in-flight transfer's completion.
     pub fn poll(&self, id: TransferId) -> Result<Completion> {
         let route = *self
             .routes

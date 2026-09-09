@@ -1,9 +1,3 @@
-//! The PLE n-gram hasher (`attention.ple_ngram_ids`, qwen4): token ids in,
-//! hashed table rows out, with a per-lane window of trailing ids as the one
-//! piece of sequence state. The hash constants ride one by-value aggregate
-//! (`ArgValue::Bytes`) — they are trace constants, derived from the config's
-//! seed, and no checkpoint plane is read to know them.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -14,9 +8,6 @@ const FILE: &str = "attn/ple.cuh";
 
 const BLOCK: u32 = 128;
 
-/// The device-side aggregate, mirrored field for field from `ple.cuh`'s
-/// `PleHash`. `#[repr(C)]` because the bytes cross the launch ABI as one
-/// parameter.
 #[repr(C)]
 struct PleHash {
     mults: [u64; 4],
@@ -78,8 +69,6 @@ fn hash_arg(
     Ok(h)
 }
 
-/// Decode form: one new token per lane, hashed against the lane's window,
-/// which then shifts by one.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids(
     ctx: &Ctx,
@@ -117,14 +106,11 @@ pub fn ngram_ids(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
-            // staged-geometry seat: live-rows word, or the null seat (`ABSENT`).
             ctx.stage(),
         ],
     )
 }
 
-/// Prefill form: walks the fire's ambient request boundaries, as the chunked
-/// convolution does.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids_chunked(
     ctx: &Ctx,
@@ -153,7 +139,6 @@ pub fn ngram_ids_chunked(
             ids.indptr.arg(),
             state.slot_stride_elems.arg(),
             ngram_ids.arg(),
-            // state advances only over the committed prefix of a fold-predicated row.
             state.write_state.arg(),
             state.write_state_mask.arg(),
             state.commit_len.arg(),
@@ -162,9 +147,6 @@ pub fn ngram_ids_chunked(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
-            // staged-geometry seat, read on the lane axis: one block per
-            // request, so this arm spends `win[2]` where the decode form
-            // above spends `win[0]`, and `win[3]` names the fire lane.
             ctx.stage(),
         ],
     )

@@ -1,16 +1,7 @@
-//! The startup box — pure presentation.
-//!
-//! Renders the three public facts of a boot (model, backend, device) and the
-//! client URL into the box `pie serve` prints. Split from `serve.rs` because
-//! column arithmetic is not part of booting anything.
-
 use crate::config;
 
 pub(super) struct StartupBanner {
     model: String,
-    /// The execution shell the box's third row names. Called `backend`, not
-    /// `engine`, since the box is headed `Pie Engine` and a field sharing
-    /// that word would collide with it.
     backend: String,
     device: String,
 }
@@ -49,8 +40,6 @@ impl StartupBanner {
         ];
         let label_width = 12;
         let header = "─ Pie Engine ";
-        // character counts, not `str::len()`: `header` opens with `─`
-        // (U+2500, three bytes), so byte and character lengths disagree.
         let header_cols = header.chars().count();
         let content_width = rows
             .iter()
@@ -79,10 +68,6 @@ impl StartupBanner {
     }
 }
 
-/// The one line a supervisor waits for. Not part of [`StartupBanner::render`]
-/// because the box is presentation and this is a readiness contract: the box
-/// may be suppressed, this may not.
 pub(super) fn ready_line(url: &str) -> String {
     format!("✓ Server ready at {url}")
 }
-

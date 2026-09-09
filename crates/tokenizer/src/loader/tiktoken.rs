@@ -1,10 +1,3 @@
-//! Native tiktoken rank-file loader.
-//!
-//! A `.tiktoken` rank file contains token bytes and merge ranks, but not the
-//! regex required to split input before BPE. We resolve that missing behavior
-//! from the official tokenizer class declared by the sibling
-//! `tokenizer_config.json`.
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -28,7 +21,6 @@ const KIMI_PROFILE: TiktokenProfile = TiktokenProfile {
     reserved_special_tokens: KIMI_RESERVED_SPECIAL_TOKENS,
 };
 
-/// Load a tiktoken rank file using its official tokenizer profile.
 pub fn from_file(path: &Path) -> Result<Tokenizer> {
     let (config, profile) = load_config(path)?;
     let text =
@@ -108,7 +100,6 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
         bpe,
         Pipeline::ByteLevelRegex {
             nfc: false,
-            // tiktoken profiles are exhaustive `Isolated` patterns.
             splitters: vec![Splitter {
                 regex: split_regex,
                 keep_gaps: true,

@@ -16,7 +16,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // Try the native (already-imported) layout first.
         let huggingface = match self.import_from_huggingface(src, platform) {
             Ok(contract) => return Ok(contract),
             Err(why) => why,
@@ -188,8 +187,6 @@ impl Model {
                 at(l, "self_attn.v_proj.weight"),
             ],
         )?;
-        // HF stores the conv bank as [channels, 1, kernel] (the 1 is `groups`); the declared
-        // type is rank-2 [3*kda_width, kernel], so each leg is squeezed before concatenation.
         b.read_expr(
             &k.conv,
             (|| -> Result<Expr, Error> {
@@ -242,8 +239,6 @@ impl Model {
         Ok(())
     }
 
-    /// Stacks the source's per-expert w1/w3/w2 legs (stored bf16) into the Mxfp4 bank this
-    /// model declares; the bf16→Mxfp4 conversion runs here, at import time.
     fn expert_bank(
         &self,
         src: &ztensor::Source,
@@ -265,7 +260,6 @@ impl Model {
     }
 }
 
-/// Drops the singleton `groups` axis: [channels, 1, kernel] -> [channels, kernel], same bytes.
 fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));

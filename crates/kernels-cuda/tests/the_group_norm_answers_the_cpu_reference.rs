@@ -1,11 +1,3 @@
-//! **`spatial::group_norm` LANDS WHAT `torch.nn.GroupNorm` LANDS** per lane
-//! and per group, with and without the fused SiLU, on two lanes of
-//! different boxes and on a lane wide enough to be split across many
-//! moment blocks — the f64 host reference against fp32 Welford on the
-//! device, to a bf16 rounding.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_group_norm_answers_the_cpu_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -20,8 +12,6 @@ fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {
     let (grid, rows) = table(boxes);
     let mut lcg = Lcg::seeded(0x9a0 ^ rows as u64);
     let (_, x) = lcg.row(rows * c);
-    // A per-channel shift so the mean is not near zero: the failure mode a
-    // one-pass variance would have.
     let x: Vec<f32> = x
         .iter()
         .enumerate()
@@ -67,17 +57,21 @@ fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {
     }
 }
 
+fn the_group_norm_answers_the_cpu_reference_every_case() {
+    two_lanes_of_different_boxes_norm_separately();
+    the_fused_silu_follows_the_affine();
+    a_wide_lane_is_folded_across_its_moment_splits();
+}
+
 #[test]
 fn two_lanes_of_different_boxes_norm_separately() {
     check(&[Box3::new(2, 4, 5), Box3::new(3, 3, 4)], 16, 4, false);
 }
 
-#[test]
 fn the_fused_silu_follows_the_affine() {
     check(&[Box3::new(2, 4, 5), Box3::new(3, 3, 4)], 24, 8, true);
 }
 
-#[test]
 fn a_wide_lane_is_folded_across_its_moment_splits() {
     check(&[Box3::new(5, 40, 48), Box3::new(1, 8, 8)], 32, 8, true);
 }

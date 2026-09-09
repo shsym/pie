@@ -1,6 +1,3 @@
-//! Device residency for one instance's channel rings, the lane-table bytes,
-//! and the launch of a fire's regions.
-
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
@@ -23,120 +20,53 @@ use crate::error::{Fault, Result};
 use super::compile::{Module, Region};
 use super::endpoint::Endpoint;
 
-/// The sixteen arguments a generated fused region takes, matching
-/// `fused_block1.cuh`'s signature. CUDA does not validate this: a mismatched
-/// count reads garbage rather than erroring.
 const FUSED_ARITY: usize = 18;
 
-/// How many blocks per lane a `top_k`/`sort_desc` region gets: each sorts
-/// every `ORDER_ROW_BLOCKS`-th row of the lane on its own slice of the
-/// temporary arena (two `u32` order arrays over one row). A block per row
-/// would want that arena per row — a gigabyte for 256 rows of 262 144.
 pub const ORDER_ROW_BLOCKS: u32 = 32;
 
-/// How many intrinsic slots the five side tables carry per lane. Tables are
-/// indexed `lane * INTRINSIC_SLOTS + intrinsic`; a mismatch with the
-/// kernel's own stride corrupts every intrinsic of every lane but the
-/// first.
 pub const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
 
-/// `IntrinsicStorageMode::F32` — the bound buffer holds `f32` elements.
 pub const INTRINSIC_STORAGE_F32: u32 = 0;
 
-/// `IntrinsicStorageMode::RawBf16` — the bound buffer holds raw `bf16`
-/// elements the kernel widens as it reads.
 pub const INTRINSIC_STORAGE_RAW_BF16: u32 = 1;
 
-/// `IntrinsicStorageMode::RowPointers` — the bound buffer is a table of row
-/// addresses, one `u64` per row, for a readout whose rows are not
-/// consecutive. `row_offset` still indexes the table; `row_stride` is
-/// ignored.
 pub const INTRINSIC_STORAGE_ROW_POINTERS: u32 = 2;
 
-/// The bound buffer holds raw `i32` elements — the `mtp_drafts` token plane.
-/// The emitted gather for that intrinsic copies ints straight off the base
-/// (`ptir_m1_runtime_body.cuh`, `p.intr == 6u`) and never consults the
-/// mode; the value is here so the side table says what it points at.
 pub const INTRINSIC_STORAGE_RAW_I32: u32 = 3;
 
-/// `BoolStorageMode::NativeBytes` — one byte per lane, which is what every
-/// device-side bool cell is.
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;
 
-/// `BoolStorageMode::WirePacked` — one bit per lane, which is what a bool cell
-/// becomes on the way to the host mirror.
 pub const BOOL_STORAGE_WIRE_PACKED: u32 = 1;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The op record, in CUDA's spelling
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One op's parameters, in the layout the generated kernels read.
-///
-/// `#[repr(C)]`, field for field with the device struct `M1OpParams` (88
-/// bytes: sixteen shared `u32`s plus five CUDA-only fields and a `u64
-/// rng_seed`, whose alignment pads the struct to 88, not 84). Field order
-/// must not change; the kernels index by offset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct CudaOpParams {
-    /// `PTIR_OP_*`.
     pub tag: u32,
-    /// First argument's value slot.
     pub a0: u32,
-    /// Second argument's value slot, or `pivot_threshold`'s predicate.
     pub a1: u32,
-    /// Third argument's value slot.
     pub a2: u32,
-    /// First result's value slot, or `a0` for an op with no results.
     pub o0: u32,
-    /// Second result's value slot, or `o0` for an op with fewer than two.
     pub o1: u32,
-    /// The op's immediate, or the vocabulary for an intrinsic.
     pub imm: u32,
-    /// The op's second immediate, or the MTP draft row.
     pub imm2: u32,
-    /// The op's third immediate.
     pub imm3: u32,
-    /// RNG kind: 0 uniform, 1 gumbel.
     pub kind: u32,
-    /// `pivot_threshold`'s predicate tag.
     pub pred_tag: u32,
-    /// A const literal's dtype.
     pub lit_dtype: u32,
-    /// A const literal's raw bits.
     pub lit_bits: u32,
-    /// The stage-local channel slot a channel op targets.
     pub channel_slot: u32,
-    /// `PTIR_INTR_*`, for `intrinsic_val`.
     pub intr: u32,
-    /// The fixed cell size a `chan_put` writes into. The kernel faults every
-    /// put whose logical bytes exceed it, so zero refuses.
     pub sink_bytes: u32,
 
-    // Past here is CUDA's alone; the shared record ends above.
-    /// How the intrinsic's buffer stores its elements:
-    /// [`INTRINSIC_STORAGE_F32`] or [`INTRINSIC_STORAGE_RAW_BF16`]. A per-fire
-    /// fact about the bound buffer, not about the trace.
     pub intrinsic_dtype: u32,
-    /// How a bool cell is stored: [`BOOL_STORAGE_NATIVE_BYTES`] or
-    /// [`BOOL_STORAGE_WIRE_PACKED`]. Always native on the device; packing
-    /// happens at the host boundary.
     pub bool_storage: u32,
-    /// Elements — not bytes — between rows in the intrinsic's buffer.
     pub intrinsic_row_stride: u32,
-    /// Which row of the intrinsic's buffer this op reads.
     pub intrinsic_row_offset: u32,
-    /// The per-op RNG seed. A `u64`: its eight-byte alignment is what pads the
-    /// record to 88.
     pub rng_seed: u64,
 }
 
-/// The record's size, as `ptir_m1_runtime_prologue.cuh` asserts it.
 const _: () = assert!(size_of::<CudaOpParams>() == 88);
 
-/// Every field's offset, pinned individually — a size check alone would not
-/// catch a field transposition.
 const _: () = {
     assert!(std::mem::offset_of!(CudaOpParams, tag) == 0);
     assert!(std::mem::offset_of!(CudaOpParams, a0) == 4);
@@ -158,15 +88,10 @@ const _: () = {
     assert!(std::mem::offset_of!(CudaOpParams, bool_storage) == 68);
     assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_stride) == 72);
     assert!(std::mem::offset_of!(CudaOpParams, intrinsic_row_offset) == 76);
-    // 80..84 is the `u64`'s padding; asserting 84 here would be the bug.
     assert!(std::mem::offset_of!(CudaOpParams, rng_seed) == 80);
 };
 
 impl CudaOpParams {
-    /// The shared record, widened, with CUDA's five extra fields at the
-    /// defaults for an op that binds no intrinsic. Fields are copied by name
-    /// rather than transmuted, so an added field in [`eta_exec::OpParams`] is
-    /// a compile error here instead of a silent shift.
     #[must_use]
     pub const fn widen(shared: OpParams) -> CudaOpParams {
         CudaOpParams {
@@ -195,12 +120,6 @@ impl CudaOpParams {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cells: native on the device, packed on the wire
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Native device bytes for a cell of `numel` lanes of `dtype`: one byte per
-/// bool lane, four per anything else.
 #[must_use]
 pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
     if dtype == Dtype::Bool {
@@ -210,12 +129,6 @@ pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
     }
 }
 
-/// A wire cell, as the device wants it.
-///
-/// # Errors
-///
-/// [`Fault::Program`] when `wire` is not exactly one wire cell; a short cell
-/// reads real-looking garbage past its end.
 pub fn wire_to_native(dtype: Dtype, numel: usize, wire: &[u8]) -> Result<Vec<u8>> {
     let numel = numel.max(1);
     let want = eta_exec::wire_cell_bytes(dtype, numel);
@@ -237,14 +150,6 @@ pub fn wire_to_native(dtype: Dtype, numel: usize, wire: &[u8]) -> Result<Vec<u8>
         .collect())
 }
 
-/// A native cell, as the wire wants it.
-///
-/// Any nonzero byte is `true`: the device promises only nonzero-means-set, so
-/// reading `== 1` would drop a `0xff` mask byte.
-///
-/// # Errors
-///
-/// [`Fault::Program`] when `native` is not exactly one native cell.
 pub fn native_to_wire(dtype: Dtype, numel: usize, native: &[u8]) -> Result<Vec<u8>> {
     let numel = numel.max(1);
     let want = native_cell_bytes(dtype, numel);
@@ -270,19 +175,14 @@ pub fn native_to_wire(dtype: Dtype, numel: usize, native: &[u8]) -> Result<Vec<u
     Ok(out)
 }
 
-/// One channel's geometry, as the ring needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelShape {
-    /// Lanes in one cell.
     pub numel: usize,
-    /// The cell's element type.
     pub dtype: Dtype,
-    /// How many unconsumed items the channel holds. The ring is one longer.
     pub capacity: u32,
 }
 
 impl ChannelShape {
-    /// The channel a launch package declares at this slot.
     #[must_use]
     pub fn of(declared: &eta_compiler::codegen::launch::LaunchChannel) -> ChannelShape {
         ChannelShape {
@@ -297,53 +197,27 @@ impl ChannelShape {
         }
     }
 
-    /// The ring length: `capacity + 1`, for the sentinel. Identical to the
-    /// host half's, which is what makes a slot-for-slot diff meaningful.
     #[must_use]
     pub const fn ring(&self) -> u64 {
         self.capacity as u64 + 1
     }
 
-    /// Native bytes in one cell.
     #[must_use]
     pub fn cell_bytes(&self) -> usize {
         native_cell_bytes(self.dtype, self.numel)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The rings
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One instance's channel state: the device cells, the device registry the
-/// control kernels move, and the pinned endpoint of every channel with a
-/// host end.
-///
-/// The registry holds the full/empty byte of `(slot, ring)`, the two ring
-/// positions per slot, and each slot's `cap1`; `channel::commit_bump` is the
-/// only writer. The host's [`Cursor`] is a prediction `channel::pull_validate`
-/// checks against the live registry before commit.
 #[derive(Debug)]
 pub struct Rings {
     cells: Vec<Buffer>,
     shapes: Vec<ChannelShape>,
-    /// The pinned mirror and counters of every channel with a host end;
-    /// `None` for a channel whose cells never leave the device.
     endpoints: Vec<Option<Arc<Endpoint>>>,
-    /// `head[slots]`, `tail[slots]`, `cap1[slots]`, `full[slots * MAX_RING]`,
-    /// one allocation since they are indexed together.
     registry: Buffer,
-    /// The addresses of the four arrays above, as the kernels take them.
     device: kernels_cuda::channel::Rings,
 }
 
 impl Rings {
-    /// Allocate a zeroed ring per channel.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for a channel whose cell is zero bytes (it holds
-    /// nothing and can never be ready), or whatever `cudaMalloc` said.
     pub fn allocate(shapes: &[ChannelShape], endpoints: Vec<Option<Arc<Endpoint>>>) -> Result<Rings> {
         if endpoints.len() != shapes.len() {
             return Err(Fault::program(
@@ -365,8 +239,6 @@ impl Rings {
                     format!("channel {index}'s cell is zero bytes, so it can never be ready"),
                 ));
             }
-            // A shared ring's cells belong to the channel, not this
-            // instance; the placeholder keeps `cells` indexed densely.
             let shared = endpoints
                 .get(index)
                 .and_then(Option::as_ref)
@@ -377,8 +249,6 @@ impl Rings {
             });
         }
 
-        // One allocation: the u32 arrays first, then the full/empty bytes,
-        // one per `(slot, ring)`, MAX_RING apart.
         let slots = shapes.len();
         let words = slots * size_of::<u32>();
         let full_at = 3 * words;
@@ -405,26 +275,16 @@ impl Rings {
         })
     }
 
-    /// The four arrays the control kernels move.
     #[must_use]
     pub const fn device(&self) -> kernels_cuda::channel::Rings {
         self.device
     }
 
-    /// Channel `channel`'s pinned endpoint, or `None` when its cells never
-    /// leave the device.
     #[must_use]
     pub fn endpoint(&self, channel: usize) -> Option<&Arc<Endpoint>> {
         self.endpoints.get(channel).and_then(Option::as_ref)
     }
 
-    /// Seed the registry's ring positions and full bytes from the cursors.
-    /// Bind-time only; on the fire path the registry belongs to
-    /// `commit_bump` alone.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the copies said.
     pub fn seed_registry(&mut self, cursors: &[Cursor]) -> Result<()> {
         let slots = self.shapes.len();
         let words = slots * size_of::<u32>();
@@ -452,59 +312,30 @@ impl Rings {
         Ok(())
     }
 
-    /// How many channels this instance carries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.shapes.len()
     }
 
-    /// Whether it carries none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty()
     }
 
-    /// Channel `channel`'s geometry.
     #[must_use]
     pub fn shape(&self, channel: usize) -> Option<ChannelShape> {
         self.shapes.get(channel).copied()
     }
 
-    /// The device address of channel `channel`'s cell at ring position
-    /// `sequence`.
-    ///
-    /// `sequence` is a free-running cursor and is reduced modulo the ring
-    /// here, not refused: the ring position is the cursor's residue.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when `channel` is not one this instance carries.
     pub fn cell_address(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape_of(channel)?;
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
         match self.shared_slab(channel) {
-            // The shared slab's bound is the endpoint's own: `cap1` cells of
-            // this width, which is the same ring `shape.ring()` counts.
             Some(base) => Ok(base + at),
             None => self.cells[channel].at(at),
         }
     }
 
-    /// The device address a FEED reads channel `channel`'s committed cell at
-    /// `sequence` from — where the committed bytes actually are, which is
-    /// not always [`cell_address`](Rings::cell_address): a host-ended
-    /// channel's committed cell lives in its pinned mirror (a `publish`
-    /// writes the mirror, and the wave's `pull_validate` copies it onto the
-    /// session's device cell only when a guest fires), and the mirror is
-    /// device-mapped, so a `cudaMemcpyAsync` reads it straight from the
-    /// stream. A shared ring's cell is its slab; a device-only session
-    /// channel's is its own cell. Bit-packed bool cells are refused: a float
-    /// port is never one.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for a channel this instance does not carry or a
-    /// bool one.
     pub fn feed_address(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape_of(channel)?;
         if shape.dtype == Dtype::Bool {
@@ -524,9 +355,6 @@ impl Rings {
         self.cells[channel].at(at)
     }
 
-    /// Channel `channel`'s shared device slab, or `None` for one whose cells
-    /// this session cut for itself. See
-    /// [`Endpoint::device_cells`](super::Endpoint::device_cells).
     #[must_use]
     pub fn shared_slab(&self, channel: usize) -> Option<u64> {
         self.endpoints
@@ -535,12 +363,6 @@ impl Rings {
             .and_then(|endpoint| endpoint.device_cells())
     }
 
-    /// Write one native cell into channel `channel` at `sequence`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown channel or a cell of the wrong width;
-    /// a short write leaves real-looking garbage in the cell's tail.
     pub fn write_cell(&mut self, channel: usize, sequence: u64, native: &[u8]) -> Result<()> {
         let shape = self.shape_of(channel)?;
         if native.len() != shape.cell_bytes() {
@@ -553,12 +375,9 @@ impl Rings {
                 ),
             ));
         }
-        // A host-visible channel's cell lives in the pinned mirror; a shared
-        // ring has no mirror, so its seed goes straight to the slab.
         if let Some(base) = self.shared_slab(channel) {
             let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
             crate::device::write_raw(base + at, native)?;
-            // Also written to the pinned shadow, which `read_cell` reads.
             if let Some(endpoint) = self.endpoint(channel)
                 && !endpoint.write_cell(sequence, native)
             {
@@ -592,16 +411,8 @@ impl Rings {
         self.cells[channel].write(at, native)
     }
 
-    /// Read channel `channel`'s cell at `sequence` back, in native form.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown channel, or whatever the copy said.
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
         let shape = self.shape_of(channel)?;
-        // A shared ring has no mirror; its committed cell is read from the
-        // pinned shadow `channel::scatter_publish` writes (native bytes,
-        // committed only, not pending).
         if let Some(endpoint) = self.endpoint(channel)
             && endpoint.role() == HostRole::None
         {
@@ -626,44 +437,18 @@ impl Rings {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// One stage's fire-path buffers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Where a channel's two cells are, for one fire.
-///
-/// A `take`/`read` reads `committed`; a `put` writes `pending`. Both are
-/// resolved on the host out of the ring cursors, because the kernel does no
-/// ring arithmetic at all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
-    /// The sequence a consumer reads.
     pub head: u64,
-    /// The sequence a producer writes.
     pub tail: u64,
 }
-/// One stage's device state, cut for `lanes` lanes and keyed by `Extents`.
-///
-/// Nothing allocates on the fire path: every buffer is carved once (sized by
-/// the plan, not the fire) and only a boundary's per-lane fields are
-/// rewritten — its record, channel slots, and intrinsic row. `offsets` and
-/// `params` are shared across lanes (they depend only on `Extents`); lane
-/// channel/pending-flag arrays are indexed by the same `channel_slot_offset`.
 #[derive(Debug)]
 pub struct Prepared {
-    /// Buffers a grow replaced, kept alive: `cudaFree` takes effect
-    /// immediately but a previous boundary's enqueued kernels may still be
-    /// reading them, so freeing here would be unsafe.
     retired: Vec<Buffer>,
     table: Buffer,
-    /// The host mirror of the table. Kept so a boundary patches each lane's
-    /// record and slots rather than rebuilding a header it already wrote.
     table_host: Vec<u8>,
     descriptors: Buffer,
-    /// One lane's descriptor row, kept so a grow can repeat it.
     descriptor_row: Vec<u8>,
-    /// [`descriptor_row`](Prepared::descriptor_row) repeated per lane, kept
-    /// because the copy that stages it is asynchronous.
     descriptors_host: Vec<u8>,
     params: Buffer,
     offsets: Buffer,
@@ -674,9 +459,6 @@ pub struct Prepared {
     intrinsic_widths: Buffer,
     intrinsic_strides: Buffer,
     intrinsic_offsets: Buffer,
-    /// Host mirrors of the five side tables, `lanes * INTRINSIC_SLOTS` each.
-    /// A binding survives across fires, so these are restaged whole once
-    /// per boundary rather than rebuilt.
     intrinsic_bases_host: Vec<u64>,
     intrinsic_modes_host: Vec<u32>,
     intrinsic_widths_host: Vec<u32>,
@@ -686,45 +468,22 @@ pub struct Prepared {
     value_count: u32,
     scratch_stride: u32,
     temporary_offset: u32,
-    /// The temporary arena's bytes, shared by a region's blocks per lane.
     temporary_bytes: u32,
-    /// Blocks per lane for each region, by region index.
     region_rows: Vec<u32>,
-    /// How many lanes every buffer above is cut for: a high-water mark that
-    /// only grows, since a grow reallocates and is only safe before a
-    /// boundary has staged anything.
     lanes: u32,
-    /// How many lanes this boundary has taken: the launch's grid and the
-    /// table header's `lane_count`, which the kernel treats as its own
-    /// bound.
     filled: u32,
-    /// This stage's local channel slot → the instance's dense channel index.
     bindings: Vec<u32>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Which of a stage's values a fire actually carries
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Whether this shell launches `region`'s generated body. A
-/// `Library(SecondParty)` region is a `kernel_call`/`sink_call` the shell
-/// would have to run itself, so it does not run. Shared by the compiler and
-/// [`describe_values`] so the two never drift apart.
 #[must_use]
 pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
     region.kind != RegionKind::Library(LibraryOp::SecondParty)
 }
 
-/// A value read only by a region this shell does not launch is not
-/// materialised: described as empty when it is read only by a skipped
-/// region's ops, read by none it does launch, and produced by
-/// `chan_read`/`chan_take` (so an empty descriptor makes the emitted copy
-/// fill nothing).
 #[must_use]
 fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
     let values = plan.value_types.len();
 
-    // Value -> the op that defines it.
     let mut producer = vec![usize::MAX; values];
     let mut result_base = 0u32;
     for (node, op) in plan.ops.iter().enumerate() {
@@ -736,7 +495,6 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
         result_base += u32::from(op.result_count);
     }
 
-    // Ops inside a skipped region, and the values they read.
     let mut skipped = vec![false; plan.ops.len()];
     let mut unread = vec![false; values];
     for region in plan.fused.iter().filter(|region| !shell_launches(region)) {
@@ -758,7 +516,6 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
         }
     }
 
-    // Anything an op that runs reads is read, and that settles it.
     for (node, op) in plan.ops.iter().enumerate() {
         if skipped.get(node).copied().unwrap_or(false) {
             continue;
@@ -770,7 +527,6 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
             }
         }
     }
-    // So is anything a launched region commits to a channel.
     for region in plan.fused.iter().filter(|region| shell_launches(region)) {
         for sink in &region.sinks {
             if let Some(value) = unread.get_mut(sink.value as usize) {
@@ -779,7 +535,6 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
         }
     }
 
-    // Condition 3: only a channel materialisation may be described as empty.
     for (value, drop) in unread.iter_mut().enumerate() {
         let tag = producer
             .get(value)
@@ -792,15 +547,6 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
     unread
 }
 
-/// Every value's device descriptor for one fire's extents, with the ones
-/// [`read_only_by_skipped_regions`] names emptied: rank and dtype stay, the
-/// extents (and `len`) go to zero. A dropped value is still resolved first,
-/// so a plan whose shapes do not resolve is still refused.
-///
-/// # Errors
-///
-/// [`Fault::Program`] when a value's shape does not resolve against
-/// `extents`.
 pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
     let empty = read_only_by_skipped_regions(plan);
     plan.value_types
@@ -828,22 +574,7 @@ pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<V
         .collect()
 }
 
-/// Every value's life on the launch clock. A generated region is one block
-/// per lane running its nodes in emission order with a `__syncthreads()`
-/// after each, so each of its nodes is a step of its own; a library region
-/// is one kernel whose internal order is its own, so it is a single step.
-/// Regions launch in index order on one stream. A value is defined at its
-/// producing node's step and last read at the last step whose node names it
-/// as an operand (a `pivot_threshold`'s predicate included), or whose region
-/// names it as an input, output or sink. A reshape's consumers may read its
-/// SOURCE (`cuda::fused` elides the copy), so a read of a reshape result also
-/// extends the source's life. Only a result its op always writes in full may
-/// take a vacated slot; a `pivot_threshold` (predicated) or a channel
-/// materialisation (may be described empty) keeps a fresh, per-fire-zeroed
-/// one. `None` when some op sits in no region, since then there is no launch
-/// order to reason from.
 fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>> {
-    // node -> its step and region; region -> its first and last step.
     let mut step_of = vec![u32::MAX; plan.ops.len()];
     let mut region_of = vec![u32::MAX; plan.ops.len()];
     let mut region_first = Vec::with_capacity(plan.fused.len());
@@ -872,12 +603,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
             .partition_point(|&first| first <= step)
             .saturating_sub(1) as u32
     };
-    // How a launch's blocks touch a value: see `Lifetime::class_def`. A
-    // many-block launch slices a value of its row geometry by row (class
-    // 1 + the row's bytes), a per-row vector by element (class 2 + the
-    // element's bytes), and reads anything else whole (class 0). The
-    // kinds are the emitter's (`cuda::fused`, `Region::row_value` /
-    // `row_alias`), computed here from the same symbolic dims.
     let class_of = |region: u32, value: u32| -> u64 {
         let Some(fused) = plan.fused.get(region as usize) else {
             return Lifetime::SEQUENTIAL;
@@ -928,7 +653,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
     ];
     let mut alias_of = vec![u32::MAX; values];
     let bump = |lifetimes: &mut Vec<Lifetime>, alias_of: &[u32], mut value: u32, step: u32| {
-        // The value, then the source chain a reshape of it may read instead.
         for _ in 0..=alias_of.len() {
             let Some(life) = lifetimes.get_mut(value as usize) else {
                 return;
@@ -963,12 +687,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
         }
         result_base += u32::from(op.result_count);
         let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
-        // A generated region is one kernel, and its streams may read a value
-        // in a later pass than the op graph's last reader of it (a pass
-        // recomputes a value from its operands rather than loading a stored
-        // copy), so a value the region both defines and reads lives until the
-        // region ends: the row max must not give its slot to the row sum
-        // while the last pass still normalises by both.
         let region = region_of[node];
         let generated = plan
             .fused
@@ -998,9 +716,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
             bump(&mut lifetimes, &alias_of, value, step);
         }
     }
-    // Launches and classes; a value a many-block launch reads whole stays
-    // until that launch has finished, since any of its blocks may still be
-    // reading it.
     for (value, life) in lifetimes.iter_mut().enumerate() {
         let value = value as u32;
         life.launch_last = region_of_step(life.last);
@@ -1010,7 +725,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
             life.last = life.last.max(region_last[life.launch_last as usize]);
         }
     }
-    // A stream's registers (`LaunchRegion::spent`) never land in scratch.
     for fused in &plan.fused {
         for &value in &fused.spent {
             if let Some(life) = lifetimes.get_mut(value as usize) {
@@ -1021,9 +735,6 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
     Some(lifetimes)
 }
 
-/// Blocks per lane for each of `plan.fused`'s regions at these descriptors:
-/// the witness value's rows for a row-parallel generated region, at most
-/// [`ORDER_ROW_BLOCKS`] for a `top_k`/`sort_desc` region, one otherwise.
 fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
     plan.fused
         .iter()
@@ -1042,9 +753,6 @@ fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
         .collect()
 }
 
-/// Whether a `top_k` region is emitted as the selection kernel (no
-/// temporary arena, a block per row) — the emitter's rule, read off the
-/// op's width: `eta_compiler::codegen::cuda::order`.
 fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
     region
         .nodes
@@ -1056,11 +764,6 @@ fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
         })
 }
 
-/// The least the temporary arena may be, so that every block of every
-/// region has its slice (`temporary_bytes / blocks`): a row block of a
-/// generated region needs the parallel reduction's two work arrays over
-/// one row (`ptir_parallel_reduce_f32`: `ceil(last / 32)` floats each);
-/// an order block needs two `u32` arrays over one row.
 fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
     let align = |bytes: u64| bytes.next_multiple_of(u64::from(SCRATCH_ALIGN));
     let widest = descriptors.iter().map(|d| u64::from(d.last)).max().unwrap_or(1).max(1);
@@ -1068,9 +771,6 @@ fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u3
         .iter()
         .zip(rows)
         .map(|(region, &blocks)| {
-            // A one-block launch is covered by `layout`'s own arena (four
-            // words an element of the widest row); only many blocks sharing
-            // it need the floor.
             if blocks <= 1 {
                 return 0;
             }
@@ -1086,9 +786,6 @@ fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u3
         .unwrap_or(0)
 }
 
-/// One lane's scratch layout for `plan`'s `descriptors`: slots reused by
-/// liveness when the plan's regions give a launch order, one per value
-/// otherwise; the temporary arena floored for the blocks that share it.
 fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
     let rows = region_rows(plan, descriptors);
     let lifetimes = value_lifetimes(plan, &rows);
@@ -1105,33 +802,17 @@ fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> 
     })
 }
 
-/// What one lane's scratch costs for `plan` at `extents` — the stride
-/// [`Prepared::build`] cuts and [`Prepared::commit_lanes`] re-zeroes.
-///
-/// # Errors
-///
-/// [`Fault::Program`] when a value's shape does not resolve or the scratch
-/// exceeds what [`eta_exec::layout`] permits.
 pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
     let descriptors = describe_values(plan, extents)?;
     lay_out(plan, &descriptors).map(|layout| layout.total)
 }
 
-/// Where each value of `plan` lands in one lane's scratch, by value id — the
-/// layout `scratch_bytes` totals. A value the layout gives no slot reads 0.
 pub fn scratch_offsets(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<u64>> {
     let descriptors = describe_values(plan, extents)?;
     lay_out(plan, &descriptors).map(|layout| layout.values)
 }
 
 impl Prepared {
-    /// Carve every buffer one stage needs, for `lanes` lanes.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when a value's shape does not resolve against
-    /// `extents` or the scratch exceeds what [`eta_exec::layout`] permits, and
-    /// whatever the allocations said.
     pub fn build(
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
@@ -1144,7 +825,6 @@ impl Prepared {
         let value_count = u32::try_from(plan.value_types.len())
             .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
 
-        // ── The value descriptors, and the scratch they size. ──
         let descriptors = describe_values(plan, extents)?;
         let scratch_layout = lay_out(plan, &descriptors)?;
         let scratch_stride = u32::try_from(scratch_layout.total)
@@ -1155,16 +835,12 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
         let region_rows = region_rows(plan, &descriptors);
 
-        // ── Op params, widened to CUDA's 88-byte record. ──
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
         for op in &plan.ops {
             let mut record =
                 CudaOpParams::widen(OpParams::of(op, result_base, OpRuntime::default()));
             if let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) {
-                // `sink_bytes` is the cell exactly: the emitted put writes
-                // `0..sink_bytes`, zero-filling past the value's own bytes,
-                // and faults when the value is wider.
                 let dense = plan
                     .channel_bindings
                     .get(channel as usize)
@@ -1243,33 +919,15 @@ impl Prepared {
         Ok(prepared)
     }
 
-    /// Cut the per-lane buffers for `lanes` lanes, keeping every intrinsic
-    /// binding the smaller table held. A high-water mark, not a fit; only
-    /// safe to call from [`Prepared::begin`] before anything is staged.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when the lane table or the scratch outgrows what
-    /// [`eta_exec::layout`] permits, and whatever the allocations said.
     fn grow(&mut self, extents: Extents, lanes: u32, stream: *mut core::ffi::c_void) -> Result<()> {
         if lanes <= self.lanes {
             return Ok(());
         }
-        // **GROWTH IS GEOMETRIC, BECAUSE EVERY STEP REALLOCATES THE SCRATCH.**
-        // The buffers below are `cudaMalloc` + `cudaMemset`, both synchronous
-        // and both proportional to the lane count; sizing them to exactly the
-        // lanes this boundary carries meant a boundary sequence of 4, 7, 9,
-        // 15, 19, 31, 44, 64 lanes paid that eight times over, 30-80 ms a
-        // step on a program whose scratch stride is wide. Rounding to the
-        // next power of two makes it a handful of steps whatever order the
-        // lane counts arrive in, and the ceiling is still the scratch cap's.
         let lanes = lanes
             .checked_next_power_of_two()
             .unwrap_or(lanes)
             .min(self.lane_ceiling())
             .max(lanes);
-        // The scratch ceiling is a wave's, not a lane's; a named refusal the
-        // caller can retry with a smaller batch.
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
         if total > eta_exec::SCRATCH_MAX_BYTES {
             return Err(Fault::Ceiling {
@@ -1289,14 +947,11 @@ impl Prepared {
             0,
             &LaneHeader {
                 abi_version: eta_exec::LANE_ABI_VERSION,
-                // Rewritten at every commit; the kernel reads it as its bound.
                 lane_count: lanes,
                 channel_slots_per_lane: self.channel_count,
                 flags: 0,
             },
         );
-        // Every lane's record carries the same extents; differs only in its
-        // channel slot offset and commit word (set at `stage_lane`).
         for lane in 0..lanes {
             let at = shape
                 .record_offset(lane)
@@ -1313,8 +968,6 @@ impl Prepared {
                     sampled_rows: extents.sampled_rows,
                     query_len: extents.query_len,
                     key_len: extents.key_len,
-                    // The lane's row in the flat slot array; the kernel
-                    // indexes both channels and pending_flags with it.
                     channel_slot_offset: shape.slot_index(lane).ok_or_else(|| {
                         Fault::program("program::launch", "a lane's slot row past the table")
                     })?,
@@ -1322,22 +975,13 @@ impl Prepared {
                 },
             );
         }
-        // The header and records above are freshly written; channel slots
-        // are rewritten by every `stage_lane`.
-        // Zeroed on the stream and NOT filled here: `commit_lanes` stages
-        // the whole of `table_host` on that stream before any kernel of this
-        // boundary reads it, and a boundary that stages no lane launches
-        // kernels that read the zeroed header's `lane_count` of 0 and return.
         let table = Buffer::zeroed_on(stream, table_bytes)?;
         self.retired.push(std::mem::replace(&mut self.table, table));
         self.table_host = table_host;
 
-        // Every lane's descriptor row is the same row, so this is the one
-        // write it ever needs.
         let row = self.descriptor_row.len().max(1);
         let mut descriptors = Buffer::zeroed_on(stream, row * lanes as usize)?;
         if !self.descriptor_row.is_empty() {
-            // Held rather than dropped: the copy below is asynchronous.
             self.descriptors_host = self
                 .descriptor_row
                 .iter()
@@ -1356,8 +1000,6 @@ impl Prepared {
             &mut self.scratch,
             Buffer::zeroed_on(stream, scratch_bytes)?,
         ));
-        // One byte per channel per lane, indexed as the channel slots are:
-        // zero means a take reads the committed cell.
         self.retired.push(std::mem::replace(
             &mut self.pending,
             Buffer::zeroed_on(
@@ -1386,13 +1028,6 @@ impl Prepared {
         Ok(())
     }
 
-    /// Open a boundary, growing to `lanes` if this batch has never carried
-    /// that many. [`Prepared::grow`] retires rather than drops replaced
-    /// buffers, since a previous boundary's kernels may still read them.
-    ///
-    /// # Errors
-    ///
-    /// As [`Prepared::grow`].
     pub fn begin(
         &mut self,
         extents: Extents,
@@ -1403,15 +1038,6 @@ impl Prepared {
         self.grow(extents, lanes, stream)
     }
 
-    /// Take the next lane of this boundary, pointing its channel slots at
-    /// the cells `cursors` name and its record at `commit`. Answers the
-    /// lane index, which is the row a later [`Prepared::bind_intrinsic`]
-    /// names.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when a stage-local slot names a channel this
-    /// instance does not carry, or the batch has no lane left.
     pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
         let lane = self.filled;
         if lane >= self.lanes {
@@ -1425,7 +1051,6 @@ impl Prepared {
             ));
         }
         let shape = LaneShape::of(self.lanes, self.channel_count);
-        // The commit word lets a refused lane early-return while others run.
         let record_at = shape
             .record_offset(lane)
             .and_then(|at| usize::try_from(at).ok())
@@ -1457,13 +1082,11 @@ impl Prepared {
                 &LaneChannelSlot {
                     committed_cell: rings.cell_address(channel, cursor.head)?,
                     pending_cell: rings.cell_address(channel, cursor.tail)?,
-                    // Not a ticket: nothing stages a table ahead of the fire.
                     expected_head: NO_TICKET,
                     expected_tail: NO_TICKET,
                 },
             );
         }
-        // Lanes are reused; clearing makes an unbound intrinsic read zero.
         let row = lane as usize * INTRINSIC_SLOTS;
         self.intrinsic_bases_host[row..row + INTRINSIC_SLOTS].fill(0);
         self.intrinsic_modes_host[row..row + INTRINSIC_SLOTS].fill(0);
@@ -1474,19 +1097,10 @@ impl Prepared {
         Ok(lane)
     }
 
-    /// The boundary's tables, staged on the stream; pending flags cleared
-    /// and scratch zeroed. The commit word is not reset here; it is seeded
-    /// on the stream by `channel::pull_validate`.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the copies said.
     pub fn commit_lanes(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
         if self.filled == 0 {
             return Ok(());
         }
-        // The header is the kernel's own bound (`dispatch_lane >= lane_count`
-        // returns early).
         write_record(
             &mut self.table_host,
             0,
@@ -1508,28 +1122,12 @@ impl Prepared {
             .stage(stream, 0, &slice_bytes(&self.intrinsic_strides_host))?;
         self.intrinsic_offsets
             .stage(stream, 0, &slice_bytes(&self.intrinsic_offsets_host))?;
-        // Only what this boundary uses, not the whole table.
         let lanes = self.filled as usize;
         self.pending
             .zero_span_on(stream, 0, lanes * self.channel_count as usize)?;
-        // The value scratch is NOT zeroed here. Every slot a region reads
-        // is written earlier in the same stage (the trace is SSA; a slot a
-        // stream keeps in registers is `dead` and never read), so a zero
-        // fill bought nothing but its bytes — and at a denoiser's 555 MB
-        // per lane that was 0.8 ms of every step.
         Ok(())
     }
 
-    /// Point one lane's intrinsic at the buffer a model fire produced.
-    /// Host-side; staged with the rest at [`Prepared::commit_lanes`].
-    ///
-    /// `storage` is a storage mode, not a `Dtype` wire code: they collide at
-    /// `INTRINSIC_STORAGE_F32 == 0`, so passing a dtype silently misreads.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an intrinsic past the table's pitch or a lane
-    /// past the batch.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
@@ -1566,14 +1164,6 @@ impl Prepared {
         Ok(())
     }
 
-    /// Launch one generated region over every lane this boundary staged:
-    /// one CTA per lane, or per row of a row-parallel region (the kernel
-    /// reads `blockIdx.x / rows_per_lane` as its lane).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`] when the driver refuses the launch. A fault inside
-    /// the kernel is asynchronous and surfaces at the next synchronize.
     pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
         if self.filled == 0 {
             return Ok(());
@@ -1595,8 +1185,6 @@ impl Prepared {
             .ptr(self.intrinsic_widths.ptr())
             .ptr(self.intrinsic_strides.ptr())
             .ptr(self.intrinsic_offsets.ptr());
-        // A row-parallel region launches `rows` blocks per lane, each on its
-        // own slice of the temporary arena.
         let rows = self
             .region_rows
             .get(region.region_index as usize)
@@ -1625,30 +1213,25 @@ impl Prepared {
             .max(1)
     }
 
-    /// How many lanes this boundary staged.
     #[must_use]
     pub const fn filled(&self) -> u32 {
         self.filled
     }
 
-    /// How many lanes the buffers are cut for.
     #[must_use]
     pub const fn lanes(&self) -> u32 {
         self.lanes
     }
 
-    /// How many channel slots one lane of this stage's table carries.
     #[must_use]
     pub const fn channel_count(&self) -> u32 {
         self.channel_count
     }
 
-    /// The lane records, which begin one header into the table.
     fn lane_records_ptr(&self) -> u64 {
         self.table.ptr() + LANE_HEADER_BYTES
     }
 
-    /// The flat channel-slot array, which begins after every lane record.
     fn channel_slots_ptr(&self) -> u64 {
         self.table.ptr()
             + LANE_HEADER_BYTES
@@ -1656,7 +1239,6 @@ impl Prepared {
     }
 }
 
-/// A `#[repr(C)]` record's bytes, written into `into` at `at`.
 fn write_record<T: Copy>(into: &mut [u8], at: usize, record: &T) {
     // SAFETY: `T` is a `#[repr(C)]` mirror of a device struct with every field
     // written by the caller, so reading it as bytes reads only initialised
@@ -1667,7 +1249,6 @@ fn write_record<T: Copy>(into: &mut [u8], at: usize, record: &T) {
     into[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
-/// One `#[repr(C)]` record as an owned byte vector.
 pub(super) fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
     // SAFETY: as `write_record` — a fully-initialised `#[repr(C)]` mirror.
     unsafe {
@@ -1675,7 +1256,6 @@ pub(super) fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
     }
 }
 
-/// A slice of op records as the flat bytes one upload copies.
 pub(super) fn slice_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     // SAFETY: as `record_bytes`, over a contiguous run of them.
     unsafe {
@@ -1692,37 +1272,23 @@ fn records_bytes(params: &[CudaOpParams]) -> Vec<u8> {
     bytes
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// cuLaunchKernel
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A kernel's argument list, kept alive across the launch.
-///
-/// `cuLaunchKernel` takes `void**` — pointers to each argument's storage,
-/// not the values — so a scalar must outlive the call.
 #[derive(Default)]
 pub struct Args {
-    /// Boxed so a later append cannot move an earlier scalar and dangle its
-    /// pointer in `slots` — a `Vec<u64>` would reallocate.
     #[allow(clippy::vec_box)]
     storage: Vec<Box<u64>>,
     slots: Vec<*mut std::ffi::c_void>,
 }
 
 impl Args {
-    /// An empty list.
     #[must_use]
     pub fn new() -> Args {
         Args::default()
     }
 
-    /// Append a device pointer argument.
     pub fn ptr(&mut self, pointer: u64) -> &mut Args {
         self.scalar(pointer)
     }
 
-    /// Append a `u32` argument, stored in a `u64` cell and pointed at its
-    /// first four bytes — correct on the little-endian hosts CUDA runs on.
     pub fn u32(&mut self, value: u32) -> &mut Args {
         self.scalar(u64::from(value))
     }
@@ -1735,26 +1301,17 @@ impl Args {
         self
     }
 
-    /// How many arguments have been appended.
     #[must_use]
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Whether nothing has been appended.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 }
 
-/// Launch `module`'s entry with `grid` blocks of `block` threads.
-///
-/// # Errors
-///
-/// [`Fault::Program`] when the argument count is not `expected` or the grid
-/// is empty — CUDA does not check either and both look like a fire that ran
-/// — and [`Fault::Device`] when the driver refuses.
 pub fn launch(
     module: &Module,
     grid: u32,
@@ -1824,8 +1381,6 @@ pub fn launch(
 mod tests {
     use super::*;
     
-
-    /// The round trip is lossless in both directions.
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {
         for (dtype, numel) in [
@@ -1847,7 +1402,6 @@ mod tests {
             assert_eq!(there.len(), native);
             let back = native_to_wire(dtype, numel, &there).expect("one native cell");
             if dtype == Dtype::Bool {
-                // High bits past `numel` are not carried; compare only real lanes.
                 for lane in 0..numel {
                     assert_eq!(
                         back[lane / 8] >> (lane % 8) & 1,

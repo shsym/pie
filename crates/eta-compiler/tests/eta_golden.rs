@@ -1,10 +1,3 @@
-//! Golden vectors: canonical container bytes, identity hash, validator
-//! verdict and tier-0 reference results, checked into `golden/*.txt` — the
-//! conformance suite every backend diffs against.
-//!
-//! Regenerate (bless) with:
-//! `PTIR_REGEN=1 cargo test -p eta-compiler --test eta_golden`
-
 use std::fmt::Write as _;
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode,
@@ -37,8 +30,6 @@ impl Report {
         match r {
             Ok(b) => {
                 writeln!(self.0, "verdict: OK").unwrap();
-                // Per-value (shape, dtype), readiness, and channel classes:
-                // what a backend is handed instead of re-inferring.
                 for stage in eta_compiler::plan::compile_bound(b) {
                     let metrics = stage.metrics();
                     writeln!(
@@ -76,7 +67,6 @@ impl Report {
     }
 }
 
-/// Compare (or bless) one case's report against its golden file.
 fn check(name: &str, report: Report) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
     let path = format!("{dir}/{name}.txt");
@@ -110,9 +100,19 @@ fn onechan(host_role: HostRole) -> ChannelDecl {
     }
 }
 
+fn eta_golden_every_case() {
+    golden_neg_spsc_second_producer();
+    golden_neg_sink_at_epilogue();
+    golden_neg_t10_nonreplayable();
+    golden_neg_intrinsic_wrong_stage();
+    golden_neg_model_gated_missing();
+    golden_neg_body_type_error();
+    extern_v2_round_trip_and_v1_hashes_stable();
+    extern_direction_violations_rejected();
+}
+
 #[test]
 fn golden_neg_spsc_second_producer() {
-    // Host writes chan 0; the epilogue also puts → SPSC bind error.
     let c = TraceContainer {
         names: vec![],
         channels: vec![{
@@ -137,7 +137,6 @@ fn golden_neg_spsc_second_producer() {
     neg_report("neg_spsc_second_producer", c, ModelProfile::dummy());
 }
 
-#[test]
 fn golden_neg_sink_at_epilogue() {
     let c = TraceContainer {
         names: vec!["lora".into()],
@@ -158,7 +157,6 @@ fn golden_neg_sink_at_epilogue() {
     neg_report("neg_sink_at_epilogue", c, ModelProfile::dummy());
 }
 
-#[test]
 fn golden_neg_t10_nonreplayable() {
     let c = TraceContainer {
         names: vec!["gpu_load".into()],
@@ -193,7 +191,6 @@ fn golden_neg_t10_nonreplayable() {
     neg_report("neg_t10_nonreplayable", c, profile);
 }
 
-#[test]
 fn golden_neg_intrinsic_wrong_stage() {
     let c = TraceContainer {
         names: vec![],
@@ -216,7 +213,6 @@ fn golden_neg_intrinsic_wrong_stage() {
     neg_report("neg_intrinsic_wrong_stage", c, ModelProfile::dummy());
 }
 
-#[test]
 fn golden_neg_model_gated_missing() {
     let c = TraceContainer {
         names: vec![],
@@ -238,13 +234,10 @@ fn golden_neg_model_gated_missing() {
     };
     let mut profile = ModelProfile::dummy();
     profile.has_mtp_logits = false;
-    // note: put shape [4] vs chan [4] — fine; the gate fires first anyway.
     neg_report("neg_model_gated_missing", c, profile);
 }
 
-#[test]
 fn golden_neg_body_type_error() {
-    // and() on numerics — a body dtype error with a stable op index.
     let c = TraceContainer {
         names: vec![],
         channels: vec![onechan(HostRole::None)],
@@ -262,18 +255,8 @@ fn golden_neg_body_type_error() {
     neg_report("neg_body_type_error", c, ModelProfile::dummy());
 }
 
-// One MCTS iteration composing quest, beam, grammar, speculative and
-// contrastive techniques through the tier-0 interpreter, from existing ops.
-
-// v1.1 extern channels: a real second-model (amateur) instance exports its
-// logits through an extern channel; the expert instance imports them for
-// the contrastive pick, exercising cross-instance SPSC, back-pressure and
-// the cross-pipeline readiness miss.
-
-#[test]
 fn extern_v2_round_trip_and_v1_hashes_stable() {
     use eta_ir::container::{ExternDecl, ExternDir, decode, encode};
-    // A v1 container (no externs) encodes version 1 — byte layout untouched.
     let c1 = TraceContainer {
         names: vec![],
         channels: vec![ChannelDecl {
@@ -302,8 +285,6 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
         "no externs => wire v1"
     );
     assert_eq!(decode(&b1).unwrap(), c1);
-    // With an extern: version 2, round-trips, and the hash differs (a
-    // different trace IS a different identity).
     let mut c2 = c1.clone();
     c2.names = vec!["x".to_string()];
     c2.channels.push(ChannelDecl {
@@ -324,11 +305,9 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
     assert_ne!(container_hash(&b1), container_hash(&b2));
 }
 
-#[test]
 fn extern_direction_violations_rejected() {
     use eta_ir::container::{ExternDecl, ExternDir};
     use eta_ir::validate::ValidateError;
-    // A stage PUT on an IMPORT channel = second producer across the pair.
     let mk = |dir: ExternDir, ops: Vec<Op>| TraceContainer {
         names: vec!["x".to_string()],
         channels: vec![

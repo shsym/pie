@@ -89,23 +89,6 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
   }
 }
 
-// ── the two TILE rungs, and why they answer the same numbers ────────────────
-//
-// **THE ROW BLOCK IS A PERFORMANCE CHOICE AND NOT A NUMERICAL ONE.** Every
-// output element of this kernel accumulates over k in ONE order — ascending,
-// in `kFragSize`-wide chunks, block after block — and `BM`, `BK`, `WM` and
-// `WN` decide only which thread holds which element and how much of the
-// operand is staged per pass. A K tail is padded with zeros into a whole
-// `BK` and a zero product adds exactly nothing, so a tail does not move the
-// order either. Two instantiations of this template therefore land the SAME
-// BITS for the same row, and that is what lets `act_x_wt` pick between them
-// on the fire's row count with the pick invisible in the answer.
-//
-// The VECTOR point below has no such property, and it is on this ladder
-// anyway. See `linear/gemm.rs`: the two rungs above are the deterministic
-// ladder's whole selection set, and the fast ladder — which this plane ships
-// — puts the vector point under them at the widths it wins, on the owner's
-// ruling that a small drift is worth 1.7x of a one-lane decode.
 
 #define instantiate_dense_gemm_t(name, itype, bm, bk, bn, wm, wn)            \
   template [[host_name(                                                      \
@@ -115,40 +98,10 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
       const constant int&, const constant int&, const constant int&,         \
       uint3, uint, uint);
 
-// The wide rung: one 32x32 tile of output per threadgroup, four simdgroups.
 instantiate_dense_gemm_t(bfloat16, bfloat, 32, 32, 32, 2, 2)
 
-// The narrow rung. `BM = 8` is the floor — an 8x8 fragment is the unit the
-// matrix instruction multiplies — so a one-row decode still pays for eight
-// rows of arithmetic; `WM = 1` gives the eight rows one simdgroup rather than
-// two idle ones, and `BK = 64` halves the staging passes that redundancy is
-// spent under. Measured on an M1 Max over qwen35-d0.8b, one decode fire:
-// 13.4 ms at one lane and 22.2 at eight, against 15.0/23.0 at BK = 32.
 instantiate_dense_gemm_t(bfloat16, bfloat, 8, 64, 32, 1, 2)
 
-// ── the vector point ────────────────────────────────────────────────────────
-//
-// One simdgroup per output column, the contraction split across its
-// thirty-two lanes and folded with `simd_sum`. **THAT FOLD IS THE WHOLE
-// POINT AND THE WHOLE COST**: it is where the parallelism comes from at one
-// row — 32 lanes a column against the tile's eight-row fragment floor — and
-// it is a different summation order from the tile's ascending walk, so the
-// two do not land the same bits and no amount of care makes them.
-//
-// It is therefore an arm of the FAST ladder only. Measured on an M1 Max over
-// qwen35-d0.8b, one decode fire, against the 8-row tile rung above:
-//
-//   lanes      1      2      4      8     16     31
-//   vector  10.3   12.9   22.1   40.3   76.9  145.1  ms
-//   tile    13.5   13.8   16.7   22.2   37.7   66.7  ms
-//
-// The lines cross between two rows and four, which is `gemm.rs`'s
-// `VECTOR_MAX_ROWS`. Above it the tile wins because it reads the weight table
-// once for eight rows where this reads it once per ROW; below it the tile is
-// paying for eight rows to compute one.
-// Two bf16 in one 32-bit word, dotted in f32: the high half is a float
-// already (bf16 IS the top sixteen bits of an f32), the low half shifts up.
-// Only meaningful for `T = bfloat`, the one instantiation below.
 inline float bf16x2_dot(uint a, uint b) {
   const float a_lo = as_type<float>(a << 16);
   const float a_hi = as_type<float>(a & 0xffff0000u);
@@ -157,11 +110,6 @@ inline float bf16x2_dot(uint a, uint b) {
   return a_lo * b_lo + a_hi * b_hi;
 }
 
-// The lane's share of one row-by-row dot: `[k0, K)` strided by `stride`
-// lanes. With `K` even the walk is over 32-bit words (two bf16 a load, four
-// independent accumulators so the loads overlap); an odd `K` falls back to
-// the scalar walk. The four accumulators fold in a fixed order, so a given
-// (K, stride) lands the same bits every launch.
 template <typename T>
 inline float gemv_lane_dot(const device T* act_row, const device T* w_row, int K, int k0, int stride) {
   float acc = 0.0f;
@@ -222,15 +170,6 @@ template <typename T>
 
 instantiate_dense_gemv_t(bfloat16, bfloat)
 
-// ── the narrow-column vector point ──────────────────────────────────────────
-//
-// A projection landing fewer columns than a threadgroup has simdgroups — the
-// router's shared gate is `[1, K]`, one number a row — gives `dense_gemv_t`
-// one working simdgroup and three idle, and a walk of K/32 loads on one
-// lane set is the whole launch. Here the WHOLE threadgroup takes one column:
-// the contraction is split across all its lanes, folded per simdgroup with
-// `simd_sum` and across simdgroups through threadgroup memory. One
-// threadgroup per (row, column), so the grid is `[N * KSPLIT_GROUP, M]`.
 MLX_MTL_CONST int KSPLIT_GROUP = 128;
 MLX_MTL_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
 

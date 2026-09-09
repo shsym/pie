@@ -1,20 +1,3 @@
-//! What the engine is handed, pinned.
-//!
-//! [`eta_compiler::codegen::launch::build`] produces the only artefact the engine
-//! executes: a `LaunchPackage` of lowered values, channels, ports, stages and
-//! per-stage grouped plans. Until this file existed it had exactly one caller
-//! in the tested workspace — `cuda_golden::emit_engine_test_kernel_fixtures`,
-//! which writes the encoded package into a gitignored fixtures directory and
-//! asserts nothing about its contents. So `StageNeeds::grouped_valid`,
-//! `plan.error`, `flags`, `mtp_rows` and `channel_rules` were all unpinned:
-//! a mutation testing this discovered that declaring `add` grouped-unsupported
-//! — which silently costs every elementwise stage its grouped path — passed
-//! the entire 208-test suite.
-//!
-//! These are structural claims plus one pinned count. The count is the part
-//! that bites: a classification flip changes it even when every structural
-//! invariant still holds.
-
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
@@ -23,8 +6,6 @@ use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::compile_bound;
 use eta_ir::validate::bind;
 
-/// The corpus, split the way binding splits it: what built a package, and the
-/// name of everything that did not.
 fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     let mut out = Vec::new();
     let mut refused = Vec::new();
@@ -43,28 +24,11 @@ fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     for (name, container, profile) in synthetic_traces() {
         push(name, container, profile);
     }
-    // This was `drop(push)`, to end the closure's mutable borrows of `out`
-    // and `refused` before the tuple is built. It is not needed -- NLL ends a
-    // borrow at its last use and `push` is never used again -- and it is a
-    // clippy error: `drop_non_drop`, because a closure has no `Drop` impl, so
-    // dropping one "only extends its contained lifetimes", which is the
-    // opposite of what the line was written to achieve. Removing it changes
-    // nothing about when the borrows end.
     (out, refused)
 }
 
 #[test]
 fn every_plan_the_engine_receives_is_well_formed() {
-    // `packages()` drops a trace that stops binding -- `let Ok(bound) = ...
-    // else { return }` -- and then every check below runs over what is left.
-    // The old guard was `>= 12` against a corpus of 24, so half the corpus
-    // could vanish without a word.
-    //
-    // Six of those 24 are *supposed* to vanish: the `neg_` traces exist to be
-    // refused, and the first version of this check read the silence as loss
-    // and failed. So the question is not how many bound, it is which. A
-    // `neg_` that binds is a refusal that stopped happening; anything else
-    // that does not bind is a trace that broke and said nothing.
     let (packages, refused) = bound_and_refused();
     let unexpected: Vec<&String> = refused.iter().filter(|n| !n.starts_with("neg_")).collect();
     assert!(
@@ -92,9 +56,6 @@ fn every_plan_the_engine_receives_is_well_formed() {
             plans += 1;
             let id = format!("{name}#{index}");
 
-            // `invalid()` clears the valid bit and sets a reason. Neither half
-            // may happen without the other, or the engine sees a plan it will
-            // run with a diagnosis attached, or refuse with none.
             assert_eq!(
                 plan.needs.grouped_valid,
                 plan.error.is_empty(),
@@ -102,12 +63,7 @@ fn every_plan_the_engine_receives_is_well_formed() {
                 plan.needs.grouped_valid,
                 plan.error
             );
-            // The "no undeclared bit" assertion that stood here is gone with
-            // the bitmask: `StageNeeds` is eight named booleans, so a bit no
-            // constant declares is not a value it can hold.
 
-            // Every lowered op is an op, and every index the engine will
-            // dereference is in range of the table it indexes.
             for op in &plan.ops {
                 assert!(
                     eta_ir::op::spec(op.tag).is_some(),
@@ -150,4 +106,3 @@ fn every_plan_the_engine_receives_is_well_formed() {
         "only {plans} stage plans; the sweep is too thin to mean anything"
     );
 }
-

@@ -1,21 +1,12 @@
-//! Tracks which pool seat each working set's sequences occupy, keeping seats
-//! stable across fires and unique across live working sets.
-
 use std::collections::HashMap;
 
 use super::kv::page_table::WorkingSetId;
 
-/// Why a working set could not be seated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeatError {
-    /// The deployment's pools seat fewer sequences than this fire holds.
     Exhausted {
-        /// Seats this ask needs beyond the ones it already holds.
         need: u32,
-        /// Seats the pools have left.
         have: u32,
-        /// Seats the pools hold in all. An ask that needs more than this
-        /// can never be seated; one that needs fewer is waiting on a peer.
         capacity: u32,
     },
 }
@@ -36,21 +27,15 @@ impl std::fmt::Display for SeatError {
     }
 }
 
-/// Who sits where: one run of pool seats per live working set.
 #[derive(Debug)]
 pub struct SeatBook {
-    /// How many sequences the pools seat at once; `0` states no ceiling.
     capacity: u32,
-    /// Seats returned by released working sets, reissued before fresh ones.
     free: Vec<u32>,
-    /// The lowest seat never yet issued.
     next: u32,
-    /// Each live working set's run, indexed by lane.
     held: HashMap<WorkingSetId, Vec<u32>>,
 }
 
 impl SeatBook {
-    /// A book over `capacity` seats. Zero means no ceiling.
     #[must_use]
     pub fn new(capacity: u32) -> Self {
         SeatBook {
@@ -61,14 +46,6 @@ impl SeatBook {
         }
     }
 
-    /// The seats `ws` sits in for a fire of `lanes` row groups, growing its
-    /// run if this fire is wider than any before it. Seats stay the same
-    /// across fires of the same working set.
-    ///
-    /// # Errors
-    ///
-    /// [`SeatError::Exhausted`] when the run would grow past the pools'
-    /// slots; a refused ask seats nothing.
     pub fn seats(&mut self, ws: WorkingSetId, lanes: usize) -> Result<Vec<u32>, SeatError> {
         let lanes = u32::try_from(lanes).unwrap_or(u32::MAX);
         if lanes == 0 {
@@ -105,16 +82,12 @@ impl SeatBook {
         Ok(self.held[&ws][..lanes as usize].to_vec())
     }
 
-    /// Give a released working set's seats back. Idempotent: releasing
-    /// twice is a no-op.
     pub fn release(&mut self, ws: WorkingSetId) {
         if let Some(run) = self.held.remove(&ws) {
             self.free.extend(run);
         }
     }
 
-    /// How many seats are neither held nor yet issued. `None` when the book
-    /// states no ceiling.
     #[cfg(test)]
     #[must_use]
     pub fn available(&self) -> Option<u32> {
@@ -131,7 +104,12 @@ mod tests {
     use super::*;
     use crate::store::registry;
 
-    /// Two working sets in one book never sit in one seat.
+    fn seat_every_case() {
+        two_working_sets_never_share_a_seat();
+        a_fire_wider_than_the_pools_is_refused_by_name();
+        releasing_a_working_set_returns_its_seats();
+    }
+
     #[test]
     fn two_working_sets_never_share_a_seat() {
         let model = registry::register_model(16, &[8], &[4]);
@@ -145,8 +123,6 @@ mod tests {
         assert_ne!(first, second, "two live sequences, two seats");
     }
 
-    /// The refusal states both numbers and seats nothing.
-    #[test]
     fn a_fire_wider_than_the_pools_is_refused_by_name() {
         let model = registry::register_model(16, &[8], &[2]);
         let stores = registry::get(model, 0);
@@ -172,8 +148,6 @@ mod tests {
         assert!(refusal.to_string().contains("Budgets::slots"));
     }
 
-    /// A released working set's seats are reissued to the next sequence.
-    #[test]
     fn releasing_a_working_set_returns_its_seats() {
         let model = registry::register_model(16, &[8], &[2]);
         let stores = registry::get(model, 0);

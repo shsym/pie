@@ -1,17 +1,3 @@
-//! **THE CATALOG'S `mini-dit-bf16-kv-bf16` ROW — whose adaLN is an f32
-//! LANE CHAIN (`sinusoid → silu → matmul → add_bias → split_rows →
-//! modulate`) — LOADS UNDER THE SERVING KNOBS: every body the arming pass
-//! records answers what its own eager walk answers.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_mini_dit_row_arms_its_bodies -- --nocapture
-//! ```
-//!
-//! Reads the artifact at `$PIE_MINI_DIT_ARTIFACT` (default
-//! `/root/.cache/pie-imagegen/mini-dit.zt`) and skips by name when it is
-//! absent or no device is present.
-
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};

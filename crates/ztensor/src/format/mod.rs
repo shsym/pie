@@ -1,26 +1,3 @@
-//! The frozen layers: L0 container and L1 manifest.
-//!
-//! This is the half of zTensor that a `.zt` file is, as opposed to the half
-//! that reads or writes one. The container frame (magic, footer, the alignment
-//! floor), the manifest schema and its CBOR mapping, the type grammar, and the
-//! rules that decide whether bytes are a conforming file — spec §2, §3, §4 and
-//! §6.4 — all live here and nowhere else.
-//!
-//! Nothing in this module opens a file or knows what a mapping is. That is
-//! deliberate: these are the definitions a second implementation would have to
-//! agree with, so they are kept where nothing about *this* implementation can
-//! leak into them.
-//!
-//! Everything here is the on-disk structure, unresolved. A [`Blob`]'s `shard`
-//! names *this file's* shard table, and an offset means an offset into
-//! whichever file that name resolves to. The manifest is a claim about one
-//! container, not an address a consumer can use directly.
-//!
-//! Turning those claims into addresses is
-//! [`Catalog`](crate::provide::Catalog)'s job, and it is the reason the two are
-//! different types: a catalog can span files that never heard of each other,
-//! which no single manifest could honestly describe.
-
 pub mod cbor;
 pub mod term;
 pub mod validate;
@@ -31,38 +8,17 @@ use crate::error::{Error, Result, Rule};
 use crate::format::cbor::Value;
 pub use crate::format::term::{Group, Leaf, Offset, Plane, Term, PLANE_ALIGN};
 
-/// Magic bytes at offset 0 and at the end of the footer (spec §2.2).
 pub const MAGIC: [u8; 8] = [0x89, b'Z', b'T', b'2', 0x0d, 0x0a, 0x1a, 0x0a];
-/// Footer version integer defined by this implementation (spec §2.3).
 pub const VERSION: u32 = 3;
-/// Fixed footer size in bytes.
 pub const FOOTER_LEN: u64 = 40;
-/// Alignment floor: every blob offset is a multiple of this (spec §2.4).
 pub const ALIGN_FLOOR: u64 = 4096;
-/// Canonical placement alignment (spec §6.4).
 pub const ALIGN_CANONICAL: u64 = 65536;
-/// Manifest size cap (spec §3.1).
 pub const MAX_MANIFEST_LEN: u64 = 1 << 30;
-/// Maximum name length in bytes (spec §3.5).
 pub const MAX_NAME_LEN: usize = 1024;
-/// Maximum shard name length in bytes (spec §7.1).
 pub const MAX_SHARD_NAME: usize = 64;
-/// Maximum shape rank (spec §3.3).
 pub const MAX_RANK: usize = 64;
-/// Minimum container size: header magic plus footer (spec §2.1).
 pub const MIN_FILE_LEN: u64 = MAGIC.len() as u64 + FOOTER_LEN;
 
-// =======================================================================
-// digests
-// =======================================================================
-
-/// A digest algorithm this implementation can compute (spec §6.1).
-///
-/// `Xxh3` is the minimum every reader must have and is what canonical form
-/// uses: it detects corruption at memory speed. `Sha256` costs more and buys
-/// something different: it is not invertible, so a root manifest whose shard
-/// digests are `Sha256` commits to every shard byte, and one signature over
-/// that root covers the whole model (§6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DigestAlgorithm {
     Xxh3,
@@ -77,7 +33,6 @@ impl DigestAlgorithm {
         }
     }
 
-    /// Digest width in bytes.
     pub fn width(self) -> usize {
         match self {
             DigestAlgorithm::Xxh3 => 8,
@@ -85,8 +40,6 @@ impl DigestAlgorithm {
         }
     }
 
-    /// The algorithm a manifest names, or `Unsupported` for one this build
-    /// cannot compute: the file may be valid and simply newer than the reader.
     pub fn parse(name: &str) -> Result<Self> {
         match name {
             "xxh3" => Ok(DigestAlgorithm::Xxh3),
@@ -97,7 +50,6 @@ impl DigestAlgorithm {
         }
     }
 
-    /// The digest of `bytes`.
     pub fn digest(self, bytes: &[u8]) -> Digest {
         let mut hasher = Hasher::new(self);
         hasher.update(bytes);
@@ -105,8 +57,6 @@ impl DigestAlgorithm {
     }
 }
 
-/// A digest as the manifest stores it: an algorithm name and the raw bytes
-/// of its width (spec §6.1). Displays as `algo:hex`.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
     pub algorithm: String,
@@ -121,7 +71,6 @@ impl Digest {
         }
     }
 
-    /// The algorithm, when this build knows it.
     pub fn algorithm(&self) -> Result<DigestAlgorithm> {
         DigestAlgorithm::parse(&self.algorithm)
     }
@@ -130,8 +79,6 @@ impl Digest {
         self.value.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Schema rules: a lowercase-alphanumeric algorithm name, a non-empty
-    /// value, and the right width when the algorithm is one this build knows.
     pub(crate) fn check(&self) -> Result<()> {
         if self.algorithm.is_empty()
             || !self
@@ -161,7 +108,6 @@ impl Digest {
         Ok(())
     }
 
-    /// Recomputes this digest over `bytes` and reports whether it matches.
     pub fn matches(&self, bytes: &[u8]) -> Result<bool> {
         Ok(self.algorithm()?.digest(bytes).value == self.value)
     }
@@ -210,8 +156,6 @@ impl std::fmt::Debug for Digest {
     }
 }
 
-/// Block digests of a blob's decoded bytes (spec §6.2): one per `size`-byte
-/// window, under the blob's own digest algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocks {
     pub size: u64,
@@ -219,12 +163,10 @@ pub struct Blocks {
 }
 
 impl Blocks {
-    /// How many blocks `decoded` bytes make.
     pub fn count(size: u64, decoded: u64) -> u64 {
         decoded.div_ceil(size)
     }
 
-    /// The byte range of block `which` within `decoded` bytes.
     pub fn span(&self, which: u64, decoded: u64) -> Option<std::ops::Range<u64>> {
         let start = which.checked_mul(self.size)?;
         (start < decoded).then(|| start..start.saturating_add(self.size).min(decoded))
@@ -294,8 +236,6 @@ impl Blocks {
     }
 }
 
-/// Computes a digest a chunk at a time, so a whole-file digest never needs the
-/// whole file in memory.
 pub(crate) enum Hasher {
     Xxh3(Box<xxhash_rust::xxh3::Xxh3>),
     Sha256(sha2::Sha256),
@@ -326,35 +266,18 @@ impl Hasher {
     }
 }
 
-// =======================================================================
-// manifest
-// =======================================================================
-
-/// An object's bytes (spec §3.4): one range of one file, plus how they are
-/// stored and what they hash to.
-///
-/// `shard` names an entry in the containing manifest's shard table. `None`
-/// means the containing file, which is the common case and the one that costs
-/// nothing to say. A name is only a label; turning it into bytes is the
-/// transport's job, and only after that is there a
-/// [`StoreId`](crate::StoreId).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Blob {
     pub shard: Option<String>,
     pub offset: u64,
     pub length: u64,
-    /// Encoding profile id; `None` means raw.
     pub encoding: Option<String>,
-    /// Required iff `encoding` is present.
     pub decoded_length: Option<u64>,
-    /// Over the decoded bytes.
     pub digest: Option<Digest>,
-    /// Never without `digest`.
     pub blocks: Option<Blocks>,
 }
 
 impl Blob {
-    /// A raw, local blob.
     pub fn local(offset: u64, length: u64) -> Self {
         Blob {
             shard: None,
@@ -367,7 +290,6 @@ impl Blob {
         }
     }
 
-    /// Decoded byte size: `length` for raw, `decoded_length` when encoded.
     pub fn decoded_size(&self) -> u64 {
         match self.encoding {
             None => self.length,
@@ -375,8 +297,6 @@ impl Blob {
         }
     }
 
-    /// Schema rules that need no file: the encoding/decoded_length pairing,
-    /// the blocks/digest pairing, digest widths.
     pub(crate) fn check(&self) -> Result<()> {
         if self.encoding.is_some() != self.decoded_length.is_some() {
             return Err(Error::reject(
@@ -452,26 +372,20 @@ impl Blob {
     }
 }
 
-/// A named object (spec §3.3): one tensor, one blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Object {
     pub shape: Vec<u64>,
-    /// The `type` field. Absent only under a layout that defines the values
-    /// itself (§5.2).
     pub term: Option<Term>,
-    /// Absent ⇒ canonical layout (§5.1).
     pub layout: Option<String>,
     pub attributes: Option<Value>,
     pub blob: Blob,
 }
 
 impl Object {
-    /// Element count: product of dimensions; empty shape is a scalar (1).
     pub fn num_elements(&self) -> Result<u64> {
         check_shape(&self.shape)
     }
 
-    /// The term, or `Unsupported` when the object has none.
     pub fn term(&self) -> Result<&Term> {
         self.term.as_ref().ok_or_else(|| {
             Error::Unsupported(format!(
@@ -481,20 +395,15 @@ impl Object {
         })
     }
 
-    /// The planes of this object under the canonical layout. `Unsupported`
-    /// when a named layout places the bytes instead.
     pub fn planes(&self) -> Result<Vec<Plane>> {
         canonical_term(self.term.as_ref(), self.layout.as_deref())?.planes(&self.shape)
     }
 
-    /// The decoded size the canonical layout requires (§5.1 rule 4).
     pub fn canonical_size(&self) -> Result<u64> {
         canonical_term(self.term.as_ref(), self.layout.as_deref())?.canonical_size(&self.shape)
     }
 }
 
-/// The term that lays out an object's bytes, when the canonical layout
-/// applies: `Unsupported` under a named layout or without a type.
 pub(crate) fn canonical_term<'a>(term: Option<&'a Term>, layout: Option<&str>) -> Result<&'a Term> {
     if let Some(layout) = layout {
         return Err(Error::Unsupported(format!(
@@ -504,8 +413,6 @@ pub(crate) fn canonical_term<'a>(term: Option<&'a Term>, layout: Option<&str>) -
     term.ok_or_else(|| Error::Unsupported("no type".into()))
 }
 
-/// Shape rules (spec §3.3): rank within the limit and a product that fits
-/// `u64`. Returns the element count; an empty shape is a scalar (1).
 pub fn check_shape(shape: &[u64]) -> Result<u64> {
     if shape.len() > MAX_RANK {
         return Err(Error::reject(
@@ -519,49 +426,30 @@ pub fn check_shape(shape: &[u64]) -> Result<u64> {
         .ok_or_else(|| Error::reject(Rule::Shape, "shape product overflows u64"))
 }
 
-/// `n` rounded up to a multiple of `align`, a power of two; `None` past
-/// the end of `u64`.
 pub(crate) fn align_up(n: u64, align: u64) -> Option<u64> {
     n.checked_add(align - 1).map(|v| v & !(align - 1))
 }
 
-/// Shard identity: size and digest, never a location (spec §7.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shard {
     pub size: u64,
     pub digest: Digest,
 }
 
-/// Root manifest (spec §3.2).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Manifest {
     pub attributes: Option<Value>,
-    /// Keyed by shard name. The containing file is never a key: it is named by
-    /// the absence of a name (see [`Blob::shard`]).
     pub shards: BTreeMap<String, Shard>,
     pub objects: BTreeMap<String, Object>,
 }
 
 impl Manifest {
-    /// Looks up an object by name.
     pub fn object(&self, name: &str) -> Result<&Object> {
         self.objects
             .get(name)
             .ok_or_else(|| Error::NotFound(format!("object {name:?}")))
     }
 
-    /// The content digest of this model (spec §6.5).
-    ///
-    /// A whole-file hash identifies an *artifact*: those bytes, that
-    /// placement. This identifies the *model*, and is defined so that
-    /// placement cannot reach it: offsets, lengths, alignment, padding, blob
-    /// sharing, encodings, block digests and the shard table are all absent.
-    ///
-    /// # Errors
-    ///
-    /// `Unsupported` when an object carries no digest: with none there is
-    /// nothing to stand for its content. Canonical form guarantees they are
-    /// present (§6.4 rule 4).
     pub fn content_digest(&self, algo: DigestAlgorithm) -> Result<Digest> {
         let mut objects = Vec::with_capacity(self.objects.len());
         for (name, object) in &self.objects {
@@ -591,12 +479,6 @@ impl Manifest {
     }
 }
 
-/// Checks a shard name against §7.1.
-///
-/// The character set is narrow on purpose. A resolver turns a name into a
-/// location, and the conventional ones (Appendix B) use it as a single path
-/// component; if the format let a name be `../../etc/passwd`, every consumer
-/// would have to sanitize it, and one of them would forget.
 pub fn check_shard_name(name: &str) -> Result<()> {
     let bad = |msg: &str| {
         Err(Error::reject(
@@ -622,8 +504,6 @@ pub fn check_shard_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Name rules (spec §3.5): non-empty UTF-8 (guaranteed by CBOR decode),
-/// ≤ 1024 bytes, no NUL. NFC is a writer duty, not a reader check.
 pub(crate) fn check_name(s: &str) -> Result<()> {
     if s.is_empty() || s.len() > MAX_NAME_LEN || s.contains('\0') {
         return Err(Error::reject(Rule::Name, format!("invalid name {s:?}")));
@@ -631,9 +511,6 @@ pub(crate) fn check_name(s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attributes rules (spec §3.1/§3.5): the value MUST be a map whose
-/// top-level keys are text obeying the name rules. Nested values are free
-/// within the §3.1 type set (the codec already enforces that).
 pub(crate) fn check_attributes(v: &Value) -> Result<()> {
     let entries = v
         .as_map()
@@ -646,10 +523,6 @@ pub(crate) fn check_attributes(v: &Value) -> Result<()> {
     }
     Ok(())
 }
-
-// =======================================================================
-// Manifest <-> CBOR
-// =======================================================================
 
 fn missing<T>(what: &str, field: &str) -> Result<T> {
     Err(Error::reject(
@@ -744,7 +617,7 @@ impl Manifest {
                     has_objects = true;
                     manifest.objects = parse_objects(val)?;
                 }
-                _ => {} // unknown fields are ignored (spec §3.1)
+                _ => {}
             }
         }
         if !has_objects {

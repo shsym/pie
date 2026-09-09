@@ -58,15 +58,9 @@ __global__ void rope_full(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: `q`, `k`, `v`, `positions`
-    // and `row_valid` are all row planes handed at their base. The token index
-    // handed to `kv_slot_for_token` moves WITH them — it is a coordinate in
-    // the same frame `positions` is indexed by, and the CSR it walks describes
-    // the whole plane; the CSR planes themselves are per-request and stay put.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
@@ -347,10 +341,7 @@ __global__ void qk_rmsnorm_rotate_devwin(
     float eps)
 {
     const int n = blockIdx.x;
-    // `devwin` is the pre-staged device window pair, `(start, count)`:
-    // word 0 is a START. The staged-geometry seat's `win` is `(count,
-    // start)` — same pointer shape, opposite word order, and the rename
-    // is what keeps one from ever arming the other.
+
     {
         const int w0 = static_cast<int>(devwin[0]);
         const int w1 = static_cast<int>(devwin[1]);
@@ -470,13 +461,9 @@ __global__ void rope_yarn(
 {
     extern __shared__ float2 yarn_cs[];
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
-    // are row planes handed at their base. The angle cache is keyed by the
-    // POSITION VALUE the vector yields, never by the row, and does not move.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
@@ -520,11 +507,6 @@ __global__ void rope_yarn(
     }
 }
 
-// `y = rope_partial_q(rmsnorm_per_head(x))`, one block per (row, head): the
-// head's moment, the weighted norm and the rotation of its first
-// `rotary_dim / 2` pairs at `positions[row]`, in registers — the two
-// launches of a KV-sharing layer's q path as one. The normed value is not
-// rounded to bf16 between the two, which the traced pair did.
 template <int BLOCK>
 __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     const bf16* __restrict__ x,
@@ -541,7 +523,7 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     static_assert(BLOCK % 32 == 0 && BLOCK <= 1024, "whole warps");
     constexpr int kWarps = BLOCK / 32;
     const int n = blockIdx.x;
-    // The staged-geometry seat (rope_partial's idiom).
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int head = blockIdx.y;
@@ -610,13 +592,9 @@ __global__ void rope_partial(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
-    // are row planes handed at their base; the angles are keyed by the
-    // position VALUE, never by the row.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
@@ -675,13 +653,9 @@ __global__ void rope_partial_last(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
-    // are row planes handed at their base; the angles are keyed by the
-    // position VALUE, never by the row.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;

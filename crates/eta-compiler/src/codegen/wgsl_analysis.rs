@@ -1,46 +1,3 @@
-//! What the WGSL arm decides BEFORE it emits, and what a shell must do with
-//! those decisions.
-//!
-//! The CUDA arm runs two analyses ahead of its fused emitter
-//! ([`super::cuda::fused`]): reshape aliasing, and direct argmax. Both are
-//! decisions about which nodes need no code, and both are wrong in the same
-//! dangerous way if got wrong — an elided node whose value nothing else
-//! produces does not fault, it reads a zeroed slot, and a sampler over a
-//! zeroed row draws token 0 forever. So the invariant CUDA states is the one
-//! kept here, verbatim: **only ever elide a node whose value some other
-//! emission still produces.**
-//!
-//! ## Why the shell has to participate
-//!
-//! In the CUDA arm an operand is spelled into the generated source as
-//! `scratch + offsets[aliases.resolve(value)]`, so eliding is entirely the
-//! emitter's business. The WGSL runtime does not work that way: `ptir_step`
-//! reads its operands out of `params[node]` as value ids and finds their
-//! bytes through `base(v) = offs[v] >> 2`, and both tables are built by the
-//! SHELL. The emitter can therefore decide an elision but cannot enact one.
-//!
-//! That is not a limitation, it is the cleaner split: [`analyze_stage`] is a
-//! pure function of the plan, the emitter drops the elided nodes' calls, and
-//! the shell points `offs[result]` at `offs[source]`. A consumer reading the
-//! elided value then reads the source's bytes, while `descs[result]` still
-//! carries the result's own shape — which is exactly what a reshape means.
-//!
-//! ## Why direct argmax is smaller here than on CUDA
-//!
-//! CUDA's `analyze_direct_argmax` elides the whole chain from a logits
-//! intrinsic to an `argmax`: the reshapes AND the `intrinsic_val`. On this
-//! arm `intrinsic_val` is a boundary op the emitter already skips and the
-//! shell already stages, and the reshapes between are elided by ordinary
-//! aliasing, whose `resolve` walks the chain to the staged logits value. So
-//! the analysis has nothing left to elide, and what it produces is the
-//! RECORD: a shell that recognises "this pass is an argmax of the logits" may
-//! answer it with its own kernel and skip the guest dispatch entirely, which
-//! is what CUDA's `RegionAnalysis::direct_argmax` exists to enable.
-//!
-//! Expressing the chain through the alias table rather than through a second
-//! elision list is also what keeps the invariant above true by construction:
-//! every elided value resolves to one the shell writes.
-
 use alloc::vec::Vec;
 
 use eta_ir::op::{IntrinsicId, intrinsic_tags, tags};
@@ -49,55 +6,28 @@ use crate::codegen::alias::{AliasTable, covers};
 use crate::codegen::launch::{LaunchPlanValue, LaunchStagePlan};
 use crate::plan::{Dimension, SymbolicType};
 
-/// An `argmax` a shell may answer without running the emitted pass, by
-/// reading a logits intrinsic's buffer directly.
-///
-/// The typed, sparse form — the dense per-node arrays CUDA carries are an
-/// implementation detail of its emitter, and a shell only ever wants the
-/// handful of rows that apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectArgmax {
-    /// The `argmax` node, by index into the stage's ops.
     pub node: u32,
-    /// The value id whose bytes it reads — the logits intrinsic's result,
-    /// which the shell stages.
     pub source_value: u32,
-    /// Which intrinsic that is. An id no intrinsic claims is dropped rather
-    /// than reported.
     pub intrinsic: IntrinsicId,
-    /// Whether the path is legal only for a single-row fire: the source's
-    /// rows are statically one and the reduction's are symbolic, so a fire
-    /// that brought more than one row would fold the wrong extent.
     pub requires_single_row: bool,
 }
 
-/// Everything decided about one stage before a line of it is emitted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageFusion {
-    /// `(result, source)`: the shell must make `offs[result]` equal
-    /// `offs[source]`, in the order given — a later entry may name an earlier
-    /// entry's result, so applying them in order resolves a chain.
     pub aliases: Vec<(u32, u32)>,
-    /// Nodes the emitter writes no call for, ascending. Every one is a
-    /// `reshape` whose result appears in [`Self::aliases`].
     pub elided: Vec<u32>,
-    /// The direct-argmax fast paths this stage admits; empty when none do.
     pub direct_argmax: Vec<DirectArgmax>,
 }
 
 impl StageFusion {
-    /// Whether the emitter should write a call for `node`.
     #[must_use]
     pub fn emits_node(&self, node: usize) -> bool {
         !self.elided.contains(&(node as u32))
     }
 }
 
-/// A launch plan's value table in the shape [`covers`] reads.
-///
-/// `LaunchPlanValue` and `SymbolicType` are the same two fields under two
-/// names; converting rather than duplicating `covers` is what keeps one
-/// answer to "may this reshape be elided" across the arms.
 fn symbolic_types(values: &[LaunchPlanValue]) -> Vec<SymbolicType> {
     values
         .iter()
@@ -108,12 +38,6 @@ fn symbolic_types(values: &[LaunchPlanValue]) -> Vec<SymbolicType> {
         .collect()
 }
 
-/// Rows and width of a value, as the direct-argmax shape test needs them.
-///
-/// Transcribed from `cuda::fused::row_shape`, whose contract this must match:
-/// `fixed_rows` is the static product of every leading axis, `row_extent` is
-/// the one symbolic leading axis if there is one, and `width` is the trailing
-/// axis, which must be static. `None` where the shape cannot be read that way.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RowShape {
     fixed_rows: u64,
@@ -157,7 +81,6 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
     Some(shape)
 }
 
-/// Who produces each value, and how many nodes read it.
 struct Uses {
     producer: Vec<u32>,
     consumers: Vec<u32>,
@@ -185,19 +108,6 @@ fn uses(plan: &LaunchStagePlan) -> Uses {
     }
 }
 
-/// Both analyses, over the shape a shell holds.
-///
-/// # The elision rule
-///
-/// A `reshape` is elided when its result covers no more bytes than its source
-/// ([`covers`]) and its result is not bound to a channel — a bound value is
-/// one the shell may WRITE rather than read, and pointing it at another
-/// value's bytes would make that write land somewhere else. Everything else
-/// is safe because the shell routes every read through `offs`, so an alias is
-/// honoured uniformly wherever the value is read.
-///
-/// A boundary op's result is never a reshape's result, so no elision can
-/// steal a value the shell stages.
 #[must_use]
 pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
     let types = symbolic_types(&plan.value_types);
@@ -236,12 +146,6 @@ pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
     fusion
 }
 
-/// Which `argmax` nodes read a logits intrinsic through nothing but reshapes.
-///
-/// The walk is CUDA's: from the reduction's operand, back through producers,
-/// following a `reshape` only while the value it produced has exactly one
-/// consumer and that consumer is the node we came from — a value read twice
-/// is a value some other op still needs at its own shape.
 fn direct_argmax(plan: &LaunchStagePlan, uses: &Uses, table: &AliasTable) -> Vec<DirectArgmax> {
     let mut found = Vec::new();
     for (node, op) in plan.ops.iter().enumerate() {
@@ -253,9 +157,6 @@ fn direct_argmax(plan: &LaunchStagePlan, uses: &Uses, table: &AliasTable) -> Vec
             if producer == u32::MAX {
                 break;
             }
-            // One consumer, and we are standing on a consumer of this value —
-            // so the one consumer IS the node we came from, and no other op
-            // still wants the value at the shape this link would skip.
             if uses.consumers.get(value as usize).copied().unwrap_or(0) != 1 {
                 break;
             }
@@ -303,8 +204,6 @@ fn direct_argmax(plan: &LaunchStagePlan, uses: &Uses, table: &AliasTable) -> Vec
             if exact || single_row {
                 found.push(DirectArgmax {
                     node: node as u32,
-                    // The chain's reshapes are already aliased, so the value
-                    // the shell will actually read is the resolved root.
                     source_value: table.resolve(op.args[0]),
                     intrinsic,
                     requires_single_row: single_row,
@@ -351,8 +250,15 @@ mod tests {
         }
     }
 
-    /// A reshape whose result is no larger than its source and which nothing
-    /// binds is elided, and its consumers are told to read the source.
+    fn wgsl_analysis_every_case() {
+        a_plain_reshape_is_elided();
+        a_reshape_that_does_not_cover_or_that_escapes_is_not_elided();
+        a_chain_of_reshapes_resolves_to_the_root();
+        an_argmax_of_the_logits_is_reported();
+        an_argmax_through_an_op_that_is_not_a_reshape_is_refused();
+        a_reshape_read_twice_breaks_the_chain();
+    }
+
     #[test]
     fn a_plain_reshape_is_elided() {
         let stage = plan(
@@ -374,11 +280,6 @@ mod tests {
         assert!(fusion.emits_node(0) && fusion.emits_node(2));
     }
 
-    /// **THE ANALYSIS DECLINING IS AS LOAD-BEARING AS IT FIRING.** A reshape
-    /// whose result is WIDER than its source would read past the source's
-    /// bytes, and one whose result a channel binds is a value the shell may
-    /// write. Neither is elided.
-    #[test]
     fn a_reshape_that_does_not_cover_or_that_escapes_is_not_elided() {
         let widening = plan(
             vec![op(tags::IOTA, 0, &[]), op(tags::RESHAPE, 1, &[0])],
@@ -406,11 +307,6 @@ mod tests {
         );
     }
 
-    /// A chain of reshapes resolves to the root, so a consumer three hops
-    /// down reads the value the shell actually staged rather than a slot
-    /// nothing writes — which is the whole of the "only elide a node whose
-    /// value some other emission still produces" invariant.
-    #[test]
     fn a_chain_of_reshapes_resolves_to_the_root() {
         let stage = plan(
             vec![
@@ -435,9 +331,6 @@ mod tests {
         );
     }
 
-    /// An `argmax` fed by the logits intrinsic through reshapes is reported,
-    /// with the root the shell stages as its source.
-    #[test]
     fn an_argmax_of_the_logits_is_reported() {
         let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
         logits.intrinsic = Some(IntrinsicId::Logits);
@@ -466,11 +359,6 @@ mod tests {
         );
     }
 
-    /// **THE DECLINE THAT MATTERS.** An `argmax` fed through anything but a
-    /// reshape is not a direct read: the op between it and the intrinsic
-    /// changes the values, and answering the argmax off the logits buffer
-    /// would ignore that op entirely. A Gumbel sampler is exactly this shape.
-    #[test]
     fn an_argmax_through_an_op_that_is_not_a_reshape_is_refused() {
         let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
         logits.intrinsic = Some(IntrinsicId::Logits);
@@ -492,9 +380,6 @@ mod tests {
         );
     }
 
-    /// A value read twice is not a chain: the second reader still needs it at
-    /// its own shape, so the reshape stays and the fast path is refused.
-    #[test]
     fn a_reshape_read_twice_breaks_the_chain() {
         let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
         logits.intrinsic = Some(IntrinsicId::Logits);

@@ -1,49 +1,3 @@
-//! `Fallback::Copy`, on the golden path: what the WALK does about a window P4
-//! could not seat when the shell says it can gather one.
-//!
-//! # The bug this pins
-//!
-//! P4's menu writes two rows per withdrawn node because its cost model is
-//! bucket-keyed (`model_compiler::layout`'s `CROSSOVER_ROWS`: a two-way split
-//! of a 64-row GEMM measured 1.82x the ideal against a copy's 1.07x, and they
-//! converge by 2048). On the catalog's fourteen-point lattice that is
-//! **`Fallback::Copy` at ten buckets and `Fallback::Split { r: 4 }` at four**
-//! — the copy covers every bucket a decode fire lands in. `model_exec::fire::walk`
-//! served all fourteen as splits and said so in its own rule 4: "there is no
-//! branch on the fallback anywhere here". So the ten small buckets paid
-//! roughly 1.7x what the table asked for, every fire, silently.
-//!
-//! # What is asserted, and what is deliberately NOT
-//!
-//! This file is the STRUCTURE half, with no device in the room:
-//!
-//! - **one launch, not `r`.** The copied region's nodes are dispatched once,
-//!   over the union of the runs, where a split dispatches them once per
-//!   interval. That is the whole performance claim, counted;
-//! - **the bracket is exactly one gather and one scatter**, in that order,
-//!   around the nodes and inside the region — a second pair would be two
-//!   gathers of the same rows and a missing one would be answers that never
-//!   went back;
-//! - **only the copied regions change.** Every region P4 seated runs its
-//!   nodes exactly once with copies on and with copies off, and the two walks
-//!   dispatch the same node MULTISET — a copy moves rows, it does not move
-//!   work;
-//! - **the default is still the split.** A backend that says nothing about
-//!   `Serve` gets the launch counts this repo has always had, which is what
-//!   makes the trait not a breaking change;
-//! - **the prepare region is copied too.** qwen3.5's `attention.plan_prefill`
-//!   states the same `captures_scores` mask its six `prefill_lse` readers do
-//!   and P4 owes it no row of its own — but a consumer standing over the
-//!   union must read a schedule carved over the union, so
-//!   `fallback::copies` asks the question of the MASK. A build where the
-//!   builder split while its readers copied would compute wrong logits and
-//!   fault nothing, so it is asserted here rather than hoped for.
-//!
-//! What is NOT asserted is that the numbers are right — a mock backend
-//! computes none. That is `engine-cuda`'s
-//! `a_copied_window_and_a_split_one_are_the_same_bytes.rs`, which diffs a
-//! copy against a split on real weights.
-
 use std::collections::HashMap;
 
 use model_exec::KernelError;
@@ -61,14 +15,6 @@ use model_ir::{
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-/// A deployment's ceilings, at an adapter capacity the catalog can seat.
-///
-/// **`max_adapters: 8` IS LOAD-BEARING** for the same reason it is in
-/// `a_fragmented_window_is_a_slow_path_not_a_fault.rs`: at 32 no catalog text
-/// compiles and every loop body in this crate's sweeps skips. The fourteen
-/// buckets are load-bearing too, and differently — they are what make the
-/// menu write a `Copy` row and a `Split` row rather than one entry covering
-/// everything, which is the thing this file is about.
 fn budget() -> Budget {
     Budget {
         max_lanes: 256,
@@ -80,19 +26,10 @@ fn budget() -> Budget {
     }
 }
 
-/// A backend that runs nothing, remembers which node it was handed by the
-/// address of the op payload inside the plan's node vector, and can be told
-/// to claim a row gather it does not have.
-///
-/// **CLAIMING IS ENOUGH FOR THIS FILE.** `Serve::copies` is what the walk
-/// branches on and `gather`/`scatter` are what it brackets with; a mock that
-/// answers the first and records the other two exercises every line of the
-/// branch. Moving actual bytes is a shell's job and a shell's gate.
 struct MockDispatch {
     at: HashMap<usize, u32>,
     seen: Vec<u32>,
     copies: bool,
-    /// `(region's first node, "gather" | "scatter")`, in call order.
     moved: Vec<(u32, &'static str)>,
 }
 
@@ -183,9 +120,6 @@ impl DispatchSpatial for MockDispatch {
 }
 
 impl Serve for MockDispatch {
-    /// The whole toggle. A real shell asks P4's table at this fire's bucket
-    /// and asks whether its own resolution can re-point the region's
-    /// operands; a mock that computes nothing needs neither question.
     fn copies(&self, _region: &Region) -> bool {
         self.copies
     }
@@ -201,7 +135,6 @@ impl Serve for MockDispatch {
     }
 }
 
-/// A sink that writes down how many runs each region was cut into.
 #[derive(Default)]
 struct Runs {
     per_region: Vec<u32>,
@@ -236,9 +169,6 @@ fn sku() -> (Trace, CompiledModel) {
     (trace, compiled)
 }
 
-/// The smallest composition that leaves a window in pieces: a plain prefill
-/// lane, a capturing prefill lane and a capturing decode lane, with the plain
-/// one's rows standing between the other two.
 fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
     [0usize, 4, 5]
         .iter()
@@ -246,7 +176,6 @@ fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
         .collect()
 }
 
-/// Walk one fire and hand back `(the sink's run counts, the dispatch)`.
 fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -> (Runs, MockDispatch) {
     let composition = compose(compiled, &budget(), lanes).expect("the fire composes");
     let descriptor = FireDescriptor::of(&composition);
@@ -264,15 +193,16 @@ fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -
     (runs, dispatch)
 }
 
+fn a_copied_window_is_one_launch_over_the_same_rows_every_case() {
+    a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs();
+    the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it();
+}
+
 #[test]
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let (trace, compiled) = sku();
     let lanes = fragmenting(&compiled);
 
-    // NOT VACUOUS, AND CHECKED AGAINST THE ARTIFACT. The whole file is about
-    // a table entry that used to be ignored, so the entry has to be there:
-    // the bucket a three-row fire lands in must be one the menu wrote a
-    // `Copy` row for, and some region must actually come back in pieces.
     let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
     assert_eq!(
         composition.present(),
@@ -316,8 +246,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let (split, split_dispatch) = fire(&trace, &compiled, &lanes, false);
     let (copy, copy_dispatch) = fire(&trace, &compiled, &lanes, true);
 
-    // THE PERFORMANCE CLAIM, COUNTED. Every fragmented region falls from its
-    // run count to one; every other region is untouched.
     for (at, region) in compiled.template().iter().enumerate() {
         let runs = descriptor.spans(&region.mask).len().max(1) as u32;
         assert_eq!(
@@ -332,9 +260,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
             region.nodes, copy.per_region[at],
         );
     }
-    // SILENT ON PURPOSE, like the catalog gates: the numbers ride in the
-    // assert message, so a green run says nothing and a red one says
-    // everything. (this crate denies both print macros in its tests.)
     let (split_launches, copy_launches) = (
         split.per_region.iter().sum::<u32>(),
         copy.per_region.iter().sum::<u32>(),
@@ -347,8 +272,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
         fragmented.len(),
     );
 
-    // THE BRACKET. Exactly one gather and one scatter per copied region, in
-    // that order, and nothing at all for a region P4 seated.
     let mut want: Vec<(u32, &str)> = Vec::new();
     for &at in &fragmented {
         let node = compiled.template()[at].nodes.start;
@@ -361,8 +284,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
         "a split moved rows, and the whole point of a split is that it does not",
     );
 
-    // AND THE WORK IS THE SAME WORK. Every node the split ran, the copy ran —
-    // once per interval there, once over the union here.
     let split_counts = split_dispatch.counts();
     let copy_counts = copy_dispatch.counts();
     assert_eq!(
@@ -385,7 +306,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     }
 }
 
-#[test]
 fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
     let (_, compiled) = sku();
     let lanes = fragmenting(&compiled);
@@ -397,12 +317,6 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
         .expect("the fire lands in the lattice") as u32;
     let descriptor = FireDescriptor::of(&composition);
 
-    // The prepare region P4 owes nothing and the capture regions it owes rows
-    // for state THE SAME MASK — qwen3.5's `attention.plan_prefill` and its six
-    // `attention.prefill_lse` readers — and both come back in pieces in this
-    // fire. That is the shape the copy has to get right: a builder that split
-    // while its readers copied would carve one schedule per interval and the
-    // single gathered launch would read the first one.
     let mut prepare = 0usize;
     let mut capture = 0usize;
     for region in compiled.template() {
@@ -425,8 +339,6 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
          claim is about a builder and its readers being both",
     );
 
-    // And the prepare region is owed no row of its OWN — which is exactly why
-    // `fallback::copies` asks the mask rather than the nodes.
     for region in compiled.template() {
         if region.phase != model_compiler::Phase::Prepare {
             continue;

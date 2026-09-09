@@ -1,10 +1,3 @@
-//! NVRTC: one self-contained translation unit in, one launchable region out.
-//! No include path — the emitter splices every runtime header into the
-//! source. Three cache tiers: in memory by program hash, on disk by identity
-//! × source fingerprint, and a bounded negative tier that remembers only
-//! [`Failure::Deterministic`]. Nothing is installed until every region of
-//! every stage compiles.
-
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -21,59 +14,28 @@ use eta_exec::{
 };
 
 use crate::error::{Fault, Result};
-// `Stage` is this module's own struct (one compiled stage), so ETA's
-// attachment-point enum is reached by path rather than imported.
 use eta_ir::registry::Stage as Attach;
 
-/// The only kind the CUDA emitter produces, named from the contract rather
-/// than written as `1`, so a renumbering is a build break and not an empty
-/// slot forever.
 const KERNEL_FUSED: KernelKind = KernelKind::Fused;
 
-/// Fallback launch width when `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`
-/// cannot be read: 256 is a power of two and inside every device's limit, so
-/// a failed query still launches.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const DEFAULT_BLOCK_THREADS: u32 = 256;
 
-/// The warp width, and the floor a rounded-down launch width may not cross.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const WARP: u32 = 32;
 
-/// The largest block CUDA permits.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const MAX_BLOCK_THREADS: u32 = 1024;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// What a compile needs to know that it cannot read off the program
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The device a program is compiled *for*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// Compute capability major, for `sm_XY`.
     pub major: i32,
-    /// Compute capability minor.
     pub minor: i32,
-    /// A stable id for this GPU, so two devices of different families never
-    /// share a cached compilation. The ordinal is enough in a one-shell
-    /// process; a multi-GPU host wants the UUID.
     pub device: u64,
-    /// NVRTC's own `(major, minor)`. Two NVRTC versions compile one source
-    /// to different machine code; folded into the memory key here since
-    /// [`eta_exec::cache_identity`] has no seat for it (shared with backends
-    /// that never call NVRTC).
     pub nvrtc: (i32, i32),
 }
 
 impl Target {
-    /// The target a bound [`Context`](crate::device::Context) describes.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Compile`] with a retryable failure when NVRTC cannot be asked
-    /// its version — which is the same condition as "there is no NVRTC", and
-    /// is a property of the machine rather than of the program.
     pub fn of(context: &crate::device::Context) -> Result<Target> {
         let (major, minor) = context.capability();
         Ok(Target {
@@ -85,23 +47,11 @@ impl Target {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NVRTC
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The `--gpu-architecture` flag for a compute capability: `sm_{major}{minor}`
-/// with no separator, so 12.0 is `sm_120` (the minor is always one digit).
 #[must_use]
 pub fn arch_flag(major: i32, minor: i32) -> String {
     format!("--gpu-architecture=sm_{major}{minor}")
 }
 
-/// The NVRTC library's version, `(major, minor)`.
-///
-/// # Errors
-///
-/// [`Fault::Compile`] (retryable) when `libnvrtc` cannot be loaded or the
-/// query fails: both are facts about the machine, not about a program.
 pub fn nvrtc_version() -> Result<(i32, i32)> {
     #[cfg(feature = "cuda")]
     {
@@ -125,15 +75,6 @@ pub fn nvrtc_version() -> Result<(i32, i32)> {
     }
 }
 
-/// Compile one emitted region to a cubin for `architecture` (an `sm_XY` flag
-/// from [`arch_flag`]); `source` is the whole translation unit, nothing
-/// prepended.
-///
-/// # Errors
-///
-/// [`Failure::Deterministic`] carrying NVRTC's log when the source is
-/// rejected — that answer is worth remembering — and [`Failure::Retryable`]
-/// for everything else.
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
     #[cfg(feature = "cuda")]
     {
@@ -142,8 +83,6 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
 
         let retryable = |reason: String| Failure::Retryable { reason };
 
-        // A NUL would truncate the C string and compile a prefix that can
-        // succeed but is missing its tail.
         let Ok(source_c) = CString::new(source) else {
             return Err(Failure::Deterministic {
                 reason: "the emitted source contains an interior NUL byte".into(),
@@ -170,8 +109,6 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
                 describe(status)
             )));
         }
-        // Past here every exit must destroy `program`, so the body is a helper
-        // and the destroy is unconditional.
         let outcome = compile_into(program, architecture);
         // SAFETY: `program` was created above and has not been destroyed.
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut program) };
@@ -186,7 +123,6 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
     }
 }
 
-/// The compile proper, with `program` guaranteed destroyed by the caller.
 #[cfg(feature = "cuda")]
 fn compile_into(
     program: cudarc::nvrtc::sys::nvrtcProgram,
@@ -200,9 +136,6 @@ fn compile_into(
     let Ok(arch) = CString::new(architecture) else {
         return Err(retryable("the architecture flag contains a NUL".into()));
     };
-    // Determinism contract, not a style choice: a contracted FMA or fast
-    // reciprocal would move a lane past the tolerance the host interpreter
-    // is diffed against.
     let options: [*const std::ffi::c_char; 5] = [
         arch.as_ptr(),
         c"--std=c++17".as_ptr(),
@@ -220,8 +153,6 @@ fn compile_into(
         )
     };
     if status != nvrtc::nvrtcResult::NVRTC_SUCCESS {
-        // The log is the whole diagnostic; read it either way — NVRTC fills it
-        // on a non-compilation failure too.
         let reason = format!("NVRTC refused the emitted region: {}", log(program));
         return Err(if status == nvrtc::nvrtcResult::NVRTC_ERROR_COMPILATION {
             Failure::Deterministic { reason }
@@ -255,7 +186,6 @@ fn compile_into(
     Ok(cubin)
 }
 
-/// The compiler log, or a note saying it could not be read.
 #[cfg(feature = "cuda")]
 fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
     use cudarc::nvrtc::sys as nvrtc;
@@ -278,7 +208,6 @@ fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
         .to_string()
 }
 
-/// NVRTC's own name for a status code.
 #[cfg(feature = "cuda")]
 fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
     // SAFETY: `nvrtcGetErrorString` returns a static string per enumerator;
@@ -294,14 +223,6 @@ fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
         .into_owned()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// A loaded cubin
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A loaded cubin and one entry point inside it.
-///
-/// NOT `Clone`: [`Drop`] unloads the module, so a copy would unload it twice.
-/// Share through the [`Arc`] the compile plane hands out.
 #[derive(Debug)]
 pub struct Module {
     #[cfg(feature = "cuda")]
@@ -321,13 +242,6 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Module {
-    /// Load `cubin` and resolve `entry_name` inside it.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`] when the image is not loadable here or carries no
-    /// such entry point — a cubin/source mismatch, which is exactly why the
-    /// caller invalidates its disk entry when this fails.
     pub fn load(cubin: &[u8], entry_name: &str) -> Result<Module> {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
@@ -361,9 +275,6 @@ impl Module {
             let code =
                 unsafe { dr::cuModuleGetFunction(&raw mut function, module, entry_c.as_ptr()) };
             if code != dr::CUresult::CUDA_SUCCESS {
-                // Unload before returning, or a stale disk cache leaks one
-                // module per retry.
-                //
                 // SAFETY: `module` is loaded and no function of it is in flight.
                 unsafe { dr::cuModuleUnload(module) };
                 return Err(Fault::Device {
@@ -385,23 +296,17 @@ impl Module {
         }
     }
 
-    /// The entry point handle, for `cuLaunchKernel`.
     #[cfg(feature = "cuda")]
     #[must_use]
     pub const fn function(&self) -> cudarc::driver::sys::CUfunction {
         self.function
     }
 
-    /// The width to launch this function at: a power of two inside its own
-    /// register limit. The emitted kernels reduce with a halving tree
-    /// (`stride = blockDim.x / 2`), which silently folds lanes wrong at any
-    /// other width.
     #[must_use]
     pub const fn block_threads(&self) -> u32 {
         self.block_threads
     }
 
-    /// The entry point's name, as the host emitted it.
     #[must_use]
     pub fn entry_name(&self) -> &str {
         &self.entry_name
@@ -419,7 +324,6 @@ impl Drop for Module {
     }
 }
 
-/// The register-limited launch width, rounded down to a power of two.
 #[cfg(feature = "cuda")]
 fn launch_width(function: cudarc::driver::sys::CUfunction) -> u32 {
     use cudarc::driver::sys as dr;
@@ -440,12 +344,8 @@ fn launch_width(function: cudarc::driver::sys::CUfunction) -> u32 {
     round_down_to_power_of_two(max_threads)
 }
 
-/// `max_threads` rounded down to a power of two inside `[WARP, 1024]`. Split
-/// out of the query so the arithmetic is testable with no GPU in the room.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn round_down_to_power_of_two(max_threads: i32) -> u32 {
-    // Below one warp the attribute is not believable; fall back rather than
-    // launch a partial warp.
     let Ok(max_threads) = u32::try_from(max_threads) else {
         return DEFAULT_BLOCK_THREADS;
     };
@@ -459,37 +359,20 @@ fn round_down_to_power_of_two(max_threads: i32) -> u32 {
     width
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The disk tier
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// File magic; the `01` is a format version, bumped when the layout changes so
-/// that older entries miss rather than misparse.
 const MAGIC: &[u8; 8] = b"PTRCUB01";
 
-/// Header bytes before the variable-length tail: magic + three `u32` + a `u64`.
 const HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 8;
 
-/// The largest entry that will be read: a corrupt header claiming a huge
-/// length must not become an allocation the size of the claim.
 const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Serialises the temp-file names of concurrent writers inside one process.
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// Where cubins are kept, or `None` when nowhere is writable. Every failure
-/// here is a miss, never an error: NVRTC is always available when the cache
-/// is not.
 #[derive(Clone, Debug)]
 pub struct Disk {
     directory: Option<PathBuf>,
 }
 
 impl Disk {
-    /// The cache a deployment's stated directory roots, or nowhere when it
-    /// stated none. The directory is a deployment fact, carried on
-    /// `Boot::cache_dir`. `None` is [`Disk::disabled`], which costs nothing
-    /// but NVRTC time.
     #[must_use]
     pub fn rooted(directory: Option<impl Into<PathBuf>>) -> Disk {
         Disk {
@@ -497,7 +380,6 @@ impl Disk {
         }
     }
 
-    /// A cache rooted at an explicit directory.
     #[must_use]
     pub fn at(directory: impl Into<PathBuf>) -> Disk {
         Disk {
@@ -505,20 +387,16 @@ impl Disk {
         }
     }
 
-    /// A cache that stores nothing: every load misses, every store is a no-op.
     #[must_use]
     pub const fn disabled() -> Disk {
         Disk { directory: None }
     }
 
-    /// Whether anything will actually be written.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
         self.directory.is_some()
     }
 
-    /// The cubin stored for `(key, region_index, entry)`, if it still matches.
-    /// A mismatched or malformed entry is removed before `None` is returned.
     #[must_use]
     pub fn load(&self, key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
         let path = self.path(key, region_index)?;
@@ -532,9 +410,6 @@ impl Disk {
         }
     }
 
-    /// Store `cubin` for `(key, region_index, entry)`. Written to a
-    /// per-writer temp file and atomically `rename`d in: a half-written
-    /// cubin another process loads is a segfault in the driver.
     pub fn store(&self, key: &str, region_index: u32, entry: &str, cubin: &[u8]) {
         let Some(directory) = self.directory.as_ref() else {
             return;
@@ -571,14 +446,12 @@ impl Disk {
         }
     }
 
-    /// Remove whatever is stored for `(key, region_index)`.
     pub fn invalidate(&self, key: &str, region_index: u32) {
         if let Some(path) = self.path(key, region_index) {
             let _ = fs::remove_file(path);
         }
     }
 
-    /// The file a `(key, region_index)` pair maps to.
     fn path(&self, key: &str, region_index: u32) -> Option<PathBuf> {
         let directory = self.directory.as_ref()?;
         Some(directory.join(format!(
@@ -588,28 +461,17 @@ impl Disk {
     }
 }
 
-/// The identity string plus an eight-byte fingerprint of the source, appended
-/// rather than folded in so the identity stays readable inside a key. Editing
-/// a device template bumps no version number, so without the source in the
-/// key a stale cubin would match today's identity.
 #[must_use]
 pub fn disk_key(identity: &str, source: &str) -> String {
     let hash = eta_ir::fnv1a64(source.as_bytes());
     let mut key = String::with_capacity(identity.len() + 16);
     key.push_str(identity);
     for byte in hash.to_le_bytes() {
-        // Hex, so a stored key stays human-readable; both sides of the
-        // comparison are produced here, so the spelling is free to choose.
         let _ = write!(key, "{byte:02x}");
     }
     key
 }
 
-/// Validate a stored entry and return its cubin. The filename is only a
-/// 64-bit hash of the key, so the key and entry name are stored and compared
-/// here too: a hash collision would otherwise load one program's machine
-/// code for another's launch. Every length is checked against the file's own
-/// size before any slice, so a lying header is a miss and not a panic.
 fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
     if bytes.len() < HEADER_BYTES || bytes.len() as u64 > MAX_ENTRY_BYTES {
         return None;
@@ -625,8 +487,6 @@ fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<
     if stored_region != region_index || key_size != key.len() || entry_size != entry.len() {
         return None;
     }
-    // The tail must be exactly the three pieces the header describes; a longer
-    // tail means header and file disagree.
     let tail = bytes.len().checked_sub(HEADER_BYTES)?;
     let claimed = (key_size as u64)
         .checked_add(entry_size as u64)?
@@ -645,34 +505,19 @@ fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<
     Some(bytes[cubin_at..].to_vec())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The compiled program
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One compiled region: the module that holds it, and which region it is.
 #[derive(Debug)]
 pub struct Region {
-    /// Which region of its stage this is.
     pub region_index: u32,
-    /// The loaded cubin and its entry point.
     pub module: Arc<Module>,
 }
 
-/// One compiled stage: every generated region it declares, in region order.
-///
-/// Shared rather than owned: two programs naming the same stage share one
-/// cubin, and a `CUmodule` unloaded while another program's launch is in
-/// flight is a fault.
 #[derive(Debug, Clone)]
 pub struct Stage {
-    /// The stage's signature hash, as its plan states it.
     pub signature_hash: u64,
-    /// The generated regions, in ascending `region_index`.
     pub regions: Arc<Vec<Region>>,
 }
 
 impl Stage {
-    /// The region with this index, if it was compiled.
     #[must_use]
     pub fn region(&self, region_index: u32) -> Option<&Region> {
         self.regions
@@ -681,33 +526,20 @@ impl Stage {
     }
 }
 
-/// A registered program's compiled form: one [`Stage`] per stage plan.
 #[derive(Debug, Clone)]
 pub struct Compiled {
-    /// The stages, in plan order.
     pub stages: Arc<Vec<Stage>>,
-    /// The stage plans these were compiled from, in the same order. Carried
-    /// rather than looked up, so a compiled program cannot drift from its plan.
     pub plans: Arc<Vec<LaunchStagePlan>>,
-    /// Each stage's attachment point (`LaunchStage::kind`). Carried because
-    /// `LaunchStagePlan` has no `kind`, and firing by position picks the
-    /// adapter rather than the sampler once a program has a prologue.
     pub kinds: Arc<Vec<Attach>>,
 }
 
 impl Compiled {
-    /// The index of the first stage with this attachment point.
     #[must_use]
     pub fn stage_of_kind(&self, kind: Attach) -> Option<usize> {
         self.kinds.iter().position(|&k| k == kind)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The cache
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The compile cache: the only thing in this crate that calls NVRTC.
 #[derive(Debug)]
 pub struct Cache {
     programs: Bounded<u64, Compiled>,
@@ -718,16 +550,12 @@ pub struct Cache {
 }
 
 impl Default for Cache {
-    /// A cache that stores nothing. The directory is the deployment's,
-    /// arriving via `Boot`; a `Default` that looked for one itself would be
-    /// an environment read this crate does not make.
     fn default() -> Cache {
         Cache::new(Disk::disabled())
     }
 }
 
 impl Cache {
-    /// A cache backed by `disk`.
     #[must_use]
     pub fn new(disk: Disk) -> Cache {
         Cache {
@@ -739,29 +567,16 @@ impl Cache {
         }
     }
 
-    /// The persistent tier this cache compiles into.
     #[must_use]
     pub const fn disk(&self) -> &Disk {
         &self.disk
     }
 
-    /// What the tiers have been doing. The claim that a second bind of a
-    /// program compiles nothing is only checkable through
-    /// [`CacheStats::compilations`].
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
     }
 
-    /// Compile `plan`'s generated regions, or answer from a tier. `versions`
-    /// carries the identity's four version numbers, so a host-side bump misses
-    /// rather than reusing a stale cubin.
-    ///
-    /// # Errors
-    ///
-    /// [`Failure::Deterministic`] when the program cannot compile here — only
-    /// these are remembered — and [`Failure::Retryable`] when the machine
-    /// could not.
     pub fn compile(
         &mut self,
         program_hash: u64,
@@ -791,13 +606,11 @@ impl Cache {
 
         match self.build(plan, kernels, versions, target) {
             Ok(compiled) => {
-                // Past the last failure: only now is anything installed.
                 self.stages.commit();
                 self.programs.insert(program_hash, compiled.clone());
                 Ok(compiled)
             }
             Err(failure) => {
-                // A half-failed program leaves no half-stage behind.
                 self.stages.abandon();
                 if let Failure::Deterministic { reason } = &failure {
                     self.negative.insert(program_key, reason.clone());
@@ -807,12 +620,10 @@ impl Cache {
         }
     }
 
-    /// Forget `program_hash`, dropping this cache's share of its modules.
     pub fn forget(&mut self, program_hash: u64) {
         self.programs.remove(&program_hash);
     }
 
-    /// The compile proper. Installs nothing; the caller commits or abandons.
     fn build(
         &mut self,
         plan: &ExecPlan,
@@ -840,8 +651,6 @@ impl Cache {
                 stage_plan.signature_hash,
                 versions,
             );
-            // NVRTC version isn't in `cache_identity` (shared with
-            // non-NVRTC backends), so it's folded into the memory key here.
             let key = fnv1a64_with(
                 identity.as_bytes(),
                 &[
@@ -858,8 +667,6 @@ impl Cache {
                         continue;
                     }
                 }
-                // A signature collision builds the stage unshared: two stages
-                // that hash alike are still two valid stages.
                 Lookup::Collided | Lookup::Miss => {}
             }
 
@@ -874,13 +681,10 @@ impl Cache {
         Ok(Compiled {
             stages: Arc::new(stages),
             plans: Arc::new(plan.package.plans.clone()),
-            // `plans` is parallel to `package.stages` — `adopt_launch_package`
-            // refuses a package where it is not — so kinds index the same way.
             kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
         })
     }
 
-    /// Every generated region of one stage.
     fn build_stage(
         &mut self,
         stage_index: u32,
@@ -894,10 +698,6 @@ impl Cache {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than four billion regions is not a stage".into(),
             })?;
-            // A skip here is not a compile failure: a `kernel_call`/
-            // `sink_call` region has no generated kernel because the shell
-            // launches it itself. `shell_launches` is the same predicate the
-            // launch half uses to decide which values need fire scratch.
             if plan
                 .fused
                 .get(region_index as usize)
@@ -907,10 +707,6 @@ impl Cache {
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry, .. } => (source, entry),
-                // Not a `continue`: this shell has no fallback path for a
-                // declined region, so skipping it would silently drop the
-                // region's ops while the plan still budgets their scratch —
-                // a confident wrong answer instead of an error.
                 Slot::Refused(why) => {
                     return Err(Failure::Deterministic {
                         reason: format!(
@@ -951,7 +747,6 @@ impl Cache {
         })
     }
 
-    /// One region: disk, else NVRTC.
     fn region_module(
         &mut self,
         identity: &str,
@@ -967,7 +762,6 @@ impl Cache {
                     self.stats.persistent_hits += 1;
                     return Ok(Arc::new(module));
                 }
-                // A cubin that will not load must not stay on disk.
                 Err(_) => self.disk.invalidate(&key, region_index),
             }
         }
@@ -977,14 +771,11 @@ impl Cache {
         let module = Module::load(&cubin, entry).map_err(|error| Failure::Retryable {
             reason: format!("loading `{entry}`: {error}"),
         })?;
-        // Stored only after it loads, so an unusable cubin never reaches disk.
         self.disk.store(&key, region_index, entry, &cubin);
         Ok(Arc::new(module))
     }
 }
 
-/// FNV-1a over `bytes` and then each of `tails`, as one stream. Folding the
-/// extra fields in is what keeps `cache_identity` free of CUDA-only facts.
 fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let mut fold = |slice: &[u8]| {
@@ -1004,7 +795,12 @@ fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
 mod tests {
     use super::*;
 
-    // A source edit must miss even when every version number is unchanged.
+    fn compile_every_case() {
+        editing_the_source_changes_the_disk_key_with_no_version_bump();
+        a_corrupt_entry_is_a_miss_and_is_deleted();
+        a_disabled_cache_is_a_miss_and_not_a_failure();
+    }
+
     #[test]
     fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
         let identity = "0100000000000000000300000000000000000000-v0003000400000003 00000015";
@@ -1025,8 +821,6 @@ mod tests {
         path
     }
 
-    // A truncated or corrupt file is a miss and is removed on the way past.
-    #[test]
     fn a_corrupt_entry_is_a_miss_and_is_deleted() {
         let directory = scratch("corrupt");
         let disk = Disk::at(&directory);
@@ -1046,9 +840,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // A cache with no home stores nothing and misses everything; neither is
-    // a failure.
-    #[test]
     fn a_disabled_cache_is_a_miss_and_not_a_failure() {
         let disk = Disk::disabled();
         assert!(!disk.is_enabled());

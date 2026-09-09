@@ -1,13 +1,3 @@
-//! Writing an object a chunk at a time.
-//!
-//! The property that matters: a streamed write and a slice write produce the
-//! same file. A producer that cannot hold a tensor in memory, such as one
-//! copying a weight off a device in chunks, should not produce a different
-//! artifact.
-//!
-//! The sink is a token rather than a borrow of the writer, which is what lets
-//! a producer driven from outside hold both in one structure.
-
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -27,6 +17,20 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
             (x >> 24) as u8
         })
         .collect()
+}
+
+fn streaming_every_case() {
+    a_streamed_object_matches_a_slice_written_one();
+    a_group_type_streams_as_its_canonical_blob();
+    the_declared_length_must_fit_the_type();
+    writing_past_a_declared_length_is_an_error();
+    closing_a_short_blob_is_an_error();
+    nothing_else_may_be_written_while_a_stream_is_open();
+    bytes_and_length_do_not_mix();
+    layout_rules_are_checked_before_the_first_chunk();
+    identical_streamed_blobs_are_shared();
+    a_sink_refuses_a_writer_that_did_not_open_it();
+    closing_onto_the_wrong_writer_is_refused();
 }
 
 #[test]
@@ -54,8 +58,6 @@ fn a_streamed_object_matches_a_slice_written_one() {
                 })
                 .unwrap();
             assert_eq!(sink.remaining(), bytes.len() as u64);
-            // Deliberately uneven chunks: the file must not depend on how the
-            // producer happened to slice its copies.
             for chunk in bytes.chunks(7919) {
                 sink.write(&mut w, chunk).unwrap();
             }
@@ -72,19 +74,14 @@ fn a_streamed_object_matches_a_slice_written_one() {
         "a streamed write produced a different file"
     );
 
-    // And the digests it computed on the fly verify.
     let src = Source::open(&streamed).unwrap();
     assert!(src.tensor("t.a").unwrap().verify().unwrap().is_checked());
     assert!(src.tensor("t.b").unwrap().verify().unwrap().is_checked());
     assert_eq!(&*src.tensor("t.a").unwrap().bytes().unwrap(), &a[..]);
 }
 
-/// A group type streams as its canonical blob: codes, padding, scales. The
-/// producer lays the planes out; the writer gets one length.
-#[test]
 fn a_group_type_streams_as_its_canonical_blob() {
     let term = Term::parse("g32_e2m1_e8m0_n").unwrap();
-    // shape [96]: 48 bytes of codes, 208 of padding, 3 scales.
     let codes = payload(3, 48);
     let scales = payload(4, 3);
     let planes = term.planes(&[96]).unwrap();
@@ -129,10 +126,6 @@ fn a_group_type_streams_as_its_canonical_blob() {
     assert!(tensor.verify().unwrap().is_checked());
 }
 
-/// The declared length is checked against the type before the stream opens,
-/// so a producer streaming gigabytes learns its object is malformed at the
-/// start, not at the end.
-#[test]
 fn the_declared_length_must_fit_the_type() {
     let path = tmp("badlength.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -144,7 +137,6 @@ fn the_declared_length_must_fit_the_type() {
     w.abandon();
 }
 
-#[test]
 fn writing_past_a_declared_length_is_an_error() {
     let path = tmp("overrun.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -156,7 +148,6 @@ fn writing_past_a_declared_length_is_an_error() {
     assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
 }
 
-#[test]
 fn closing_a_short_blob_is_an_error() {
     let path = tmp("short.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -171,9 +162,6 @@ fn closing_a_short_blob_is_an_error() {
     );
 }
 
-/// The writer has one blob cursor, so bytes from a second object written while
-/// a stream is open would land inside the blob being streamed.
-#[test]
 fn nothing_else_may_be_written_while_a_stream_is_open() {
     let path = tmp("interleaved.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -186,14 +174,10 @@ fn nothing_else_may_be_written_while_a_stream_is_open() {
 
     sink.write(&mut w, &[0u8; 16]).unwrap();
 
-    // Nor may the file be closed around an object that is still open.
     let err = w.finish().unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
 }
 
-/// Mixing the two ways of giving an object its bytes is refused rather than
-/// half honoured: an object is written from a slice or streamed, not both.
-#[test]
 fn bytes_and_length_do_not_mix() {
     let path = tmp("mixed.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -215,9 +199,6 @@ fn bytes_and_length_do_not_mix() {
     assert!(format!("{err}").contains("length"), "{err}");
 }
 
-/// A layout's metadata rules are checked when the object is declared, before
-/// any bytes move.
-#[test]
 fn layout_rules_are_checked_before_the_first_chunk() {
     let path = tmp("badlayout.zt");
     let mut w = Writer::options()
@@ -232,7 +213,6 @@ fn layout_rules_are_checked_before_the_first_chunk() {
                 .layout("zt.sparse_csr/2")
                 .attr("index", "u32")
                 .attr("nnz", 2u64)
-                // The plan takes 520 bytes; this declares 100.
                 .length(100)
         })
         .expect_err("a malformed CSR object must be refused up front");
@@ -240,9 +220,6 @@ fn layout_rules_are_checked_before_the_first_chunk() {
     assert!(err.to_string().contains("520"), "{err}");
 }
 
-/// Two streamed objects with the same bytes share one blob, as two `bytes`
-/// objects would, so a canonical writer can stream and stay canonical.
-#[test]
 fn identical_streamed_blobs_are_shared() {
     let path = tmp("stream-shared.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -269,13 +246,6 @@ fn identical_streamed_blobs_are_shared() {
     assert!(src.tensor("c").unwrap().verify().unwrap().is_checked());
 }
 
-/// A sink drives the writer that opened it, and no other.
-///
-/// The check used to be "is *some* object open on that writer", which any
-/// writer mid-stream satisfies. A sink handed the wrong writer appended its
-/// bytes to whatever blob that writer had open: two files quietly wrong, and
-/// the sink believing it had written a blob it never wrote.
-#[test]
 fn a_sink_refuses_a_writer_that_did_not_open_it() {
     let a = tmp("sink-owner-a.zt");
     let b = tmp("sink-owner-b.zt");
@@ -285,11 +255,9 @@ fn a_sink_refuses_a_writer_that_did_not_open_it() {
     let mut sa = open_sink(&mut wa, "from_a");
     let mut sb = open_sink(&mut wb, "from_b");
 
-    // Both writers are streaming, which is exactly when the old check passed.
     let err = sa.write(&mut wb, &[0xAA; 8]).unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)), "{err}");
 
-    // Each still works with its own, and the crossed write left no trace.
     sa.write(&mut wa, &[0xAA; 8]).unwrap();
     sa.close(&mut wa).unwrap();
     sb.write(&mut wb, &[0xBB; 8]).unwrap();
@@ -304,9 +272,6 @@ fn a_sink_refuses_a_writer_that_did_not_open_it() {
     }
 }
 
-/// `close` is checked too: committing an object onto the wrong writer would
-/// put it in the wrong manifest.
-#[test]
 fn closing_onto_the_wrong_writer_is_refused() {
     let a = tmp("sink-close-a.zt");
     let b = tmp("sink-close-b.zt");
@@ -319,7 +284,6 @@ fn closing_onto_the_wrong_writer_is_refused() {
 
     assert!(sb.close(&mut wa).is_err(), "b's object onto a's writer");
 
-    // `wa` is untouched: its own sink still finishes, and `from_b` is absent.
     sa.close(&mut wa).unwrap();
     wa.finish().unwrap();
     let src = Source::open(&a).unwrap();
@@ -328,7 +292,6 @@ fn closing_onto_the_wrong_writer_is_refused() {
     wb.abandon();
 }
 
-/// One eight-byte u8 blob, streamed.
 fn open_sink(w: &mut Writer, name: &str) -> ztensor::Sink {
     w.stream(name, |o| o.shape([8u64]).term(Leaf::U8).length(8))
         .unwrap()

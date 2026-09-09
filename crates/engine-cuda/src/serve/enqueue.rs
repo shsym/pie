@@ -1,5 +1,3 @@
-//! The stream half of one step: prologue guests, staging, the walk, epilogue guests, readback.
-
 use std::cell::Cell;
 
 use kernels_cuda::attn::plan::Shape;
@@ -31,30 +29,12 @@ use crate::window::{At, Cursor, Lanes};
 
 use super::{Golden, Graphs, Prepared, Readback, Shell};
 
-/// One boundary's guest fires, left on the stream.
 #[derive(Debug)]
 pub(super) struct GuestBatch {
-    /// `(lane, instance)` for every launch owing a settlement, in launch order.
     launched: Vec<(usize, u64)>,
-    /// The step whose settlement callback proves this batch landed.
     seq: u64,
 }
 
-/// Which fire lane a `peer` names: the lane of attention group `want` that
-/// carries the SAME STREAM as the asking lane.
-///
-/// Guidance names a group rather than a lane because its two branches must
-/// not attend each other — they are two independent denoisings of one
-/// canvas, one holding the prompt and one the negative one, and one
-/// attention group would make each see the other's rows. So they are two
-/// groups of one fire, and the stream picks the branch's own rectangle out
-/// of the group (a group also seats its context lane, which predicts no
-/// velocity).
-///
-/// Refused, never guessed, in three cases a guest can write: a peer group
-/// this fire seats no same-stream lane of, one it seats several of, and the
-/// asking lane's own group. The last matters most — it is guidance quietly
-/// becoming `u + s(u − u)`, a picture that looks fine and is unguided.
 fn seating(lanes: &[super::Seated<'_>]) -> String {
     let mut out = String::new();
     for (at, lane) in lanes.iter().enumerate() {
@@ -106,22 +86,13 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
 }
 
 impl Shell {
-    /// `enqueue`'s body — see the wrapper for what it does not do.
-    ///
-    /// # Errors
-    ///
-    /// The shell's fault, for a launch the backend refused at enqueue time.
     pub(super) fn enqueue_on(
         &mut self,
         p: &mut Prepared<'_>,
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
-        // The step this fire settles at, stamped onto the cache before anything launches.
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
-        // The read path's scratch, grown to this fire's extended rows before
-        // the frame is cut — after a drain, since a step still on the stream
-        // may be reading the old one.
         if p.rs.rows_ext > 0 {
             let need = crate::run::RsScratch::need(
                 p.rs.rows_ext,
@@ -179,7 +150,6 @@ impl Shell {
     }
 }
 
-/// The borrowed halves of a `Shell` one enqueue reads, phase by phase.
 struct FireCtx<'a> {
     device: &'a Context,
     trace: &'a Trace,
@@ -199,7 +169,6 @@ struct FireCtx<'a> {
     voxels: Option<&'a mut crate::voxels::Store>,
     held: &'a mut [u32],
     buffers: Option<&'a Buffers>,
-    /// The read path's scratch span `(ptr, bytes)`, grown before this frame was cut.
     rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
@@ -209,14 +178,11 @@ struct FireCtx<'a> {
     airborne: &'a Airborne,
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
-    /// Per `Trace::values` id: which region's launch reads that attention schedule — what [`crate::run::Ceilings::readers`] carries.
     schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
-    /// The step this fire settles at.
     seq: u64,
 }
 
-/// What the staging phase put on the stream, read by the walk and the readback.
 struct Staged {
     lane_count: u32,
     handles: Handles,
@@ -224,7 +190,6 @@ struct Staged {
     voxels: Option<crate::voxels::Handles>,
     mrope: Option<kernels_cuda::Tensor>,
     self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
-    /// The float ports' rectangles, carved at this fire's rows / lanes.
     ports: Vec<crate::run::PortBinding>,
     slots: SlotTable,
     caches: CacheTable,
@@ -232,12 +197,9 @@ struct Staged {
 }
 
 impl FireCtx<'_> {
-    /// Prologue guests: stage, fly, write the fold predicate, one wait, every verdict.
     fn prologue(&mut self, p: &Prepared<'_>) -> Result<()> {
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut prologues = AirborneFires::default();
-        // A session may hold one airborne fire, so the deferred batch is reaped
-        // only when a prologue is about to stage.
         if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
             reap_guest_fires(
                 self.programs,
@@ -257,11 +219,8 @@ impl FireCtx<'_> {
                 verdicts.push((at, fired));
             }
         }
-        // The prologues fly before the predicate is written: `pull_validate` seeds the commit word.
         prologues.fly(self.device, self.programs)?;
 
-        // The fold predicate, one byte per lane: the lane's own commit word where it
-        // has a prologue, the standing one where it has none, zero for a buffered scatter.
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
             let mut commits: Vec<u64> = vec![self.predicate.always(); lane_count as usize];
@@ -295,8 +254,6 @@ impl FireCtx<'_> {
             }
         }
 
-        // One wait for the whole boundary, in front of the forward; a prologue
-        // that did not commit is a fire nobody can replay.
         prologues.settle_into(self.device, self.programs, &mut verdicts)?;
         for (at, fired) in verdicts {
             committed_or(fired, p.attachments[at].instance, "prologue")?;
@@ -304,10 +261,7 @@ impl FireCtx<'_> {
         Ok(())
     }
 
-    /// The fresh slots' banks zeroed, the staging commit, the patch and rotation
-    /// copies, and the arena and pool tables a `Run` resolves through.
     fn stage(&mut self, p: &mut Prepared<'_>, slot: &SlotGuard) -> Result<Staged> {
-        // On the stream: zeroed before the launches that read the bank.
         for fresh in &p.fresh {
             self.pools.clear_on(self.device.stream(), *fresh)?;
         }
@@ -315,8 +269,6 @@ impl FireCtx<'_> {
         let rows = p.composition.rows();
         let lane_count = p.composition.lane_count();
 
-        // The first stream touch: commit the slot `prepare` wrote, in front of
-        // the launches that read it.
         let handles =
             self.inputs
                 .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
@@ -324,8 +276,6 @@ impl FireCtx<'_> {
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);
 
-        // The patch bytes and the trunk's rotation stream ride no ring: pageable
-        // copies on the same stream, none at all for a fire without them.
         let patches = if p.patch_payload.is_empty() {
             None
         } else {
@@ -347,7 +297,6 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
-        // The voxel tables (D8), the same way: pageable copies on the stream.
         let voxels = if p.voxel_tables.grid.is_empty() {
             None
         } else {
@@ -358,13 +307,6 @@ impl FireCtx<'_> {
             })?;
             Some(store.stage(self.device.stream(), &p.voxel_tables)?)
         };
-        // The voxel port fed from a channel (D8): the tables above staged the
-        // grid and the slots and left the payload region as the load did, and
-        // each fed lane's rows land in it now — device to device from the
-        // cell the instance's own `take` would read this fire, at the lane's
-        // `voxel_offset`. Nothing crosses the host bus: a decode's latent and
-        // an encode's pixels are already on the card, on the ring the guest
-        // wrote them to.
         if let Some(handles) = voxels {
             for feed in &p.voxel_feeds {
                 let dest = handles.voxels.ok_or_else(|| Fault::Unbound {
@@ -408,9 +350,6 @@ impl FireCtx<'_> {
                 &p.self_cond_rows,
                 &p.self_cond_weights,
             )?;
-            // Lanes fed off their own channels: their taps land over the
-            // zeros just staged, device to device, from the cells their own
-            // `take` would read this fire.
             for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
                 let bytes = cells * 4;
                 let (rows_at, weights_at) = self.programs.self_cond_cells(
@@ -436,12 +375,6 @@ impl FireCtx<'_> {
             Some(staged)
         };
 
-        // The float ports (D3): each fed lane's rows of each port rectangle
-        // are copied from the channel's committed cell — the cell at the
-        // consumer head, resolved now, after the prologue, so a prologue's
-        // `take` moves the feed with it. Device to device (or off the
-        // pinned mirror, which is device-mapped), on the compute stream, in
-        // front of the launches that read the rectangle.
         for feed in &p.port_feeds {
             let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
             let rectangle = self
@@ -471,15 +404,11 @@ impl FireCtx<'_> {
             }
         }
 
-        // A bodied fire carves both columns at the key's bucket, so a replay's
-        // grids never outrun the rectangle its baked pointers address.
         let carve_rows = if p.bodied {
             u64::from(p.composition.bucket()).max(u64::from(rows))
         } else {
             u64::from(rows)
         };
-        // Lane rectangles likewise carve at the key's lane ceiling: a
-        // lane-shaped launch grids at it and a replay never outruns it.
         let carve_lanes = u64::from(p.lane_carve).max(u64::from(lane_count));
         let ports: Vec<crate::run::PortBinding> = self
             .inputs
@@ -521,10 +450,6 @@ impl FireCtx<'_> {
                 readouts: p.readout_rows.len() as u64,
             },
         );
-        // The ports merged straight into a stream land in their merged
-        // column now — after the feeds and the carve, before the walk: the
-        // arm's lanes' rows from the port rectangle, or zeros for a lane
-        // that fed nothing, so the column never reads the last fire's bytes.
         for land in &p.merge_lands {
             let Some(column) = slots.0[land.merge.0 as usize] else {
                 return Err(Fault::Unbound {
@@ -557,7 +482,6 @@ impl FireCtx<'_> {
                 crate::device::alloc::zero_span_on(self.device.stream(), at, bytes)?;
             }
         }
-        // The three RS seats: a plain fire binds `Tensor::ABSENT` for all of them.
         let caches = self.pools.table(
             &self
                 .inputs
@@ -596,15 +520,11 @@ impl FireCtx<'_> {
         })
     }
 
-    /// The geometry and schedule seats, the `Run`, and the router: a body, the
-    /// eager walk, or the arming pass's hole.
     fn route(&mut self, p: &Prepared<'_>, staged: &Staged) -> Result<()> {
         let lane_count = staged.lane_count;
         let paging = staged.paging;
         let handles = &staged.handles;
 
-        // The geometry seats and their host twins: the same vector bound as a
-        // handle for the launches and as a `Vec<i32>` for the plan builders.
         let mut geometry = Vec::with_capacity(p.geometries.len());
         for (space, host) in p.geometries.iter().enumerate() {
             let seat = handles.spaces[space];
@@ -626,7 +546,6 @@ impl FireCtx<'_> {
             });
         }
 
-        // One schedule seat per (run, plan value).
         let runs = p.windows.max_runs();
         let facts = self.facts;
         let inputs = &*self.inputs;
@@ -695,7 +614,6 @@ impl FireCtx<'_> {
                 mask_indptr: handles.mask_indptr,
                 pool_state: self.pools.pool_slabs(),
             },
-            // A seat only when somebody asked: a non-capturing fire pays nothing.
             scores: self
                 .scores
                 .filter(|_| p.lanes.iter().any(|seated| seated.captures_scores))
@@ -704,7 +622,6 @@ impl FireCtx<'_> {
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
         };
-        // The cursor's cell and the stream cell: what stands between the sink and the `Run`.
         let place = At::new();
         let stream = Cell::new(0u32);
         let side_ctx = self.device.side_ctx();
@@ -725,7 +642,6 @@ impl FireCtx<'_> {
                 windows: &p.windows,
                 at: &stream,
             });
-        // D4's pad pair per row axis; the off arm hands `bucket == rows`.
         let armed = kernels_cuda::Pad {
             rows: p.composition.rows(),
             bucket: if self.pad {
@@ -742,8 +658,6 @@ impl FireCtx<'_> {
                 p.composition.patch_rows()
             },
         };
-        // The ceilings are armed in one piece: pad pair, admission and ladder together.
-        // The voxel axis is served eagerly this phase: its pad is the live count.
         let armed_voxels = kernels_cuda::Pad {
             rows: p.composition.voxel_rows(),
             bucket: p.composition.voxel_rows(),
@@ -766,7 +680,6 @@ impl FireCtx<'_> {
                         ladder,
                         lane_ceiling: None,
                     }),
-                    // No body carves the voxel axis (M0: eager).
                     None,
                 ]),
             }),
@@ -801,17 +714,14 @@ impl FireCtx<'_> {
             });
         }
         super::btrace::mark("run_new");
-        // A buffered fire and a rotating load are not graph-replayable: both walk.
         let records = self.graphs.records()
             && !p.rs.buffered
             && !self.weights.rotating()
             && !self.weights.hosts_experts();
         let walked = if records {
             if self.arming && !p.bodied {
-                // A synthetic the gate refused: nothing to record, nothing worth running.
                 Ok(())
             } else if p.bodied {
-                // The body arm: every clause was decided in `prepare`.
                 let fire = record::Fire {
                     eager_twin: self.golden_arm == Golden::Eager,
                     trace: self.trace,
@@ -823,13 +733,11 @@ impl FireCtx<'_> {
                     decoding: self.decoding,
                     lane_ceiling: p.lane_ceiling,
                     towered: p.towered,
-                    // The same bundle the `Run` above was handed.
                     ceilings,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
-                // Tier 3: a recording mode with no body for this fire walks, counted per composition.
                 let mut cursor = Cursor::new(&place);
                 walk(
                     self.trace,
@@ -842,14 +750,12 @@ impl FireCtx<'_> {
                 .map_err(Fault::from)
             }
         } else {
-            // An eager walk under a recording mode is counted.
             if self.graphs.records() {
                 self.cache.eager_walk(
                     self.weights.rotating() || self.weights.hosts_experts(),
                     p.rs.buffered,
                 );
             }
-            // The rotation rides the eager cursor.
             let mut cursor = Cursor::new(&place);
             if let Some(rotor) = self.weights.rotor() {
                 cursor = cursor.pumping(crate::window::Pump {
@@ -868,8 +774,6 @@ impl FireCtx<'_> {
             .map_err(Fault::from)
         };
         drop(run);
-        // The pad, the seat and the region are the fire's: every context the walk
-        // could have armed is put back, refusal or not.
         self.device.ctx().disarm();
         self.device.ctx().disarm_stage();
         self.device.ctx().disarm_region();
@@ -886,17 +790,11 @@ impl FireCtx<'_> {
         Ok(())
     }
 
-    /// The epilogue guests, the `held` advance, and where the numbers are —
-    /// or `None` for an arming fire, which computes nothing.
     fn readback(&mut self, p: &Prepared<'_>, staged: &Staged) -> Result<Option<Readback>> {
-        // The golden pass's two fires are arming fires that exist for their numbers.
         if self.arming && self.golden_arm == Golden::Off {
             return Ok(None);
         }
         let slots = &staged.slots;
-        // The pixels seam (D8): the plane and its output grid, resolved here
-        // whenever the fire carried clips — the planting of the class the
-        // clips run in (M0: one voxel class a fire).
         let voxel_class = p
             .composition
             .voxel_classes()
@@ -925,12 +823,6 @@ impl FireCtx<'_> {
             }
             _ => None,
         };
-        // Where each lane's pixels BEGIN in that plane, on the host, before
-        // the walk that computes the device grid: the epilogue's `pixels()`
-        // intrinsic is a base address, so it cannot wait for the launch.
-        // `voxels::host_grid` replays the plan's `Spatial::Grid` chain with
-        // the rules' own host twins over this fire's port grid. A chain the
-        // twins cannot follow binds nothing rather than binding a wrong row.
         let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> =
             vec![None; p.lanes.len()];
         if let (Some(seat), Some((_, grid))) =
@@ -956,14 +848,6 @@ impl FireCtx<'_> {
                 ));
             }
         }
-        // **THE READOUT RECTANGLE IS THE GATHERED ONE, NOT THE FIRE'S ROWS.**
-        // The head runs over `layout.gather_rows`' output, so a lane's rows
-        // here are its run of THAT rectangle — the readouts `prepare` laid
-        // out — and every reader below (the host readback, the guest's
-        // `Logits` intrinsic) indexes it the same way. For a decode lane the
-        // two coincide; for a prefill lane the run is one row where the fire
-        // carries hundreds. The class its word landed in still comes off the
-        // composition.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
@@ -979,8 +863,6 @@ impl FireCtx<'_> {
             lane_rows[lane] = count;
             last_row[lane] = first + count.saturating_sub(1);
         }
-        // One export rectangle, as the carve placed it, checked for an
-        // element this shell can read back or point an intrinsic at.
         let plane_of = |value: model_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
             let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
@@ -998,12 +880,6 @@ impl FireCtx<'_> {
             }
             Ok(plane)
         };
-        // The readout seam, PER LANE, from the lane's class: `out` (logits)
-        // when its arm writes one, else the float readout its arm plants
-        // (`velocity`, then its last `hidden`) — design D3's "this kind's
-        // logits", and D5's several arms of one plan each reading back their
-        // own seam. A pixels-only plan (a VAE decoder, D8) has no row
-        // readout at all: its numbers come off the pixels seam below.
         let mut lane_planes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>> =
             vec![None; lane_count];
         for lane in 0..lane_count {
@@ -1033,7 +909,6 @@ impl FireCtx<'_> {
             }
         }
 
-        // The capture columns' rectangles, one per exported attention layer.
         let mut columns = Vec::with_capacity(self.exports.scores.len());
         if p.lanes.iter().any(|seated| seated.captures_scores) {
             for export in &self.exports.scores {
@@ -1057,7 +932,6 @@ impl FireCtx<'_> {
             }
         }
 
-        // The epilogue: intrinsics point at rows of the arena, read where they lie.
         let storage_of = |plane: kernels_cuda::Tensor| {
             if plane.dtype == Dtype::F32 {
                 crate::program::launch::INTRINSIC_STORAGE_F32
@@ -1086,7 +960,6 @@ impl FireCtx<'_> {
             }
             None => None,
         };
-        // The previous frame's epilogues are collected here, the latest point a lane must be free.
         reap_guest_fires(
             self.programs,
             self.owed,
@@ -1097,14 +970,9 @@ impl FireCtx<'_> {
         super::btrace::mark("epi_reap");
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
-            // The guest's own rows, by index within the lane.
             let lane = attached.lane as usize;
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
-            // The gather laid this lane's readouts out in the order it
-            // stated them, so the rows it wants are its run, in order — a
-            // consecutive one, which is why no pointer table is minted for
-            // a multi-row readout any more.
             let wanted: Vec<u32> = match stated {
                 None => vec![last_row[lane]],
                 Some(rows) if rows.is_empty() => vec![last_row[lane]],
@@ -1121,19 +989,9 @@ impl FireCtx<'_> {
                         .collect()
                 }
             };
-            // A consecutive run is a base and an offset; only a list a stride
-            // cannot spell pays for a pointer table.
             let consecutive = wanted
                 .windows(2)
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            // The float planes bind at the lane's whole row run: a
-            // denoiser's epilogue reads every latent row's velocity, and a
-            // hidden readout every row's state (`Readout::Rows` narrows the
-            // logits row list, never these).
-            // Each from the lane's OWN arm (a multi-reading plan's denoise
-            // arm plants velocity, its encoder arm hidden): a lane whose arm
-            // plants none binds none, and a program reading it is refused at
-            // its mint by name.
             let class = lane_class[lane];
             let velocity = match self.exports.velocity_for(class) {
                 Some(export) => Some(plane_of(export.value, "velocity")?),
@@ -1153,14 +1011,6 @@ impl FireCtx<'_> {
                     plane.width,
                     first_row[lane],
                 )?;
-                // GUIDANCE. A lane that named a peer reads that lane's rows
-                // off the SAME plane at the SAME stride — only the first row
-                // differs. There is no ordering to arrange: this rectangle
-                // was written by the forward walk, on this stream, before any
-                // epilogue block started. (A cross-lane CHANNEL read is the
-                // other question, and it is not this one: a put lands in
-                // `pending_cell` and commits at `Wave::land`, after every
-                // lane's regions, and two lanes are two CTAs of one launch.)
                 if let Some(peer_group) = p.lanes[lane].peer {
                     let peer = peer_lane(p.lanes, lane, peer_group)?;
                     self.programs.bind_intrinsic(
@@ -1185,9 +1035,6 @@ impl FireCtx<'_> {
                     first_row[lane],
                 )?;
             }
-            // The pixels plane (D8), at the lane's OWN first output voxel —
-            // not `first_row`, which is its TOKEN row: a VAE lane's rows are
-            // its clips' voxels, and the plane is the whole fire's.
             if let Some((plane, first, _)) = pixels_at[lane] {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -1199,16 +1046,12 @@ impl FireCtx<'_> {
                     first,
                 )?;
             }
-            // The logits intrinsic is the out seam's alone: a plan whose
-            // readout is a float seam binds none, and a program reading
-            // `logits()` against it is refused at its mint by name.
             let logits = match lane_planes[lane] {
                 Some((engine::fire::ReadoutSeam::Logits, plane)) => plane,
                 _ => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
             };
             let vocab = logits.width;
             if logits.ptr == 0 {
-                // Nothing to bind for `logits`: this lane's arm plants none.
             } else if consecutive {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -1250,11 +1093,6 @@ impl FireCtx<'_> {
                     first_row[attached.lane as usize],
                 )?;
             }
-            // The token plane: the emitted gather copies `depth` ints off the
-            // base it is handed and applies no row arithmetic of its own, so
-            // the base is the lane's readout row of the plane (Metal's
-            // `plane + at * depth * 4`). Which row is the readout's is what
-            // `wanted` already resolved for the logits.
             if self.programs.needs_mtp_drafts(attached.instance)? {
                 let export = self.exports.drafts.as_ref().ok_or_else(|| {
                     Fault::program(
@@ -1302,7 +1140,6 @@ impl FireCtx<'_> {
                     0,
                 )?;
             }
-            // The observability door: the stride is the slab's, the rows the program's.
             if let Some(slab) = self.scores.filter(|_| {
                 p.lanes
                     .get(attached.lane as usize)
@@ -1315,7 +1152,6 @@ impl FireCtx<'_> {
                         have: u64::from(slab.lanes()),
                     });
                 }
-                // A declared plane count past the slab's is refused, not truncated.
                 let declared = self.programs.declared_score_planes(attached.instance);
                 if let Some(declared) = declared
                     && declared > slab.planes()
@@ -1347,8 +1183,6 @@ impl FireCtx<'_> {
         }
 
         super::btrace::mark("epi_bind");
-        // The epilogue boundary does not wait: its fires are parked and reaped
-        // next frame; a mid-batch flush's verdicts are final now and read here.
         let mut settled: Vec<(usize, Fired)> = Vec::new();
         *self.owed = epilogues.defer(
             self.device,
@@ -1372,7 +1206,6 @@ impl FireCtx<'_> {
             committed_or(fired, attached.instance, "epilogue")?;
         }
 
-        // The sequences are longer — only the slots this shell counts for.
         for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less_seats) {
             if table.is_empty()
                 && !kv_less
@@ -1394,89 +1227,15 @@ impl FireCtx<'_> {
     }
 }
 
-/// **THE FIRES OF ONE BOUNDARY, ENQUEUED AND UNSETTLED** (alto §14 exception
-/// #1, closed).
-///
-/// A boundary is a run of independent guest passes — sixty-four samplers at
-/// c=64, one per lane — and until this wave the shell fired them one at a
-/// time, each ending in `Session::fire`'s own `cudaStreamSynchronize`. A
-/// profile put the bill at 16,898 synchronize calls for 869 ms, 44% of all
-/// CUDA API time, with the GPU idle 45% of its kernel span in ~56 µs bubbles
-/// that matched the fires one for one: the host was waiting ~72 µs for a
-/// 51 µs epilogue before it would mint the next lane's.
-///
-/// So the boundary enqueues everything and waits once. This holds what is
-/// airborne between the two.
-///
-/// # And then the epilogue stopped waiting at all
-///
-/// One wait a boundary is still one wait a frame, and it drained the stream:
-/// the device had nothing left when it returned and stayed idle for as long as
-/// the host took to build the next frame. [`AirborneFires::defer`] is what
-/// replaced it — the fires are parked as a [`GuestBatch`] and
-/// [`reap_guest_fires`] collects them at the next frame — and it became
-/// possible when `channel::settle` moved the endpoint counters onto the device
-/// and `Endpoint::predicted` moved the shared rings' host answer off the
-/// words. The PROLOGUE still waits, because its verdicts gate the forward
-/// launched a few lines after them.
-///
-/// # The one ordering the batch may not flatten
-///
-/// A DEVICE-ONLY RING SHARED BY TWO ATTACHMENTS (design §5's draft→verify
-/// chaining) is a putting pass and a taking pass, and the taker's admission
-/// depends on the putter's settlement having happened. **That is a launch
-/// order, not a host visibility problem, and it survived the move of the
-/// prediction onto `Endpoint`**: `channel::pull_validate` runs ONCE at the
-/// front of a wave, for every lane, before any lane's regions — so a taker
-/// batched with its putter is validated against words the putter's
-/// `channel::settle` has not reached yet, `REQUIRE_INPUT`'s `tail > head` is
-/// false, and the fire is refused. Whatever the host believes, and however
-/// the host came to believe it.
-///
-/// So two attachments of one ring must be two waves, and this reinstates that:
-/// an attachment whose shared rings collide with one already airborne FLUSHES
-/// the batch first — one synchronize, every verdict, a clean slate — and only
-/// then launches. Nothing is lost but the batching, and only for the passes
-/// that genuinely chain.
 #[derive(Default)]
 struct AirborneFires {
-    /// `(tag, instance)` for every launch owing a settlement, in launch order.
-    /// `tag` is whatever the caller wants back beside the verdict — an
-    /// attachment index at the prologue, a lane at the epilogue.
     launched: Vec<(usize, u64)>,
-    /// The identities of the shared rings the airborne fires hold, as
-    /// `Session::shared_rings` answers them.
     rings: Vec<usize>,
-    /// Settled verdicts a flush produced, kept until `settle_into` hands the
-    /// whole boundary's back in one list.
     settled: Vec<(usize, Fired)>,
-    /// **HAS THIS BATCH LEFT THE GROUND?** `stage` only mints; `fly` is what
-    /// puts the pull, the regions and the tail on the stream, and it is
-    /// idempotent because two callers reach for it — the prologue, which
-    /// needs the fires enqueued before it writes the fold predicate, and the
-    /// flush, which needs them enqueued before it waits.
     flown: bool,
 }
 
 impl AirborneFires {
-    /// Stage instance `instance` into the plane's wave, flushing first if it
-    /// chains onto a shared ring already airborne.
-    ///
-    /// Answers `Some(fired)` for a fire that never launched — a blocked
-    /// channel or a poisoned instance, whose verdict is final without a wait
-    /// — and `None` for one now holding a lane of the wave.
-    ///
-    /// **NOTHING IS ON THE STREAM WHEN THIS RETURNS.** The whole point of the
-    /// wave is that a boundary's lanes are staged before any of them flies,
-    /// so the three control kernels can launch once with a block per lane
-    /// rather than once per attachment with one block. A caller that binds
-    /// intrinsics or writes side tables between two `stage` calls is still
-    /// ordered correctly: every one of those copies is enqueued before `fly`
-    /// puts the first region on the stream.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the mint, the flush's synchronize or a settlement said.
     fn stage(
         &mut self,
         device: &Context,
@@ -1484,12 +1243,6 @@ impl AirborneFires {
         tag: usize,
         instance: u64,
     ) -> Result<Option<Fired>> {
-        // **DEBRIS FROM A FAULTED BOUNDARY IS NOT THIS BATCH'S TO FLY.** The
-        // wave is the plane's and lives across boundaries; a fault raised
-        // between some earlier boundary's first stage and its landing unwinds
-        // past the landing that would have cleared it. This batch's first
-        // lane is the one moment nothing of ours is in there, so anything
-        // that is belongs to fires nobody will settle.
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
         }
@@ -1507,21 +1260,6 @@ impl AirborneFires {
         }
     }
 
-    /// **THE BATCH, ON THE STREAM**: one `pull_validate` over every staged
-    /// lane, then each fire's regions in staging order, then one
-    /// `commit_bump` and one `scatter_publish` over the same lanes.
-    ///
-    /// The order within a fire is what it always was — pull, regions, bump,
-    /// publish — and the order BETWEEN fires is nothing, which is what makes
-    /// the interleave sound: two lanes of one wave share no ring (a shared
-    /// ring flushes at `stage`) and the stream orders each lane's own three
-    /// phases around its own regions.
-    ///
-    /// Idempotent: a batch already flown is left alone.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the copy and the launches said.
     fn fly(&mut self, device: &Context, programs: &mut ProgramPlane) -> Result<()> {
         if self.flown || self.launched.is_empty() {
             return Ok(());
@@ -1532,7 +1270,6 @@ impl AirborneFires {
         Ok(())
     }
 
-    /// Everything enqueued, one wait, then every airborne fire's verdict.
     fn flush(&mut self, device: &Context, programs: &mut ProgramPlane) -> Result<()> {
         if self.launched.is_empty() {
             self.rings.clear();
@@ -1549,12 +1286,6 @@ impl AirborneFires {
         Ok(())
     }
 
-    /// [`AirborneFires::flush`], appending every verdict this batch produced
-    /// — including any a mid-batch flush already read — onto `into`.
-    ///
-    /// # Errors
-    ///
-    /// As [`AirborneFires::flush`].
     fn settle_into(
         &mut self,
         device: &Context,
@@ -1566,21 +1297,6 @@ impl AirborneFires {
         Ok(())
     }
 
-    /// **EVERYTHING ENQUEUED AND NOTHING WAITED FOR** — the line this wave is
-    /// about, and [`AirborneFires::settle_into`]'s replacement wherever a
-    /// verdict can be read one frame late.
-    ///
-    /// Puts the batch on the stream, records `landed` behind it, and hands
-    /// the airborne fires back as a [`GuestBatch`] for the caller to park.
-    /// Any verdict a MID-BATCH flush already read is appended to `into` —
-    /// those cost their wait when a shared ring forced one and are final now.
-    ///
-    /// `seq` is the step whose settlement callback will prove this batch
-    /// landed; the reap reads it before it touches the event.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the launches and the event record said.
     fn defer(
         &mut self,
         device: &Context,
@@ -1595,11 +1311,6 @@ impl AirborneFires {
             self.rings.clear();
             return Ok(None);
         }
-        // **RECORDED ON THE COMPUTE STREAM, BEHIND THIS BATCH AND NOTHING
-        //    MORE.** A stream synchronize would drain every launch enqueued
-        //    after it too, which at the epilogue is the whole of the next
-        //    frame; waiting on a point instead lets the device run past it
-        //    while the host is still behind.
         landed.record(device.stream())?;
         let batch = GuestBatch {
             launched: core::mem::take(&mut self.launched),
@@ -1611,51 +1322,6 @@ impl AirborneFires {
     }
 }
 
-/// **READ A DEFERRED BOUNDARY'S VERDICTS, WAITING ONLY IF THE DEVICE HAS NOT
-/// PASSED THEM.**
-///
-/// The far half of [`AirborneFires::defer`], and the reason the boundary's
-/// `cudaStreamSynchronize` could go at all. Three things had to become true
-/// first, and each is somewhere else:
-///
-/// ```text
-/// the endpoint counters the next mint predicts off  channel::settle, on the
-///                                                   device, in stream order
-/// where a SHARED ring stands, for either attachment Endpoint::predicted
-/// the verdict itself                                only ever an error path
-/// ```
-///
-/// So this is what is left of the wait: a check of two host atomics, and —
-/// only when the frame that carried the batch has not called back yet — a
-/// `cudaEventSynchronize` on the point the batch landed at. **The device is
-/// not idle across it.** By the time anything reaps, the next frame's forward
-/// is already enqueued behind the batch, so the host blocks and the GPU runs
-/// on; that is the whole difference from the drain this replaced, where the
-/// stream was empty on the far side of the wait and stayed empty for as long
-/// as the host took to build the next frame.
-///
-/// **WHERE IT MUST BE CALLED, AND WHY EACH ONE.** In front of every path that
-/// reads a guest ring on the host or stages a second fire into a session that
-/// already has one:
-///
-/// ```text
-/// serve::enqueue, before either boundary's stage loop   a session may hold
-///                                                       ONE airborne fire
-/// serve::prepare, before the descriptor-port read       the port is a cell
-///                                                       `scatter_publish`
-///                                                       writes
-/// api's publish/take channel doors                      the same cells, from
-///                                                       the runtime's side
-/// close_instance                                        a session whose
-///                                                       kernels are running
-///                                                       may not be dropped
-/// ```
-///
-/// # Errors
-///
-/// Whatever the wait said, and the first non-committing verdict — deferred by
-/// one frame from where it used to be raised, which is the one semantic this
-/// wave changes and is stated at [`committed_or`].
 pub(super) fn reap_guest_fires(
     programs: &mut ProgramPlane,
     owed: &mut Option<GuestBatch>,
@@ -1666,11 +1332,7 @@ pub(super) fn reap_guest_fires(
     let Some(batch) = owed.take() else {
         return Ok(());
     };
-    // The free question first. A batch whose frame has already settled is
-    // reaped with no CUDA call at all, which is the steady state whenever the
-    // host is not running ahead of the device.
     if !airborne.settled_past(batch.seq) {
-        // `reap-trace`: which door waited, and how long, per reap.
         let traced = super::diag::on().reap_trace;
         let started = traced.then(std::time::Instant::now);
         landed.settle()?;
@@ -1686,10 +1348,6 @@ pub(super) fn reap_guest_fires(
     super::btrace::mark("waited");
     let mut first: Option<crate::error::Fault> = None;
     for (lane, instance) in batch.launched {
-        // **EVERY LANE IS SETTLED, EVEN AFTER ONE HAS FAULTED.** A session
-        // that keeps its `pending` mint can never fire again, so an early
-        // return here would turn one bad epilogue into a permanently stuck
-        // instance for every lane behind it in the batch.
         let outcome = programs
             .settle_launched(instance)
             .and_then(|fired| committed_or(fired, instance, "epilogue"));
@@ -1704,25 +1362,6 @@ pub(super) fn reap_guest_fires(
     }
 }
 
-/// A guest pass that ran, or the sentence for the one that did not.
-///
-/// **THREE VERDICTS ARE FAILURES HERE AND ONE IS NOT ELSEWHERE.** Fired on
-/// its own, a [`Fired::Blocked`] program is a normal answer a caller retries
-/// on. Attached to a model fire it is not: the gate already asked, before
-/// anything launched, so a block at this point means the pass's own cursors
-/// moved under it — which one attachment per instance is exactly the rule
-/// that forbids. [`Fired::Declined`] is a stage clearing its commit slot and
-/// [`Fired::Faulted`] is an instance that is unusable from now on; both leave
-/// the guest's channels where they were, and both are the caller's to poison.
-///
-/// **AND AN EPILOGUE'S VERDICT NOW ARRIVES ONE FRAME LATE.** The epilogue
-/// boundary is enqueue-only ([`AirborneFires::defer`]), so its fires are
-/// settled by [`reap_guest_fires`] at the next frame and a fault raised here
-/// fails THAT frame rather than the one that produced it. Nothing downstream
-/// reads a verdict for anything but this: a guest's cells reach it through
-/// device-written pinned words, and the fold predicate is the commit word
-/// itself, on the device. The prologue boundary is unchanged and still waits,
-/// because its verdicts gate the forward that follows them in the same call.
 fn committed_or(fired: Fired, instance: u64, at: &str) -> Result<()> {
     match fired {
         Fired::Committed => Ok(()),
@@ -1752,21 +1391,6 @@ mod tests {
     use super::{Boundary, Fired, committed_or};
     use crate::serve::Attached;
 
-    /// **A PASS THAT DID NOT COMMIT IS AN ERROR BY NAME, NEVER A REPLAY**
-    /// (alto E; design §1 article 4, and the retry-fails-loudly gate).
-    ///
-    /// The readiness gate that used to stand in `prepare` answered
-    /// `Fault::Blocked`, which `api::fault()` crossed as `Error::Exhausted`
-    /// and the runtime's lane slept on and re-offered. Both are gone: static
-    /// admission (`runtime::pipeline::fire::validate_frame`) proves ring
-    /// occupancy, host-writer staging and reader pressure over the whole
-    /// frame before it is admitted, so a pass that reaches its boundary and
-    /// cannot commit means something moved cursors the admission had already
-    /// proved — and an epilogue fires AFTER the forward wrote the lane's KV,
-    /// so there is nothing to replay anyway.
-    ///
-    /// All three non-commit verdicts must therefore name the instance and say
-    /// which one happened.
     #[test]
     fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
         let attached = Attached {

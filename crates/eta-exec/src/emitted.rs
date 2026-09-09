@@ -7,8 +7,6 @@ pub enum Slot<'a> {
     Kernel {
         source: &'a str,
         entry: &'a str,
-        /// The streamed form's dispatch table (`EmittedKernel::steps`);
-        /// empty for every other kind.
         steps: &'a [u32],
     },
 

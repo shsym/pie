@@ -1,7 +1,3 @@
-//! Modern Hugging Face profile latency for Pie-style requests.
-//!
-//! Run: `cargo bench -p pie-tokenizer --bench hf_profiles`
-
 #[path = "../tests/common/mod.rs"]
 mod common;
 

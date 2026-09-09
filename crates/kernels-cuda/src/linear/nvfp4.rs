@@ -1,17 +1,3 @@
-//! NVFP4 weight-only: `g16_e2m1_gt_e4m3_f32_n_n`, decoded inside the dot
-//! against a bf16/f16 activation, since the hardware that decodes it
-//! natively is sm120 only.
-//!
-//! Three factors reach one weight, stored three different ways: the e2m1
-//! code, an e4m3 scale per sixteen codes, and one f32 for the whole tensor.
-//! The first two arrive as planes; the third arrives as an argument, since
-//! it is one number and a plane would cost a load per block to say it.
-//!
-//! The plane widths are the form's own algebra: `Dtype::Nvfp4` states
-//! `plane_widths(4096) == [2048, 256, 4]`, and the two widths this entry
-//! checks are that statement at any `k`: `k/2` code bytes a row, `k/16`
-//! scale bytes a row.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -22,17 +8,11 @@ const FILE: &str = "linear/nvfp4.cuh";
 
 const WARP: u32 = 32;
 
-/// Codes under one e4m3 scale — the `g16` in the form's name.
 const GROUP: u32 = 16;
 
-/// Weight rows a warp folds at once, and the lanes a block spends on them:
-/// `linear::fp8`'s geometry, kept so the decode-in-dot points tile alike.
 const ROWS_PER_WARP: u32 = 4;
 const BLOCK_LANES: u32 = 128;
 
-/// `linear.matmul` over a weight the store seats as `g16_e2m1_gt_e4m3_f32_n_n`
-/// — e2m1 codes at `k/2` bytes a row, an e4m3 scale per sixteen of them at
-/// `k/16` bytes a row, and `tensor_scale` over the whole weight.
 pub fn matmul(
     ctx: &Ctx,
     act: Tensor,
@@ -44,7 +24,6 @@ pub fn matmul(
     fire(ctx, "linear.matmul", act, codes, scales, tensor_scale, y)
 }
 
-/// [`matmul`] under the head's own op name, `linear::gemm`'s pairing kept.
 pub fn lm_head(
     ctx: &Ctx,
     act: Tensor,
@@ -56,8 +35,6 @@ pub fn lm_head(
     fire(ctx, "linear.lm_head", act, codes, scales, tensor_scale, y)
 }
 
-/// The one launch behind both entries. A fire with no rows is the same silent
-/// no-op the dense gemm keeps, and for the same capture reason.
 fn fire(
     ctx: &Ctx,
     op: &'static str,
@@ -82,8 +59,6 @@ fn fire(
             format!("K is {k}, not a whole number of {GROUP}-code nvfp4 groups"),
         ));
     }
-    // Two e2m1 codes to the byte, so a row of codes is exactly half the
-    // contraction and there is nothing else the width could mean.
     if codes.width != k / 2 {
         return Err(refuse(
             op,
@@ -108,9 +83,6 @@ fn fire(
             format!("a {}-row scale plane is not {n} rows over a {n}x{k} weight", scales.rows),
         ));
     }
-    // a non-finite tensor scale is refused, not multiplied: it reaches every
-    // output, so a NaN here would flatten the whole logit vector with no
-    // fire having failed.
     if !tensor_scale.is_finite() {
         return Err(refuse(
             op,
@@ -141,7 +113,6 @@ fn fire(
             tensor_scale.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            // staged-geometry seat: live-rows word, or the null seat (`ABSENT`).
             ctx.stage(),
         ],
     )

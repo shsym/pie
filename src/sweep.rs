@@ -1,35 +1,7 @@
-//! The measurement loop: one resident model, many rounds, load restarted each
-//! time.
-//!
-//! Booting a process per candidate works and is even fast — 1.03 s for a
-//! 1.4 GiB model — right up until the model is the size that makes tuning
-//! worth doing, at which point a candidate costs minutes and the whole
-//! approach has a model-size ceiling.
-//!
-//! So the expensive thing happens once. What restarts per round is the load,
-//! which is milliseconds, and the knobs move in between through
-//! `scheduler::reconfigure`.
-//!
-//! That ordering is also what makes the reconfigure legal: it refuses while any
-//! guest is live, because `model.frame-size()` is cached for the life of a
-//! program and a value already handed out cannot be recalled. A round that ends
-//! by draining its lanes leaves exactly the state the next round needs.
-
 pub mod fleet;
 
 use anyhow::{Context, Result};
 
-/// The batching knobs one round holds fixed.
-///
-/// Only the two that `scheduler::reconfigure` can move. The memory-lattice
-/// knobs (`kv_page_size`, `max_forward_tokens`, `max_forward_requests`) are
-/// fixed at boot and belong to the engine's own sweep.
-///
-/// **THERE IS NO THIRD AXIS.** `submit_depth` — frames a guest keeps
-/// outstanding — is `dispatch_depth + 1`
-/// (`engine::runahead::Runahead::submit_depth`). Sweeping it independently
-/// would measure eighty candidates where sixteen exist, and four fifths of them
-/// were configs the runtime can no longer be asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Knobs {
     pub frame_size: usize,
@@ -37,33 +9,21 @@ pub struct Knobs {
 }
 
 impl Knobs {
-    /// The largest `frame_size` a deployment may state — `k` in the engine's
-    /// staging formula. Read from the formula's own module rather than
-    /// restated here.
     pub const MAX_FRAME_SIZE: usize = worker::config::Runahead::STEPS_MAX as usize;
-    /// The largest `frame_dispatch_depth` a deployment may state.
     pub const MAX_DISPATCH_DEPTH: usize = worker::config::Runahead::MAX_FRAMES as usize;
 
-    /// Steps the engine has in flight at this shape — `frames × k`.
-    ///
-    /// **A DESCRIPTION, NOT A BOUND.** The engine carves its ring from
-    /// `frames_in_flight` and `k`, so what a candidate has to clear is each
-    /// factor's own ceiling; this is just how big the ring will be.
     pub fn steps_in_flight(&self) -> usize {
         self.frame_size * self.dispatch_depth
     }
 
-    /// How many staging slots the engine will carve for this shape.
     pub fn staging_depth(&self) -> usize {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
     }
 
-    /// Frames a guest keeps outstanding at this shape — derived, not swept.
     pub fn submit_depth(&self) -> usize {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth()
     }
 
-    /// Is this a shape `RuntimeConfig::validate` will admit?
     pub fn admissible(&self) -> bool {
         self.frame_size >= 1
             && self.frame_size <= Self::MAX_FRAME_SIZE
@@ -84,52 +44,21 @@ impl std::fmt::Display for Knobs {
     }
 }
 
-/// What one candidate measured, across its repeats.
 pub struct Round {
     pub knobs: Knobs,
-    /// Median throughput across repeats. Median rather than mean because one
-    /// slow fleet — a host hiccup, a stray process — should not move the
-    /// estimate, and with a handful of repeats it easily would.
     pub throughput_tok_s: f64,
-    /// Spread as a fraction of the median. This is the number that decides
-    /// whether a difference between two candidates is real, so it is carried
-    /// rather than discarded: at the serving level the noise floor measured
-    /// ~6% on an L40S while the gap between k=2 and k=4 was ~2.4%, and a
-    /// ranking that ignores that is reporting noise.
     pub throughput_rel_sigma: f64,
-    /// Median of the per-repeat p95s.
     pub lane_p95_us: u128,
-    /// Spread of the per-repeat p95s, as a fraction of the median. Carried for
-    /// the same reason as the throughput spread: it is what decides whether a
-    /// latency difference is real.
     pub lane_p95_rel_sigma: f64,
-    /// Lanes that returned nothing, summed over repeats. Non-zero means this
-    /// is not a measurement, and the caller must not rank it against one that
-    /// is.
     pub failed_lanes: usize,
     pub repeats: usize,
 }
 
 impl Round {
-    /// A round only ranks if every lane came back. A configuration that fails
-    /// half its lanes can post an excellent tokens-per-second, because the
-    /// tokens it did produce came out of a fleet that was half the size.
     pub fn is_measurement(&self) -> bool {
         self.failed_lanes == 0
     }
 
-    /// Is this candidate better than `other`, on `metric`, by more than the two
-    /// of them can explain by noise?
-    ///
-    /// The same rule the engine's own sweep uses after `fe8d85040`: combine the
-    /// two candidates' spreads in quadrature and require the gap to clear it.
-    /// Anything closer than that is a coin flip that will land the other way on
-    /// the next run, and reporting it as a win is how a sweep produces
-    /// confident garbage.
-    ///
-    /// `metric` is not cosmetic. Ranking a `--for latency` sweep on throughput
-    /// was the state of this code before: the command asked for one thing and
-    /// ordered its answers by another.
     pub fn beats(&self, other: &Round, metric: Metric) -> bool {
         if !self.is_measurement() || !other.is_measurement() {
             return false;
@@ -145,17 +74,9 @@ impl Round {
     }
 }
 
-/// What a sweep ranks its candidates by.
-///
-/// One per objective, because the objective already names a serving shape and
-/// the quantity that shape is judged on follows from it. There is no ranking
-/// that serves both: latency and throughput pull opposite ways, which is why
-/// `--for` has two spellings in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
-    /// Aggregate tokens per second over the fleet. Higher wins.
     Throughput,
-    /// 95th-percentile lane latency. Lower wins.
     LaneP95,
 }
 
@@ -186,7 +107,6 @@ impl Metric {
     }
 }
 
-/// Median of a sample set, and the spread as a fraction of it.
 fn median_and_rel_sigma(samples: &[f64]) -> (f64, f64) {
     if samples.is_empty() {
         return (0.0, 0.0);
@@ -203,11 +123,6 @@ fn median_and_rel_sigma(samples: &[f64]) -> (f64, f64) {
     (median, variance.sqrt() / median)
 }
 
-/// The distinct reasons a set of lanes gave, with how many gave each.
-///
-/// Deduplicated because a fleet fails the same way in every lane far more
-/// often than it fails N different ways, and 64 copies of one line buries the
-/// one line. Capped for the same reason.
 fn distinct_reasons(failures: &[String]) -> String {
     const SHOWN: usize = 3;
     let mut counts: Vec<(String, usize)> = Vec::new();
@@ -229,32 +144,11 @@ fn distinct_reasons(failures: &[String]) -> String {
     out.join("\n")
 }
 
-/// Run the load once and throw the result away.
-///
-/// **Not optional, and not test scaffolding.** Measured on an L40S: the first
-/// round of a sweep came in at 844 tok/s and the identical configuration
-/// measured 1228 tok/s when it ran again at the end — 45% apart, with the
-/// candidates in between judged against whichever position they happened to
-/// occupy. A sweep without this ranks round order.
-///
-/// It is a separate call rather than something [`measure`] does silently,
-/// because a warmup folded into every round would pay the cost N times and
-/// hide it. The first round is the one that is different; the rest are not.
 pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> {
-    // Until two consecutive fleets agree, not a fixed count. One round was not
-    // enough: with a single warmup the first MEASURED candidate absorbed what
-    // was left and came back at +/-18.2% spread where every later candidate sat
-    // near 2%. That candidate is the baseline everything else is ranked
-    // against, so its inflated spread made `Round::beats` nearly unsatisfiable
-    // and the sweep reported "nothing is faster" from a noisy reference rather
-    // than from the machine.
     let mut previous: Option<f64> = None;
     for round in 0..MAX_WARMUP_ROUNDS {
         let run = fleet::run(addr, program, inputs).await;
         if run.failed_lanes() > 0 {
-            // The reason, not just the count. A bare count sent readers to
-            // `pie inferlet list` for a program that was already installed,
-            // while the lanes had been saying something else entirely.
             anyhow::bail!(
                 "{} of {} lanes failed during warmup; the fleet cannot run here at all.\n{}",
                 run.failed_lanes(),
@@ -271,24 +165,12 @@ pub async fn warmup(addr: &str, program: &str, inputs: &[String]) -> Result<()> 
         previous = Some(rate);
         let _ = round;
     }
-    // Not an error. A machine that never settles still gets measured; what it
-    // does not get is a claim that the measurement is tight, and the spread on
-    // every round will say so.
     Ok(())
 }
 
-/// Two consecutive warmup fleets this close means the machine has settled.
 const WARMUP_SETTLED: f64 = 0.05;
-/// Give up warming and measure anyway. A busy host may never settle, and
-/// refusing to measure it is worse than measuring it with an honest spread.
 const MAX_WARMUP_ROUNDS: usize = 5;
 
-/// Set the knobs, run the load, report.
-///
-/// Every lane connects fresh and retires before this returns, so the next call
-/// finds the runtime idle and its `reconfigure` succeeds. A caller that leaves
-/// guests running between rounds gets a refusal rather than a silently
-/// mis-attributed measurement, which is the intended failure.
 pub async fn measure(
     addr: &str,
     program: &str,
@@ -296,10 +178,6 @@ pub async fn measure(
     knobs: Knobs,
     repeats: usize,
 ) -> Result<Round> {
-    // One candidate, so interleaving is a no-op and this is [`sweep_all`] with
-    // a shorter list. Delegating rather than repeating the loop keeps ONE
-    // definition of what a `Round` means: two aggregations that must agree
-    // about medians, spreads and failed lanes is two chances to disagree.
     Ok(
         sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
             .await?
@@ -308,18 +186,6 @@ pub async fn measure(
     )
 }
 
-/// Measure every candidate, interleaved.
-///
-/// One fleet per candidate per pass, cycling, rather than all of a candidate's
-/// fleets back to back. Batched repeats share whatever state the machine is in
-/// for those few seconds, so they measure the WITHIN-BURST variation and report
-/// it as the uncertainty — which made `Round::beats` over-confident by the
-/// difference. Measured: a candidate's own reported spread was 1.2-2.7% while
-/// the same knobs re-measured at the end of the sweep landed 3.4% away.
-///
-/// Interleaving spreads each candidate's fleets across the whole run, so a slow
-/// stretch of machine time lands on every candidate instead of on whichever one
-/// happened to occupy it — and the spread it reports is the one that matters.
 pub async fn sweep_all(
     addr: &str,
     program: &str,
@@ -366,26 +232,12 @@ pub async fn sweep_all(
         .collect())
 }
 
-/// Every knob combination worth measuring, given the engine's staging bound.
-///
-/// Enumerated rather than searched: the feasible set is small, each point is
-/// seconds, and enumeration has no surrogate model
-/// to misfit or evaluation order to depend on. `steps_in_flight < staging_depth`
-/// is what makes it small — at a staging depth of 13 there are only a few dozen
-/// combinations, most of which the bound removes.
 pub fn candidates() -> Vec<Knobs> {
     let mut groups: Vec<Vec<Knobs>> = Vec::new();
     debug_assert!(4 <= Knobs::MAX_FRAME_SIZE && 4 <= Knobs::MAX_DISPATCH_DEPTH);
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
-            // **THE BOUND IS PER FACTOR**: the engine carves its
-            // staging ring from these two numbers rather than owning a fixed
-            // pool a product could overflow, so what a candidate has to clear
-            // is `frame_size <= STEPS_MAX` and `dispatch_depth <= MAX_FRAMES`
-            // — both of which the loops above already stay inside, which is
-            // why nothing is skipped here. The guest's own window rides along
-            // (`Knobs::submit_depth`) rather than being a third loop.
             group.push(Knobs {
                 frame_size,
                 dispatch_depth,
@@ -394,11 +246,6 @@ pub fn candidates() -> Vec<Knobs> {
         groups.push(group);
     }
 
-    // Round-robin across frame sizes rather than lexicographic order, because
-    // `--budget` truncates this list and a lexicographic one spends the whole
-    // budget in a single corner. Measured: a budget of six explored k=1 five
-    // times and nothing else, so the report ranked one axis and called it a
-    // sweep. Interleaved, the same six touch every k.
     let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
     let mut out = Vec::new();
     for index in 0..longest {
@@ -415,12 +262,11 @@ pub fn candidates() -> Vec<Knobs> {
 mod tests {
     use super::*;
 
-    /// **EVERY CANDIDATE IS ONE THE RUNTIME WILL ADMIT.**
-    ///
-    /// There is no fixed staging pool — the engine carves the ring from the
-    /// candidate's own numbers — so what has to hold is that
-    /// every generated shape clears `RuntimeConfig::validate`'s two per-factor
-    /// bounds, which is the same property against the check that now exists.
+    fn sweep_every_case() {
+        every_candidate_is_one_the_runtime_admits();
+        a_failed_round_never_beats_anything();
+    }
+
     #[test]
     fn every_candidate_is_one_the_runtime_admits() {
         let candidates = candidates();
@@ -448,10 +294,7 @@ mod tests {
         dispatch_depth: 2,
     };
 
-    #[test]
     fn a_failed_round_never_beats_anything() {
-        // Fewer lanes finishing raises tokens per second, so a broken round
-        // can post the best number. It must not be allowed to rank at all.
         let broken = round(BASE, 4000.0, 0.001, 2);
         let good = round(BASE, 1265.0, 0.01, 0);
         assert!(!broken.beats(&good, Metric::Throughput));

@@ -1,11 +1,8 @@
-//! Waker-table unit tests.
-
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64 as StdAtomicU64};
 use std::task::{Wake, Waker};
 
-/// A test waker that records wakes and can unpark a spinning poller.
 struct Flag(AtomicBool);
 impl Wake for Flag {
     fn wake(self: Arc<Self>) {
@@ -17,6 +14,16 @@ fn flag_waker() -> (Arc<Flag>, Waker) {
     (f.clone(), f.into())
 }
 
+fn tests_every_case() {
+    alloc_register_wake_roundtrip();
+    epoch_filter_wakes_only_when_index_passes();
+    foreign_completion_publish_records_epoch_before_wake();
+    reserved_epochs_are_rejected_in_release_logic();
+    stale_generation_is_noop_b10();
+    spurious_wakes_are_harmless();
+    sweep_on_abort_resolves_blocked_take_to_err_b12();
+}
+
 #[test]
 fn alloc_register_wake_roundtrip() {
     let t = WakerTable::new();
@@ -25,11 +32,9 @@ fn alloc_register_wake_roundtrip() {
     assert!(t.register(id, &w, 0));
     assert_eq!(t.wake(id), WakeOutcome::Woken);
     assert!(f.0.load(std::sync::atomic::Ordering::SeqCst));
-    // One-shot: the waker was taken.
     assert_eq!(t.wake(id), WakeOutcome::Empty);
 }
 
-#[test]
 fn epoch_filter_wakes_only_when_index_passes() {
     let t = WakerTable::new();
     let id = t.alloc();
@@ -42,7 +47,6 @@ fn epoch_filter_wakes_only_when_index_passes() {
     assert!(f.0.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-#[test]
 fn foreign_completion_publish_records_epoch_before_wake() {
     let t = Arc::new(WakerTable::new());
     let id = t.alloc();
@@ -78,7 +82,6 @@ fn foreign_completion_publish_records_epoch_before_wake() {
     t.free(id);
 }
 
-#[test]
 fn reserved_epochs_are_rejected_in_release_logic() {
     let t = WakerTable::new();
     let id = t.alloc();
@@ -92,20 +95,17 @@ fn reserved_epochs_are_rejected_in_release_logic() {
     t.free(id);
 }
 
-#[test]
 fn stale_generation_is_noop_b10() {
     let t = WakerTable::new();
     let id = t.alloc();
     let (_, w) = flag_waker();
     assert!(t.register(id, &w, 0));
     t.free(id);
-    // A freed id: every op is inert.
     assert_eq!(t.wake(id), WakeOutcome::Stale);
     assert_eq!(t.wake_past(id, 99), WakeOutcome::Stale);
     assert_eq!(t.publish(id, 99), WakeOutcome::Stale);
     assert_eq!(t.published(id), None);
     assert!(!t.register(id, &w, 0));
-    // The recycled slot gets a new generation: old id still stale.
     let id2 = t.alloc();
     assert_eq!(id & 0xFFFF_FFFF, id2 & 0xFFFF_FFFF, "index recycled");
     assert_ne!(id, id2, "generation bumped");
@@ -114,14 +114,11 @@ fn stale_generation_is_noop_b10() {
     assert_eq!(t.wake(id2), WakeOutcome::Woken);
 }
 
-#[test]
 fn spurious_wakes_are_harmless() {
     let t = WakerTable::new();
     let id = t.alloc();
-    // Nobody parked: empty, not an error, no panic.
     assert_eq!(t.wake(id), WakeOutcome::Empty);
     assert_eq!(t.wake_past(id, 1), WakeOutcome::Empty);
-    // Double-wake after a single register: second is empty.
     let (_, w) = flag_waker();
     assert!(t.register(id, &w, 0));
     assert_eq!(t.wake(id), WakeOutcome::Woken);
@@ -131,21 +128,18 @@ fn spurious_wakes_are_harmless() {
     assert_eq!(m.empty, 3);
 }
 
-#[test]
 fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
-    // A blocked take on a channel that never fills: poison + sweep from a
-    // foreign thread must resolve it to Err, never hang.
     let t = Arc::new(WakerTable::new());
     let ch = ChannelWakers::alloc(&t);
     let poisoned = Arc::new(AtomicBool::new(false));
-    let head = Arc::new(StdAtomicU64::new(0)); // ring index: never bumps
+    let head = Arc::new(StdAtomicU64::new(0));
 
     let sweeper = {
         let (t, poisoned) = (t.clone(), poisoned.clone());
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
             poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
-            ch.sweep(&t); // wakes both endpoints, epochs ignored
+            ch.sweep(&t);
         })
     };
 
@@ -177,4 +171,3 @@ fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
     let m = t.metrics();
     assert_eq!(m.swept, 2, "both endpoints swept");
 }
-

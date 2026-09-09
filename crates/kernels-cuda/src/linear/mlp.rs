@@ -1,7 +1,3 @@
-//! `Mlp`: gated activations over a packed `[gate | up]` row (and one
-//! two-tensor form). One entry per IR variant; every packed form fires the
-//! chunked unit, gridded one row per block-row.
-
 use crate::error::Error;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
@@ -11,7 +7,6 @@ const FILE: &str = "linear/glu.cuh";
 
 const BLOCK: u32 = 256;
 
-/// Rows on their own grid axis, the width chunked across blocks.
 fn elementwise_rows(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     nonzero(op, "the activation's width", width)?;
@@ -21,7 +16,6 @@ fn elementwise_rows(op: &'static str, rows: u32, width: u32) -> Result<Launch, E
     ))
 }
 
-/// The geometry every packed `[gate | up]` entry shares, checked once.
 fn packed_halves(
     op: &'static str,
     packed: Tensor,
@@ -29,8 +23,6 @@ fn packed_halves(
     fan: u32,
     y: &Tensor,
 ) -> Result<(Launch, i32), Error> {
-    // `fan` must divide the packed rectangle's rows (fan rows per token),
-    // else the row axis isn't the one the caller thinks.
     if fan == 0 || y.rows % fan != 0 {
         return Err(refuse(
             op,
@@ -74,9 +66,7 @@ pub fn swiglu(
             packed.arg(),
             y.arg(),
             width.arg(),
-            // Fan: seat counts token rows, this rectangle's are `fan` per token.
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
@@ -105,9 +95,7 @@ pub fn swiglu_clamp(
             y.arg(),
             width.arg(),
             limit.arg(),
-            // Fan: seat counts token rows, this rectangle's are `fan` per token.
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
@@ -138,18 +126,12 @@ pub fn swiglu_clamp_alpha(
             width.arg(),
             limit.arg(),
             alpha.arg(),
-            // Fan: seat counts token rows, this rectangle's are `fan` per token.
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `mlp_swiglu_clamp` over an unfused pair; refused by name. No 2-bit MLX
-/// bank is served on this plane, so `glu.cuh` has no `swiglu_clamp_split`
-/// unit for it. The arm exists (dispatch is exhaustive) but must not claim
-/// a shape it would compute wrong.
 pub fn swiglu_clamp_split(
     _ctx: &Ctx,
     gate: Tensor,
@@ -196,25 +178,13 @@ pub fn geglu_tanh(
             up.arg(),
             y.arg(),
             stated(OP, lanes)?.arg(),
-            // Element-form seat's width: launch is flat over `rows * width`.
             stated(OP, y.width)?.arg(),
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Ungated GELU: `y = gelu_tanh(x)`, no `up` half.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16, f16 and f32 -- the last
-/// for a LANE VECTOR's chain, which stays f32 end to end (`elemwise::silu`
-/// already serves it there, and a timestep embedder whose activation is GELU
-/// rather than SiLU reaches this entry through
-/// `elemwise::activation::gelu_tanh`); a refusal for an empty rectangle or an
-/// extent past a 32-bit launch.
 pub fn gelu_tanh(ctx: &Ctx, x: Tensor, fan: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
     let t = dtype_dispatch!(
@@ -238,10 +208,8 @@ pub fn gelu_tanh(ctx: &Ctx, x: Tensor, fan: u32, y: &mut Tensor) -> Result<(), E
             x.arg(),
             y.arg(),
             stated(OP, lanes)?.arg(),
-            // Element-form seat's width: launch is flat over `rows * width`.
             stated(OP, y.width)?.arg(),
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
@@ -268,15 +236,12 @@ pub fn geglu_tanh_packed(
             packed.arg(),
             y.arg(),
             width.arg(),
-            // Fan: seat counts token rows, this rectangle's are `fan` per token.
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `up_cap: None` means uncapped; the kernel reads 0 as "no cap".
 pub fn situ(
     ctx: &Ctx,
     packed: Tensor,
@@ -301,9 +266,7 @@ pub fn situ(
             width.arg(),
             beta.arg(),
             up_cap.unwrap_or(0.0).arg(),
-            // Fan: seat counts token rows, this rectangle's are `fan` per token.
             stated(OP, fan)?.arg(),
-            // Staged-geometry seat: region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )

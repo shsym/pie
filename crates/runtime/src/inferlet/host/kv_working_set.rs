@@ -1,16 +1,3 @@
-//! `pie:inferlet/working-set` — KV working-set host resource.
-//!
-//! The WASM resource type is [`crate::store::kv::working_set::KvWorkingSet`],
-//! a thin handle (model, engine, WorkingSetId); every substantive operation
-//! delegates to the per-(model, engine) [`KvStore`] resolved through
-//! `store::registry`. Lock the store synchronously and release before any
-//! await (see `store::registry` docs).
-//!
-//! reserve is purely logical; discard/fork/slice are ordered on a pipeline.
-//! All pipelines share the single per-engine sequencer queue, so host-side
-//! inline execution here IS their queue position relative to this instance's
-//! submissions.
-
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -51,10 +38,7 @@ fn scoped_working_set(
 impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<KvWorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // Single-model runtime: bind the one model (index 0), engine 0.
         let stores = store_registry::get(0, 0);
-        // Allocate before locking: a stalled malloc under the global KV lock
-        // freezes every lane, not just this one.
         let prepared = crate::store::kv::PreparedWorkingSet::new();
         let id = store_registry::with_kv_lock(&stores.kv, "host-working-set", move |kv| {
             kv.install_working_set(prepared)
@@ -75,8 +59,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         this: Resource<KvWorkingSet>,
         pages: u32,
     ) -> Result<Result<WitRange, String>> {
-        // Strict admission: even a logical page claim counts as pooled
-        // demand the residency planner reasons about.
         crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
@@ -208,8 +190,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         });
         match forked {
             Ok(id) => {
-                // a distinct working-set id gets its own fresh lifecycle,
-                // never a clone of the parent's release-once guard.
                 let child = ws.forked(id);
                 self.register_kv_working_set(&child);
                 Ok(Ok(self.ctx().table.push(child)?))
@@ -240,7 +220,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         });
         match sliced {
             Ok(id) => {
-                // See `fork`: a fresh id always gets a fresh lifecycle.
                 let child = ws.forked(id);
                 self.register_kv_working_set(&child);
                 Ok(Ok(self.ctx().table.push(child)?))
@@ -273,8 +252,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
 
     async fn drop(&mut self, this: Resource<KvWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // `release` performs the release/retire/contention-drain sequence
-        // and marks the shared lifecycle done, so `ws`'s own drop is a no-op.
         let ws = self.ctx().table.delete(this)?;
         self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
         ws.release();

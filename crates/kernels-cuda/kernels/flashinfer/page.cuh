@@ -1,32 +1,22 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
-// PIE: REMOVED -- host-only `<driver_types.h>` and `<vector>`. 3 lines of host C++, guarded out
-// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
-// is one a strip does NOT undo; see MODIFICATIONS.
 
-// PIE: `exception.h` is deleted, and this include with it. That file was pure
-// host C++ -- `flashinfer::Error` derives from `std::exception` and every macro
-// in it builds its message in a `std::ostringstream` -- so its entire body was
-// already inside `#ifndef __CUDACC_RTC__` and NVRTC has always seen an empty
-// file through this line. `src/plan/error.rs` owns the refusals now. This is
-// the one marker in the tree that a strip does NOT undo: restoring upstream
-// means restoring the deleted file too. See MODIFICATIONS.
 #include "fastdiv.cuh"
 #include "layout.cuh"
 #include "utils.cuh"
@@ -34,12 +24,11 @@
 
 namespace flashinfer {
 
-/*!
- * \brief Paged key-value cache
- * \tparam layout The layout of last 3 dimensions in KV-Cache.
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
- */
+
+
+
+
+
 template <typename DType, typename IdType>
 struct paged_kv_t {
   uint_fastdiv page_size;
@@ -50,23 +39,18 @@ struct paged_kv_t {
   uint32_t stride_n;
   uint32_t stride_h;
 
-  // Internal layout:
-  // [max_num_pages, num_heads, page_size, head_dim] if layout == HND
-  // [max_num_pages, page_size, num_heads, head_dim] if layout == NHD
   DType* k_data;
   DType* v_data;
   IdType* indices;
 
-  // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
   IdType* indptr;
-  // [batch_size] The offset of the last page for each request in the batch
+
   IdType* last_page_len;
-  // [batch_size] The start position of each request in the batch.
+
   IdType* rope_pos_offset;
 
-  /*!
-   * \brief Construct an empty paged key-value cache
-   */
+
+
   __host__ __device__ __forceinline__ paged_kv_t()
       : num_heads(0),
         page_size(),
@@ -82,42 +66,34 @@ struct paged_kv_t {
         last_page_len(nullptr),
         rope_pos_offset(nullptr) {}
 
-  /*!
-   * \brief Construct a paged key-value cache
-   * \param num_heads The number of heads
-   * \param page_size The size of each page
-   * \param head_dim The dimension of each head
-   * \param batch_size The batch size
-   * \param layout The layout of last 3 dimensions in KV-Cache.
-   * \param k_data The start pointer of key cache, k_cache should be contiguous
-   * \param v_data The start pointer of value cache, v_cache should be contiguous
-   * \param indices The page indices array
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param rope_pos_offset The start position of each request in the batch.
-   */
-// PIE: REMOVED -- a `__host__` `paged_kv_t` constructor. 18 lines of host C++, guarded out of
-// every NVRTC compile before it was removed, so removing it changes no compile. This marker is
-// one a strip does NOT undo; see MODIFICATIONS.
 
-  /*!
-   * \brief Construct a paged key-value cache with custom kv-cache strides
-   * \param num_heads The number of heads
-   * \param page_size The size of each page
-   * \param head_dim The dimension of each head
-   * \param batch_size The batch size
-   * \param layout The layout of last 3 dimensions in KV-Cache.
-   * \param k_data The start pointer of key cache, k_cache doesn't have to be contiguous
-   * \param v_data The start pointer of value cache, v_cache doesn't have to be contiguous
-   * \param kv_strides custom strides of each dimensions of k_data and v_data
-   * \param indices The page indices array
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param rope_pos_offset The start position of each request in the batch.
-   */
-// PIE: REMOVED -- the second `__host__` `paged_kv_t` constructor. 19 lines of host C++, guarded
-// out of every NVRTC compile before it was removed, so removing it changes no compile. This
-// marker is one a strip does NOT undo; see MODIFICATIONS.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
     if (indptr[batch_idx + 1] == indptr[batch_idx]) {
@@ -126,25 +102,23 @@ struct paged_kv_t {
     return (indptr[batch_idx + 1] - indptr[batch_idx] - 1) * page_size + last_page_len[batch_idx];
   }
 
-  /*!
-   * \brief Compute the offset of element in the allocated buffer.
-   * \param page_idx The page index
-   * \param head_idx The head index
-   * \param entry_idx The page entry index
-   * \param feat_idx The feature index
-   */
+
+
+
+
+
+
   __host__ __device__ __forceinline__ size_t get_elem_offset(size_t page_idx, size_t head_idx,
                                                              size_t entry_idx,
                                                              size_t feat_idx) const {
     return page_idx * stride_page + head_idx * stride_h + entry_idx * stride_n + feat_idx;
   }
 
-  /*!
-   * \brief Compute the offset of element inside the page.
-   * \param head_idx The head index
-   * \param entry_idx The page entry index
-   * \param feat_idx The feature index
-   */
+
+
+
+
+
   __host__ __device__ __forceinline__ size_t get_elem_offset_in_page(size_t head_idx,
                                                                      size_t entry_idx,
                                                                      size_t feat_idx) const {
@@ -260,16 +234,15 @@ __device__ __forceinline__ bool nvfp4_append_is_positive_finite_scale(float scal
   return isfinite(scale) && scale > 0.0f;
 }
 
-/*!
- * \brief CUDA kernel to append new keys/values to the paged key-value cache in the decode phase
- * \tparam head_dim The dimension of each head
- * \tparam vec_size The vector size used in the kernel
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
- * \param paged_kv The paged key-value cache
- * \param key The key to be appended
- * \param value The value to be appended
- */
+
+
+
+
+
+
+
+
+
 template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
 __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_kv,
                                                DType* __restrict__ key, DType* __restrict__ value) {
@@ -294,18 +267,17 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
       v_ptr, value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
-/*!
- * \brief CUDA kernel to append new keys/values to the paged key-value cache in the prefill phase
- * \tparam head_dim The dimension of each head
- * \tparam vec_size The vector size used in the kernel
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
- * \param paged_kv The paged key-value cache
- * \param key The key to be appended
- * \param value The value to be appended
- * \param batch_indices The batch indices of elements to be appended
- * \param positions The positions of elements to be appended
- */
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
 __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
                                          DType* __restrict__ append_key,
@@ -334,19 +306,15 @@ __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
   }
 }
 
-/*!
- * \brief Append new keys/values to the paged key-value cache in the decode phase
- * \tparam DType The data type of the key-value cache
- * \tparam IdType The index data type of the kv-cache
- * \param paged_kv The paged key-value cache
- * \param key The key to be appended
- * \param value The value to be appended
- * \param stream The CUDA stream to execute kernels.
- * \return status Indicates whether CUDA calls are successful
- */
-// PIE: REMOVED -- `AppendPagedKVCacheDecode` and `AppendPagedKVCache`, host launchers. 67 lines
-// of host C++, guarded out of every NVRTC compile before it was removed, so removing it changes
-// no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
+
+
+
+
+
+
+
+
+
 
 template <uint32_t HEAD_DIM, typename DType, typename IdType>
 __global__ void NVFP4QuantizeAppendPagedKVCacheKernel(
@@ -464,9 +432,6 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
   }
 }
 
-// PIE: REMOVED -- `NVFP4QuantizeAppendPagedKVCache` and its `WithSlotMapping` twin, host
-// launchers. 89 lines of host C++, guarded out of every NVRTC compile before it was removed, so
-// removing it changes no compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <typename DType, typename IdType>
 struct paged_kv_mla_t {
@@ -479,22 +444,18 @@ struct paged_kv_mla_t {
   uint32_t stride_n_ckv;
   uint32_t stride_n_kpe;
 
-  // Internal layout:
-  // [max_num_pages, page_size, head_dim]
   DType* ckv_data;
   DType* kpe_data;
   IdType* indices;
 
-  // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
   IdType* indptr;
-  // [batch_size] The offset of the last page for each request in the batch
+
   IdType* last_page_len;
-  // [batch_size] The start position of each request in the batch.
+
   IdType* rope_pos_offset;
 
-  /*!
-   * \brief Construct an empty paged key-value cache
-   */
+
+
   __host__ __device__ __forceinline__ paged_kv_mla_t()
       : head_dim_ckv(0),
         head_dim_kpe(0),
@@ -510,41 +471,33 @@ struct paged_kv_mla_t {
         last_page_len(nullptr),
         rope_pos_offset(nullptr) {}
 
-  /*!
-   * \brief Construct a paged mla kv cache
-   * \param page_size The size of each page
-   * \param head_dim_compressed_kv The dimension of compressed-kv
-   * \param head_dim_kpe The dimension of k-pe
-   * \param batch_size The batch size
-   * \param compressed_kv_data The start pointer of compressed-kv cache, cache should be contiguous
-   * \param kpe_data The start pointer of k-pe cache, cache should be contiguous
-   * \param indices The page indices array
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param rope_pos_offset The start position of each request in the batch.
-   */
-// PIE: REMOVED -- a `__host__` `paged_kv_mla_t` constructor. 20 lines of host C++, guarded out
-// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
-// is one a strip does NOT undo; see MODIFICATIONS.
 
-  /*!
-   * \brief Construct a paged key-value cache with custom kv-cache strides
-   * \param page_size The size of each page
-   * \param head_dim_compressed_kv The dimension of compressed-kv
-   * \param head_dim_kpe The dimension of k-pe
-   * \param batch_size The batch size
-   * \param compressed_kv_data The start pointer of compressed-kv cache, cache should be contiguous
-   * \param compressed_kv_strides custom strides of each dimensions of compressed-kv cache
-   * \param kpe_data The start pointer of k-pe cache, cache should be contiguous
-   * \param kpe_strides custom strides of each dimensions of k-pe cache
-   * \param indices The page indices array
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param rope_pos_offset The start position of each request in the batch.
-   */
-// PIE: REMOVED -- the second `__host__` `paged_kv_mla_t` constructor. 22 lines of host C++,
-// guarded out of every NVRTC compile before it was removed, so removing it changes no compile.
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
     if (indptr[batch_idx + 1] == indptr[batch_idx]) {
@@ -623,10 +576,7 @@ __global__ void AppendPagedKVMlaCacheKernel(paged_kv_mla_t<DType, IdType> paged_
   }
 }
 
-// PIE: REMOVED -- `AppendPagedKVMlaCache`, a host launcher. 39 lines of host C++, guarded out
-// of every NVRTC compile before it was removed, so removing it changes no compile. This marker
-// is one a strip does NOT undo; see MODIFICATIONS.
 
-}  // namespace flashinfer
+}
 
-#endif  // FLAHSINFER_PAGE_CUH_
+#endif

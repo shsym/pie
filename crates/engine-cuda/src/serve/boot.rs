@@ -1,5 +1,3 @@
-//! What a load states: the boot document's typed words and their defaults.
-
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
@@ -8,27 +6,20 @@ use model_ir::Trace;
 
 use super::diag::Diagnostics;
 
-/// The capture mode: `Off` walks eagerly, `Shaped` walks with graph-shaped
-/// schedules, `On` records bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Graphs {
-    /// Eager, with schedules carved to fit each fire — the golden.
     Off,
-    /// Eager, with graph-shaped (padded) schedules.
     Shaped,
-    /// Bodies: armed at load, replayed after. The serving default.
     #[default]
     On,
 }
 
 impl Graphs {
-    /// Whether the plan builders carve graph-shaped schedules.
     #[must_use]
     pub fn shaped(self) -> bool {
         !matches!(self, Graphs::Off)
     }
 
-    /// Whether fires reach [`record`](crate::record).
     #[must_use]
     pub fn records(self) -> bool {
         matches!(self, Graphs::On)
@@ -38,7 +29,6 @@ impl Graphs {
 impl std::str::FromStr for Graphs {
     type Err = String;
 
-    /// `on` (or `graph`), `shaped`, `off` (or `eager`); anything else refuses by name.
     fn from_str(word: &str) -> std::result::Result<Graphs, String> {
         match word {
             "off" | "eager" => Ok(Graphs::Off),
@@ -52,22 +42,12 @@ impl std::str::FromStr for Graphs {
     }
 }
 
-/// What the shell records of a fire: D4's pad and the bodies path, as one word.
-///
-/// The bodies route requires the pad, so the three states are a ladder:
-/// `Off` arms neither, `Shaped` arms the pad alone, `Bodies` arms both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recording {
-    /// No pad, no bodies: every launch at its live extent (the A/B arm).
     Off,
-    /// The pad armed, no bodies: the eager walk at graph-shaped extents.
     Shaped,
-    /// The pad armed and bodies served.
     Bodies {
-        /// Diff every armed body against its own eager walk at load
-        /// (`Fault::Golden` fails the load).
         golden: bool,
-        /// How many megabytes of graph exec the arming pass may spend.
         mem_megabytes: u32,
     },
 }
@@ -82,25 +62,21 @@ impl Default for Recording {
 }
 
 impl Recording {
-    /// Whether the pad is armed before each walk.
     #[must_use]
     pub fn pad(self) -> bool {
         !matches!(self, Recording::Off)
     }
 
-    /// Whether fires may be served from a recorded body.
     #[must_use]
     pub fn bodies(self) -> bool {
         matches!(self, Recording::Bodies { .. })
     }
 
-    /// Whether the arming pass diffs each body against its walk.
     #[must_use]
     pub fn golden(self) -> bool {
         matches!(self, Recording::Bodies { golden: true, .. })
     }
 
-    /// Megabytes the arming pass may spend; `0` under a mode with no bodies.
     #[must_use]
     pub fn bodies_mem(self) -> u32 {
         match self {
@@ -113,7 +89,6 @@ impl Recording {
 impl std::str::FromStr for Recording {
     type Err = String;
 
-    /// `off`, `shaped`, or `bodies` (at the default dials); anything else refuses by name.
     fn from_str(word: &str) -> std::result::Result<Recording, String> {
         match word {
             "off" => Ok(Recording::Off),
@@ -127,56 +102,33 @@ impl std::str::FromStr for Recording {
     }
 }
 
-/// The shell's own words, typed — the `[engine]` table of the boot document.
-//
-// NOT `Copy`, since [`Diagnostics`] carries the trace filters a person types
-// (`ptr-trace=<key substring>`, `graph-dot=<dir>`). One `.clone()` at the one
-// seam that copied it is the whole cost, and it buys a knob that can be a
-// string.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Knobs {
-    /// The pad and the bodies path, as one word (`[engine] recording`).
     pub recording: Recording,
-    /// `Fallback::Copy` where P4's table asks for one (`[engine] fallback_copy`). On.
     pub copies: bool,
-    /// Name [`crate::GROUPED`] to the compiler (`[engine] grouped`). On.
     pub grouped: bool,
-    /// Override `DeviceProfile::side_streams`; `None` keeps the profile's figure.
     pub side_streams: Option<u32>,
-    /// What fraction of the card this deployment lets pie hold, weights included.
     pub gpu_mem_utilization: f64,
-    /// What a person debugging turned on (`[engine] diagnostics`, or `--diag`
-    /// on `pie serve` / `pie run`). Everything off by default; the shell
-    /// publishes it at load and reads it back through
-    /// [`diag::on`](super::diag::on).
     pub diagnostics: Diagnostics,
-    /// What a tensor-parallel group's ranks talk over (`[engine]
-    /// nccl_transport`). Shared memory by default; read once, by
-    /// [`open_group`](crate::open_group), and written into NCCL's environment
-    /// there because NCCL has no other door.
     pub nccl_transport: crate::comm::Transport,
 }
 
 impl Knobs {
-    /// Whether the pad is armed before each walk.
     #[must_use]
     pub fn pad(&self) -> bool {
         self.recording.pad()
     }
 
-    /// Whether fires may be served from a recorded body.
     #[must_use]
     pub fn bodies(&self) -> bool {
         self.recording.bodies()
     }
 
-    /// Whether the arming pass diffs each body against its walk.
     #[must_use]
     pub fn golden(&self) -> bool {
         self.recording.golden()
     }
 
-    /// Megabytes the arming pass may spend on graph execs.
     #[must_use]
     pub fn bodies_mem(&self) -> u32 {
         self.recording.bodies_mem()
@@ -197,68 +149,38 @@ impl Default for Knobs {
     }
 }
 
-/// Which half of the golden pass a fire is (`Shell::golden_arm`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Golden {
-    /// Not a golden fire.
     #[default]
     Off,
-    /// The control: a bodied fire whose hit path walks its own stretches.
     Eager,
-    /// The claim: the same synthetic, served by the body just armed.
     Body,
 }
 
-/// What `[engine] gpu_mem_utilization` means when nobody wrote it.
 pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 
-/// What `[engine] bodies_mem` means when nobody wrote it, in megabytes.
 pub const DEFAULT_BODIES_MEGABYTES: u32 = 2048;
 
-/// Everything a load states.
 pub struct Boot<'a> {
-    /// The model's own request classifier, for the arming pass.
     pub classify: model_ir::ClassifyFn,
-    /// The traced supergraph; the compile happens on this side.
     pub trace: Trace,
-    /// How the checkpoint's bytes become this plan's params.
     pub contract: &'a ModelContract,
-    /// A snapshot directory, or one container file.
     pub checkpoint: &'a Path,
-    /// The ceilings every fire is baked against, on the token axis.
     pub budget: Budget,
-    /// The patch axis's ceilings, or `None` for a deployment that admits no image.
     pub patches: Option<model_compiler::PatchLadder>,
-    /// The voxel axis's ceilings (D8), or `None` for a deployment that admits no clip.
     pub voxels: Option<model_compiler::VoxelLadder>,
-    /// What the device charges; `None` takes the defaults at this device's SM count.
     pub profile: Option<DeviceProfile>,
-    /// Tokens per kv page.
     pub page_size: u32,
-    /// The most tokens one sequence may hold.
     pub context: u32,
-    /// How many sequences the pools seat at once.
     pub slots: u32,
-    /// KV pages the pool holds.
     pub pages: u32,
-    /// Which device to bind.
     pub ordinal: i32,
-    /// The capture mode (`[engine] graphs`).
     pub graphs: Graphs,
-    /// The shell's own words.
     pub knobs: Knobs,
-    /// Where this deployment keeps its caches; `None` stores nothing.
     pub cache_dir: Option<&'a Path>,
-    /// How many frames the caller will keep in flight.
     pub runahead: engine::runahead::Runahead,
-    /// How much of the weight table this load may hold on the device.
     pub residency: crate::experts::Plan,
-    /// May a warm boot defer the pinned tier (`engine::Residency::deferred_tier`,
-    /// `[model] deferred_tier`)? On, where the device reports
-    /// `pageableMemoryAccess`; off builds the page-locked image up front.
     pub deferred_tier: bool,
-    /// Which rank of how wide a group this shell is (rank 0 of 1 alone).
     pub world: crate::api::World,
-    /// The rank's `ncclComm_t`, or null on a single device.
     pub comm: *mut core::ffi::c_void,
 }

@@ -1,52 +1,3 @@
-//! **THE WAN 2.2 VAE ENCODER, LOADED OUT OF THE SERVING ARTIFACT, TURNS A
-//! `17 x 480 x 832` PIXEL CLIP INTO THE REFERENCE'S `5 x 30 x 52`
-//! DiT-SPACE LATENT — ONE FIRE PER CHUNK, DOWN ONE SLOT, THE HEAD ARM
-//! FIRST.** (design D8/D11, milestone M3)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_wan_2_vae_encodes_the_reference -- --nocapture
-//! ```
-//!
-//! The golden is `scripts/imagegen/wan22_golden.py --vae`, which after
-//! decoding the run's final latent puts the decode BACK IN through
-//! `AutoencoderKLWan._encode` in fp32 and dumps, under
-//! `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_vae_encode/`: `pixels.f32`
-//! (`[F·H·W, 3]` in `[-1, 1]`, the encoder's input), `mean.f32`
-//! (`quant_conv`'s first 48 channels — `DiagonalGaussianDistribution`'s
-//! MEAN) and `latent.f32` (the same rows normalised into the denoiser's
-//! space, `(mean − latents_mean)/latents_std`), rows of voxels in
-//! `(t, h, w)` order. The weights come out of
-//! `$PIE_IMAGEGEN_ARTIFACTS/wan22-ti2v-5b.zt` through `own_contract` over
-//! the ENCODE plan's params alone, so the load is the encoder's planes and
-//! not the row's 22.5 GB. It is the artifact and not the snapshot for the
-//! same reason the decode gate gives: `vae.enc.norm_scale` /
-//! `vae.enc.norm_bias` are STATED rows (a `Concat` of filled cells) that
-//! only `pie model import` materializes.
-//!
-//! **WHAT IS CLAIMED, AND WHAT IS NOT.**
-//!
-//! 1. *The chunked encode is the reference's encode.* Pixel frame 0 goes
-//!    through `vae.encode.head` and lands ONE latent frame; every later
-//!    group of FOUR frames goes through `vae.encode` and lands one more.
-//!    The two arms share one slot, so each causal conv's `CacheRow::State`
-//!    slab carries its last frames forward — and the two `downsample3d`
-//!    time convolutions, which the reference does not run on the first
-//!    chunk at all, are seeded there by `spatial.cache_store`. Gate:
-//!    `cos >= 0.999` over the whole clip and per chunk.
-//! 2. *The frame caches MATTER.* A later chunk is fired a second time on a
-//!    FRESH slot — same pixels, every slab zeroed — and the latent must
-//!    move by more than the gate's tolerance. If it does not, the state
-//!    rows are not reaching the convolutions.
-//! 3. *The arm answers the DENOISER's space.* The same rows are scored
-//!    against the RAW posterior mean, which they must fit materially
-//!    worse: the arm's own `(z − mean)/std` is the exact inverse of what
-//!    `vae.decode` undoes, so a guest hands this straight to `denoise`.
-//!
-//! Nothing here claims a sampled posterior (the logvar's 48 channels are
-//! never computed), a tiled encode, or a clip longer than the golden's.
-//! Skipped by name without a device, the artifact or the golden.
-
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -62,9 +13,6 @@ use model_dsl::{
 use models::wan_2::forward::Facts;
 use models::wan_2::model::Model;
 
-/// The two VAE ENCODER arms as a plan of their own: the reading bits still
-/// select between them, so the trace keeps the family's own split and the
-/// state slabs are the family's own `caches()`.
 struct EncodeOnly {
     model: Model,
 }
@@ -94,8 +42,6 @@ impl ForwardHybrid for EncodeOnly {
         let head = codes.vae_encode_head.expect("the head arm's code");
         let rest = codes.vae_encode.expect("the later-chunks arm's code");
         let _ = models::wan_2::forward::vae_encode(&arms[usize::from(head)], &vae.enc, true);
-        // A hybrid plan answers one value; the arms plant their own seams
-        // and this is only what the trace hands back.
         models::wan_2::forward::vae_encode(&arms[usize::from(rest)], &vae.enc, false)
     }
 }
@@ -160,7 +106,6 @@ fn score(got: &[f32], want: &[f32]) -> Score {
     }
 }
 
-/// The box `shapes.json` states for one plane.
 fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     let at = &shapes[key];
     let get = |name: &str| at[name].as_u64().expect("a box extent") as u32;
@@ -170,7 +115,6 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     )
 }
 
-/// The word one lane of `reading` on the video stream carries.
 fn word(reading: u8) -> u64 {
     Facts::of(
         &Request::new(1, false)
@@ -180,7 +124,6 @@ fn word(reading: u8) -> u64 {
     .word()
 }
 
-/// The loaded encoder, held across the fires that share its caches.
 struct Encoder {
     shell: Shell,
     head: u8,
@@ -188,7 +131,6 @@ struct Encoder {
 }
 
 impl Encoder {
-    /// One pixel chunk in, its latent rows and their box out.
     fn chunk(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
         let reading = if first { self.head } else { self.rest };
         let tokens = [0u32];
@@ -213,8 +155,6 @@ impl Encoder {
         (values, boxes[0])
     }
 
-    /// Zero every frame cache: `Shell::open` is what clears a slot's state
-    /// rows, and it is what starts a clip.
     fn rewind(&mut self) {
         self.shell.open(0).expect("slot 0 opens");
     }
@@ -314,8 +254,6 @@ fn the_encoder_answers_the_reference_chunk_by_chunk() {
         .collect();
     assert_eq!(chunks.len(), t_lat as usize + 1);
 
-    // The ladder is the INPUT clip's ceiling: the widest chunk is four
-    // pixel frames, and every rectangle downstream shrinks from it.
     let widest = chunks
         .windows(2)
         .map(|w| (w[1] - w[0]) as usize * in_plane)
@@ -324,7 +262,6 @@ fn the_encoder_answers_the_reference_chunk_by_chunk() {
     let (mut vae, load_s) = load(&root, widest as u32 + 8);
     eprintln!("wan vae encode: load {load_s:.1} s, {frames} pixel frames of {hp}x{wp}");
 
-    // ---- the clip, chunk by chunk ----------------------------------------
     let mut got: Vec<f32> = Vec::with_capacity(latent.len());
     let mut per_chunk: Vec<(u32, Score)> = Vec::new();
     for k in 0..t_lat as usize {
@@ -382,10 +319,6 @@ fn the_encoder_answers_the_reference_chunk_by_chunk() {
         whole.mean_abs
     );
 
-    // ---- claim 3: the answer is the DENOISER's space ----------------------
-    // The same rows against the RAW posterior mean. `(z − mean)/std` is a
-    // per-channel affine with means as large as 0.5 and stds from 0.35 to
-    // 1.7, so a port that forgot it would sit visibly further from these.
     let unnormalised = score(&got, &raw_mean);
     eprintln!(
         "against the RAW posterior mean: cos {:.6}, mean |err| {:.5}",
@@ -400,7 +333,6 @@ fn the_encoder_answers_the_reference_chunk_by_chunk() {
         whole.cos
     );
 
-    // ---- claim 2: the frame caches matter --------------------------------
     assert!(t_lat >= 2, "the caches can only be claimed past chunk 0");
     let k = (t_lat - 1) as usize;
     let (from, to) = (chunks[k] as usize, chunks[k + 1] as usize);

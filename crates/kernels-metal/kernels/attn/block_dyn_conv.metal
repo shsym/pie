@@ -1,24 +1,4 @@
-// block_dyn_conv.metal — DFlash2's two-tap grouped dynamic convolution.
-//
-// Within one request's span of rows, every row mixes itself with the row
-// before it, and the mixing coefficients are the row's OWN: a learned
-// per-channel base plus a per-group correction the sublayer's input projected
-// (`kernel_projection`, both sides at once). The reference
-// (`mlx_dspark.dflash_model.DFlashGroupedConv._convolve`):
-//
-//     coeff[i, t, c] = base[side, t, c] + delta[i, t, g(c)]
-//     y[i, c]        = Σ_t coeff[i, t, c] · x[i − t, c],   x[i − t] = 0 for i < t
-//
-// applied to the block rows alone — position 0 (the anchor) has no in-block
-// predecessor, position 1 reads the anchor — which is exactly the zero fill
-// at each request's first row here. One thread per (channel, request), the
-// span walked in order; a draft block is eight rows, so the walk is short,
-// and any longer span is merely correct.
-//
-// `coeff` rows are `[2 · taps · groups]` laid `(side, tap, group)`; `base` is
-// `[2 · taps, channels]` at row `side · taps + tap`. Accumulated in f32 and
-// rounded once, where the reference accumulates in bf16 — an ulp-class
-// parting, the same one every other op in this plane takes.
+
 
 #include <metal_stdlib>
 using namespace metal;

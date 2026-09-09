@@ -1,9 +1,3 @@
-//! Reading a `pie.serving/1` artifact. [`Artifact`] is a serving artifact,
-//! open and mapped, answering what this file is, which objects it carries in
-//! which order, where one lies, and — only when asked — whether the bytes
-//! match what was written. [`read_head`] answers "what is this file for"
-//! without mapping.
-
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -13,11 +7,8 @@ use crate::error::Error;
 use crate::serving::{self, Blocks, Mismatch, PROFILE, Span, Stamp};
 use crate::term::{blob_planes, plane_of};
 
-/// Concurrent readers on the verify and fill paths.
 pub const READERS: usize = 8;
 
-/// A serving artifact, open and mapped. A `&[u8]` handed out here points
-/// into the mapping.
 pub struct Artifact {
     path: PathBuf,
     stamp: Stamp,
@@ -33,25 +24,14 @@ impl std::fmt::Debug for Artifact {
     }
 }
 
-/// One plane of an object, located: the object it is in, where that
-/// object's blob starts in the file, and the plane's range within the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     pub object: String,
-    /// The blob's file offset; the plane lies at `at + plane.offset`.
     pub at: u64,
     pub plane: Plane,
 }
 
 impl Artifact {
-    /// Open the serving artifact at `path` and map it. Reads the manifest and
-    /// then the stamp; hashes nothing.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Unsupported`] for a container version or a `pie.serving/<n>`
-    /// this build does not implement; [`Error::Checkpoint`] for a file that
-    /// is not a serving artifact at all, or whatever the container refuses.
     pub fn open(path: &Path) -> Result<Artifact, Error> {
         let source = ztensor::Source::options()
             .vocabulary(&serving::vocabulary())
@@ -102,7 +82,6 @@ impl Artifact {
         &self.source
     }
 
-    /// How far the mapping extends: the file's length.
     #[must_use]
     pub fn mapped_len(&self) -> u64 {
         self.source.store(ztensor::StoreId(0)).len()
@@ -112,13 +91,11 @@ impl Artifact {
         self.stamp.check(deployment)
     }
 
-    /// The serving sequence, recovered from the manifest's offsets.
     #[must_use]
     pub fn sequence(&self) -> Vec<&str> {
         serving::sequence(self.manifest())
     }
 
-    /// Every serving object, in sequence order.
     #[must_use]
     pub fn spans(&self) -> Vec<Span<'_>> {
         serving::spans(self.manifest())
@@ -129,7 +106,6 @@ impl Artifact {
         serving::alignment(&self.spans())
     }
 
-    /// One object's whole blob, borrowed from the mapping.
     pub fn object(&self, name: &str) -> Result<&[u8], Error> {
         self.source
             .tensor(name)
@@ -137,12 +113,6 @@ impl Artifact {
             .map_err(Error::from)
     }
 
-    /// Where a plane named as a trace names it lies: the object holding it,
-    /// that object's blob offset in the file, and the plane's range in the
-    /// blob. `w` is object `w`'s codes, `w.scales` its gain plane,
-    /// `w.biases` its offset plane — unless the file holds an object under
-    /// the whole name, which wins. A blob in a shard is refused: the artifact
-    /// is served out of its one mapped file.
     pub fn locate(&self, name: &str) -> Result<Located, Error> {
         for (object, path) in plane_of(name) {
             let Some(tensor) = self.source.get(&object) else {
@@ -179,7 +149,6 @@ impl Artifact {
         )))
     }
 
-    /// One plane's bytes, by the name a trace gives it.
     pub fn plane(&self, name: &str) -> Result<&[u8], Error> {
         let located = self.locate(name)?;
         let blob = self.object(&located.object)?;
@@ -193,14 +162,11 @@ impl Artifact {
         })
     }
 
-    /// One object's block digests.
     pub fn blocks(&self, object: &str) -> Result<Blocks<'_>, Error> {
         let entry = self.manifest().object(object).map_err(Error::from)?;
         Blocks::of(object, entry)
     }
 
-    /// Hash the blocks of these objects and compare them to their digests.
-    /// Also warms the page cache.
     pub fn verify(&self, objects: &[&str]) -> Result<(), Error> {
         let mut work = Vec::new();
         for object in objects {
@@ -209,8 +175,6 @@ impl Artifact {
         self.hash(&work)
     }
 
-    /// Hash every block of every serving object, and each object's own
-    /// digest too.
     pub fn verify_all(&self) -> Result<(), Error> {
         let sequence = self.sequence();
         self.verify(&sequence)?;
@@ -320,9 +284,6 @@ impl Work<'_> {
     }
 }
 
-/// Read a serving artifact's stamp without mapping it: `Ok(None)` is an
-/// ordinary checkpoint (or not a container at all), `Ok(Some)` a serving
-/// artifact this build reads, `Err` a file that claims to be one and is not.
 pub fn stamp_of(path: &Path) -> Result<Option<Stamp>, Error> {
     let Ok(Some(manifest)) = ztensor::read::manifest_of(path) else {
         return Ok(None);

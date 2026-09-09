@@ -1,41 +1,3 @@
-//! **FLUX.2'S AUTOENCODER TRACES AND BAKES BOTH WAYS ON THE VOXEL AXIS,
-//! AND THE IMPORT READS EVERY `vae.` TENSOR OF THE REAL SNAPSHOT ONCE.**
-//! (design D8, milestone M2)
-//!
-//! ```text
-//! cargo test -p models --test the_flux_2_vae_bakes
-//! ```
-//!
-//! ```text
-//! (a) the flagship declares `vae.decode` and `vae.encode` after its two
-//!     token readings, each a token-less, kv-less `Image` lane with one
-//!     `Voxels` port and a `pixels` readout; both ports sit at the DiT's
-//!     own 128-wide `/16` grid (128 in / 3 out on decode, 3 in / 128 out
-//!     on encode); the miniature declares neither
-//! (b) the trace reads exactly those two voxel ports — at DIFFERENT voxel
-//!     indices, since the engine seats one rectangle per `(kind, index)`
-//!     and the two clips are 128 and 3 wide — and plants `pixels`
-//!     twice — the decoder's `[VoxelsTimes(256), 3]` plane (a 2x2 shuffle
-//!     then three nearest x2 upsamples) and the encoder's `[Voxels, 128]`
-//!     normalised mean — each beside its `[Clips, 4]` grid
-//! (c) the shapes of `AutoencoderKLFlux2`: 2 whole-row attentions at 512,
-//!     3 upsamples x2 (plus the port's factor-1 copy), 3 stride-2
-//!     convolutions padded `(0, 1, 0, 1)` behind the box, one 2x2 shuffle
-//!     each way, every conv weight interned tap-major at its own `c_in`,
-//!     every GroupNorm 32 groups at 1e-6 (SiLU fused on all but the
-//!     attention's)
-//! (d) each VAE lane classifies into its own class, apart from the token
-//!     readings'
-//! (e) the plan bakes on CUDA against a voxel ladder sized for one 32x32
-//!     token grid (its 512x512 image), the voxel regions their own units
-//! (f) over the real `black-forest-labs/FLUX.2-klein-4B` snapshot (skipped
-//!     by name when the HuggingFace cache holds none): every one of the
-//!     251 `vae.` tensors but the frozen BatchNorm's step counter is read
-//!     exactly once, every conv kernel as a transmute of its own bytes
-//!     (`quant_conv` sliced down to the posterior mean's rows), and every
-//!     plane type-checks
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -66,7 +28,15 @@ fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::Reading
         .unwrap_or_else(|| panic!("no reading `{name}`"))
 }
 
-/// (a)
+fn the_flux_2_vae_bakes_every_case() {
+    the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
+    the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
+    the_shapes_are_the_flux2_autoencoders();
+    each_vae_lane_has_a_class_of_its_own();
+    the_plan_bakes_against_a_voxel_ladder();
+    the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
+}
+
 #[test]
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(KLEIN).generative.as_ref().expect("facts");
@@ -82,8 +52,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         assert_eq!(r.ports[0].kind, PortKind::Voxels);
         assert_eq!(r.ports[0].streams, vec![Stream::Image]);
     }
-    // The port is the 128-wide `/16` grid the DiT itself emits and reads:
-    // the 2x2 shuffle and the BatchNorm are inside the plan on both arms.
     assert_eq!(
         (
             decode.ports[0].name,
@@ -101,11 +69,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         ("pixels", vae::RGB, model::IN_CHANNELS)
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    // Its STATED index, not its position: `ReadingFact::port` resolves
-    // through `ports_indexed`, so a port carrying `at` answers with the
-    // index the TRACE reads it at. `vae.encode`'s only voxel port is read
-    // at index 1 so `vae.decode`'s latent clip keeps 0, and the runtime
-    // must bind it there or the shell seats the wrong width.
     assert_eq!(
         encode.port("pixels").map(|(index, _)| index),
         Some(model::port::PIXEL_VOXELS)
@@ -116,8 +79,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         "the pixel clip is seated at its own voxel index"
     );
     assert_eq!((decode.index, encode.index), (2, 3));
-    // The latent fact stays the denoiser's: a token is 128 channels at
-    // /16, and the VAE's own 32 at /8 never leave the arms.
     let latent = facts.latent.as_ref().expect("a latent space");
     assert_eq!(
         (latent.channels, latent.spatial_compression),
@@ -143,8 +104,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
 }
 
-/// (b)
-#[test]
 fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     let plan = trace(KLEIN);
     let mut ports: Vec<(u8, u32, String)> = plan
@@ -159,9 +118,6 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         })
         .collect();
     ports.sort_unstable();
-    // Two voxel INDICES, not one: the engine seats one rectangle per
-    // `(kind, index)` for the whole plan, so the 128-wide packed latent clip
-    // and the 3-wide pixel clip cannot share index 0.
     assert_eq!(
         ports,
         vec![
@@ -194,7 +150,6 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         shape: vec![rows, Dim::Const(width)],
         dtype: Dtype::Bf16,
     };
-    // 4 (the 2x2 shuffle) x 4 x 4 x 4 (three nearest x2) = 256 pixels a token.
     let mut want = vec![
         plane(Dim::VoxelsTimes(256), u64::from(vae::RGB)),
         plane(Dim::Voxels, u64::from(model::IN_CHANNELS)),
@@ -211,8 +166,6 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     );
 }
 
-/// (c)
-#[test]
 fn the_shapes_are_the_flux2_autoencoders() {
     let plan = trace(KLEIN);
     let (mut attentions, mut upsamples, mut copies, mut strided, mut convs, mut norms) =
@@ -225,9 +178,6 @@ fn the_shapes_are_the_flux2_autoencoders() {
         match op {
             Spatial::Attention { sm_scale, q, .. } => {
                 attentions += 1;
-                // One head as wide as the row. The decode arm's rows are
-                // the shuffled `VoxelsTimes(4)` rectangle, the encode
-                // arm's the port's own `Voxels`.
                 let Ty::Tensor { shape, dtype } = &plan.values[q.0 as usize].ty else {
                     panic!("a query is a tensor")
                 };
@@ -320,19 +270,11 @@ fn the_shapes_are_the_flux2_autoencoders() {
     assert_eq!(copies, 1, "the decode arm's one fresh copy of the port");
     assert_eq!(strided, 3);
     assert_eq!((shuffles, unshuffles), (1, 1), "the 2x2 packing, both ways");
-    // Decode: post_quant, conv_in, 2 mid resnets x2, 12 resnets x2 + 2
-    // shortcuts, 3 upsamplers, conv_out = 1+1+4+24+2+3+1 = 36. Encode:
-    // conv_in, 8 resnets x2 + 2 shortcuts, 3 downsamplers, 2 mid resnets
-    // x2, conv_out, quant = 1+16+2+3+4+1+1 = 28.
     assert_eq!(convs, 64);
-    // Two norms per resnet (14 + 10 resnets), one per attention, one out
-    // norm per side: 48 + 2 + 2.
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
 }
 
-/// (d)
-#[test]
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(KLEIN);
     let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
@@ -358,8 +300,6 @@ fn each_vae_lane_has_a_class_of_its_own() {
     assert_eq!(seen.len(), 6, "six lanes, six classes");
 }
 
-/// (e)
-#[test]
 fn the_plan_bakes_against_a_voxel_ladder() {
     let plan = trace(KLEIN);
     let budget = model_compiler::Budget {
@@ -368,7 +308,6 @@ fn the_plan_bakes_against_a_voxel_ladder() {
         buckets: vec![1024, 4096],
         max_adapters: 0,
     };
-    // One 32x32 token grid (a 512x512 image) per fire.
     let budgets = model_compiler::Budgets::of(budget)
         .with_voxels(model_compiler::VoxelLadder::new(32 * 32, 1));
     let compiled =
@@ -387,10 +326,6 @@ fn the_plan_bakes_against_a_voxel_ladder() {
         "and against no voxel ladder the plan is refused, not sized at zero"
     );
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// (f) the real snapshot
-// ─────────────────────────────────────────────────────────────────────────
 
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
@@ -424,7 +359,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-#[test]
 fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     let Some(root) = snapshot() else {
         eprintln!(
@@ -434,8 +368,6 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     };
     let src = checkpoint::file::diffusers::open(&root)
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    // The VAE-only contract states the same reads the whole-model import
-    // does, and is what the parity gate loads.
     let contract = model::Model::klein_4b(Dtype::Bf16, 1)
         .import_vae(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"));
@@ -468,8 +400,6 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
          `(var+eps)^-1/2` share one internal sum)"
     );
 
-    // Every conv kernel is a transmute of its own bytes into the natural
-    // `[C_out, C_in·k·k]` rectangle; every plane types to its extents.
     let types = Types(&src);
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
     let mut kernels = 0;
@@ -480,9 +410,6 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
         if let Expr::Transmute { .. } = &tensor.expr {
             assert!(tensor.name.starts_with("vae."), "`{}`", tensor.name);
         }
-        // `quant_conv` declares the posterior mean's 32 output rows of the
-        // stored 64: a slice of the transmuted kernel, and of its bias
-        // (the bias through an internal `.head` step under its root cast).
         if tensor.name == "vae.quant" || tensor.name == "vae.quant.bias.head" {
             assert!(
                 format!("{:?}", tensor.expr).contains("Slice"),

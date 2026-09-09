@@ -8,11 +8,8 @@ pub mod tokenizer;
 use model::Model;
 use model_dsl::Dtype;
 
-/// Identification order: the first row whose import fits the checkpoint wins.
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
-        // Before the plain mixture: the head is extra tensors a plain row
-        // would ignore, so the row that needs them must be asked first.
         (
             "gemma4-26b-a4b-dflash",
             1,
@@ -83,8 +80,6 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b(Dtype::Bf16, Dtype::Bf16, tp),
         ),
-        // The same checkpoint two ranks wide (`gemma4-e4b-bf16-kv-bf16-tp2`):
-        // an artifact imported at tp=1 serves it, each rank reading its band.
         (
             "gemma4-e4b",
             2,
@@ -115,8 +110,6 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::b31(Dtype::Bf16, Dtype::Bf16, tp),
         ),
-        // Parity miniatures, after every real row so identification never
-        // picks them; a gate names them by SKU.
         (
             "gemma4-e4b-mini-l1",
             1,

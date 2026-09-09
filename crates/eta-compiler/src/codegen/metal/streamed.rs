@@ -1,40 +1,3 @@
-//! `emit_streamed_region_msl` — the streamed form (`ptir_m4`): one kernel per
-//! fused region, run as a **table of dispatches**, each over a grid of
-//! `(element blocks × lanes)`.
-//!
-//! The grouped form gives a lane one threadgroup and walks the region's ops
-//! inside it, barrier after barrier. A lane's epilogue is then bound to one
-//! GPU core: a vocabulary-wide value streams through it at a small fraction
-//! of the device's bandwidth, and thirty of them take milliseconds. Here the
-//! barrier between ops is a dispatch boundary instead, and a dispatch is
-//! what this file schedules.
-//!
-//! **A dispatch is a sequence of grid-strided passes sharing one thread ↔
-//! element mapping** — element `i` belongs to thread `i mod grid` in every
-//! pass — **behind a prologue every thread computes for itself.** Under that
-//! mapping a pass may read, at index `i`, what an earlier pass of the same
-//! dispatch wrote at index `i`: the same thread wrote it. So consecutive
-//! element-independent ops share a dispatch, and share one loop when their
-//! lengths agree. What ends a dispatch is a cross-thread read: a broadcast or
-//! gather from a value the dispatch wrote, a stateful walk, a reduction's
-//! upper levels. A reduction is split at its first level: level 0 fits the
-//! mapping (a SIMD group holds a whole 32-chunk) and runs as one more pass
-//! in the producer's dispatch, writing a word per chunk to a plane; the
-//! remaining levels run in the **prologue of the next dispatch**, inside
-//! every threadgroup redundantly, and the result reaches the consumer in a
-//! register. Scalar ops go to the prologue the same way. A reduction or a
-//! scalar therefore costs no dispatch of its own unless nothing follows it.
-//!
-//! The kernel takes the grouped form's eleven bindings plus an `M4Step` at
-//! buffer 11 — which dispatch (its position in the table), which reduction
-//! level, how many groups the partial pass had — and switches on it. The engine reads the step table
-//! this file answers beside the source (`EmittedKernel::steps`) and issues
-//! the dispatches in order, deriving grids from the same descriptors the
-//! kernel reads. Nothing about the arithmetic changes: the ops are the
-//! runtime's `ptir_m1_execute_part` strided by the grid or that arithmetic
-//! spelled with literal dtypes, and every reduction reproduces the 32-wide
-//! tree chunk for chunk.
-
 use crate::codegen::error::{EmitError, RegionForm};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -48,6 +11,7 @@ use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 
 use super::fused::{
     METAL_M3_REGION_THREADS, emit_logits_argmax, emit_logits_gather, emit_mtp_drafts,
+    emit_pixels_gather,
     emit_score_gather,
 };
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
@@ -57,44 +21,26 @@ use crate::codegen::fault::M3_THREADS_EXCEEDED;
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
-/// How one step of a streamed region is dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StepKind {
-    /// Element-independent passes: the whole grid, sized by the step's
-    /// value.
     Wide = 0,
-    /// A walk with state, a fused threadgroup pattern, or a prologue alone:
-    /// one threadgroup.
     Single = 1,
-    /// `reduce_sum/max/min` over a multi-row value: one dispatch per two
-    /// levels of the 32-wide tree.
     Reduce = 2,
-    /// `reduce_argmax` over f32: a partial pass over the grid, then a final
-    /// pass over the partials in one threadgroup.
     Argmax = 3,
-    /// Element-independent passes sized by a reduction's input: a dispatch
-    /// opened by its level-0 pass. Dispatched exactly as `Wide`.
     Partial = 4,
 }
 
-/// Pack a step for `EmittedKernel::steps`: the value whose descriptor sizes
-/// its grid (a wide pass's result, a reduction's input; any value for a
-/// single-threadgroup step) and how it is dispatched. The kernel's `case` for
-/// it is its position in the table, which the engine hands over as
-/// `M4Step::index`.
 #[must_use]
 pub const fn streamed_step(value: u32, kind: StepKind) -> u32 {
     (value << 8) | kind as u32
 }
 
-/// The value a packed step is sized by.
 #[must_use]
 pub const fn step_value(step: u32) -> u32 {
     step >> 8
 }
 
-/// The kind a packed step is; `None` for a byte this version does not emit.
 #[must_use]
 pub const fn step_kind(step: u32) -> Option<StepKind> {
     match step & 0xFF {
@@ -107,11 +53,6 @@ pub const fn step_kind(step: u32) -> Option<StepKind> {
     }
 }
 
-/// Levels of the 32-wide reduction tree over a row of `last` elements, until
-/// one value is left; at least one (a row of one element still writes its
-/// result). The runtime's `m4_reduce_two_levels` walks two of them per
-/// dispatch, so the engine dispatches once per entry of
-/// [`reduce_dispatch_levels`].
 #[must_use]
 pub fn reduce_levels(last: u32) -> u32 {
     let mut count = last;
@@ -123,20 +64,11 @@ pub fn reduce_levels(last: u32) -> u32 {
     levels.max(1)
 }
 
-/// The first level each multi-row `Reduce` dispatch starts at: `0, 2, 4, …`
-/// up to the tree's depth.
 #[must_use]
 pub fn reduce_dispatch_levels(last: u32) -> Vec<u32> {
     (0..reduce_levels(last)).step_by(2).collect()
 }
 
-/// How an op runs in the streamed form, from its tag alone (plus the
-/// pivot's predicate and the argmax operand's class). Everything
-/// `ptir_m1_execute_part` strides without a barrier is `Wide`; the walks the
-/// grouped form keeps on one threadgroup are `Single`; the fixed-tree
-/// reductions and the f32 argmax have their own multi-dispatch shapes. The
-/// scheduler refines a `Reduce` over a single row into a partial pass and a
-/// prologue final.
 #[must_use]
 pub fn op_step_kind(tag: u8, pred_tag: u8, argmax_over_f32: bool) -> StepKind {
     match tag {
@@ -166,17 +98,12 @@ pub fn op_step_kind(tag: u8, pred_tag: u8, argmax_over_f32: bool) -> StepKind {
     }
 }
 
-/// The wire byte of a value's dtype, or `None` outside ETA's four.
 fn wire_dtype(value_types: &[SymbolicType], value: u32) -> Option<u8> {
     value_types
         .get(value as usize)
         .and_then(|ty| eta_ir::types::to_wire(ty.dtype))
 }
 
-/// A value's symbolic dims with the unit ones dropped: two values with the
-/// same key have the same element count at run time, whatever their ranks
-/// (`[1, V]` and `[V]` share a loop); an empty key is a scalar. The wire
-/// shape is not this — it is filled only for a few ops.
 fn length_key(value_types: &[SymbolicType], value: u32) -> Vec<Dimension> {
     value_types
         .get(value as usize)
@@ -190,7 +117,6 @@ fn length_key(value_types: &[SymbolicType], value: u32) -> Vec<Dimension> {
         .unwrap_or_default()
 }
 
-/// The MSL type of a wire dtype.
 fn msl_type(dtype: u8) -> &'static str {
     match dtype {
         0 => "float",
@@ -200,9 +126,6 @@ fn msl_type(dtype: u8) -> &'static str {
     }
 }
 
-/// A typed load of element `index` of a value held at `ptr` as `own` bits,
-/// read as `want`: the runtime's `m1_load_*` with a literal dtype, which
-/// folds to one access.
 fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
     let load = match want {
         0 => "m1_load_f",
@@ -213,9 +136,6 @@ fn typed_load(want: u8, ptr: &str, index: &str, own: u8) -> String {
     format!("{load}({ptr}, {index}, {own}u)")
 }
 
-/// A value held in a register as the bits of its own dtype, read as `want`.
-/// The conversions are the ones `m1_load_*` perform on a memory read of the
-/// same dtype, so a register operand and a memory operand agree.
 fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
     let as_own = match own {
         0 => format!("as_type<float>({bits})"),
@@ -237,7 +157,6 @@ fn typed_from_bits(want: u8, bits: &str, own: u8) -> String {
     }
 }
 
-/// The bits of a typed register, for [`typed_from_bits`].
 fn bits_of(ty: u8, value: &str) -> String {
     match ty {
         0 => format!("as_type<uint>({value})"),
@@ -247,10 +166,6 @@ fn bits_of(ty: u8, value: &str) -> String {
     }
 }
 
-/// A direct element-independent op: code emitted with literal dtypes, in
-/// pieces the scheduler places — a `pre` run once per dispatch (the hoisted
-/// value bases and lengths), a `decl` of the typed `v_<node>`, a `compute`
-/// that assigns it for the element `i` in scope, and a `store` of it at `i`.
 struct DirectCode {
     pre: String,
     decl: String,
@@ -258,12 +173,6 @@ struct DirectCode {
     store: String,
 }
 
-/// A `Wide` step's body emitted directly for the element-independent ops
-/// whose tag and dtypes are known here — the runtime's own arithmetic,
-/// spelled with literal dtypes so every load and store folds to one typed
-/// access and no tag is switched on per element. An operand in `regs` is
-/// read from its register instead of memory. Everything else answers
-/// `None` and takes the generic `ptir_m1_execute_part`.
 #[allow(clippy::too_many_lines)]
 fn direct_wide(
     op: &OpView,
@@ -280,15 +189,9 @@ fn direct_wide(
     let d1 = dt(arg(1));
     let d2 = dt(arg(2));
     let dout = wire_dtype(value_types, base)?;
-    // The value bases, hoisted out of the loop: a store through `scratch`
-    // may alias `offsets[]` and `descriptors[]` for all the compiler knows,
-    // so a base spelled `scratch + offsets[k]` inside the loop is re-read
-    // after every store — a dependent load chain per element. Read once.
     let pa = |k: usize| format!("pa{k}_{node}");
     let po0 = format!("po0_{node}");
     let mut pre = String::new();
-    // `a0` always: a channel root reads its cell through it with no value
-    // operand at all.
     for (k, slot) in [&slots.a0, &slots.a1, &slots.a2].into_iter().enumerate() {
         if k == 0 || k < op.args.len() {
             let _ = writeln!(pre, "    const device uchar* {} = {slot};", pa(k));
@@ -297,8 +200,6 @@ fn direct_wide(
     let _ = writeln!(pre, "    device uchar* {po0} = {};", slots.o0);
     let n = format!("m4_n_{node}");
     let _ = writeln!(pre, "    const uint {n} = descriptors[{base}].len;");
-    // Operand `k` is read at `i` or, when it is a scalar, at 0 — `m1_pick`;
-    // decided once per dispatch. A register operand is a scalar already.
     let stride = |k: usize, pre: &mut String| -> String {
         let name = format!("s{k}_{node}");
         if let Some(value) = arg(k)
@@ -478,11 +379,6 @@ fn direct_wide(
             let _ = writeln!(compute, "{v} = {};", typed_from_bits(dout, "i", 2));
         }
         tags::BROADCAST => {
-            // Left-aligned broadcast. A scalar source reads element 0 for
-            // every output; anything else walks the runtime's index
-            // arithmetic per element — equal lengths do NOT mean identity
-            // here (`[V]` into `[1, V]` aligns `V` against `1` and reads 0
-            // throughout). Decided once per dispatch, uniformly.
             let d0 = d0?;
             let src = arg(0)?;
             if let Some(bits) = regs.get(&src) {
@@ -504,9 +400,6 @@ fn direct_wide(
             }
         }
         tags::GATHER => {
-            // `out[i] = src[idx[i]]` for a source of rank one (or a scalar),
-            // where the runtime's row-major walk has one element per index;
-            // an index out of range reads as zero, as the runtime answers.
             let (d0, d1) = (d0?, d1?);
             let src = arg(0)?;
             if value_types.get(src as usize).is_none_or(|ty| ty.dims.len() > 1) {
@@ -523,9 +416,7 @@ fn direct_wide(
             );
         }
         tags::RESHAPE | tags::CHAN_TAKE | tags::CHAN_READ => {
-            // A materialised copy, element `i` of `n`.
             if dout == 3 && op.tag != tags::RESHAPE {
-                // A packed-bool channel root unpacks bits; keep the runtime's walk.
                 return None;
             }
             let own = if op.tag == tags::RESHAPE { d0? } else { dout };
@@ -548,13 +439,8 @@ fn direct_wide(
     })
 }
 
-/// The step record the engine hands the kernel, one per dispatch. Spelled
-/// here and in `engine-metal`'s `program::launch`; `tests` below pin the
-/// text.
 pub const STEP_STRUCT: &str = "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n";
 
-/// The broadcast's source index for output element `i`: the runtime's walk,
-/// out of line so a loop that never takes the branch carries no array.
 const BROADCAST_INDEX: &str = r"
 inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uint i) {
   uint rem = i, source_index = 0;
@@ -573,24 +459,13 @@ inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uin
 }
 ";
 
-/// Most reductions one region may split into a partial pass and a prologue
-/// final: each needs a plane of `n / 8` bytes in `temporary`, which holds
-/// `widest × 16`.
 const MAX_SPLIT_REDUCTIONS: usize = 64;
 
-/// The `temporary` a pivot selection owns: the runtime's `M4_SEL_BYTES`.
 const SELECT_BYTES: usize = 16384;
 
-/// Rounds of up to 1024 candidates a pivot selection runs before the serial
-/// fallback: three cover 3072 kept tokens, past which the fallback's pick
-/// loop is the cost it always was.
 const SELECT_ROUNDS: usize = 3;
 
-/// What a node becomes, before scheduling.
 enum Plan {
-    /// A direct element-independent op (see [`direct_wide`]); `scalar` when
-    /// its result has one element by shape, `cross` the operands it reads at
-    /// an index other than its own (a broadcast's or gather's source).
     Direct {
         base: u32,
         len: Vec<Dimension>,
@@ -598,15 +473,11 @@ enum Plan {
         reads: Vec<u32>,
         cross: Vec<u32>,
     },
-    /// An intrinsic gather, strided over the grid; `single_row` when its
-    /// value's rows are one by shape, so its element mapping is the grid's.
     Gather {
         text: String,
         writes: u32,
         single_row: bool,
     },
-    /// An op through the runtime, strided by the grid. `cross` says its
-    /// reads may be at other indices than its own.
     Generic {
         text: String,
         reads: Vec<u32>,
@@ -614,19 +485,12 @@ enum Plan {
         len: Vec<Dimension>,
         cross: bool,
     },
-    /// A channel put through the runtime, plus its flag; `value` is what it
-    /// puts and `len` that value's length class.
     Put {
         text: String,
         value: u32,
         len: Vec<Dimension>,
     },
-    /// A stateful walk or a fused threadgroup pattern on one threadgroup.
     Single(String),
-    /// A pivot selection by rank or by mass (`pivot_threshold`, predicate
-    /// `rank_le` / `cummass_le`): rounds of a radix select over the grid,
-    /// each finished by one threadgroup walking the round's candidates in
-    /// the serial order, then a serial fallback for whatever is left.
     Select {
         node: u32,
         mode: u32,
@@ -635,16 +499,12 @@ enum Plan {
         o0: String,
         input: u32,
     },
-    /// A scatter: the base copied into the result as a grid pass, then the
-    /// read-modify-write over the indices on one threadgroup.
     Scatter {
         copy: String,
         rmw: String,
         base_len: Vec<Dimension>,
         result: u32,
     },
-    /// A fixed-tree reduction; `split` when it is over a single row of a
-    /// non-bool dtype and may take the partial/final form.
     Reduce {
         tag: u8,
         dtype: u8,
@@ -654,12 +514,9 @@ enum Plan {
         split: bool,
         two_level: String,
     },
-    /// The f32 argmax, partial and final, sized by `input`.
     Argmax { text: String, input: u32 },
 }
 
-/// A reduction whose partial pass has run and whose final is owed to the
-/// next prologue.
 struct PendingFinal {
     tag: u8,
     dtype: u8,
@@ -670,35 +527,22 @@ struct PendingFinal {
     result_ptr: String,
 }
 
-/// The dispatch being assembled.
 struct Open {
-    /// The value whose length sizes its grid.
     value: u32,
     kind: StepKind,
-    /// The length class of its wide passes; `None` while it holds only a
-    /// prologue.
     len: Option<Vec<Dimension>>,
-    /// Text of the passes so far.
     passes: String,
-    /// Every value a pass of this dispatch wrote, at the grid mapping.
     writes: BTreeSet<u32>,
-    /// Values the prologue wrote (thread 0 only, in memory; every thread in
-    /// a register).
     prologue_writes: BTreeSet<u32>,
-    /// Direct ops of the current loop, not yet closed into text.
     loop_members: Vec<(u32, u32)>,
     loop_len: Option<Vec<Dimension>>,
 }
 
-/// Everything the scheduler needs to spell a dispatch: the plan tables and
-/// the running register map.
 struct Scheduler<'a> {
     ops: &'a [OpView],
     value_types: &'a [SymbolicType],
     alias: &'a AliasTable,
     slots: BTreeMap<u32, Slots>,
-    /// Values held in registers by the open dispatch's prologue: value id →
-    /// the expression of its bits.
     regs: BTreeMap<u32, String>,
     cases: String,
     steps: Vec<u32>,
@@ -721,8 +565,6 @@ impl Scheduler<'_> {
         .expect("planned as direct")
     }
 
-    /// Close the running loop of the open dispatch into text: one strided
-    /// loop, each member guarded by its own length.
     fn close_loop(&mut self) {
         let Some(o) = self.open.as_mut() else { return };
         if o.loop_members.is_empty() {
@@ -754,7 +596,6 @@ impl Scheduler<'_> {
         o.passes.push_str("    }\n");
     }
 
-    /// Emit the open dispatch, if any, as one `case`.
     fn flush_open(&mut self) {
         self.close_loop();
         if let Some(o) = self.open.take() {
@@ -765,9 +606,6 @@ impl Scheduler<'_> {
         }
     }
 
-    /// The prologue of a new dispatch: the owed finals, then the owed
-    /// scalars, each computed by every thread and stored by thread 0; each
-    /// leaves its bits in a register.
     fn prologue(&mut self) -> (String, BTreeSet<u32>) {
         self.regs.clear();
         let mut text = String::new();
@@ -794,8 +632,6 @@ impl Scheduler<'_> {
         (text, writes)
     }
 
-    /// One scalar op as every thread computes it: its bits land in the
-    /// register `r_<value>`, thread 0 stores the value.
     fn scalar_inline(&mut self, node: u32, base: u32) -> String {
         let code = self.direct(node, base);
         let dout = wire_dtype(self.value_types, base).unwrap_or(0);
@@ -813,7 +649,6 @@ impl Scheduler<'_> {
         text
     }
 
-    /// Start a dispatch sized by `value`, with the owed prologue.
     fn begin(&mut self, value: u32, kind: StepKind, len: Option<Vec<Dimension>>) {
         let (passes, prologue_writes) = self.prologue();
         self.open = Some(Open {
@@ -828,8 +663,6 @@ impl Scheduler<'_> {
         });
     }
 
-    /// Owed finals and scalars with nothing to ride on run as a dispatch of
-    /// their own, on one threadgroup.
     fn flush_pending(&mut self) {
         self.flush_open();
         if self.pending_finals.is_empty() && self.pending_scalars.is_empty() {
@@ -849,9 +682,6 @@ impl Scheduler<'_> {
         self.steps.push(streamed_step(value, StepKind::Single));
     }
 
-    /// Whether `reads` names something the owed prologue will write: such a
-    /// pass reading memory would race thread 0's store, so the owed work runs
-    /// as its own dispatch first.
     fn reads_pending(&self, reads: &[u32]) -> bool {
         reads.iter().any(|v| {
             self.pending_finals.iter().any(|f| f.result == *v)
@@ -859,8 +689,6 @@ impl Scheduler<'_> {
         })
     }
 
-    /// Make sure a dispatch of length class `len` is open for a pass over
-    /// `value`, closing the current one when `fits` says it cannot take it.
     fn ensure_open(
         &mut self,
         value: u32,
@@ -881,9 +709,6 @@ impl Scheduler<'_> {
     }
 }
 
-/// The streamed kernel's opening: runtime, preamble, signature and the
-/// per-dispatch derivations every case relies on — lane, status, tables,
-/// channels, `m4_gtid` / `m4_gthreads`. Shared with the streamed top-k.
 pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);
@@ -906,13 +731,8 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
     source.push_str("    constant M4Step& step [[buffer(11)]],\n");
     source.push_str("    uint2 m4_group [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint2 m4_groups [[threadgroups_per_grid]],\n");
-    // Every grid attribute of a kernel must share one dimensionality, so the
-    // thread ones are `uint2` too and read through `.x`.
     source.push_str("    uint2 m4_tid [[thread_position_in_threadgroup]],\n");
     source.push_str("    uint2 m4_threads [[threads_per_threadgroup]],\n");
-    // The reductions fold a chunk across a SIMD group; the engine dispatches
-    // a power-of-two threadgroup of at least 32 on a device whose execution
-    // width is 32, or declines the form.
     source.push_str("    uint m4_simd_lane [[thread_index_in_simdgroup]],\n");
     source.push_str("    uint m4_simd_id [[simdgroup_index_in_threadgroup]]) {\n");
     source.push_str("  const uint m3_tid = m4_tid.x;\n");
@@ -922,7 +742,6 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
         "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
     );
     source.push_str(extra);
-    // The lane is the grid's second axis; the first is element blocks.
     source.push_str("  const uint dispatch_lane = m4_group.y;\n");
     source.push_str("  if (dispatch_lane >= layout->lane_count) return;\n");
     source.push_str("  const uint lane_index = lane_indices[dispatch_lane];\n");
@@ -945,8 +764,6 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
         "  device M1Status* status = \
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
-    // A faulted lane stops at the next dispatch; every thread of every
-    // group sees the same word, so the return is uniform.
     source.push_str("  if (status->state != 1) return;\n");
     let _ = writeln!(
         source,
@@ -982,8 +799,6 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
             source,
             "  const uint pending_index_{channel} = lane.channel_slot_offset + dense_{channel};"
         );
-        // Re-derived every dispatch: a put in an earlier step set the flag,
-        // and this step reads the cell it points at.
         let _ = writeln!(
             source,
             "  const device uchar* current_{channel} = reinterpret_cast<const device uchar*>(\
@@ -1002,12 +817,6 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
     source
 }
 
-/// One fused region as a streamed kernel, and its dispatch table.
-///
-/// # Errors
-///
-/// The grouped form's refusals: an intrinsic the lane record cannot bind, a
-/// library region whose ABI does not hold, a node outside the stage.
 #[allow(clippy::too_many_lines)]
 pub fn emit_streamed_region(
     function_name: &str,
@@ -1035,8 +844,6 @@ pub fn emit_streamed_region(
     };
     let mut source = kernel_head(function_name, channel_count, extra);
 
-    // The same view/alias decisions as the grouped emitter, so the two forms
-    // read the same values at the same offsets.
     let escapes = crate::codegen::alias::escaping_values(region);
     let covers =
         |source: u32, result: u32| crate::codegen::alias::covers(value_types, source, result);
@@ -1088,6 +895,8 @@ pub fn emit_streamed_region(
                 && ops.get(n).is_some_and(|p| {
                     p.tag == tags::INTRINSIC_VAL
                         && (p.intr == intrinsic_tags::LOGITS
+                            || p.intr == intrinsic_tags::VELOCITY
+                            || p.intr == intrinsic_tags::HIDDEN
                             || p.intr == intrinsic_tags::MTP_LOGITS)
                 })
         });
@@ -1105,7 +914,6 @@ pub fn emit_streamed_region(
     };
     let key_of = |value: u32| length_key(value_types, value);
 
-    // ── Planning: what each node is.
     let mut planned: Vec<(u32, Plan)> = Vec::new();
     let mut planned_slots: BTreeMap<u32, Slots> = BTreeMap::new();
     for &node in &region.nodes {
@@ -1133,8 +941,6 @@ pub fn emit_streamed_region(
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
         let mut reads: Vec<u32> = op.args.iter().map(|&a| alias.resolve(a)).collect();
-        // A pivot's threshold is a value too, carried as its predicate
-        // payload rather than an operand; the scheduler must see it read.
         if op.tag == tags::PIVOT_THRESHOLD {
             reads.push(alias.resolve(op.pred_payload));
         }
@@ -1148,7 +954,13 @@ pub fn emit_streamed_region(
                 intrinsic_tags::ATTN_SCORE => {
                     emit_score_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
                 }
-                intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS => {
+                intrinsic_tags::PIXELS => {
+                    emit_pixels_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
+                }
+                intrinsic_tags::LOGITS
+                | intrinsic_tags::VELOCITY
+                | intrinsic_tags::HIDDEN
+                | intrinsic_tags::MTP_LOGITS => {
                     emit_logits_gather(
                         &mut body,
                         base,
@@ -1159,8 +971,6 @@ pub fn emit_streamed_region(
                     );
                 }
                 _ => {
-                    // See the grouped emitter: `logits` is typed `bfloat*` for
-                    // the gathers above and the runtime takes `uchar*`.
                     slots.a0 = "reinterpret_cast<const device uchar*>(logits)".to_string();
                     let text = format!(
                         "    ptir_m1_execute_part({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary, m4_gtid, m4_gthreads);\n",
@@ -1252,9 +1062,6 @@ pub fn emit_streamed_region(
                         reads,
                     }
                 } else {
-                    // The runtime's strided ops read their operands at their
-                    // own index or at 0, except the ones that follow indices
-                    // or walk a row.
                     let same_index = (tags::EXP..=tags::SELECT).contains(&op.tag)
                         || matches!(
                             op.tag,
@@ -1293,10 +1100,6 @@ pub fn emit_streamed_region(
             StepKind::Reduce => {
                 let input = reads.first().copied().unwrap_or(base);
                 let dtype = wire_dtype(value_types, input).unwrap_or(3);
-                // The shape class is the operand's as written, not its
-                // alias's: `reduce(reshape(logits[rows, V], [V]))` reads the
-                // gather's bytes, and the reshape is the program's own
-                // statement that they are one row.
                 let len = key_of(op.args.first().copied().unwrap_or(input));
                 let two_level = format!(
                     "    m4_reduce_two_levels({}u, {}, {}, temporary, descriptors[lane_params[{node}].a0], step.level, m4_group.x, m3_tid, m3_threads, m3_tgbuf, m4_simd_lane, m4_simd_id);\n",
@@ -1325,8 +1128,6 @@ pub fn emit_streamed_region(
         planned.push((node_u32, plan));
     }
 
-    // `temporary` is carved: a 16 KiB area per pivot selection first, then
-    // a plane per reduction that may split.
     let select_count = planned
         .iter()
         .filter(|(_, plan)| matches!(plan, Plan::Select { .. }))
@@ -1344,7 +1145,6 @@ pub fn emit_streamed_region(
         );
     }
 
-    // ── Scheduling: nodes into dispatches.
     let mut sched = Scheduler {
         ops: &ops,
         value_types,
@@ -1369,12 +1169,6 @@ pub fn emit_streamed_region(
                 cross,
                 ..
             } => {
-                // A scalar is computed by every thread and stored by thread 0.
-                // Its operands are scalars: registers, or memory written by
-                // earlier dispatches. In an open dispatch it can run between
-                // the passes as long as none of them wrote an operand at the
-                // grid mapping (another thread's store); otherwise it waits
-                // for the next prologue and the open dispatch closes.
                 let wrote = sched
                     .open
                     .as_ref()
@@ -1404,13 +1198,10 @@ pub fn emit_streamed_region(
                 sched.ensure_open(*base, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len)
                         && !cross.iter().any(|v| o.writes.contains(v))
-                        // A register operand is read from the register; a
-                        // prologue value read from memory would race thread 0.
                         && !reads
                             .iter()
                             .any(|v| o.prologue_writes.contains(v) && !regs.contains_key(v))
                 });
-                // Same length as the running loop: join it; else a new loop.
                 if sched
                     .open
                     .as_ref()
@@ -1430,10 +1221,6 @@ pub fn emit_streamed_region(
                 writes,
                 single_row,
             } => {
-                // A gather reads the lane's logits, never a value; it opens a
-                // dispatch or joins one of its length class. A multi-row
-                // gather's element mapping is per row, not the grid's, so
-                // nothing may read it in the same dispatch.
                 let len = key_of(*writes);
                 sched.ensure_open(*writes, StepKind::Wide, &len, |o| {
                     o.len.as_ref().is_none_or(|l| *l == len)
@@ -1454,8 +1241,6 @@ pub fn emit_streamed_region(
                 len,
                 cross,
             } => {
-                // The runtime reads its operands from memory: never in the
-                // dispatch whose prologue writes one of them.
                 if sched.open.is_none() && sched.reads_pending(reads) {
                     sched.flush_pending();
                 }
@@ -1470,8 +1255,6 @@ pub fn emit_streamed_region(
                 o.writes.insert(*writes);
             }
             Plan::Put { text, value, len } => {
-                // A put copies its value at the grid mapping — a scalar by
-                // thread 0, which is the thread that wrote it in a prologue.
                 sched.ensure_open(*value, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len || len.is_empty())
                 });
@@ -1489,10 +1272,6 @@ pub fn emit_streamed_region(
                 two_level,
             } => {
                 if *split && planes_used < split_count {
-                    // Level 0 as a pass: in the open dispatch when it holds
-                    // the input's length class (the producer wrote every
-                    // element at the grid mapping), else opening one sized
-                    // by the input. It reads the input from memory.
                     if sched.open.is_none() && sched.reads_pending(&[*input]) {
                         sched.flush_pending();
                     }
@@ -1512,8 +1291,6 @@ pub fn emit_streamed_region(
                         o.passes,
                         "    m4_reduce_partial({tag}u, {dtype}u, {input_ptr}, reinterpret_cast<device uint*>(m4_planes + {plane}u * m4_plane_bytes), descriptors[{input}].len, m4_gtid, m4_gthreads, m4_simd_lane);"
                     );
-                    // The final belongs to the next dispatch's prologue, so
-                    // this one is complete.
                     sched.flush_open();
                     sched.pending_finals.push(PendingFinal {
                         tag: *tag,
@@ -1587,9 +1364,6 @@ pub fn emit_streamed_region(
                 base_len,
                 result,
             } => {
-                // The copy reads the base at its own index: a pass of the open
-                // dispatch, or one of its own. The read-modify-write then needs
-                // the whole copy in place, so it is a dispatch of one group.
                 sched.ensure_open(*result, StepKind::Wide, base_len, |o| {
                     o.len.as_ref().is_none_or(|l| l == base_len)
                 });
@@ -1619,7 +1393,6 @@ pub fn emit_streamed_region(
             }
         }
     }
-    // The tail: whatever is still open or owed.
     sched.flush_pending();
 
     source.push_str("  switch (step.index) {\n");
@@ -1632,6 +1405,13 @@ pub fn emit_streamed_region(
 mod tests {
     use super::*;
 
+    fn streamed_every_case() {
+        the_tree_has_the_levels_the_runtime_walks();
+        a_step_round_trips();
+        the_walks_with_state_stay_on_one_threadgroup();
+        a_register_reads_as_a_memory_load_would();
+    }
+
     #[test]
     fn the_tree_has_the_levels_the_runtime_walks() {
         assert_eq!(reduce_levels(0), 1);
@@ -1643,7 +1423,6 @@ mod tests {
         assert_eq!(reduce_levels(248_320), 4);
     }
 
-    #[test]
     fn a_step_round_trips() {
         let step = streamed_step(41, StepKind::Reduce);
         assert_eq!(step_value(step), 41);
@@ -1655,7 +1434,6 @@ mod tests {
         assert_eq!(step_kind(0xFF), None);
     }
 
-    #[test]
     fn the_walks_with_state_stay_on_one_threadgroup() {
         assert_eq!(op_step_kind(tags::EXP, 0, false), StepKind::Wide);
         assert_eq!(op_step_kind(tags::CUMSUM, 0, false), StepKind::Single);
@@ -1672,13 +1450,9 @@ mod tests {
         assert_eq!(op_step_kind(tags::REDUCE_ARGMAX, 0, false), StepKind::Single);
     }
 
-    #[test]
     fn a_register_reads_as_a_memory_load_would() {
-        // f32 bits read as f32: a reinterpretation, no conversion.
         assert_eq!(typed_from_bits(0, "r", 0), "as_type<float>(r)");
-        // A bool register read as f32 is 1.0 or 0.0, as `m1_load_f` answers.
         assert_eq!(typed_from_bits(0, "r", 3), "(((r) != 0u) ? 1.0f : 0.0f)");
-        // An int register read as f32 converts.
         assert_eq!(typed_from_bits(0, "r", 1), "float(int(r))");
     }
 }

@@ -1,12 +1,3 @@
-//! Host shadow of an instance's committed channel state — the value oracle
-//! behind evaluated fire geometry and canonical-KV evidence. Mirrors, per
-//! bound pass, what each channel's committed cells hold: seeds at bind, then
-//! per fire the net effect of folding the trace's stage programs through
-//! [`eta_compiler::eval::pareval`] (a device-decided value shadows as
-//! *unknown* rather than a wrong guess). Ring semantics mirror the tier-0
-//! interpreter's pass overlay: within one pass a channel is a register, and
-//! the pass commits at most one net take and one net put per channel.
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -20,29 +11,15 @@ use eta_ir::validate::BoundTrace;
 use crate::pipeline::channel::{BoundCells, staged_put_bytes};
 use crate::pipeline::instance::ChannelSeed;
 
-/// One entry of a [`ShadowPlan`]'s per-pass phase order.
 #[derive(Debug, Clone)]
 pub enum Phase {
-    /// Fold this stage against the fire's values.
     Fold(Stage),
-    /// Commit these channels unknown without folding: every put the stage
-    /// makes is statically device-decided, so the fold's only consumed
-    /// output (`fold.puts`) is `Err` for all of them on every fire.
     Unknown(Vec<u32>),
 }
 
-/// The per-pass fold schedule and net-take set of a bound trace. Both are
-/// functions of the trace alone, so this is derived once per
-/// [`crate::pipeline::program::RegisteredProgram`] and shared by every
-/// instance of it.
 #[derive(Debug, Default)]
 pub struct ShadowPlan {
-    /// Channels the trace net-takes each pass: any stage `ChanTake` plus
-    /// consuming descriptor ports bound to channels.
     taken_per_pass: BTreeSet<u32>,
-    /// [`HostShadow::advance`]'s phase order with the channel-inert stages
-    /// dropped and the statically device-decided ones demoted to
-    /// [`Phase::Unknown`].
     phases: Vec<Phase>,
 }
 
@@ -64,10 +41,6 @@ impl ShadowPlan {
             }
         }
 
-        // Two exact reductions, both read off immutable IR: (1) a stage with
-        // no ChanPut is dropped, since it cannot change `pending`; (2) a
-        // stage whose puts are all statically device-decided commits them
-        // Unknown directly instead of folding.
         let device_decided = eta_compiler::eval::pareval::geometry_taint(bound).device_decided;
         let phase_of = |stage: Stage| -> Option<Phase> {
             let mut puts: Vec<u32> = Vec::new();
@@ -116,8 +89,6 @@ impl ShadowPlan {
     }
 }
 
-/// The per-pass host mirror of committed channel cells. `None` cells are
-/// committed-but-unknown (device-decided).
 #[derive(Debug, Default)]
 pub struct HostShadow {
     queues: BTreeMap<u32, VecDeque<Option<Value>>>,
@@ -143,7 +114,6 @@ impl HostShadow {
         HostShadow { queues, plan }
     }
 
-    /// The committed front value of `chan`, if host-known.
     fn front(&self, chan: u32) -> Option<Value> {
         self.queues
             .get(&chan)
@@ -151,8 +121,6 @@ impl HostShadow {
             .flatten()
     }
 
-    /// The value channel `chan` presents to the NEXT fire: the Writer put
-    /// staged for it, else the shadow's committed front.
     pub fn fire_value(&self, bound: &BoundTrace, cells: &BoundCells, chan: u32) -> Option<Value> {
         if let Some(cell) = cells.get(chan as usize)
             && let Some(bytes) = staged_put_bytes(cell)
@@ -175,15 +143,8 @@ impl HostShadow {
         self.front(chan)
     }
 
-    /// Advance the shadow by one committed pass: fold every stage program in
-    /// the interpreter's phase order over the fire's values, then commit the
-    /// net takes and puts. Device-decided puts commit as unknown cells.
     pub fn advance(&mut self, bound: &BoundTrace, cells: &BoundCells) {
-        // Cross-stage pass overlay: pending puts (Ok = known value, Err =
-        // committed-but-unknown), visible to later stages' reads.
         let mut pending: BTreeMap<u32, Result<Value, EvalBlocker>> = BTreeMap::new();
-        // Indexed so the shared plan stays borrowed immutably alongside the
-        // `known` closure's `&self` read of the shadow.
         let plan = Arc::clone(&self.plan);
         for phase in &plan.phases {
             let stage = match phase {
@@ -205,9 +166,6 @@ impl HostShadow {
             };
             match fold {
                 Ok(fold) => pending.extend(fold.puts),
-                // A fold fault means the trace faulted under evaluation; the
-                // fire itself will surface it — shadow everything this pass
-                // touches as unknown.
                 Err(blocker) => {
                     for program in bound
                         .container
@@ -228,7 +186,6 @@ impl HostShadow {
             if let Some(queue) = self.queues.get_mut(&chan) {
                 queue.pop_front();
             }
-            // A taken Writer channel consumed this fire's ring entry.
             if let Some(cell) = cells.get(chan as usize) {
                 crate::pipeline::channel::consume_writer_host_copy(cell);
             }
@@ -340,9 +297,6 @@ mod tests {
         eta_ir::validate::bind(container, profile).unwrap()
     }
 
-    /// The trace the tests above and below share: an epilogue that takes the
-    /// mask channel and puts a value back, so the mask is the only channel
-    /// whose per-fire derivability is in question.
     fn device_put_trace() -> eta_ir::validate::BoundTrace {
         trace(vec![
             Op::IntrinsicVal {
@@ -354,6 +308,11 @@ mod tests {
             Op::ChanTake(2),
             Op::ChanPut { chan: 2, value: 1 },
         ])
+    }
+
+    fn shadow_every_case() {
+        seeded_mask_becomes_device_derived_after_epilogue_put();
+        a_host_derivable_put_is_still_folded();
     }
 
     #[test]
@@ -398,11 +357,7 @@ mod tests {
         );
     }
 
-    #[test]
     fn a_host_derivable_put_is_still_folded() {
-        // The same trace with the sampler taken out of the put's slice: the
-        // epilogue now copies the mask channel back to itself, which the host
-        // derives on every fire from the shadow's own front cell.
         let bound = trace(vec![Op::ChanTake(2), Op::ChanPut { chan: 2, value: 0 }]);
         let plan = ShadowPlan::derive(&bound);
         assert!(

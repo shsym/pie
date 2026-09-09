@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef VEC_DTYPES_CUH_
 #define VEC_DTYPES_CUH_
 
@@ -63,7 +63,7 @@ __device__ __forceinline__ int4 ld_global_volatile(int4* addr) {
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 < 120200) && \
     (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
-// CUDA version < 12.2 and GPU architecture < 80
+
 FLASHINFER_INLINE __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __nv_bfloat16 y) {
   __nv_bfloat162 t;
   t.x = x;
@@ -75,7 +75,7 @@ FLASHINFER_INLINE __nv_bfloat16 __hmul(const __nv_bfloat16 a, const __nv_bfloat1
   __nv_bfloat16 val;
   const float fa = __bfloat162float(a);
   const float fb = __bfloat162float(b);
-  // avoid ftz in device code
+
   val = __float2bfloat16(__fmaf_ieee_rn(fa, fb, -0.0f));
   return val;
 }
@@ -106,7 +106,6 @@ FLASHINFER_INLINE float2 __bfloat1622float2(const __nv_bfloat162 a) {
 }
 #endif
 
-/******************* vec_t type cast *******************/
 
 template <typename dst_t, typename src_t>
 struct vec_cast {
@@ -207,14 +206,13 @@ constexpr FLASHINFER_INLINE int get_mantissa_bits() {
   }
 }
 
-/*!
- * \brief Fallback to software fast dequant implementation if hardware dequantization is not
- * available.
- * \note Inspired by Marlin's fast dequantization, but here we don't have to permute
- * weights order.
- * \ref
- * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
- */
+
+
+
+
+
+
+
 template <typename fp8_dtype, typename fp16_dtype>
 __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
   uint32_t q = *input;
@@ -227,29 +225,27 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
     constexpr int FP16_EXPONENT = get_exponent_bits<fp16_dtype>();
 
     constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
-    // Calculate MASK for extracting mantissa and exponent
+
     constexpr int MASK1 = 0x80000000;
     constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
     constexpr int MASK3 = MASK2 & 0x7fffffff;
     constexpr int MASK = MASK3 | (MASK3 >> 16);
     q = __byte_perm(q, q, 0x1302);
 
-    // Extract and shift FP8 values to FP16 format
     uint32_t Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
     uint32_t Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
 
     constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
-    // Construct and apply exponent bias
+
     if constexpr (std::is_same_v<fp16_dtype, half>) {
       const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
 
-      // Convert to half2 and apply bias
       *(half2*)&(output->x) = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
       *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
     } else {
       constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
       const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
-      // Convert to bfloat162 and apply bias
+
       *(nv_bfloat162*)&(output->x) =
           __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
       *(nv_bfloat162*)&(output->y) =
@@ -319,7 +315,7 @@ struct vec_cast<__nv_fp8_e4m3, half> {
     for (size_t i = 0; i < vec_size; ++i) {
       dst[i] = __nv_fp8_e4m3(src[i]);
     }
-#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
   }
 };
 
@@ -344,7 +340,7 @@ struct vec_cast<__nv_fp8_e5m2, half> {
     for (size_t i = 0; i < vec_size; ++i) {
       dst[i] = __nv_fp8_e5m2(src[i]);
     }
-#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
   }
 };
 
@@ -377,7 +373,7 @@ struct vec_cast<half, __nv_fp8_e4m3> {
         fast_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
       }
     }
-#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
   }
 };
 
@@ -410,16 +406,12 @@ struct vec_cast<half, __nv_fp8_e5m2> {
         fast_dequant_f8f16x4<__nv_fp8_e5m2, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
       }
     }
-#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
   }
 };
 
 #if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
-// Convert __nv_fp4x2_e2m1 (2 fp4 values per byte) to fp16.
-// vec_size counts fp16 output elements; src has stride-2 layout:
-//   src[0] holds x0,x1  src[1] is padding
-//   src[2] holds x2,x3  src[3] is padding  ... etc.
-// Each valid byte encodes 2 fp4 values -> 2 fp16 via cvt.rn.f16x2.e2m1x2.
+
 template <>
 struct vec_cast<half, __nv_fp4x2_e2m1> {
   template <size_t vec_size>
@@ -429,7 +421,7 @@ struct vec_cast<half, __nv_fp4x2_e2m1> {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
       uint32_t y;
-      // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
+
       uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
       asm volatile(
           "{\n"
@@ -442,26 +434,24 @@ struct vec_cast<half, __nv_fp4x2_e2m1> {
       reinterpret_cast<uint32_t*>(dst)[i] = y;
     }
 #else
-    // Software LUT fallback for arch < SM100.
-    // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
-    // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
+
     constexpr uint16_t lut[16] = {
-        0x0000,  // +0.0
-        0x3800,  // +0.5
-        0x3C00,  // +1.0
-        0x3E00,  // +1.5
-        0x4000,  // +2.0
-        0x4200,  // +3.0
-        0x4400,  // +4.0
-        0x4600,  // +6.0
-        0x8000,  // -0.0
-        0xB800,  // -0.5
-        0xBC00,  // -1.0
-        0xBE00,  // -1.5
-        0xC000,  // -2.0
-        0xC200,  // -3.0
-        0xC400,  // -4.0
-        0xC600,  // -6.0
+        0x0000,
+        0x3800,
+        0x3C00,
+        0x3E00,
+        0x4000,
+        0x4200,
+        0x4400,
+        0x4600,
+        0x8000,
+        0xB800,
+        0xBC00,
+        0xBE00,
+        0xC000,
+        0xC200,
+        0xC400,
+        0xC600,
     };
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
@@ -481,11 +471,11 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
       uint32_t y;
-      // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
+
       uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
 #if (defined __CUDACC_VER_MAJOR__) && (defined __CUDACC_VER_MINOR__) && \
     ((__CUDACC_VER_MAJOR__ > 13) || ((__CUDACC_VER_MAJOR__ == 13) && (__CUDACC_VER_MINOR__ >= 2)))
-      // cvt.rn.bf16x2.e2m1x2 requires CUDA Toolkit >= 13.2
+
       asm volatile(
           "{\n"
           ".reg .b8 fp4_byte;\n"
@@ -495,7 +485,7 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
           : "=r"(y)
           : "r"(b));
 #else
-      // Fallback: convert e2m1 -> fp16 -> bf16 when cvt.rn.bf16x2.e2m1x2 is unavailable
+
       uint32_t fp16x2;
       asm volatile(
           "{\n"
@@ -512,26 +502,24 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
       reinterpret_cast<uint32_t*>(dst)[i] = y;
     }
 #else
-    // Software LUT fallback for arch < SM100.
-    // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
-    // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
+
     constexpr uint16_t lut[16] = {
-        0x0000,  // +0.0
-        0x3F00,  // +0.5
-        0x3F80,  // +1.0
-        0x3FC0,  // +1.5
-        0x4000,  // +2.0
-        0x4040,  // +3.0
-        0x4080,  // +4.0
-        0x40C0,  // +6.0
-        0x8000,  // -0.0
-        0xBF00,  // -0.5
-        0xBF80,  // -1.0
-        0xBFC0,  // -1.5
-        0xC000,  // -2.0
-        0xC040,  // -3.0
-        0xC080,  // -4.0
-        0xC0C0,  // -6.0
+        0x0000,
+        0x3F00,
+        0x3F80,
+        0x3FC0,
+        0x4000,
+        0x4040,
+        0x4080,
+        0x40C0,
+        0x8000,
+        0xBF00,
+        0xBF80,
+        0xBFC0,
+        0xC000,
+        0xC040,
+        0xC080,
+        0xC0C0,
     };
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
@@ -543,7 +531,7 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
   }
 };
 
-#endif  // FLASHINFER_ENABLE_FP4_E2M1 && CUDA_VERSION >= 12080
+#endif
 
 template <>
 struct vec_cast<float, nv_bfloat16> {
@@ -627,9 +615,7 @@ FLASHINFER_INLINE void cast_store_impl(tgt_float_t* dst_ptr,
   }
 }
 
-/******************* vec_t<__nv_fp8_e4m3> *******************/
 
-// __nv_fp8_e4m3 x 1
 template <>
 struct vec_t<__nv_fp8_e4m3, 1> {
   __nv_fp8_e4m3 data;
@@ -669,7 +655,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 1>::memcpy(__nv_fp8_e4m3* dst,
   *dst = *src;
 }
 
-// __nv_fp8_e4m3 x 2
 template <>
 struct vec_t<__nv_fp8_e4m3, 2> {
   __nv_fp8x2_e4m3 data;
@@ -714,7 +699,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 2>::memcpy(__nv_fp8_e4m3* dst,
   *((__nv_fp8x2_e4m3*)dst) = *((__nv_fp8x2_e4m3*)src);
 }
 
-// __nv_fp8_e4m3 x 4
 
 template <>
 struct vec_t<__nv_fp8_e4m3, 4> {
@@ -762,7 +746,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 4>::memcpy(__nv_fp8_e4m3* dst,
   *((__nv_fp8x4_e4m3*)dst) = *((__nv_fp8x4_e4m3*)src);
 }
 
-// __nv_fp8_e4m3 x 8
 
 template <>
 struct vec_t<__nv_fp8_e4m3, 8> {
@@ -814,7 +797,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 8>::memcpy(__nv_fp8_e4m3* dst,
   *((uint2*)dst) = *((uint2*)src);
 }
 
-// __nv_fp8_e4m3 x 16 or more
 template <size_t vec_size>
 struct vec_t<__nv_fp8_e4m3, vec_size> {
   static_assert(vec_size % 16 == 0, "Invalid vector size");
@@ -899,9 +881,7 @@ struct vec_t<__nv_fp8_e4m3, vec_size> {
   }
 };
 
-/******************* vec_t<__nv_fp8_e5m2> *******************/
 
-// __nv_fp8_e5m2 x 1
 template <>
 struct vec_t<__nv_fp8_e5m2, 1> {
   __nv_fp8_e5m2 data;
@@ -941,7 +921,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 1>::memcpy(__nv_fp8_e5m2* dst,
   *dst = *src;
 }
 
-// __nv_fp8_e5m2 x 2
 template <>
 struct vec_t<__nv_fp8_e5m2, 2> {
   __nv_fp8x2_e5m2 data;
@@ -987,7 +966,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 2>::memcpy(__nv_fp8_e5m2* dst,
   *((__nv_fp8x2_e5m2*)dst) = *((__nv_fp8x2_e5m2*)src);
 }
 
-// __nv_fp8_e5m2 x 4
 
 template <>
 struct vec_t<__nv_fp8_e5m2, 4> {
@@ -1035,7 +1013,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 4>::memcpy(__nv_fp8_e5m2* dst,
   *((__nv_fp8x4_e5m2*)dst) = *((__nv_fp8x4_e5m2*)src);
 }
 
-// __nv_fp8_e5m2 x 8
 
 template <>
 struct vec_t<__nv_fp8_e5m2, 8> {
@@ -1086,7 +1063,6 @@ FLASHINFER_INLINE void vec_t<__nv_fp8_e5m2, 8>::memcpy(__nv_fp8_e5m2* dst,
   *((uint2*)dst) = *((uint2*)src);
 }
 
-// __nv_fp8_e5m2 x 16 or more
 
 template <size_t vec_size>
 struct vec_t<__nv_fp8_e5m2, vec_size> {
@@ -1172,13 +1148,12 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
 };
 
 #if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
-/******************* vec_t<__nv_fp4_e2m1> *******************/
 
-// __nv_fp4_e2m1 x 2
+
 template <>
 struct vec_t<__nv_fp4_e2m1, 2> {
   uint8_t data;
-  // index access is not supported for sub-byte data type
+
   FLASHINFER_INLINE __nv_fp4_e2m1* ptr() { return reinterpret_cast<__nv_fp4_e2m1*>(&data); }
   FLASHINFER_INLINE void fill(__nv_fp4_e2m1 val) {
     data = (__nv_fp4x2_storage_t(val.__x) << 4) | __nv_fp4x2_storage_t(val.__x);
@@ -1202,7 +1177,6 @@ struct vec_t<__nv_fp4_e2m1, 2> {
   }
 };
 
-// __nv_fp4_e2m1 x 4
 template <>
 struct vec_t<__nv_fp4_e2m1, 4> {
   uint16_t data;
@@ -1232,7 +1206,6 @@ struct vec_t<__nv_fp4_e2m1, 4> {
   }
 };
 
-// __nv_fp4_e2m1 x 8
 template <>
 struct vec_t<__nv_fp4_e2m1, 8> {
   uint32_t data;
@@ -1294,7 +1267,6 @@ struct vec_t<__nv_fp4_e2m1, 16> {
   }
 };
 
-// __nv_fp4_e2m1 x 32 or more
 template <size_t vec_size>
 struct vec_t<__nv_fp4_e2m1, vec_size> {
   static_assert(vec_size % 32 == 0, "Invalid vector size");
@@ -1370,11 +1342,9 @@ struct vec_t<__nv_fp4_e2m1, vec_size> {
   }
 };
 
-#endif  // FLASHINFER_ENABLE_FP4_E2M1 && CUDA_VERSION >= 12080
+#endif
 
-/******************* vec_t<half> *******************/
 
-// half x 1
 template <>
 struct vec_t<half, 1> {
   half data;
@@ -1409,7 +1379,6 @@ FLASHINFER_INLINE void vec_t<half, 1>::store(half* ptr) const { *ptr = data; }
 
 FLASHINFER_INLINE void vec_t<half, 1>::memcpy(half* dst, const half* src) { *dst = *src; }
 
-// half x 2
 template <>
 struct vec_t<half, 2> {
   half2 data;
@@ -1446,7 +1415,6 @@ FLASHINFER_INLINE void vec_t<half, 2>::memcpy(half* dst, const half* src) {
   *((half2*)dst) = *((half2*)src);
 }
 
-// half x 4
 
 template <>
 struct vec_t<half, 4> {
@@ -1486,7 +1454,6 @@ FLASHINFER_INLINE void vec_t<half, 4>::memcpy(half* dst, const half* src) {
   *((uint2*)dst) = *((uint2*)src);
 }
 
-// half x 8 or more
 
 template <size_t vec_size>
 struct vec_t<half, vec_size> {
@@ -1561,9 +1528,7 @@ struct vec_t<half, vec_size> {
   }
 };
 
-/******************* vec_t<nv_bfloat16> *******************/
 
-// nv_bfloat16 x 1
 template <>
 struct vec_t<nv_bfloat16, 1> {
   nv_bfloat16 data;
@@ -1600,7 +1565,6 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::memcpy(nv_bfloat16* dst, const nv_
   *dst = *src;
 }
 
-// nv_bfloat16 x 2
 template <>
 struct vec_t<nv_bfloat16, 2> {
   nv_bfloat162 data;
@@ -1644,7 +1608,6 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 2>::memcpy(nv_bfloat16* dst, const nv_
   *((nv_bfloat162*)dst) = *((nv_bfloat162*)src);
 }
 
-// nv_bfloat16 x 4
 
 template <>
 struct vec_t<nv_bfloat16, 4> {
@@ -1690,7 +1653,6 @@ FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::memcpy(nv_bfloat16* dst, const nv_
   *((uint2*)dst) = *((uint2*)src);
 }
 
-// nv_bfloat16 x 8 or more
 
 template <size_t vec_size>
 struct vec_t<nv_bfloat16, vec_size> {
@@ -1767,9 +1729,7 @@ struct vec_t<nv_bfloat16, vec_size> {
   }
 };
 
-/******************* vec_t<uint8_t> *******************/
 
-// uint8_t x 1
 template <>
 struct vec_t<uint8_t, 1> {
   uint8_t data;
@@ -1806,7 +1766,6 @@ FLASHINFER_INLINE void vec_t<uint8_t, 1>::store(uint8_t* ptr) const { *ptr = dat
 
 FLASHINFER_INLINE void vec_t<uint8_t, 1>::memcpy(uint8_t* dst, const uint8_t* src) { *dst = *src; }
 
-// uint8_t x 2
 template <>
 struct vec_t<uint8_t, 2> {
   uint16_t data;
@@ -1847,7 +1806,6 @@ FLASHINFER_INLINE void vec_t<uint8_t, 2>::memcpy(uint8_t* dst, const uint8_t* sr
   *((uint16_t*)dst) = *((uint16_t*)src);
 }
 
-// uint8_t x 4
 
 template <>
 struct vec_t<uint8_t, 4> {
@@ -1889,7 +1847,6 @@ FLASHINFER_INLINE void vec_t<uint8_t, 4>::memcpy(uint8_t* dst, const uint8_t* sr
   *((uint32_t*)dst) = *((uint32_t*)src);
 }
 
-// uint8_t x 8
 
 template <>
 struct vec_t<uint8_t, 8> {
@@ -1933,7 +1890,6 @@ FLASHINFER_INLINE void vec_t<uint8_t, 8>::memcpy(uint8_t* dst, const uint8_t* sr
   *((uint2*)dst) = *((uint2*)src);
 }
 
-// uint8_t x 16 or more
 
 template <size_t vec_size>
 struct vec_t<uint8_t, vec_size> {
@@ -2010,9 +1966,7 @@ struct vec_t<uint8_t, vec_size> {
   }
 };
 
-/******************* vec_t<float> *******************/
 
-// float x 1
 
 template <>
 struct vec_t<float, 1> {
@@ -2047,7 +2001,6 @@ FLASHINFER_INLINE void vec_t<float, 1>::store(float* ptr) const { *ptr = data; }
 
 FLASHINFER_INLINE void vec_t<float, 1>::memcpy(float* dst, const float* src) { *dst = *src; }
 
-// float x 2
 
 template <>
 struct vec_t<float, 2> {
@@ -2084,7 +2037,6 @@ FLASHINFER_INLINE void vec_t<float, 2>::memcpy(float* dst, const float* src) {
   *((float2*)dst) = *((float2*)src);
 }
 
-// float x 4 or more
 template <size_t vec_size>
 struct vec_t<float, vec_size> {
   static_assert(vec_size % 4 == 0, "Invalid vector size");
@@ -2189,6 +2141,6 @@ FLASHINFER_INLINE vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int 
   return ((vec2_dtype_t<T>*)&(vec[0]))[i];
 }
 
-}  // namespace flashinfer
+}
 
-#endif  // VEC_DTYPES_CUH_
+#endif

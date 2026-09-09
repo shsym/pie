@@ -1,8 +1,3 @@
-//! OpenTelemetry telemetry module for Pie runtime.
-//!
-//! This module provides OTLP tracing and metrics export to SigNoz.
-//! Telemetry is controlled via the `[telemetry]` section in pie config.
-
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
@@ -16,8 +11,7 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
-/// All metric instruments for the Pie runtime
-#[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
+#[allow(dead_code)]
 pub struct Metrics {
     pub scheduler_arrival_rate: Gauge<f64>,
     pub scheduler_estimated_latency_ms: Gauge<f64>,
@@ -105,17 +99,11 @@ impl Metrics {
     }
 }
 
-/// Get a reference to the global metrics.
-/// Returns None if metrics have not been initialized.
-#[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
+#[allow(dead_code)]
 pub fn metrics() -> Option<&'static Metrics> {
     METRICS.get()
 }
 
-/// Initialize OpenTelemetry OTLP tracing and metrics.
-///
-/// Returns an optional tracing-opentelemetry layer that can be added to the subscriber.
-/// Caller is responsible for only calling this when telemetry is enabled.
 pub fn init_otel_layer<S>(
     endpoint: &str,
     service_name: &str,
@@ -186,7 +174,6 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
-/// Initialize tracing only (when metrics fails to init)
 fn init_tracing_only<S>(
     endpoint: &str,
     resource: Resource,
@@ -221,8 +208,7 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
-/// Shutdown OpenTelemetry, flushing any pending spans and metrics.
-#[allow(dead_code)] // scaffolded for a graceful-shutdown call site not yet wired.
+#[allow(dead_code)]
 pub fn shutdown() {
     if let Some(provider) = TRACER_PROVIDER.get() {
         let _ = provider.shutdown();

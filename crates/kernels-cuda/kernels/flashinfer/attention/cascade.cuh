@@ -1,18 +1,18 @@
-/*!
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
@@ -26,21 +26,20 @@ namespace flashinfer {
 using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
 
-/*!
- * \brief The CUDA kernel that merges the self-attention state of two index sets A and B.
- * \tparam vec_size The vector size used in the kernel.
- * \tparam DTypeIn The data type of v_a and v_b.
- * \tparam DTypeO The data type of v_merged.
- * \param v_a The partial v of index set A. (n, h, d)
- * \param s_a The logsumexp value of index set A. (n, h)
- * \param v_b The partial v of index set B. (n, h, d)
- * \param s_b The logsumexp value of index set B. (n, h)
- * \param v_merged The merged v of index set A union B. (n, h, d)
- * \param s_merged The merged logsumexp value of index set A union B. (n, h)
- * \param num_heads The number of heads of v_a and v_b.
- * \param head_dim The dimension of each head.
- * \note Both s_a and s_b are logsumexp values with base 2.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
 __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
                                  DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
@@ -70,19 +69,18 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   }
 }
 
-/*!
- * \brief The CUDA kernel that merges the self-attention state with another state in-place.
- * \tparam vec_size The vector size used in the kernel.
- * \tparam DType The data type of v and v_other.
- * \param v The partial v to be updated in-place. (n, h, d)
- * \param s The logsumexp value to be updated in-place. (n, h)
- * \param v_other The other v to be merged. (n, h, d)
- * \param s_other The other logsumexp value to be merged. (n, h)
- * \param mask Optional mask of whether to merge given sequences or not. (n)
- * \param num_heads The number of heads of v and v_other.
- * \param head_dim The dimension of each head.
- * \note Both s and s_other are logsumexp values with base 2.
- */
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, typename DType>
 __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict__ s,
                                         DType* __restrict__ v_other, float* __restrict__ s_other,
@@ -255,23 +253,22 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
   }
 }
 
-/*!
- * \brief The CUDA kernel that merges self-attention states of a list of index sets,
- *   accelerated for larger number of index sets.
- * \tparam vec_size The vector size used in the kernel.
- * \tparam bdx The blockDim.x used in the kernel.
- * \tparam bdy The blockDim.y used in the kernel.
- * \tparam num_smem_stages The number of stages of shared memory used in the kernel.
- * \tparam DTypeIn The data type of v.
- * \tparam DTypeO The data type of v_merged.
- * \param V The partial v of index sets. (n, num_index_sets, h, d)
- * \param S The logsumexp value of index sets. (n, num_index_sets, h)
- * \param v_merged The merged v of index sets union. (n, h, d)
- * \param s_merged The merged logsumexp value of index sets union. (n, h)
- * \param num_heads The number of heads of v.
- * \param head_dim The dimension of each head.
- * \note s are logsumexp values with base 2.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO>
 __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
@@ -339,32 +336,31 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
   }
 }
 
-/*!
- * \brief The CUDA kernel to merge self-attention states of multiple index sets, the number of
- * index sets at each position might vary.
- *
- * For CUDA graph support, the kernel can be built with a maximum sequence length and executed
- * using a truncated, dynamic sequence length passed through `seq_len_ptr`.
- *
- * \tparam vec_size The vector size used in the kernel.
- * \tparam bdx The blockDim.x used in the kernel.
- * \tparam bdy The blockDim.y used in the kernel.
- * \tparam num_smem_stages The number of stages of shared memory used in the kernel.
- * \tparam DTypeIn The data type of v.
- * \tparam DTypeO The data type of v_merged.
- * \param V The partial v of index sets. (nnz, h, d)
- * \param S The logsumexp value of index sets. (nnz, h)
- * \param indptr The start offsets of each position in the variable length array.
- * \param v_merged The merged v of index sets union. (n, h, d)
- * \param s_merged The merged logsumexp value of index sets union. (n, h)
- * \param max_seq_len The maximum sequence length supported by the kernel.
- * \param seq_len_ptr The current sequence length (number of positions populated in indptr).
- * \param num_heads The number of heads of v.
- * \param head_dim The dimension of each head.
- * \param win PIE: the staged-geometry seat -- (live positions, first plane row),
- *   or nullptr for the whole extent from row zero.
- * \note s are logsumexp values with base 2.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthMergeStatesKernel(
@@ -374,10 +370,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
-  // PIE: the staged-geometry seat.  `win[0]` is how many positions of the
-  // merge are this launch's own and `win[1]` is where they sit in the plane
-  // `v_merged` points at; a null seat is one launch over the whole extent
-  // from row zero, which is what upstream always did.
+
   const uint32_t staged = seq_len_ptr ? *seq_len_ptr : max_seq_len;
   const uint32_t seq_len = (win != nullptr && win[0] < staged) ? win[0] : staged;
   const uint32_t row_base = win != nullptr ? win[1] : 0;
@@ -394,7 +387,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
 
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
-    // NOTE (Yilong): necessary to prevent hazard on smaller `num_index_sets`
+
     __syncthreads();
 
     uint32_t pos = i / num_heads;
@@ -486,7 +479,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
-  // PIE: the staged-geometry seat, as on the merge kernel above.
+
   const uint32_t staged = seq_len_ptr ? *seq_len_ptr : max_seq_len;
   const uint32_t seq_len = (win != nullptr && win[0] < staged) ? win[0] : staged;
   const uint32_t row_base = win != nullptr ? win[1] : 0;
@@ -566,13 +559,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 #endif
 }
 
-// PIE: REMOVED -- six `cudaError_t` host launchers -- `MergeState`, `MergeStateInPlace`,
-// `MergeStates`, `VariableLengthMergeStates`, `AttentionSum` and `VariableLengthAttentionSum`.
-// 233 lines of host C++ that built a `void* args[]` for `cudaLaunchKernel`. Unguarded and
-// unreached -- NVRTC parsed it as an uninstantiated template, which is a weaker shield than a
-// guard. Rust plans and fires these kernels with `cuLaunchKernel`. This marker is one a strip
-// does NOT undo; see MODIFICATIONS.
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_CASCADE_CUH_
+#endif

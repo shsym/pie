@@ -1,26 +1,3 @@
-//! **THE PARITY HARNESS'S BISECTION KNOB: A TAPPED `mini-dit` PLANTS ITS
-//! VELOCITY SEAM ON THE NAMED INTERMEDIATE, AT THAT RECTANGLE'S WIDTH, AND
-//! STILL READS EVERY PORT THE READING DECLARES.**
-//!
-//! ```text
-//! cargo test -p models --test the_mini_dit_tap_exports_an_intermediate
-//! ```
-//!
-//! `scripts/imagegen/mini_dit_parity.py --tap <key>` bisects a parity
-//! mismatch by reading an intermediate out in the velocity's place
-//! (`forward::Tap`). What is asserted:
-//!
-//! ```text
-//! (a) untapped, the velocity seam is `[rows, PATCH_FEATURES]`; tapped at a
-//!     trunk rectangle it is `[rows, HIDDEN]`; the row's `Generative` facts
-//!     state the same width, so the guest's `velocity(width)` agrees
-//! (b) a tap plants ONE float readout and no `out`, like the model itself
-//! (c) a tap that ends the trace at block 0 still reads block 2's context
-//!     port: the plan declares every port the reading does, whatever the
-//!     tap cuts, so the runtime's port feeds do not change under a probe
-//! (d) an unknown key taps nothing: the plan is the model's
-//! ```
-
 use std::collections::BTreeSet;
 
 use model_dsl::{Def, Dim, Dtype, Platform, RuntimeInput, Trace, Ty, seam, trace_hybrid};
@@ -32,7 +9,6 @@ fn traced(tap: Option<&str>) -> Trace {
     trace_hybrid("mini-dit", &text, Platform::Cuda)
 }
 
-/// The width of the one velocity seam's value.
 fn velocity_width(plan: &Trace) -> u64 {
     let seams: Vec<_> = plan
         .seams
@@ -67,7 +43,13 @@ fn ports(plan: &Trace) -> BTreeSet<String> {
         .collect()
 }
 
-/// (a)
+fn the_mini_dit_tap_exports_an_intermediate_every_case() {
+    a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width();
+    a_tap_is_still_one_float_readout_and_no_logits();
+    a_tap_that_cuts_the_trace_short_still_reads_every_port();
+    an_unknown_key_taps_nothing();
+}
+
 #[test]
 fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
     assert_eq!(
@@ -100,8 +82,6 @@ fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
     }
 }
 
-/// (b)
-#[test]
 fn a_tap_is_still_one_float_readout_and_no_logits() {
     for tap in ["x_embed", "b0.attn_heads", "b1.out_img", "b2.cross_q"] {
         let plan = traced(Some(tap));
@@ -118,8 +98,6 @@ fn a_tap_is_still_one_float_readout_and_no_logits() {
     }
 }
 
-/// (c)
-#[test]
 fn a_tap_that_cuts_the_trace_short_still_reads_every_port() {
     let whole = ports(&traced(None));
     assert!(
@@ -135,8 +113,6 @@ fn a_tap_that_cuts_the_trace_short_still_reads_every_port() {
     }
 }
 
-/// (d)
-#[test]
 fn an_unknown_key_taps_nothing() {
     let model = traced(None);
     let probe = traced(Some("not.a.dump.key"));

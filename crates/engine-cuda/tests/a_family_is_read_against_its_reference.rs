@@ -1,26 +1,3 @@
-//! **ONE SNAPSHOT, FIRED OVER A PROBE BATTERY, ITS ROWS DUMPED** for an
-//! external reference to be read against — the CUDA twin of engine-metal's
-//! test of the same name. It asserts nothing about the numbers: the
-//! comparison is `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref`,
-//! against rows a reference wrote for the same probes
-//! (`scripts/muse_glimmer_parity_ref.py`, `scripts/gemma4_parity_ref.py`).
-//!
-//! Two arms per probe, as the dsv4 gate fires them: teacher-forced (one
-//! token a fire, the decode class over the prompt) and prefill + greedy.
-//!
-//! ```text
-//! PIE_PARITY_ARTIFACT=<stamped .zt> | PIE_PARITY_SNAPSHOT=<snapshot dir> PIE_PARITY_SKU=<row> \
-//! PIE_PARITY_PROBES=OUT/probes.json PIE_PARITY_OUT=OUT \
-//! [PIE_PARITY_STEPS=16] [PIE_PARITY_CONTEXT=512] [PIE_PARITY_TAG=pie] \
-//! [PIE_PARITY_DEVICE_BUDGET=14GiB] [PIE_PARITY_HOST_BUDGET=8GiB] \
-//!   cargo test -p engine-cuda --features cuda --test a_family_is_read_against_its_reference -- --nocapture
-//! ```
-//!
-//! A raw snapshot is read through the named row's import — what a
-//! miniature row over a carved checkpoint needs, since identification never
-//! picks it — and handed to the shell as the checkpoint itself, the way the
-//! runtime hands it a stamped artifact.
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -66,9 +43,6 @@ fn every_probe_is_dumped() {
     let steps: usize = std::env::var("PIE_PARITY_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let context: u32 = std::env::var("PIE_PARITY_CONTEXT").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
 
-    // Either a stamped artifact (its own SKU, its own planes), or a raw
-    // snapshot read through a named SKU's import — what a miniature row
-    // over a carved checkpoint needs, since identification never picks it.
     let (snapshot, sku, contract) = match (std::env::var("PIE_PARITY_ARTIFACT"), std::env::var("PIE_PARITY_SNAPSHOT")) {
         (Ok(artifact), _) => {
             let artifact = PathBuf::from(artifact);
@@ -86,9 +60,6 @@ fn every_probe_is_dumped() {
             let snapshot = PathBuf::from(snapshot);
             let name = std::env::var("PIE_PARITY_SKU").expect("PIE_PARITY_SKU names the row that reads the snapshot");
             let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
-            // Every container under the snapshot, joined into one name space
-            // (`runtime::engine::load::open_source`'s reading, which this
-            // crate cannot call).
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")
@@ -115,9 +86,6 @@ fn every_probe_is_dumped() {
     };
     let trace = (sku.trace)(Platform::Cuda);
     let word = |query_len: u32| (sku.classify)(&Request::new(query_len, false));
-    // `PIE_PARITY_DEVICE_BUDGET` / `PIE_PARITY_HOST_BUDGET` (bytes, or a
-    // `GiB` suffix) cap the weight tiers, so a model the card does not hold
-    // whole is read through the pinned and mapped tiers the runtime would use.
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;
         let text = text.trim();
@@ -129,27 +97,16 @@ fn every_probe_is_dumped() {
         Some(text.parse().expect("a byte count"))
     };
     let budgets = Budgets { device: budget("PIE_PARITY_DEVICE_BUDGET"), host: budget("PIE_PARITY_HOST_BUDGET") };
-    // The ranking the runtime cuts (`Cuda::settle`): the prospect pairs every
-    // split-plane bank's codes with its factors off the contract.
-    // Uncapped budgets cut to the empty plan, but a quantized routed bank
-    // still needs its codes paired with its factors, which only the prospect
-    // reads off the contract — so every load goes through it.
     let residency = {
         let target = checkpoint::plan::StorageTarget::for_backend(checkpoint::types::BackendKind::Cuda, 0, 1);
         let prospect = engine_cuda::weights::prospect(&trace, &contract, &snapshot, target)
             .unwrap_or_else(|why| panic!("the prospect reads the artifact: {why}"));
         Plan::cut(&prospect.ranking, budgets).unwrap_or_else(|why| panic!("the budgets plan: {why}"))
     };
-    // `PIE_PARITY_TAG` names the dump (`pie` by default), so two boots of one
-    // artifact can be read against each other.
     let tag = std::env::var("PIE_PARITY_TAG").unwrap_or_else(|_| "pie".to_string());
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
-        // Neither field existed when this test was written: `voxels` is the
-        // third row axis a VAE runs on, `deferred_tier` the expert-residency
-        // knob that stopped being an environment read. A plan with no voxel
-        // rows states no ladder.
         voxels: None,
         deferred_tier: false,
         classify: sku.classify,
@@ -164,7 +121,6 @@ fn every_probe_is_dumped() {
         slots: 4,
         pages: 4 * context / 16,
         ordinal: 0,
-        // Eager, schedules carved to fit: the golden arm, nothing captured.
         graphs: Graphs::Off,
         knobs: Knobs::default(),
         cache_dir: None,

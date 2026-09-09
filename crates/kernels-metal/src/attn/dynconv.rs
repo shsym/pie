@@ -1,6 +1,3 @@
-//! DFlash2's two-tap grouped dynamic convolution along a request's block
-//! rows — `Attention::BlockDynConv`. One kernel, `attn/block_dyn_conv.metal`.
-
 use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
@@ -9,20 +6,8 @@ use crate::tensor::{RaggedTensor, Tensor};
 
 const FILE: &str = "attn/block_dyn_conv.metal";
 
-/// Threads per threadgroup along the channel axis.
 const GROUP: u32 = 256;
 
-/// `y[i] = Σ_t (base[side, t] + δ[i, side, t, g]) ⊙ x[i − t]` within each
-/// request's rows of `x`, `x` before the span being zero.
-///
-/// `coeff` is `[rows, 2·taps·groups]` laid `(side, tap, group)`; `base` is
-/// `[2·taps, channels]`; `group` channels share one correction.
-///
-/// # Errors
-///
-/// Refuses a dtype the kernel is not stamped for, a `side` past the two the
-/// projection carries, a channel count `group` does not divide, and a
-/// `coeff` or `base` whose width is not the one those numbers imply.
 #[allow(clippy::too_many_arguments)]
 pub fn block_dyn_conv(
     ctx: &Ctx<'_>,

@@ -78,7 +78,7 @@ from pathlib import Path
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - the runner installs it
+except ImportError:
     sys.exit(
         "workflow-ref-audit: needs PyYAML (`pip install pyyaml`). Unlike the\n"
         "sibling audits this one parses real YAML: matrix resolution needs the\n"
@@ -93,13 +93,8 @@ EXPRESSION = re.compile(r"\$\{\{\s*([^}]*?)\s*\}\}")
 MATRIX_PATH = re.compile(r"^matrix\.([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_-]+))?$")
 SHELL_COMMENT = re.compile(r"^\s*#.*$", re.M)
 
-# The flags this reads. `--exclude` is here because it takes a package
-# name and cargo refuses an unknown one exactly as it refuses an unknown
-# `-p`, which is a thing that is easy to forget until a sweep's exclusion
-# list outlives a crate.
 PACKAGE_FLAGS = {"-p", "--package", "--exclude"}
 TARGET_FLAGS = {"--test": "test", "--bench": "bench", "--example": "example", "--bin": "bin"}
-
 
 def workspace() -> dict[str, dict]:
     """`name -> package` for every workspace member, out of cargo itself."""
@@ -111,7 +106,6 @@ def workspace() -> dict[str, dict]:
         check=True,
     )
     return {p["name"]: p for p in json.loads(out.stdout)["packages"]}
-
 
 def matrix_entries(job: dict) -> list[dict]:
     """One dict per matrix combination, or `[{}]` for an unmatrixed job.
@@ -134,7 +128,6 @@ def matrix_entries(job: dict) -> list[dict]:
         return [{}]
     width = max(len(values) for values in axes.values())
     return [{key: values[i % len(values)] for key, values in axes.items()} for i in range(width)]
-
 
 def substitute(text: str, entry: dict) -> tuple[str, int]:
     """Resolve `${{ matrix.… }}` against one matrix entry.
@@ -160,7 +153,6 @@ def substitute(text: str, entry: dict) -> tuple[str, int]:
 
     return EXPRESSION.sub(resolve, text), unresolved
 
-
 def commands(body: str) -> list[list[str]]:
     """The `cargo …` invocations in a shell body, as token lists.
 
@@ -178,7 +170,6 @@ def commands(body: str) -> list[list[str]]:
                 found.append(tokens[tokens.index("cargo") :])
     return found
 
-
 def values_of(tokens: list[str], flag: str) -> list[str]:
     """Every value given to `flag`, in `--flag v` and `--flag=v` form."""
     found = []
@@ -188,7 +179,6 @@ def values_of(tokens: list[str], flag: str) -> list[str]:
         elif token.startswith(f"{flag}="):
             found.append(token.split("=", 1)[1])
     return found
-
 
 def check(tokens: list[str], members: dict[str, dict], where: str) -> list[str]:
     problems = []
@@ -254,7 +244,6 @@ def check(tokens: list[str], members: dict[str, dict], where: str) -> list[str]:
             )
     return problems
 
-
 def main() -> int:
     members = workspace()
     problems: list[str] = []
@@ -296,7 +285,6 @@ def main() -> int:
         + (f" {unresolved} expression(s) not resolvable and skipped." if unresolved else "")
     )
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

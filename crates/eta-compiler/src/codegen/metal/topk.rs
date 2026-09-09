@@ -1,20 +1,3 @@
-//! `emit_grouped_topk_msl` — the grouped top-k library kernel.
-//!
-//! Same shape as the nucleus kernel: one threadgroup per (lane, row), then
-//! the first `k` entries of the row's descending order written to the value
-//! and index results. The `top_k` op defines two results, so the emitter
-//! needs the node's result base as well as its argument.
-//!
-//! The order is total: non-NaN values descending, then NaNs, ties by index
-//! ascending (`-0.0` reads as `+0.0`). For `k` up to [`SELECT_MAX_K`] the
-//! kernel finds the `k`-th key by an MSB-first radix select over the row
-//! (five histogram passes, each a coalesced sweep), compacts the survivors
-//! in index order into threadgroup memory and bitonic-sorts them there —
-//! about `6 × len` element reads. Beyond that it falls back to the original
-//! nine-pass LSD radix sort of the whole row, which permutes an index array
-//! twice per pass through device memory: the same order, at a cost that
-//! made `tail-free-sampling` three times a plain program.
-
 use crate::codegen::error::{EmitError, RegionForm};
 use alloc::string::String;
 use core::fmt::Write as _;
@@ -41,9 +24,6 @@ inline uint m3_topk_order_digit(float value, uint pass) {
 
 kernel void "#;
 
-/// The eleven bindings and three ids every grouped library sampler takes.
-/// `engine-metal` writes eleven `setBuffer:` calls in this exact order and
-/// dispatches at the one width the first line accepts.
 pub const SIGNATURE: &str = r#"(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -162,15 +142,9 @@ const BODY: &str = r#"
   threadgroup_barrier(mem_flags::mem_device);
 "#;
 
-
-/// Widest `k` the select path holds in threadgroup memory (12 KB of
-/// candidates); wider asks take the sort path.
 pub const SELECT_MAX_K: u32 = 1024;
 
 const SELECT_PROLOGUE: &str = r#"
-// The row's total order as a key: `flag` is 1 for NaN (sorted last, all
-// equal), else `key` is the bitwise-descending image of the value — the same
-// bits `m3_topk_order_digit` reads, so the select lands where the sort did.
 inline uint m3_topk_key(float value, thread uint& flag) {
   if (isnan(value)) { flag = 1u; return 0u; }
   flag = 0u;
@@ -203,18 +177,12 @@ const SELECT_BODY: &str = r#"
   threadgroup uint tg_pick[4];
   threadgroup atomic_uint tg_fill[2];
 
-  // ── The k-th key, MSB first. Every sweep is strided, so the group reads
-  // the row coalesced. Sweep 0 histograms the NaN flag and the top byte at
-  // once (512 bins); sweeps 1–3 the next bytes, among keys matching the
-  // prefix so far — a 1/256 sliver each, so their atomics are few.
   uint sel_flag = 0u, prefix = 0u, remaining = count;
   for (uint pass = 0u; pass < 4u; ++pass) {
     for (uint b = thread_index; b < 512u; b += threads)
       atomic_store_explicit(&tg_hist[b], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint shift = 24u - 8u * pass;
-    // Eight loads in flight per thread before any of them is used: one
-    // threadgroup cannot hide a load's latency behind other threadgroups.
     for (uint i0 = thread_index; i0 < len; i0 += 8u * threads) {
       float held[8];
       for (uint u = 0u; u < 8u; ++u) {
@@ -223,16 +191,10 @@ const SELECT_BODY: &str = r#"
       }
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * threads;
-        // Uniform across the SIMD group (`len` and the strides are), so the
-        // votes below see every lane.
         const bool live = i < len;
         uint flag = 0u;
         const uint key = live ? m3_topk_key(held[u], flag) : 0u;
         if (pass == 0u) {
-          // The first sweep is the one with an atomic per element; the
-          // top bytes of a row's keys crowd into a few bins, so the SIMD
-          // group settles its 32 lanes' bins among itself first and adds
-          // one count per distinct bin.
           uint pending = live ? ((flag << 8u) | (key >> 24u)) : ~0u;
           while (true) {
             const simd_vote vote = simd_ballot(pending != ~0u);
@@ -278,15 +240,9 @@ const SELECT_BODY: &str = r#"
     remaining = tg_pick[2];
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  // Every key below `pivot` is taken; of the keys equal to it, the
-  // `remaining` lowest indices.
   const ulong pivot = (ulong(sel_flag) << 32) | ulong(prefix);
   const uint total_lt = count - remaining;
 
-  // ── Compaction, unordered: the sort below orders everything, so the
-  // survivors are appended as they are met, in one coalesced sweep. Keys
-  // equal to the pivot are all kept while they fit; when they do not (a
-  // row of near-ties), the ordered walk below keeps the lowest indices.
   const uint eq_room = kSelectMax - total_lt;
   for (uint i0 = thread_index; i0 < len; i0 += 8u * threads) {
     float held[8];
@@ -317,8 +273,6 @@ const SELECT_BODY: &str = r#"
   const uint n_eq = atomic_load_explicit(&tg_fill[1], memory_order_relaxed);
   uint held = total_lt + min(n_eq, eq_room);
   if (n_eq > eq_room) {
-    // Ties overflowed the room: walk the row in index order for the pivot
-    // keys alone, each thread its contiguous chunk, counts scanned.
     const uint chunk_begin = uint((ulong(len) * thread_index) / threads);
     const uint chunk_end = uint((ulong(len) * (thread_index + 1u)) / threads);
     uint n_mine = 0u;
@@ -355,8 +309,6 @@ const SELECT_BODY: &str = r#"
   }
   (void)tg_scan_lt;
 
-  // ── Bitonic sort of the survivors by (key, index) ascending; the first
-  // `count` are the answer.
   uint n = 1u;
   while (n < held) n <<= 1u;
   for (uint p = held + thread_index; p < n; p += threads) {
@@ -389,7 +341,6 @@ const SELECT_BODY: &str = r#"
   threadgroup_barrier(mem_flags::mem_device);
 "#;
 
-/// Emits the grouped top-k MSL kernel source for one region.
 pub fn emit_grouped_topk(
     function_name: &str,
     stage: &CompiledStage,

@@ -1,20 +1,3 @@
-//! **THE GROUPED ROUTED MATMUL, AGAINST THE DOT IT CLAIMS TO COMPUTE.**
-//!
-//! `matmul_select` fired the per-route GEMV at every width. A prefill names
-//! each expert many times over, and the GEMV re-reads the whole bank once
-//! per route that names it, so the wide fire it was serving cost an order
-//! of magnitude more bandwidth than the work needs. The grouped leg sorts
-//! the routes by expert, gathers the activations behind that permutation,
-//! and hands cuBLAS one batched GEMM whose every block reads its bank once.
-//!
-//! Reordering a sum is not free of consequence — the batched GEMM
-//! accumulates in a different order from the GEMV and lands different last
-//! bits — so this reads both against the host's own dot rather than against
-//! each other.
-//!
-//!   cargo test --release -p kernels-cuda --features cuda \
-//!     --test the_grouped_expert_select_answers_the_routed_dot
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -24,22 +7,12 @@ use dtype::Dtype;
 use kernels_cuda::linear::moe::{ExpertTable, matmul_select};
 use kernels_cuda::tensor::Tensor;
 
-/// How a fire's routes are spread over the experts.
 #[derive(Clone, Copy)]
 enum Spread {
-    /// Deterministic and skewed — an even spread would hide a block whose
-    /// expert id was read off by one.
     Mixed,
-    /// **THE BLOCK BUDGET'S WORST CASE**: one expert takes half the fire
-    /// while the rest still hold rows, so the dominant expert spans several
-    /// blocks AND every other expert still claims a partial one. That sum —
-    /// not `experts`, and not `routes / block` — is what the budget has to
-    /// cover. Note that routing EVERYTHING to one expert is the easy case,
-    /// not the hard one: it needs fewer blocks, not more.
     Dominant,
 }
 
-/// The routing a token's `j`th pick lands on.
 fn expert_of(token: usize, j: usize, experts: usize, spread: Spread) -> i32 {
     let e = match spread {
         Spread::Mixed => (token * 3 + j * 5 + token / 7) % experts,
@@ -49,8 +22,6 @@ fn expert_of(token: usize, j: usize, experts: usize, spread: Spread) -> i32 {
     i32::try_from(e).expect("an expert id inside i32")
 }
 
-/// `y[route] = x[row(route)] . bank[expert(route)]`, in f32, on the host.
-/// The one definition both device legs answer to.
 fn routed_dot(
     x: &[f32],
     bank: &[f32],
@@ -75,8 +46,6 @@ fn routed_dot(
     y
 }
 
-/// One fire, checked against [`routed_dot`]. `x_rows` states the reading:
-/// one row per token is the up leg, one per route the down leg.
 fn check(
     experts: usize,
     tokens: usize,
@@ -110,12 +79,6 @@ fn check(
         u32::try_from(k).unwrap(),
         Dtype::Bf16,
     );
-    // **THE RECTANGLE THE SHELL ACTUALLY HANDS.** A routed bank arrives one
-    // row per expert, each row that expert's whole `N x K` plane — the
-    // `[experts, N, K]` declaration flattened on its last two axes. Building
-    // it as `experts * N` rows of K would be the same bytes and would pass
-    // the GEMV (which reads a pointer and a stated stride), while telling the
-    // grouped leg's dispatch a shape no fire ever carries.
     let bank = Tensor::new(
         bank_at,
         u32::try_from(experts).unwrap(),
@@ -160,49 +123,36 @@ fn check(
     );
 }
 
-/// The up leg: one activation row per token, read once per route.
+fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
+    the_token_read_leg_answers_the_dot();
+    the_route_read_leg_answers_the_dot();
+    a_fire_wider_than_the_gemvs_grid_is_still_answered();
+    a_decode_width_fire_is_still_served();
+    a_dominant_expert_still_fits_the_block_budget();
+    a_ragged_expert_count_still_lands();
+}
+
 #[test]
 fn the_token_read_leg_answers_the_dot() {
     check(8, 48, 2, 64, 96, true, Spread::Mixed);
 }
 
-/// The down leg: one activation row per route already.
-#[test]
 fn the_route_read_leg_answers_the_dot() {
     check(8, 48, 2, 64, 96, false, Spread::Mixed);
 }
 
-/// **THE WIDTH THE GEMV REFUSES.** Its route run rides the grid's y axis,
-/// which stops at 65535, so a fire past that is one the per-route leg
-/// cannot serve at all: passing here is the proof that the grouped leg —
-/// not a silent fallback — computed this.
-#[test]
 fn a_fire_wider_than_the_gemvs_grid_is_still_answered() {
     check(8, 33_000, 2, 32, 32, true, Spread::Mixed);
 }
 
-/// **THE WIDTH THAT MUST NOT GROUP.** A decode fire names each expert about
-/// once, so sorting and gathering would buy nothing and the per-route GEMV
-/// is already the right shape. This is the fallback still answering — and
-/// the same dot answering it.
-#[test]
 fn a_decode_width_fire_is_still_served() {
     check(8, 1, 2, 64, 96, true, Spread::Mixed);
 }
 
-/// **THE BLOCK BUDGET UNDER ITS WORST CASE.** A dominant expert spanning
-/// several blocks while every other expert still claims a partial one sums
-/// past `experts`, so the budget has to be `experts + ceil(routes/block)`.
-/// Too tight and the alignment drops the routes past it — silently, since
-/// the kernel guards that write rather than reporting it.
-#[test]
 fn a_dominant_expert_still_fits_the_block_budget() {
     check(8, 48, 2, 64, 96, true, Spread::Dominant);
 }
 
-/// An expert count that is not a power of two, and a fan-out that does not
-/// divide it: the alignment's per-expert prefix sum walks a ragged tail.
-#[test]
 fn a_ragged_expert_count_still_lands() {
     check(48, 40, 3, 64, 96, true, Spread::Mixed);
 }

@@ -5,11 +5,9 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// Per-rank (already divided by tp). Output of the latent kernels is sized mla_heads × kv_lora_rank.
     pub mla_heads: u32,
     pub kv_lora_rank: u32,
 
-    /// Adapter bank dims, same at every layer.
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -30,9 +28,6 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// This layer's adapter bank: lora_a is `[slots, rank, hidden]`, lora_b is `[slots, hidden, rank]`.
-    /// Applied to the mixer sublayer's replicated output, after all_reduce (a rows-cut partial
-    /// product would sum the correction tp times if applied before).
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -383,11 +378,6 @@ impl Model {
             adapters: ADAPTERS,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], weights),
-            // The untied head is `vocab x hidden` of its own and every rank
-            // streamed all of it. Band it on the vocab axis: each rank lands
-            // its slice and `forward` all-gathers the logits shard. Exact —
-            // partitioning a GEMM's output changes no reduction.
-            // `PIE_NO_VOCAB_SHARD` restores the replicated head.
             head: {
                 let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
                 let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
@@ -401,7 +391,6 @@ impl Model {
     }
 }
 
-/// Deployment ceiling for adapter slots/rank (not a checkpoint fact); change and re-trace to grow it.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {}

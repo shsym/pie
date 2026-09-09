@@ -3,7 +3,7 @@
 using namespace metal;
 
 struct M1Status {
-  uint state;  // 0 unset, 1 ready/running, 2 retry, 3 fault, 4 committed
+  uint state;
   uint fault;
   uint reserved0;
   uint reserved1;
@@ -170,13 +170,9 @@ inline bool m1_sort_better(float value, uint index, float best, uint best_index)
   return index < best_index;
 }
 
-// The descending total order of `m1_sort_better`, as a sortable u32 key:
-// smaller key = better. NaN keys sort last so they never displace a real
-// element. Ported from `ptir_m1_runtime_prologue.cuh`'s `m1_desc_key`, whose
-// radix select below reads the same bits in the same order.
 inline uint m1_desc_key(float value) {
   if (isnan(value)) return 0xFFFFFFFFu;
-  if (value == 0.0f) value = 0.0f;  // -0.0 compares equal to +0.0
+  if (value == 0.0f) value = 0.0f;
   const uint bits = as_type<uint>(value);
   const uint ascending = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
   return ~ascending;
@@ -191,14 +187,6 @@ inline void m1_fault(device M1Status* status, uint code) {
   status->state = 3;
 }
 
-// A fault that says which op and which guard. `fault` alone is the op tag, and
-// several ops share one tag -- every intrinsic is 0xA0 -- so the tag names a
-// family rather than a cause. `reserved0` carries the intrinsic id and
-// `reserved1` packs the guard site with the immediate, which is what turns
-// "instance N launch failed: op tag 0xA0" into something actionable.
-//   site 1 = channel sink is narrower than the value
-//   site 2 = MtpDrafts with a zero row width
-//   site 3 = no arm claimed this tag
 inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
   status->reserved0 = p.intr;
   status->reserved1 = (site << 24) | (p.imm & 0x00ffffffu);
@@ -206,11 +194,6 @@ inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
   status->state = 3;
 }
 
-// A strided, word-wide typed copy. `begin`/`step` partition it across a
-// threadgroup; 0/1 is the serial walk. The byte-at-a-time version this replaces
-// issued one device access per byte, so copying a vocabulary-wide f32 row -- a
-// plain reshape in the sampler's PTIR graph -- was ~1M dependent accesses on a
-// single thread, about 85ms of an ~89ms decode step.
 inline void m1_copy_typed_range(
     const device uchar* input,
     device uchar* output,
@@ -347,13 +330,6 @@ inline void m1_reduce_integer(
   }
 }
 
-// Sequential fold, not a staged tree. `m1_argmax_combine` is a strict total
-// order on (have, value desc, index asc), so its maximum is unique and every
-// evaluation order yields the same (value, index) -- unlike m1_reduce_float's
-// sum, whose tree shape is part of the numeric ABI. The tree here cost a
-// materialization of one 16-byte candidate per element into device `temporary`
-// plus a full read-modify-write per pass, all on the single thread that owns the
-// lane; on a 248k vocab that was ~257ms, roughly 60x the entire model forward.
 inline void m1_reduce_argmax(
     const device uchar* input,
     device uchar* output,
@@ -380,9 +356,7 @@ inline void m1_reduce_argmax(
       reinterpret_cast<const device float*>(input);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
-    // Four independent accumulators, folded at the end. Associativity makes the
-    // split free (see the note above), and it breaks the dependent chain that
-    // otherwise serialises one device load per iteration on this single thread.
+
     M1ArgmaxCandidate best[4] = {
         {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u},
         {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u}};
@@ -411,11 +385,6 @@ inline void m1_reduce_argmax(
   }
 }
 
-// Threadgroup-cooperative argmax, for the grouped region launch that gives a
-// lane a whole threadgroup instead of one thread. Same strict total order as
-// m1_argmax_combine, so the answer is identical to the serial fold above; only
-// the partition changes. The tree guards `tid + stride` so a non-power-of-two
-// threadgroup is still correct.
 inline void m1_reduce_argmax_mt(
     const device uchar* input,
     device uchar* output,
@@ -425,8 +394,7 @@ inline void m1_reduce_argmax_mt(
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
   if (in_desc.dtype != 0) {
-    // Integer argmax rows are small in every shipped program; keep the serial
-    // path rather than duplicating it.
+
     if (tid == 0) m1_reduce_argmax(input, output, temporary, in_desc);
     return;
   }
@@ -453,19 +421,6 @@ inline void m1_reduce_argmax_mt(
   }
 }
 
-// The staged tree of m1_reduce_float, partitioned across a threadgroup. The
-// tree is a numeric ABI: 32-wide chunks, each folded pairwise from offset 16
-// down, level after level until one value is left. This walk keeps every
-// chunk, every lane and every fold exactly where the serial one has them, so
-// the result is bit-identical; only who computes each chunk changes. Thread t
-// folds chunks t, t + nthreads, ... of a level, and a level reads from one
-// half of `temporary` and writes into the other, because a chunk's output
-// slot (`work[chunk]`) is inside some earlier chunk's input window once the
-// level has more than 32 chunks — the serial walk read that window first, a
-// concurrent one may not. `temporary` is `widest * 16` bytes, so two f32
-// planes of `in_desc.last` fit with room to spare. `nthreads` above one is
-// the caller's promise that every thread of the group is here, since the
-// levels are separated by a device barrier.
 inline void m1_reduce_float_part(
     uint tag,
     const device uchar* input,
@@ -491,8 +446,7 @@ inline void m1_reduce_float_part(
       if (tid == 0) result[row] = identity;
       continue;
     }
-    // Level 0 reads the operand in place; the serial form's first copy into
-    // `work` moves the same bits and folds them the same way.
+
     const device float* src = values + base;
     device float* dst = plane_a;
     while (count > 1) {
@@ -524,7 +478,6 @@ inline void m1_reduce_float_part(
   }
 }
 
-// m1_reduce_integer's tree, partitioned the same way and for the same reason.
 inline void m1_reduce_integer_part(
     uint tag,
     const device uchar* input,
@@ -560,8 +513,7 @@ inline void m1_reduce_integer_part(
       }
       continue;
     }
-    // A signed operand is read through the same bits the serial walk casts
-    // into `work`: `uint(int)` is the identity on the representation.
+
     const device uint* src = values + base;
     device uint* dst = plane_a;
     while (count > 1) {
@@ -602,10 +554,6 @@ inline void m1_reduce_integer_part(
   }
 }
 
-// A scatter's read-modify-write over its indices, after the base has been
-// copied into the result: one thread owns it, since indices may repeat. The
-// streamed form runs the copy as a grid pass and this on a threadgroup of
-// its own; the single-lane and grouped walks call it from thread 0.
 inline void m1_scatter_rmw(
     uint tag,
     const device uchar* a1,
@@ -640,16 +588,6 @@ inline void m1_scatter_rmw(
   }
 }
 
-// One op, walked by `nthreads` threads of which this is `tid`. `0, 1` is the
-// serial walk every single-lane kernel takes. Every op whose elements are
-// independent strides its loop by `nthreads`; an op whose walk carries state
-// across elements (a scan, a sort, a pivot, a scatter's read-modify-write, a
-// matmul) runs on thread 0 alone and the other threads return — the caller
-// barriers between ops, so a returned thread is back for the next one. The
-// two reductions with a fixed tree are partitioned by `m1_reduce_*_part`,
-// which reproduces the tree. A barrier appears inside this function only where
-// a strided phase feeds a serial one (the scatter's copy), and only when
-// `nthreads > 1`; every branch that reaches one is uniform across the group.
 inline void ptir_m1_execute_part(
     uint generated_tag,
     device M1Status* status,
@@ -671,7 +609,7 @@ inline void ptir_m1_execute_part(
   const M1ValueDesc d2 = descriptors[p.a2];
   const M1ValueDesc out0 = descriptors[p.o0];
 
-  if (p.tag == 0x81) {  // const
+  if (p.tag == 0x81) {
     for (uint i = tid; i < out0.len; i += nthreads) {
       if (p.lit_dtype == 0) m1_store_f(o0, i, as_type<float>(p.lit_bits));
       else if (p.lit_dtype == 1) m1_store_i(o0, i, int(p.lit_bits));
@@ -680,7 +618,7 @@ inline void ptir_m1_execute_part(
     }
     return;
   }
-  if (p.tag == 0x90 || p.tag == 0x91) {  // channel root
+  if (p.tag == 0x90 || p.tag == 0x91) {
     if (out0.dtype == 3) {
       for (uint i = tid; i < out0.len; i += nthreads)
         o0[i] = (a0[i >> 3] >> (i & 7)) & 1u;
@@ -689,7 +627,7 @@ inline void ptir_m1_execute_part(
     }
     return;
   }
-  if (p.tag == 0x92) {  // direct channel sink
+  if (p.tag == 0x92) {
     const uint logical_bytes =
         d0.dtype == 3 ? (d0.len + 7u) / 8u : d0.len * 4u;
     if (logical_bytes > p.sink_bytes) {
@@ -697,8 +635,7 @@ inline void ptir_m1_execute_part(
       return;
     }
     if (d0.dtype == 3) {
-      // Bit packing ORs eight elements into one byte: a read-modify-write
-      // that only one thread may own.
+
       if (tid != 0) return;
       for (uint i = 0; i < logical_bytes; ++i) o0[i] = 0;
       for (uint i = 0; i < d0.len; ++i)
@@ -710,30 +647,10 @@ inline void ptir_m1_execute_part(
     for (uint i = logical_bytes + tid; i < p.sink_bytes; i += nthreads) o0[i] = 0;
     return;
   }
-  if (p.tag == 0xA0) {  // intrinsic staging: bf16, except where the id says f32
-    // **THE ELEMENT TYPE IS THE INTRINSIC'S, NOT THE BINDING'S** — the one
-    // structural difference from the CUDA handler next door, and it is the
-    // platform rather than the idea. That side reads `p.intrinsic_dtype` out
-    // of a per-(lane, intrinsic) side array the host uploads, because a CUDA
-    // kernel argument is a raw address that has to be told how to walk. Metal
-    // binds an OBJECT at an index and the slot table
-    // (`eta_compiler::codegen::metal::intrinsics`) fixes which index each id
-    // takes, so the element type is a function of the ID and is known at
-    // EMIT time — which means it needs no plan word, no ABI change, and no
-    // fourth number in a 64-byte `M1OpParams` that is asserted at 64 in two
-    // crates. `m2_intrinsic_element_bytes` is the host's copy of this arm and
-    // `program::launch` refuses a rectangle whose dtype disagrees with it.
-    if (p.intr == 7u) {  // AttnScore: the observability slab is F32
-      // **A PROBABILITY IS NOT A bf16 QUANTITY** (`.wiki/alto/attn-score.md`
-      // §4). The capture arm wrote per-key mass a guest divides by and ranks
-      // on; the slab is the one rectangle on this plane where the four bytes
-      // are what they say, and reading it as `bfloat` would halve every row
-      // into the next one's keys.
-      //
-      // No row arithmetic: the engine binds the lane's block at
-      // `setBuffer:offset:`, the slab's pitch IS the declared row width
-      // (`ATTN_SCORE_KV_MAX`), so the reader's rows are consecutive and this
-      // is a straight `out0.len` gather off the binding.
+  if (p.tag == 0xA0) {
+
+    if (p.intr == 7u) {
+
       const device float* planes = reinterpret_cast<const device float*>(a0);
       device float* score_out = reinterpret_cast<device float*>(o0);
       for (uint i = tid; i < out0.len; i += nthreads) score_out[i] = planes[i];
@@ -742,7 +659,7 @@ inline void ptir_m1_execute_part(
     const device bfloat* logits =
         reinterpret_cast<const device bfloat*>(a0) +
         ulong(p.imm2) * p.imm;
-    if (p.intr == 6u) {  // MtpDrafts: bounded argmax of the bound MTP rows
+    if (p.intr == 6u) {
       if (p.imm == 0u) {
         if (tid == 0) m1_fault_op(status, 2u, p);
         return;
@@ -770,9 +687,7 @@ inline void ptir_m1_execute_part(
       for (uint i = tid; i < out0.len; i += nthreads) out_f[i] = float(logits[i]);
       return;
     }
-    // Unrolled: the lane that owns this region is a single thread, so a scalar
-    // loop over a vocab-wide row is a chain of dependent device round trips.
-    // Eight independent loads per iteration let the memory pipeline overlap them.
+
     uint i = 0;
     for (; i + 8u <= out0.len; i += 8u) {
       const float v0 = float(logits[i + 0]), v1 = float(logits[i + 1]);
@@ -785,11 +700,11 @@ inline void ptir_m1_execute_part(
     for (; i < out0.len; ++i) out_f[i] = float(logits[i]);
     return;
   }
-  if (p.tag == 0xA1) {  // explicit Metal semantic boundary: identity
+  if (p.tag == 0xA1) {
     m1_copy_typed_range(a0, o0, out0.len, out0.dtype, tid, nthreads);
     return;
   }
-  if (p.tag == 0xA2) {  // explicit Metal semantic boundary: discard sink
+  if (p.tag == 0xA2) {
     return;
   }
 
@@ -844,7 +759,7 @@ inline void ptir_m1_execute_part(
     }
     return;
   }
-  if (p.tag == 0x07) {  // cast
+  if (p.tag == 0x07) {
     for (uint i = tid; i < out0.len; i += nthreads) {
       const uint source = m1_pick(d0.len, i);
       if (out0.dtype == 0) m1_store_f(o0, i, m1_load_f(a0, source, d0.dtype));
@@ -966,12 +881,11 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0x33) {
-    // The grouped caller partitions this one itself (`m1_reduce_argmax_mt`);
-    // here it is the serial fold.
+
     if (tid == 0) m1_reduce_argmax(a0, o0, temporary, d0);
     return;
   }
-  if (p.tag == 0x38) {  // left-aligned broadcast
+  if (p.tag == 0x38) {
     uint source_stride[4] = {1, 1, 1, 1};
     for (int dim = int(out0.rank) - 2; dim >= 0; --dim)
       source_stride[dim] =
@@ -1014,13 +928,7 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0x40 || p.tag == 0x41) {
-    // A scan carries its accumulator across the row, in the operand's own
-    // dtype; a parallel scan would fold a float row in another order. Rows
-    // are independent, so each thread owns whole rows.
-    //
-    // Scanned in the operand's own dtype. A u32 offset scan is exactly what
-    // ragged row offsets are built from, and accumulating one through float
-    // is exact only below 2^24 -- past that it rounds, silently.
+
     const bool is_sum = p.tag == 0x40;
     for (uint row = tid; row < d0.rows; row += nthreads) {
       float accumulated_f = is_sum ? 0.0f : 1.0f;
@@ -1070,7 +978,7 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0x51) {
-    // Rows are independent selections; each thread owns whole rows.
+
     const uint count = min(p.imm, d0.last);
     for (uint row = tid; row < d0.rows; row += nthreads) {
       for (uint position = 0; position < count; ++position) {
@@ -1101,8 +1009,7 @@ inline void ptir_m1_execute_part(
       if (tid == 0) m1_fault(status, p.tag);
       return;
     }
-    // Each output row accumulates over `inner` in a fixed order; a thread
-    // owns whole rows so that order is kept.
+
     const uint m = d0.dims[0], inner = d0.dims[1], n = d1.dims[1];
     for (uint row = tid; row < m; row += nthreads) {
       for (uint column = 0; column < n; ++column)
@@ -1121,7 +1028,7 @@ inline void ptir_m1_execute_part(
   }
   if (p.tag == 0x58) {
     if (p.pred_tag == 2) {
-      // A plain threshold compare: independent per element.
+
       for (uint i = tid; i < d0.rows * d0.last; i += nthreads) {
         const uint row = d0.last == 0u ? 0u : i / d0.last;
         const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
@@ -1129,8 +1036,7 @@ inline void ptir_m1_execute_part(
       }
       return;
     }
-    // A selection walks its row with state (a histogram prefix, a running
-    // mass); rows are independent, so each thread owns whole rows.
+
     for (uint row = tid; row < d0.rows; row += nthreads) {
       const uint base = row * d0.last;
       if (p.pred_tag == 0) {
@@ -1140,24 +1046,13 @@ inline void ptir_m1_execute_part(
         if (k == 0u) {
           for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
         } else {
-          // 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len). The
-          // form this replaces rescanned the whole row for every element --
-          // O(len^2) on ONE thread, ~1.2e11 visits at a 248320-token
-          // vocabulary, which is a hang rather than a slow answer.
-          //
-          // `greater(i)` is the count of strictly smaller keys and is monotone
-          // in the key, so `greater(i) < k` holds exactly when
-          // `key(i) <= K_k` for `K_k` the k-th smallest key counting
-          // multiplicity: ties all survive or all fall together, which is what
-          // the reference does. Ported from `ptir_m1_runtime_body.cuh`, which
-          // took the same fix for the same reason.
+
           uint histogram[256];
           uint prefix = 0u;
           uint target = k;
           for (int pass = 0; pass < 4; ++pass) {
             const int shift = 24 - 8 * pass;
-            // `pass == 0` is special-cased because shifting a 32-bit value by
-            // 32 is undefined, not zero.
+
             const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
             for (uint bucket = 0u; bucket < 256u; ++bucket) histogram[bucket] = 0u;
             for (uint j = 0; j < d0.last; ++j) {
@@ -1180,16 +1075,7 @@ inline void ptir_m1_execute_part(
           }
         }
       } else {
-        // Descending selection with the LAST PICK's total-order key as the
-        // availability threshold (the k_pivot_cummassle technique) instead of
-        // an already-picked rescan: the rescan made this O(len^3) on ONE
-        // thread -- >10^16 steps at a 248320-token vocabulary, which is what
-        // hung every sampling inferlet on this plane. Bit-identical picks and
-        // keep bits: `m1_sort_better` is a strict total order, so "strictly
-        // after the previous pick" visits the same elements in the same
-        // order, and once `exclusive` clears the threshold (or goes NaN) every
-        // later keep is false -- they are pre-stored and the loop stops early.
-        // Ported from `ptir_m1_runtime_body.cuh`, which took the same fix.
+
         const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
         for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
@@ -1251,9 +1137,7 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0x62 || p.tag == 0x63) {
-    // The copy is the wide part and strides; the scatter is a read-modify-
-    // write over indices that may repeat, so one thread owns it. Every thread
-    // reaches the barrier: nothing above it returns.
+
     m1_copy_typed_range(a0, o0, d0.len, d0.dtype, tid, nthreads);
     if (nthreads > 1u) threadgroup_barrier(mem_flags::mem_device);
     if (tid != 0) return;
@@ -1328,8 +1212,6 @@ inline void ptir_m1_execute_part(
   if (tid == 0) m1_fault_op(status, 3u, p);
 }
 
-// The serial walk: one thread owns the op. What every single-lane kernel
-// calls.
 inline void ptir_m1_execute(
     uint generated_tag,
     device M1Status* status,
@@ -1345,24 +1227,12 @@ inline void ptir_m1_execute(
                        o1, temporary, 0u, 1u);
 }
 
-// `m1_sort_better` as a fold: the better of two candidates, an absent one
-// losing to any present one. A strict total order, so a tree over any
-// partition lands on the same element the serial scan does.
 inline M1ArgmaxCandidate m1_sort_pick(M1ArgmaxCandidate left, M1ArgmaxCandidate right) {
   if (right.have == 0u) return left;
   if (left.have == 0u) return right;
   return m1_sort_better(right.value, right.index, left.value, left.index) ? right : left;
 }
 
-// The descending-mass selection of `0x58` / `pred_tag == 1`, across a
-// threadgroup. Each pick is the best remaining element under
-// `m1_sort_better` — a strict total order, so the threadgroup's tree lands on
-// the element the serial scan lands on, and the keep bits and the running
-// mass come out bit-identical. The serial form visited the whole row once per
-// pick on one thread: at 171 picks over a 248,320-wide row that was 42M
-// dependent loads, most of a program's twelve seconds. Every thread runs every
-// iteration: the loop bounds are uniform, and the barriers inside are reached
-// by all of them.
 inline void m1_nucleus_select_mt(
     const device uchar* a0,
     const device uchar* a1,
@@ -1409,12 +1279,6 @@ inline void m1_nucleus_select_mt(
   }
 }
 
-// The radix top-k of `0x58` / `pred_tag == 0`, across a threadgroup: the
-// same four 8-bit passes over `m1_desc_key`, with the histogram built by
-// every thread through threadgroup atomics and the bucket scan repeated by
-// every thread (a uniform 256-step loop, cheaper than publishing one result).
-// Counts do not depend on visit order, so `prefix` and the keep bits are the
-// serial form's exactly. The histogram borrows the argmax buffer's storage.
 inline void m1_topk_select_mt(
     const device uchar* a0,
     const device uchar* a1,
@@ -1467,15 +1331,6 @@ inline void m1_topk_select_mt(
   }
 }
 
-// ── The streamed form's multi-dispatch shapes ──────────────────────────────
-//
-// A streamed region runs each op as its own dispatch over a grid; a fixed-tree
-// reduction cannot cross threadgroups inside one dispatch, so it runs as one
-// dispatch per level. Level `l` reads what level `l - 1` wrote and folds every
-// 32-wide chunk of it pairwise from offset 16 down — the same chunks, the same
-// lanes, the same folds as `m1_reduce_float`, so the result is bit-identical;
-// only which thread folds which chunk changes. Levels alternate between two
-// planes of `temporary`, pitched per row by the level-0 chunk count.
 
 inline uint m4_reduce_count(uint last, uint level) {
   uint count = last;
@@ -1483,7 +1338,6 @@ inline uint m4_reduce_count(uint last, uint level) {
   return count;
 }
 
-// The identity of a fixed-tree reduction, as the bits of its element type.
 inline uint m4_reduce_identity(uint tag, uint dtype) {
   if (dtype == 0) return as_type<uint>(tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY));
   if (tag == 0x30) return 0u;
@@ -1491,12 +1345,6 @@ inline uint m4_reduce_identity(uint tag, uint dtype) {
   return tag == 0x31 ? 0u : UINT_MAX;
 }
 
-// One 32-wide chunk of the fixed tree, folded across a SIMD group: lane `l`
-// holds element `l` of the chunk and, for `offset` 16 down to 1, lanes below
-// `offset` fold `lanes[l] op lanes[l + offset]` — the serial tree's pairs in
-// the serial tree's order, so lane 0 ends with its bits. `simd_shuffle_down`
-// needs every lane of the group here; the callers keep the control flow
-// around it uniform. Requires an execution width of 32 (the engine checks).
 inline uint m4_fold_chunk(uint tag, uint dtype, uint bits) {
   if (dtype == 0) {
     float v = as_type<float>(bits);
@@ -1522,20 +1370,8 @@ inline uint m4_fold_chunk(uint tag, uint dtype, uint bits) {
   return v;
 }
 
-// Level-`level + 1` chunks one threadgroup of a reduce dispatch owns. The
-// engine sizes the grid by the same number (`launch::REDUCE_CHUNKS_PER_GROUP`).
 #define M4_REDUCE_CHUNKS_PER_GROUP 4u
 
-// Two levels of the fixed tree in one dispatch, SIMD-folded. Threadgroup
-// `group` owns level-`level` chunks `[128 group, 128 group + 128)`: four
-// level-`level + 1` chunks. Its SIMD groups take the 128 chunks in rounds,
-// each lane loading one element (coalesced) and the group folding it; the
-// 128 results land in threadgroup memory and four SIMD groups fold those
-// into the next level's values — plane or result. Same chunks, same pairs,
-// same order as the serial tree: bit-identical. The threadgroup is a power
-// of two of at least 32 (the engine rounds it), so the rounds divide.
-// Levels alternate between two planes of `temporary`, pitched per row by the
-// level-0 chunk count. Rows are walked in a uniform outer loop.
 inline void m4_reduce_two_levels(
     uint tag,
     const device uchar* input,
@@ -1558,9 +1394,7 @@ inline void m4_reduce_two_levels(
   device uint* planes = reinterpret_cast<device uint*>(temporary);
   device uint* result = reinterpret_cast<device uint*>(output);
   if (count <= 1u) {
-    // An empty row is the identity; a one-element row is copied untouched —
-    // the serial walk moves it through `work` without a fold, so `-0.0`
-    // stays `-0.0`.
+
     if (group != 0u) return;
     for (uint row = tid; row < d.rows; row += threads) {
       if (count == 0u) {
@@ -1582,7 +1416,7 @@ inline void m4_reduce_two_levels(
     const device uint* src = level == 0u
         ? reinterpret_cast<const device uint*>(input) + row * d.last
         : plane + ((level - 1u) & 1u) * d.rows * pitch + row * pitch;
-    // Every lane's loads first, so they overlap; then the folds.
+
     uint held[8];
     for (uint k = 0; k < 8u; ++k) {
       const uint chunk = group * span + simd_id + k * simds;
@@ -1608,27 +1442,13 @@ inline void m4_reduce_two_levels(
   }
 }
 
-// ── A reduction split across two dispatches at the tree's first level ─────
-//
-// A streamed dispatch is a sequence of grid-strided passes sharing one
-// thread↔element mapping (element `i` is thread `i mod grid`). A reduction's
-// level 0 fits that mapping — each SIMD group holds a whole 32-chunk — so it
-// runs as one more pass in the producer's dispatch, writing one word per
-// chunk to a plane in `temporary`. The remaining levels need every chunk, so
-// they run at the start of the NEXT dispatch, inside each threadgroup
-// redundantly, and the result reaches the consumer's registers without a
-// dispatch of its own. Same chunks, same pairs, same order: bit-identical.
 
-// Level 0 over a single row of `n` elements: chunk `i0 / 32` per SIMD group.
-// `gtid - simd_lane` is the group's first element, so `i0` is 32-aligned
-// when the threadgroup is a multiple of 32 wide (the engine's promise).
 inline void m4_reduce_partial(
     uint tag, uint dtype, const device uchar* input, device uint* plane, uint n,
     uint gtid, uint gthreads, uint simd_lane) {
   const uint identity = m4_reduce_identity(tag, dtype);
   const device uint* src = reinterpret_cast<const device uint*>(input);
-  // Eight chunks' loads in flight before any fold: a rolled loop would wait
-  // on each load before issuing the next.
+
   uint i0 = gtid - simd_lane;
   for (; i0 < n; i0 += 8u * gthreads) {
     uint held[8];
@@ -1646,12 +1466,6 @@ inline void m4_reduce_partial(
   }
 }
 
-// Levels 1 and up over the `(n + 31) / 32` level-0 words in `plane`, folded
-// through threadgroup memory (`tgbuf`, 2048 words) by one threadgroup, the
-// result's bits returned to every thread of it. Uniform control flow: every
-// bound here is a function of `n`. A row of one element is copied untouched,
-// as the serial walk copies it (`-0.0` stays `-0.0`); an empty row is the
-// identity. A row past what the memory holds faults and answers the identity.
 inline uint m4_reduce_final(
     uint tag, uint dtype, const device uchar* input, uint n, const device uint* plane,
     device M1Status* status, uint threads, uint simd_lane, uint simd_id,
@@ -1668,8 +1482,7 @@ inline uint m4_reduce_final(
   threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
   const uint simds = threads / 32u;
   uint next = (count + 31u) / 32u;
-  // Level 1 reads the plane from device memory: sixteen chunks' loads in
-  // flight per SIMD group before any fold.
+
   for (uint c0 = simd_id; c0 < next; c0 += 16u * simds) {
     uint held[16];
     for (uint k = 0; k < 16u; ++k) {
@@ -1705,37 +1518,23 @@ inline uint m4_reduce_final(
   return result;
 }
 
-// ── A pivot selection (`0x58`, rank or mass) across the grid ──────────────
-//
-// `m1_nucleus_select_mt` picks the best remaining element of the row once
-// per kept token, each pick a scan of the whole row by one threadgroup:
-// 171 kept tokens over a 248k row was 17 ms, most of a chat-completion
-// token. The streamed form selects instead: rounds of up to `M4_SEL_CAP`
-// candidates — the elements next in `m1_sort_better` order after the
-// previous round's last — found by a radix select over the grid on
-// `m1_desc_key`, compacted, sorted in one threadgroup, and walked in order
-// by one thread doing exactly the serial walk's additions (`exclusive +=
-// value`, keep while `exclusive < threshold`) or counts (keep the first k).
-// Same order, same sums, same keep bits. A row that outruns the rounds is
-// finished by the serial pick loop from where the rounds stopped; a
-// multi-row value takes the serial walk outright.
 
 #define M4_SEL_CAP 1024u
 #define M4_SEL_BYTES 16384u
 
 struct M4SelState {
-  uint fast;        // 1: one row, the rounds run; 0: the fallback does it all
-  uint done;        // 1: every keep bit is written
-  uint have_bound;  // 1: `bound_*` name the last element taken so far
+  uint fast;
+  uint done;
+  uint have_bound;
   uint bound_key;
   uint bound_idx;
-  float exclusive;  // mass taken so far (mode 1)
-  uint taken;       // elements taken so far (mode 0)
-  uint want;        // candidates this round asks for
-  uint sel_prefix;  // the radix select's prefix so far
+  float exclusive;
+  uint taken;
+  uint want;
+  uint sel_prefix;
   uint sel_remaining;
-  uint total_lt;    // candidates strictly below the pivot this round
-  uint held;        // candidates the round produced
+  uint total_lt;
+  uint held;
   uint pad[4];
 };
 
@@ -1755,15 +1554,11 @@ inline device uint* m4_sel_idx(device uchar* base) {
   return reinterpret_cast<device uint*>(base + 64u + 2048u + 16u + 4096u);
 }
 
-// Is `(key, idx)` after the bound in the descending order (a candidate for
-// this round)?
 inline bool m4_sel_after(const device M4SelState* st, uint key, uint idx) {
   if (st->have_bound == 0u) return true;
   return key > st->bound_key || (key == st->bound_key && idx > st->bound_idx);
 }
 
-// Step 0 (grid): the mask cleared, the state seeded. `mode` 0 keeps the
-// first `k` (`a1` an integer), 1 keeps by mass (`a1` a float threshold).
 inline void m4_sel_init(
     device uchar* base, device uchar* o0, const M1ValueDesc d0, const M1ValueDesc d1,
     const device uchar* a1, uint mode, uint gtid, uint gthreads) {
@@ -1798,9 +1593,6 @@ inline void m4_sel_init(
   }
 }
 
-// A histogram sweep of the candidates' keys: pass 0 the top byte, passes
-// 1–3 the next among keys matching the prefix. Bins land in threadgroup
-// memory first, then one device add per bin per group.
 inline void m4_sel_hist_pass(
     device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint pass,
     uint gtid, uint gthreads, uint tid, uint threads, threadgroup atomic_uint* tg_hist) {
@@ -1834,8 +1626,6 @@ inline void m4_sel_hist_pass(
   }
 }
 
-// One group: the bin holding the `want`-th candidate, the prefix extended,
-// the histogram cleared for the next byte.
 inline void m4_sel_pick(device uchar* base, uint pass, uint tid, uint threads) {
   device M4SelState* st = m4_sel_state(base);
   if (st->done != 0u || st->fast == 0u) return;
@@ -1862,8 +1652,6 @@ inline void m4_sel_pick(device uchar* base, uint pass, uint tid, uint threads) {
   }
 }
 
-// The grid: every candidate below the pivot, and those equal to it while
-// they fit, appended unordered.
 inline void m4_sel_compact(
     device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint gtid, uint gthreads) {
   const device M4SelState* st = m4_sel_state(base);
@@ -1896,9 +1684,6 @@ inline void m4_sel_compact(
   }
 }
 
-// One group: the round's candidates sorted by `(key, index)`, then walked
-// in order by thread 0 exactly as the serial pick loop would have walked
-// them. Ties at the pivot beyond the room are recovered by an ordered walk.
 inline void m4_sel_finish(
     device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
     const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
@@ -1953,7 +1738,7 @@ inline void m4_sel_finish(
     held = want;
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  // The row may hold fewer candidates than the round asked for.
+
   uint n_all = 1u;
   while (n_all < held) n_all <<= 1u;
   for (uint p = held + tid; p < n_all; p += threads) {
@@ -1979,7 +1764,7 @@ inline void m4_sel_finish(
     }
   }
   if (tid == 0u) {
-    // Exactly the serial walk, over exactly its next `held` elements.
+
     float exclusive = st->exclusive;
     uint taken = st->taken;
     bool done = false;
@@ -2002,7 +1787,7 @@ inline void m4_sel_finish(
         ++taken;
       }
     }
-    if (!done && (held < want || held == 0u)) done = true;  // the row is exhausted
+    if (!done && (held < want || held == 0u)) done = true;
     if (!done && mode == 0u && taken >= k) done = true;
     if (!done && mode == 1u && !(exclusive < threshold)) done = true;
     if (!done && held > 0u) {
@@ -2018,8 +1803,6 @@ inline void m4_sel_finish(
   }
 }
 
-// One group: whatever the rounds left — a multi-row value, or a row whose
-// keep set outran them — by the serial pick loop, continued from the bound.
 inline void m4_sel_fallback(
     device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
     const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
@@ -2041,7 +1824,7 @@ inline void m4_sel_fallback(
   float exclusive = st->exclusive;
   uint taken = st->taken;
   bool have_prev = st->have_bound != 0u;
-  // The bound as the previous pick: its value is recovered from the row.
+
   float prev_value = have_prev ? m1_load_f(a0, st->bound_idx, d0.dtype) : 0.0f;
   uint prev_index = st->bound_idx;
   for (uint position = 0; position < n; ++position) {
@@ -2072,9 +1855,6 @@ inline void m4_sel_fallback(
   if (tid == 0u) st->done = 1u;
 }
 
-// The f32 argmax in two dispatches: every threadgroup folds its grid-strided
-// share of a row to one candidate in `temporary` (order-free: the combine is
-// a strict total order), then one threadgroup folds the candidates.
 inline void m4_argmax_partial(
     const device uchar* input,
     device uchar* temporary,
@@ -2134,13 +1914,6 @@ inline void m4_argmax_final(
   }
 }
 
-// The grouped region hands a lane a whole threadgroup. Every op whose
-// elements are independent is partitioned across it by `ptir_m1_execute_part`;
-// the two fixed-tree reductions are partitioned by a walk that reproduces the
-// tree (the tree shape is a numeric ABI and must not be repartitioned); the
-// argmax takes the cooperative fold below; and an op whose walk carries state
-// across elements stays on thread 0 with the exact serial semantics. The
-// caller barriers between ops.
 inline void ptir_m1_execute_mt(
     uint generated_tag,
     device M1Status* status,
@@ -2160,13 +1933,12 @@ inline void ptir_m1_execute_mt(
   p.tag = generated_tag;
   const M1ValueDesc d0 = descriptors[p.a0];
 
-  if (p.tag == 0x33) {  // argmax: order-independent, so partition it
+  if (p.tag == 0x33) {
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
     return;
   }
   if (p.tag == 0x58 && nthreads > 1u && p.pred_tag != 2) {
-    // The two selections that walk a row with state: their picks are
-    // total-order maxima and their counts are order-free, so both partition.
+
     const M1ValueDesc d1 = descriptors[p.a1];
     if (p.pred_tag == 0) m1_topk_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);
     else m1_nucleus_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);

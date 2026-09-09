@@ -1,8 +1,3 @@
-//! `Collective`: collectives on the metal plane — there are none. Metal serves a
-//! single device, so every variant answers [`Error::Unsupported`]; the
-//! entries exist so the driver arm stays destructure → resolve → call, and
-//! the refusal stays typed.
-
 use crate::error::Error;
 
 use crate::encode::Ctx;

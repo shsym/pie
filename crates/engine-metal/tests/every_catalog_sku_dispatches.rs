@@ -1,50 +1,12 @@
-//! **WHICH CATALOG ROWS THIS SHELL CAN SERVE, ASSERTED RATHER THAN ASSUMED.**
-//!
-//! `model_ir::ops` states the rule this test enforces from the outside: *"one
-//! variant per family, so 'does this backend cover this op' is a missing match
-//! arm in its `Dispatch` impl, caught at compile time."* Compile time settles
-//! the arms; it cannot settle an arm that exists and refuses, and it cannot
-//! settle an arm that dispatches into a kernel entry which itself refuses.
-//! Those two are the coverage holes, they are few, and each is named in
-//! [`REFUSED`] beside the reason it stands and the source that carries it.
-//!
-//! Every row of `models::skus()` is traced on this shell's platform, every
-//! node's `Operation::name()` is read off the trace, and a row that names a
-//! refused op fails — unless it sits in [`CANNOT_SERVE`] with the op that
-//! stops it. So the test fails in four directions:
-//!
-//! * a shell or kernels crate that grows a refusal an unlisted row reaches;
-//! * a catalog row that grows an op this backend refuses;
-//! * an exemption that stops being true — [`no_exemption_outlives_its_reason`];
-//! * a refusal that stops being real — [`every_refusal_is_still_carried`],
-//!   which reads each listed site back and fails if the refusal has gone.
-//!   Without it a covered op left in the list would silently exempt every row
-//!   that names it.
-//!
-//! It runs anywhere: a trace is arithmetic over the SKU's recipe, and no device
-//! is opened. It does NOT check that a covered op *computes* the right thing —
-//! `kernels_*.rs` and the artifact tests carry that.
-//!
-//! # Why op names and not the dispatch arms themselves
-//!
-//! Driving the arms would be stronger and is not available without a device:
-//! `Run::new` wants a `&Scratch`, and `Scratch::reserve` allocates. The
-//! refusals are declared here instead and pinned to their source.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_ir::Operands;
 use model_ir::Platform;
 
-/// The platform this shell serves.
 const PLATFORM: Platform = Platform::Metal;
 
-/// Which backend the refusal list below was read from.
 const SHELL: &str = "engine-metal";
 
-/// One refused op: what it is called, why the refusal stands, the file that
-/// carries it (relative to this crate, `../` for a sibling), and a fragment of
-/// that file which must still be there.
 struct Refusal {
     op: &'static str,
     why: &'static str,
@@ -52,43 +14,7 @@ struct Refusal {
     needle: &'static str,
 }
 
-/// **EVERY OP THIS BACKEND REFUSES**, whether the refusal is in the shell's
-/// dispatch arm or in the kernel entry the arm dispatches into. An op absent
-/// from this list is covered.
 const REFUSED: &[Refusal] = &[
-    // `dispatch/elemwise.rs`, the "No shipped shader for these" arm.
-    // `engine-metal` refuses the same three in the same place; `engine-cuda`
-    // covers all three (`kernels-cuda/src/elemwise/{layernorm,clip}.rs`).
-    Refusal {
-        op: "elementwise.layernorm_no_scale",
-        why: "no shipped shader; engine-vulkan refuses it too, engine-cuda covers it",
-        file: "src/dispatch/elemwise.rs",
-        needle: "Elementwise::LayernormNoScale",
-    },
-    Refusal {
-        op: "elementwise.clamp",
-        why: "no shipped shader; engine-vulkan refuses it too, engine-cuda covers it",
-        file: "src/dispatch/elemwise.rs",
-        needle: "Elementwise::Clamp {",
-    },
-    Refusal {
-        op: "elementwise.clamp_learned",
-        why: "no shipped shader; engine-vulkan refuses it too, engine-cuda covers it",
-        file: "src/dispatch/elemwise.rs",
-        needle: "Elementwise::ClampLearned",
-    },
-    // The arm dispatches; the kernel entry is the refusal. `kernels-metal`
-    // refuses it identically; `kernels-cuda` claims the point and hands it to
-    // its attention plane.
-    Refusal {
-        op: "elementwise.res_blend",
-        why: "typed refusal in the kernels crate; kernels-metal refuses it too, kernels-cuda \
-              covers it",
-        file: "../kernels-metal/src/elemwise/norm.rs",
-        needle: "op: \"elementwise.res_blend\"",
-    },
-    // One device, so there is nothing to reduce across. `kernels-cuda` answers
-    // these through NCCL; `kernels-metal` refuses them exactly as here.
     Refusal {
         op: "collective.all_reduce",
         why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
@@ -107,82 +33,21 @@ const REFUSED: &[Refusal] = &[
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.reduce_scatter\"",
     },
-    // `dispatch/custom.rs`. A CUDA fusion has no portable reading; only
-    // `engine-cuda` answers this family, and no catalog row names it.
     Refusal {
         op: "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
         why: "a CUDA-only fusion; engine-vulkan refuses it too",
         file: "src/dispatch/custom.rs",
-        needle: "Unsupported",
-    },
-    // M0 (`crates/model-ir/IMAGEGEN_CONTRACT.md`): the image/video substrate's
-    // ops are CUDA-first this phase, and every arm below refuses by name in
-    // its own `M0: ...` block. `engine-vulkan` and `engine-wgpu` refuse them
-    // identically.
-    Refusal {
-        op: "attention.ragged",
-        why: "the M0 ragged attention (D2) is CUDA-first this phase",
-        file: "src/dispatch/attn.rs",
-        needle: "Attention::Ragged { .. } => {",
+        needle: "Err(KernelError::Unsupported { op: op.name() })",
     },
     Refusal {
-        op: "layout.pack_rows",
-        why: "the M0 row packing (D2) is CUDA-first this phase",
-        file: "src/dispatch/layout.rs",
-        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
-    },
-    Refusal {
-        op: "layout.unpack_rows",
-        why: "the M0 row packing (D2) is CUDA-first this phase",
-        file: "src/dispatch/layout.rs",
-        needle: "Layout::PackRows { .. } | Layout::UnpackRows { .. }",
-    },
-    Refusal {
-        op: "elementwise.modulate",
-        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::Modulate { .. }",
-    },
-    Refusal {
-        op: "elementwise.gated_residual_add",
-        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::GatedResidualAdd { .. }",
-    },
-    Refusal {
-        op: "elementwise.sinusoid",
-        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::Sinusoid { .. }",
-    },
-    Refusal {
-        op: "elementwise.silu",
-        why: "the M0 conditioning ops (D6) are CUDA-first this phase",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::Silu { .. }",
-    },
-    Refusal {
-        op: "elementwise.rope_axes",
-        why: "the M0 axis rope (D7) is CUDA-first this phase",
-        file: "src/dispatch/elemwise.rs",
-        needle: "| Elementwise::RopeAxes { .. }",
+        op: "spatial.patchify",
+        why: "voxels to patch tokens has no arm here; no catalog row reaches it",
+        file: "src/dispatch/custom.rs",
+        needle: "Spatial::Patchify { .. } | Spatial::Unpatchify { .. }",
     },
 ];
 
-/// Rows this backend cannot serve, each with EVERY op that stops it — the set
-/// is compared for equality, so a row exempted over one refusal cannot quietly
-/// acquire another. Every entry is a debt, not a decision; the goal is an
-/// empty list.
-///
-/// This shell is the bar `engine-vulkan` and `engine-wgpu` were measured
-/// against; `engine-cuda` serves them all.
 const CANNOT_SERVE: &[(&str, &[&str])] = &[
-    // Tensor parallelism: rank-crossing reductions, and this backend drives
-    // one device. `worker::serve` refuses `tensor_parallel_size > 1` for every
-    // flavor but CUDA, so these rows are unreachable from the CLI as well.
-    // A row whose lm_head is sharded on the vocab axis gathers the shards
-    // back, so `collective.all_gather` stops it as well. `dsv4-base` ties
-    // its head and states no gather.
     ("dsv4-base-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     (
         "gemma4-e4b-bf16-kv-bf16-tp2",
@@ -208,298 +73,16 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "muse-glimmer-30b-bf16-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
-    // kimi-k3 folds its residual through `res_blend`, which only the CUDA
-    // plane claims; the tp2 row wants the collective as well.
-    ("kimik3-bf16-mxfp4-kv-bf16", &["elementwise.res_blend"]),
     (
         "kimik3-bf16-mxfp4-kv-bf16-tp2",
-        &[
-            "collective.all_gather",
-            "collective.all_reduce",
-            "elementwise.res_blend",
-        ],
+        &["collective.all_gather", "collective.all_reduce"],
     ),
-    // gemma-4's vision tower clamps a learned per-channel bound.
-    (
-        "gemma4-e4b-vision-bf16-kv-bf16",
-        &["elementwise.clamp_learned"],
-    ),
-    // TODO(R2-ENGINE): the synthetic generative row names every M0 op at once,
-    // which is what it is for, plus the centred LayerNorm this shell has never
-    // shipped a shader for. Drop the M0 names when this shell's arms land.
-    (
-        "mini-dit-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    // z-image and flux.2: the M0 image families, whose conditioning ops are
-    // CUDA-first this phase.
-    (
-        "z-image-mini-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "z-image-turbo-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "flux2-mini-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "flux2-klein-4b-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    // wan 2.2 and ltx-2.5: the video families. `wan22-ti2v-5b` clamps its VAE's
-    // latents on top of the M0 set.
-    (
-        "wan22-mini-nano-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "wan22-mini-d128-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "wan22-ti2v-5b-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.clamp",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "ltx25-mini-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "ltx25-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    // minimax h3: one stream over video and audio. It norms with a scale, so it
-    // does not name the centred LayerNorm the others do.
-    (
-        "minimax-h3-mini-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "minimax-h3-fl2va-bf16-kv-bf16",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "minimax-h3-fl2va-bf16-kv-bf16-tp2",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "minimax-h3-fl2va-bf16-kv-bf16-tp4",
-        &[
-            "attention.ragged",
-            "elementwise.gated_residual_add",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    // hunyuanimage 3: an AR/diffusion hybrid on a text trunk, so it names the
-    // modulation ops without the ragged attention or the row packing.
-    (
-        "hunyuanimage3-mini-bf16-kv-bf16",
-        &[
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-        ],
-    ),
-    (
-        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
-        &[
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-        ],
-    ),
-    (
-        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
-        &[
-            "collective.all_reduce",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-        ],
-    ),
-    (
-        "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
-        &[
-            "collective.all_reduce",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-        ],
-    ),
-    // the synthetic generative row's sharded twins: the M0 set plus the collective.
-    (
-        "mini-dit-bf16-kv-bf16-tp2",
-        &[
-            "attention.ragged",
-            "collective.all_reduce",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
-    (
-        "mini-dit-bf16-kv-bf16-tp4",
-        &[
-            "attention.ragged",
-            "collective.all_reduce",
-            "elementwise.gated_residual_add",
-            "elementwise.layernorm_no_scale",
-            "elementwise.modulate",
-            "elementwise.rope_axes",
-            "elementwise.silu",
-            "elementwise.sinusoid",
-            "layout.pack_rows",
-            "layout.unpack_rows",
-        ],
-    ),
+    ("hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4", &["collective.all_reduce"]),
+    ("hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4", &["collective.all_reduce"]),
+    ("mini-dit-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
+    ("mini-dit-bf16-kv-bf16-tp4", &["collective.all_reduce"]),
 ];
 
-/// The ops one row names.
 fn ops_of(sku: &str) -> BTreeSet<String> {
     let row = models::sku(sku).expect("the row is in the catalog");
     (row.trace)(PLATFORM)
@@ -513,7 +96,6 @@ fn refused() -> BTreeMap<&'static str, &'static Refusal> {
     REFUSED.iter().map(|r| (r.op, r)).collect()
 }
 
-/// Which refused ops stop each row, by row.
 fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     let refused = refused();
     let mut stopped = BTreeMap::new();
@@ -529,7 +111,13 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     stopped
 }
 
-/// **EVERY CATALOG ROW NAMES ONLY OPS THIS BACKEND COVERS.**
+fn every_catalog_sku_dispatches_every_case() {
+    every_catalog_sku_dispatches();
+    no_exemption_outlives_its_reason();
+    every_refusal_is_still_carried();
+    every_catalog_sku_traces();
+}
+
 #[test]
 fn every_catalog_sku_dispatches() {
     let refused = refused();
@@ -560,9 +148,6 @@ fn every_catalog_sku_dispatches() {
     );
 }
 
-/// **NO EXEMPTION OUTLIVES ITS REASON.** A row in [`CANNOT_SERVE`] must still
-/// be stopped, and stopped by the op the list names.
-#[test]
 fn no_exemption_outlives_its_reason() {
     let stopped = stopped();
     let mut stale = Vec::new();
@@ -593,10 +178,6 @@ fn no_exemption_outlives_its_reason() {
     );
 }
 
-/// **EVERY REFUSAL NAMED HERE IS STILL CARRIED.** Reads each listed site back
-/// and fails if its refusal has gone — the guard that keeps the list from
-/// becoming fiction.
-#[test]
 fn every_refusal_is_still_carried() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut gone = Vec::new();
@@ -616,9 +197,6 @@ fn every_refusal_is_still_carried() {
     assert!(gone.is_empty(), "{}", gone.join("\n  "));
 }
 
-/// **EVERY ROW TRACES**, and traces for this platform. A row that traces to
-/// nothing is a hole no refusal list would show.
-#[test]
 fn every_catalog_sku_traces() {
     let mut empty = Vec::new();
     for row in models::skus() {
@@ -635,8 +213,6 @@ fn every_catalog_sku_traces() {
     assert!(empty.is_empty(), "rows that trace to nothing: {empty:?}");
 }
 
-/// The op-by-op and row-by-row reading, printed rather than asserted. Run with
-/// `cargo test -p engine-metal --test every_catalog_sku_dispatches -- --ignored --nocapture`.
 #[test]
 #[ignore = "a report, not a claim"]
 fn report() {

@@ -1,13 +1,3 @@
-//! **`spatial::attention` LANDS ONE SOFTMAX ATTENTION PER LANE, THE HEAD AS
-//! WIDE AS THE ROW** — at 256, 512, **640** (Wan 2.2's ENCODER mid block,
-//! the scalar-slice instantiation) and **1024** channels (its DECODER's),
-//! over two lanes of boxes whose voxel counts do not
-//! divide the warp's query group (so a group straddles the lane boundary),
-//! with padded rows past the last lane landing zeros; against an f64 host
-//! reference to bf16 tolerance.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_spatial_attention_answers_the_cpu_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -18,7 +8,6 @@ use dtype::Dtype;
 use kernels_cuda::spatial::{Segment, attention};
 use kernels_cuda::tensor::Tensor;
 
-/// The reference: per lane, `softmax(q kᵀ · scale) v` in f64.
 fn attention_ref(
     q: &[f32],
     k: &[f32],
@@ -59,7 +48,6 @@ fn attention_ref(
 fn check(c: usize) {
     let boxes = [Box3::new(1, 5, 7), Box3::new(2, 3, 4)];
     let (grid, live) = table(&boxes);
-    // Five padded rows past the last lane, as a bucketed fire leaves them.
     let rows = live + 5;
     let scale = (c as f32).sqrt().recip();
     let mut lcg = Lcg::seeded(0xa77e ^ c as u64);
@@ -83,7 +71,6 @@ fn check(c: usize) {
         t(v_at),
         Tensor::new(grid_at, boxes.len() as u32, 4, Dtype::I32),
         Segment::Lane,
-        // A sharper softmax than the head's own, so a wrong key order shows.
         scale * 4.0,
         &mut y,
     )
@@ -113,6 +100,11 @@ fn check(c: usize) {
     eprintln!("C {c}: {rows} rows, max |err| {worst:.5}");
 }
 
+fn the_spatial_attention_answers_the_cpu_reference_every_case() {
+    the_attention_answers_the_reference_at_256_512_and_1024_channels();
+    the_attention_answers_the_reference_at_the_scalar_640_width();
+}
+
 #[test]
 fn the_attention_answers_the_reference_at_256_512_and_1024_channels() {
     check(256);
@@ -120,11 +112,6 @@ fn the_attention_answers_the_reference_at_256_512_and_1024_channels() {
     check(1024);
 }
 
-/// 640 is Wan 2.2's ENCODER mid block, and the one stamped width whose
-/// per-lane slice (20 channels) is neither a whole number of 16-byte words
-/// nor 16-byte aligned: that instantiation moves bf16 scalars instead, and
-/// has to answer the same reference the vector path does.
-#[test]
 fn the_attention_answers_the_reference_at_the_scalar_640_width() {
     check(640);
 }

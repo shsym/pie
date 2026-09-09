@@ -1,19 +1,8 @@
-//! Out-of-band data-plane blob fetch.
-//!
-//! Large binary inputs (user images/audio) never travel the gateway↔worker
-//! command path — `dispatch` carries only a [`BlobRef`], and the worker pulls
-//! the bytes here over plain HTTP (`GET {origin}/blob/{hash}`). Content-
-//! addressed, so integrity is free: size pre-check, then verify
-//! `blake3(body) == hash`.
-
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use worker_api::BlobRef;
 
-/// Fetch a blob's bytes out-of-band (`GET {origin}/blob/{hash}`) and verify
-/// integrity (content-addressed): size pre-check then `blake3(body) == hash`.
-/// 404 fails the turn; 502 gets a bounded retry.
 pub async fn fetch(blob: &BlobRef) -> Result<Vec<u8>> {
     const RETRIES: usize = 3;
     const RETRY_BACKOFF: Duration = Duration::from_millis(100);

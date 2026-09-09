@@ -1,18 +1,10 @@
-//! Fire planning: computes the member row order and, per divergence site,
-//! the device-independent lowering for one step group.
-
-/// How a divergence site's variation prices out, independent of device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DivClass {
-    /// Identical for every member; emit once, no branch.
     #[allow(dead_code)] // v0's two sites are never Shared.
     Shared,
-    /// Folds into an additive fix on an already-materialized output.
     #[allow(dead_code)]
     Correction,
-    /// Same operator, per-member weights: one batched GEMM, no branch.
     Weight,
-    /// Genuinely different operators: the fused region must split.
     Structural,
 }
 
@@ -27,14 +19,9 @@ impl DivClass {
     }
 }
 
-/// The extent a site's divergence varies over. Token-granularity sites
-/// can't be seriated by member order (variation is inside each member's
-/// rows), so their lowering is always data-driven, never a prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Granularity {
-    /// Varies per fire member (request/lane): adapters, hooks, depth.
     Request,
-    /// Varies per token row within every member: the MoE expert axis.
     Token,
 }
 
@@ -47,19 +34,12 @@ impl Granularity {
     }
 }
 
-/// The lowering chosen for one site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lowering {
-    /// Every lane agrees; the fast path covers the whole step.
     Uniform,
-    /// The agreeing prefix takes the fast path, the tail does not.
-    /// `fast_rows` counts members, not wire rows; converted downstream via
-    /// `batch::planned_prefix_wire_rows`.
     Prefix { fast_rows: u32 },
-    /// Per-lane weights/corrections applied by span.
     PerLane,
-    /// Genuinely different operators behind a guard.
-    #[allow(dead_code)] // reserved: no Structural site lowers to a real branch yet.
+    #[allow(dead_code)]
     Conditional,
 }
 
@@ -74,42 +54,29 @@ impl Lowering {
     }
 }
 
-/// One place in the model where the step's members may diverge, with the
-/// lowering this plan chose for it.
 #[derive(Clone, Debug)]
 pub(crate) struct Site {
     pub(crate) name: &'static str,
-    #[allow(dead_code)] // read by report()/tests; the runtime consumer is a later increment.
+    #[allow(dead_code)]
     pub(crate) class: DivClass,
-    #[allow(dead_code)] // read by report()/tests, like `class`.
+    #[allow(dead_code)]
     pub(crate) granularity: Granularity,
     pub(crate) lowering: Lowering,
-    /// Why this lowering, for `report()`.
     pub(crate) note: String,
 }
 
-/// Attention-hook programs switch a lane off the fused QKV+norm+rope+KV-write
-/// kernel.
 pub(crate) const SITE_QKV_POSTPROCESS: &str = "qkv_postprocess";
 
-/// A program carrying the pass-wide `lora` sink wants x(W+BA)^T where its
-/// neighbors want xW^T.
 pub(crate) const SITE_PROJECTION_WEIGHTS: &str = "projection_weights";
 
-/// Members carrying a user-authored wire mask force the custom-mask
-/// attention arm.
 pub(crate) const SITE_ATTENTION_MASK: &str = "attention_mask";
 
-/// Per-token weight divergence from an MoE trace's expert-indexed matmuls.
-/// Not derived from [`MemberFacts`]; nothing emits one yet.
 #[allow(
     dead_code,
     reason = "the vocabulary outlives its producer on purpose; the module doc measures why"
 )]
 pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
 
-/// The [`SITE_EXPERT_WEIGHTS`] vocabulary entry, as an engine-reported
-/// summary would land in it.
 #[allow(
     dead_code,
     reason = "same as `SITE_EXPERT_WEIGHTS`: nothing reports a site, so only tests build one"
@@ -127,42 +94,26 @@ pub(crate) fn expert_weights_site(experts: u32, top_k: u32) -> Site {
     }
 }
 
-/// The facts about one step member that planning reads — nothing else.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemberFacts {
-    /// The program declares an attention-hook stage.
     pub(crate) hook_program: bool,
-    /// The program carries the pass-wide `lora` configuration sink.
     pub(crate) lora: bool,
-    /// Wire rows carry a user-authored attention mask. Nests under hooks in
-    /// the seriation key so masked members form a contiguous tail.
     pub(crate) custom_mask: bool,
-    /// The member requests a layer truncation; nests inside the mask key.
     pub(crate) truncated: bool,
-    /// The truncation's k; orders deepest-first inside the truncated block
-    /// so the live rows at layer l are always a prefix. `None` if untruncated.
     pub(crate) max_layers: Option<u32>,
-    /// Multi-token members sort before single-token ones within each block.
     pub(crate) multi_token: bool,
-    /// The sort's primary term: a device-resolved member composes as the
-    /// ordered suffix sub-batch, never interleaved with wire members.
     pub(crate) geometry_class: eta_ir::registry::GeometryClass,
-    /// Arrival position within the step group; the stable-order tiebreak.
     pub(crate) arrival: usize,
 }
 
-/// One step's plan: the member permutation plus a lowering per site.
 #[derive(Clone, Debug)]
 pub(crate) struct FirePlan {
-    /// Indices into the planned members, sorted stably by `(geometry class,
-    /// hook_program, custom_mask, arrival)`.
     pub(crate) member_order: Vec<usize>,
     pub(crate) sites: Vec<Site>,
 }
 
 impl FirePlan {
-    /// Debug rendering.
-    #[allow(dead_code)] // debugging surface; tests exercise it.
+    #[allow(dead_code)]
     pub(crate) fn report(&self) -> String {
         let mut out = vec![format!("{} members", self.member_order.len())];
         for site in &self.sites {
@@ -183,21 +134,13 @@ impl FirePlan {
     }
 }
 
-/// Plan one step group from member facts alone. Equivalent to
-/// [`plan_fire_with_model`] with no model-structural sites.
-#[allow(dead_code)] // production always calls the merge form now (capabilities wiring); kept as the named no-sites entry point the tests and the reduce-to-empty equivalence pin.
+#[allow(dead_code)]
 pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
     plan_fire_with_model(members, &[])
 }
 
-/// Plan one step group: derives member-fact sites, then appends
-/// `model_sites` in the caller's order. Model-structural sites never affect
-/// `member_order` — token-granularity divergence can't be seriated.
 pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]) -> FirePlan {
     let mut member_order: Vec<usize> = (0..members.len()).collect();
-    // Sort key order: geometry class, then [full | truncated deepest-first |
-    // masked], hooks early among full-depth rows. Stable, so `arrival` is
-    // the tiebreak.
     member_order.sort_by_key(|&index| {
         let member = &members[index];
         (
@@ -211,9 +154,6 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         )
     });
 
-    // Each window axis (mask, hook, truncation) must form one contiguous
-    // run; a fragmented axis needs the gather fallback, so it logs loudly
-    // (latched) instead of fragmenting silently.
     {
         let contiguous = |bit: fn(&MemberFacts) -> bool| -> bool {
             let mut runs = 0;
@@ -249,7 +189,6 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             note: "no hook lanes; the fused QKV path covers the step".to_string(),
         }
     } else {
-        // Agreeing prefix after ordering; all-hook degenerates to 0.
         let fast_rows = member_order
             .iter()
             .take_while(|&&index| !members[index].hook_program)
@@ -357,8 +296,17 @@ mod tests {
         }
     }
 
-    /// Truncated members order deepest-first inside their block, so at any
-    /// layer l the live rows (k > l) are a prefix of the block.
+    fn fire_plan_every_case() {
+        truncated_members_seriate_deepest_first();
+        full_depth_hook_sorts_before_truncated_members();
+        masked_members_seriate_last_and_the_site_counts_the_prefix();
+        all_plain_members_plan_uniform_everywhere();
+        all_hook_members_plan_an_empty_prefix();
+        mixed_hooks_order_hook_free_first_and_count_the_prefix();
+        lora_mixing_plans_per_lane_weights();
+        device_geometry_members_are_forced_last();
+    }
+
     #[test]
     fn truncated_members_seriate_deepest_first() {
         let band = |k: u32, arrival: usize| {
@@ -381,9 +329,6 @@ mod tests {
         );
     }
 
-    /// Depth outranks the hook bit: full-depth (hooked or not) sorts before
-    /// every truncated member; the mask suffix stays untouched.
-    #[test]
     fn full_depth_hook_sorts_before_truncated_members() {
         let band = |k: u32, arrival: usize| {
             let mut m = member(false, false, false, arrival);
@@ -393,9 +338,9 @@ mod tests {
         };
         let members = [
             band(8, 0),
-            member(true, false, false, 1), // hooked, full depth
+            member(true, false, false, 1),
             band(12, 2),
-            member(false, false, false, 3), // plain, full depth
+            member(false, false, false, 3),
         ];
         let plan = plan_fire_with_model(&members, &[]);
         assert_eq!(
@@ -412,9 +357,6 @@ mod tests {
         );
     }
 
-    /// NS-1: masked members seriate to the tail of their (geometry, hook)
-    /// class and the attention_mask site reports the unmasked prefix.
-    #[test]
     fn masked_members_seriate_last_and_the_site_counts_the_prefix() {
         let members = vec![
             masked_member(0),
@@ -427,8 +369,6 @@ mod tests {
         let mask_site = site(&plan, SITE_ATTENTION_MASK);
         assert_eq!(mask_site.class, DivClass::Structural);
         assert_eq!(mask_site.lowering, Lowering::Prefix { fast_rows: 2 });
-        // The mask key is outermost: a masked member sorts after every
-        // unmasked one, hooked or not.
         let mixed = vec![masked_member(0), member(true, false, false, 1)];
         let plan = plan_fire(&mixed);
         assert_eq!(plan.member_order, vec![1, 0]);
@@ -441,7 +381,6 @@ mod tests {
             .expect("site is always planned")
     }
 
-    #[test]
     fn all_plain_members_plan_uniform_everywhere() {
         let members: Vec<MemberFacts> = (0..4).map(|i| member(false, false, false, i)).collect();
         let plan = plan_fire(&members);
@@ -456,7 +395,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn all_hook_members_plan_an_empty_prefix() {
         let members: Vec<MemberFacts> = (0..3).map(|i| member(true, false, false, i)).collect();
         let plan = plan_fire(&members);
@@ -467,7 +405,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn mixed_hooks_order_hook_free_first_and_count_the_prefix() {
         let members = vec![
             member(true, false, false, 0),
@@ -477,7 +414,6 @@ mod tests {
             member(false, false, false, 4),
         ];
         let plan = plan_fire(&members);
-        // Hook-free lanes first in arrival order, then hook lanes.
         assert_eq!(plan.member_order, vec![1, 3, 4, 0, 2]);
         assert_eq!(
             site(&plan, SITE_QKV_POSTPROCESS).lowering,
@@ -485,7 +421,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn lora_mixing_plans_per_lane_weights() {
         let members = vec![
             member(false, false, false, 0),
@@ -498,15 +433,10 @@ mod tests {
             Lowering::PerLane
         );
         assert_eq!(site(&plan, SITE_PROJECTION_WEIGHTS).class, DivClass::Weight);
-        // lora does not perturb the member order: weight-class divergence
-        // is a pointer, not a branch.
         assert_eq!(plan.member_order, vec![0, 1, 2]);
     }
 
-    #[test]
     fn device_geometry_members_are_forced_last() {
-        // A device-resolved envelope lane arriving first must still land
-        // after every wire lane, hooks or not.
         let members = vec![
             member(false, false, true, 0),
             member(true, false, false, 1),
@@ -514,7 +444,6 @@ mod tests {
         ];
         let plan = plan_fire(&members);
         assert_eq!(plan.member_order, vec![2, 1, 0]);
-        // The prefix counts only the leading hook-free run.
         assert_eq!(
             site(&plan, SITE_QKV_POSTPROCESS).lowering,
             Lowering::Prefix { fast_rows: 1 }

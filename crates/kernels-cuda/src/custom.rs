@@ -1,9 +1,3 @@
-//! `CustomCuda`: the escape hatch's family — entries that fuse work the
-//! other five families would each spell separately. Its one member splits
-//! packed qkv, head-norms q and k, ropes them, norms v, and appends k/v to
-//! the cache in one pass. Emitting it is a model-source decision; this file
-//! only launches it.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -12,13 +6,6 @@ use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.cuh";
 
-/// Splits `packed`, norms and ropes q/k at their stated head geometry,
-/// norms v, and appends k/v into the pool — `q` is the only tensor left
-/// over. `positions` feeds the rope math; `write_page`/`write_offset` are
-/// the op's per-token write descriptors the append lands by.
-///
-/// The kernel applies one epsilon to both head norms, so two different
-/// stated epsilons are refused rather than silently normalising k at q's.
 #[allow(clippy::too_many_arguments)]
 pub fn qkv_fused_qknorm_rope_vnorm_write(
     ctx: &Ctx,
@@ -83,9 +70,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rows = count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
-    // The rope-table seat, absent on this point.
     let rope_table = ArgValue::ABSENT;
-    // Live-rows word when a body replay armed a stage, else ABSENT.
     let window = ctx.stage();
 
     let warped = match head_dim {

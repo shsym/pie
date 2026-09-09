@@ -1,8 +1,3 @@
-//! `mini-dit` has no chat surface. The catalog's template column is not
-//! optional, so this row reuses `qwen_3`'s ChatML constructor over whatever
-//! tokenizer it is handed — the same borrowing its [`super::tokenizer`]
-//! contract does, and for the same reason.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;

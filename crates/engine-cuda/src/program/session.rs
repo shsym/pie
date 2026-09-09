@@ -1,5 +1,3 @@
-//! One bound instance: rings, per-stage buffers, and one fire.
-
 use std::sync::Arc;
 
 use eta_exec::{ExecPlan, Extents};
@@ -17,31 +15,20 @@ use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_
 use super::ports::{self, Envelope};
 use super::wave::Wave;
 
-/// What one fire produced; mirrors [`eta_exec::StepOutcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fired {
-    /// Every stage ran and the cursors advanced.
     Committed,
-    /// This channel did not meet the program's declared requirement.
     Blocked(u32),
-    /// A stage declined; cursors are unchanged.
     Declined,
-    /// The instance is unusable and stays so.
     Faulted(String),
 }
 
-/// A fire's staged result, kept apart from [`Fired`] so nothing settles
-/// what never launched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Launched {
-    /// On the stream; owed a verdict from [`Session::settle_launched`].
     Airborne,
-    /// Nothing launched; nothing owed.
     Refused(Fired),
 }
 
-/// An intrinsic bound to a buffer; row is per-lane, resolved when the lane
-/// is taken.
 #[derive(Clone, Copy, Debug)]
 struct Intrinsic {
     id: eta_ir::op::IntrinsicId,
@@ -52,59 +39,30 @@ struct Intrinsic {
     row_offset: u32,
 }
 
-/// One bound instance's device state. Cursors are `u64` sequence numbers
-/// that never wrap; a ring position is the residue.
 #[derive(Debug)]
 pub struct Session {
     rings: Rings,
     shapes: Vec<ChannelShape>,
-    /// Predicted cursors, advanced at mint and rolled back on refusal. For a
-    /// host-ended channel only the engine's own counter lives here; the
-    /// guest's is its pinned word.
     cursors: Vec<Cursor>,
-    /// What this instance's value shapes resolve against, fixed at bind.
     extents: Extents,
-    /// Intrinsic bindings, indexed by `IntrinsicId as usize`; survive a fire.
     intrinsics: Vec<Option<Intrinsic>>,
-    /// One bit per bound `IntrinsicId`. An unbound intrinsic's base is zero,
-    /// which the kernel would dereference, so `stage` checks this first.
     bound: u64,
     poisoned: bool,
     fires: u64,
-    /// Mapped pinned pair: `[0]` pass commit flag, `[1]` kill word.
     commit: Pinned,
-    /// The one fire this session may have airborne. At most one, since a
-    /// second mint would predict against unreconciled cursors.
     pending: Option<Minted>,
-    /// A tensor-parallel follower's session: its host-ended rings are rank
-    /// 0's endpoints, shared. The predictions here advance in step with
-    /// rank 0's, the tickets are [`Ticket::SHADOW`] (pull, never vote,
-    /// never write), and no seed or host verb touches the shared words.
     shadow: bool,
 }
 
-/// What one fire's mint decided, kept until settlement reads it.
 #[derive(Debug)]
 struct Minted {
-    /// Cursors before this fire; rolled back to on device refusal.
     before: Vec<Cursor>,
-    /// Tickets as staged, re-checked on refusal.
     tickets: Vec<Ticket>,
-    /// Shared rings whose predicted head this fire advanced.
     shared_head: Vec<u32>,
-    /// Same, for the predicted tail.
     shared_tail: Vec<u32>,
 }
 
 impl Session {
-    /// Allocates rings and fire-path buffers, then seeds declared channels.
-    /// `seeds` are wire cells per `(channel, bytes)`; `extents` is what
-    /// symbolic value shapes resolve against.
-    ///
-    /// # Errors
-    ///
-    /// Stages/plans mismatch, or a seed for a channel this instance lacks
-    /// or of the wrong width.
     pub fn bind(
         compiled: &Compiled,
         plan: &ExecPlan,
@@ -127,7 +85,6 @@ impl Session {
         let rings = Rings::allocate(&shapes, endpoints)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
-        // Pinned: settlement reads it on the host.
         let commit = Pinned::mapped(2 * size_of::<u32>())?;
 
         let mut session = Session {
@@ -144,9 +101,6 @@ impl Session {
             shadow,
         };
         for (channel, wire) in seeds {
-            // A follower's host-ended ring was seeded by rank 0, whose bind
-            // came first: the cell and the guest-owned word are already
-            // there. Only the engine-owned prediction moves here.
             if shadow
                 && let Some(endpoint) = session.rings.endpoint(*channel as usize)
                 && endpoint.role() != HostRole::None
@@ -156,7 +110,6 @@ impl Session {
                 }
                 continue;
             }
-            // A shared ring is seeded once, by whichever attachment binds first.
             let shared = session
                 .rings
                 .endpoint(*channel as usize)
@@ -176,47 +129,28 @@ impl Session {
                 ));
             }
         }
-        // Registry state as of the seeds; later writes are `commit_bump`'s.
         let seeded = session.cursors_now();
         session.rings.seed_registry(&seeded)?;
         Ok(session)
     }
 
-    /// How many channels this instance carries.
     #[must_use]
     pub fn channels(&self) -> usize {
         self.shapes.len()
     }
 
-    /// Channel `channel`'s geometry.
     #[must_use]
     pub fn shape(&self, channel: u32) -> Option<ChannelShape> {
         self.shapes.get(channel as usize).copied()
     }
 
-    /// Channel `channel`'s cursors, as the two owners have them right now.
     #[must_use]
-    /// The device address of channel `channel`'s cell at `sequence`, and the
-    /// cell's byte width — the ring's own arithmetic, for a reader outside
-    /// the guest program (the self-conditioning feed).
-    ///
-    /// # Errors
-    ///
-    /// The ring's own, for a channel past the table.
     pub fn cell(&self, channel: usize, sequence: u64) -> Result<(u64, u64)> {
         let address = self.rings.cell_address(channel, sequence)?;
         let bytes = self.rings.shape_of(channel)?.cell_bytes() as u64;
         Ok((address, bytes))
     }
 
-    /// Where a float-port feed reads channel `channel`'s committed cell
-    /// this fire — the cell at the consumer head, what this instance's own
-    /// `take` would read — and how many bytes that cell is. `None` when the
-    /// ring holds no committed cell. See [`Rings::feed_address`].
-    ///
-    /// # Errors
-    ///
-    /// An unknown or bool channel.
     pub fn feed_cell(&self, channel: u32) -> Result<Option<(u64, u64)>> {
         if self.depth(channel) == 0 {
             return Ok(None);
@@ -227,12 +161,6 @@ impl Session {
         Ok(Some((address, bytes)))
     }
 
-    /// One channel's committed-cell bytes, cursor-independent: what a feed's
-    /// cell must be, checked before any stream is touched.
-    ///
-    /// # Errors
-    ///
-    /// An unknown channel.
     pub fn cell_bytes(&self, channel: u32) -> Result<u64> {
         Ok(self.rings.shape_of(channel as usize)?.cell_bytes() as u64)
     }
@@ -243,14 +171,11 @@ impl Session {
         Some(self.merge(channel, prediction))
     }
 
-    /// Every channel's two counters, as the host predicts them right now.
-    /// Under tensor parallelism every rank's answer must be the same.
     #[must_use]
     pub fn predictions(&self) -> Vec<Cursor> {
         self.cursors_now()
     }
 
-    /// Every channel's two counters, from whichever owner keeps each.
     fn cursors_now(&self) -> Vec<Cursor> {
         (0..self.shapes.len())
             .map(|channel| {
@@ -262,7 +187,6 @@ impl Session {
 
     fn merge(&self, channel: usize, prediction: Cursor) -> Cursor {
         match self.rings.endpoint(channel) {
-            // A shared ring's truth is the endpoint's own predicted counters.
             Some(endpoint) if endpoint.role() == HostRole::None => {
                 let (head, tail) = endpoint.predicted();
                 Cursor { head, tail }
@@ -283,7 +207,6 @@ impl Session {
         }
     }
 
-    /// Test-only: skew `channel`'s prediction to force a device refusal.
     #[cfg(any(test, feature = "probe"))]
     pub fn skew_prediction(&mut self, channel: u32, head: i64, tail: i64) {
         let shift = |counter: &mut u64, by: i64| {
@@ -295,37 +218,27 @@ impl Session {
         }
     }
 
-    /// Device address of this instance's pass commit word.
     #[must_use]
     pub fn commit_word(&self) -> u64 {
         self.commit.device()
     }
 
-    /// How many fires have committed on this instance.
     #[must_use]
     pub const fn fires(&self) -> u64 {
         self.fires
     }
 
-    /// Whether this instance is unusable.
     #[must_use]
     pub const fn poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// How many unconsumed cells channel `channel` holds.
     #[must_use]
     pub fn depth(&self, channel: u32) -> u64 {
         self.cursor(channel)
             .map_or(0, |cursor| cursor.tail.saturating_sub(cursor.head))
     }
 
-    /// Push one wire cell into channel `channel`; `false` means back-pressure,
-    /// not a drop.
-    ///
-    /// # Errors
-    ///
-    /// Unknown channel, wrong cell width, or whatever the copy said.
     pub fn publish(&mut self, channel: u32, wire: &[u8]) -> Result<bool> {
         let shape = self.shape_of(channel)?;
         if self.depth(channel) >= u64::from(shape.capacity) {
@@ -338,7 +251,6 @@ impl Session {
         Ok(true)
     }
 
-    /// Advance whichever storage owns channel `channel`'s tail by one.
     fn advance_tail(&mut self, channel: usize) {
         match self.rings.endpoint(channel) {
             Some(endpoint) if !endpoint.engine_owns_tail() => endpoint.bump_tail(),
@@ -350,7 +262,6 @@ impl Session {
         }
     }
 
-    /// Advance whichever storage owns channel `channel`'s head by one.
     fn advance_head(&mut self, channel: usize) {
         match self.rings.endpoint(channel) {
             Some(endpoint) if !endpoint.engine_owns_head() => endpoint.bump_head(),
@@ -362,12 +273,6 @@ impl Session {
         }
     }
 
-    /// Take channel `channel`'s committed cell as wire bytes, advancing its
-    /// head; `None` when the ring is empty.
-    ///
-    /// # Errors
-    ///
-    /// Unknown channel, and whatever the copy said.
     pub fn take(&mut self, channel: u32) -> Result<Option<Vec<u8>>> {
         if self.depth(channel) == 0 {
             return Ok(None);
@@ -379,39 +284,16 @@ impl Session {
         Ok(Some(native_to_wire(shape.dtype, shape.numel, &native)?))
     }
 
-    /// Channel `channel`'s cell at ring position `sequence`, as wire bytes,
-    /// touching no cursor. For the parity test, not for serving.
-    ///
-    /// # Errors
-    ///
-    /// Unknown channel, and whatever the copy said.
     pub fn peek(&self, channel: u32, sequence: u64) -> Result<Vec<u8>> {
         let shape = self.shape_of(channel)?;
         let native = self.rings.read_cell(channel as usize, sequence)?;
         native_to_wire(shape.dtype, shape.numel, &native)
     }
 
-    /// What this instance's descriptor ports hold right now: the cell at
-    /// `head`. Nothing is consumed here.
-    ///
-    /// # Errors
-    ///
-    /// A port names a channel this instance lacks or a non-integer cell.
     pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
         ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
-    /// The device-side source of the [`Port::EmbedTokens`] cell this fire
-    /// will read, when the token lives on a device-only ring: `(cell
-    /// address, native bytes)`. The token is already on device — the host
-    /// round-trip only relocates it into the inputs slab — so this lets the
-    /// commit inject it device-to-device instead. `None` (keep the host
-    /// round-trip) when the port is const, host-facing, or unresolved for
-    /// the class. Read at `head`, the same cell [`ports::resolve`] reads.
-    ///
-    /// This states WHERE the token is, not whether run-ahead wants it there.
-    /// That policy is [`engine::runahead::Runahead::runs_ahead`] and is asked
-    /// at one site, in `serve::prepare`.
     #[must_use]
     pub fn token_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
         if !ports::resolves(class, Port::EmbedTokens) {
@@ -434,13 +316,6 @@ impl Session {
         Some((src, native))
     }
 
-    /// Point one intrinsic at a device buffer, for every stage of this
-    /// instance; survives a fire. `width` is the row width, `row_stride` the
-    /// elements between rows, `row_offset` the row this instance reads.
-    ///
-    /// # Errors
-    ///
-    /// An intrinsic past the side tables' pitch.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
@@ -470,18 +345,11 @@ impl Session {
         Ok(())
     }
 
-    /// What this instance's value shapes resolve against.
     #[must_use]
     pub const fn extents(&self) -> Extents {
         self.extents
     }
 
-    /// The enqueue half of a fire: mint, pull-validate, launch, bump,
-    /// publish. At most one fire airborne at a time.
-    ///
-    /// # Errors
-    ///
-    /// As [`super::Plane::fire`], less whatever the launches said.
     pub fn stage(
         &mut self,
         compiled: &Compiled,
@@ -504,7 +372,6 @@ impl Session {
         }
         stages_and_plans_agree(compiled)?;
 
-        // An unbound intrinsic is a null pointer the kernel dereferences.
         if plan.needs_logits && self.bound & (1u64 << (eta_ir::op::IntrinsicId::Logits as u32)) == 0
         {
             return Err(Fault::program(
@@ -514,7 +381,6 @@ impl Session {
                  which is address zero",
             ));
         }
-        // The draft column needs the same guard.
         if plan.needs_mtp_logits
             && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpLogits as u32)) == 0
         {
@@ -526,7 +392,6 @@ impl Session {
             ));
         }
 
-        // And the token plane beside it.
         if plan.needs_mtp_drafts
             && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpDrafts as u32)) == 0
         {
@@ -538,7 +403,6 @@ impl Session {
             ));
         }
 
-        // The attention-score capture buffer needs the same guard.
         if plan.needs_attn_scores
             && self.bound & (1u64 << (eta_ir::op::IntrinsicId::AttnScore as u32)) == 0
         {
@@ -550,11 +414,6 @@ impl Session {
             ));
         }
 
-        // The pixels plane (D8) needs the same guard, read off the program's
-        // own values rather than a plan flag: a lane whose arm plants no
-        // `seam::PIXELS` — a text pass, a denoise pass, any load with no VAE
-        // reading — binds none, and the emitted kernel would dereference the
-        // side table's zero.
         if self.bound & (1u64 << (eta_ir::op::IntrinsicId::Pixels as u32)) == 0
             && plan
                 .package
@@ -568,13 +427,6 @@ impl Session {
             ));
         }
 
-        // The peer velocity (guidance) needs the same guard, and it is the
-        // one that matters most to get loud: a lane that reads a peer it
-        // never named would otherwise dereference the side table's zero, and
-        // — worse, if the zero ever read as this lane's own base — quietly
-        // compute `u + s(u - u)`, which is a picture that looks fine and is
-        // not guided at all. `readback` binds this only for a lane whose
-        // `Seated::peer` names a real other lane of its own group.
         if self.bound & (1u64 << (eta_ir::op::IntrinsicId::PeerVelocity as u32)) == 0
             && plan
                 .package
@@ -590,12 +442,10 @@ impl Session {
             ));
         }
 
-        // First failing channel wins, matching `eta_exec::step`'s ordering.
         if let Some(blocked) = self.blocked_channel(plan) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
         }
 
-        // Mint: predictions advance here, rolled back at settle on refusal.
         let minted = match self.mint(plan, wave) {
             Ok(minted) => minted,
             Err(why) => {
@@ -608,13 +458,6 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// Take this fire's lane of the program's batch, in every stage: writes
-    /// cell addresses, commit word, and intrinsic bindings into the row.
-    ///
-    /// # Errors
-    ///
-    /// A stage-local slot names a channel this instance lacks, or the batch
-    /// has no lane left.
     pub fn take_lane(&mut self, stages: &mut [Option<Prepared>]) -> Result<()> {
         let Some(minted) = self.pending.as_ref() else {
             return Ok(());
@@ -622,7 +465,6 @@ impl Session {
         let commit = self.commit.device();
         for prepared in stages.iter_mut().flatten() {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
-            // Bind every stage: e.g. `logits` binds both prologue and epilogue.
             for intrinsic in self.intrinsics.iter().flatten() {
                 prepared.bind_intrinsic(
                     lane,
@@ -638,14 +480,6 @@ impl Session {
         Ok(())
     }
 
-    /// The verdict half: read the pinned commit word and reconcile
-    /// predictions with it. Caller must ensure the kernels have run (e.g.
-    /// after a synchronize). Answers [`Fired::Committed`] when nothing was
-    /// airborne.
-    ///
-    /// # Errors
-    ///
-    /// As [`Session::settle`].
     pub fn settle_launched(&mut self) -> Result<Fired> {
         let Some(minted) = self.pending.take() else {
             return Ok(Fired::Committed);
@@ -653,14 +487,11 @@ impl Session {
         self.settle(&minted)
     }
 
-    /// Whether a fire of this session's is on the stream, unsettled.
     #[must_use]
     pub const fn airborne(&self) -> bool {
         self.pending.is_some()
     }
 
-    /// The shared (device-only) rings this instance is attached to, keyed by
-    /// endpoint identity.
     pub fn shared_rings(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.shapes.len()).filter_map(|channel| {
             self.rings
@@ -670,15 +501,12 @@ impl Session {
         })
     }
 
-    /// This fire's tickets, slot lists, and three lanes, staged; touches no
-    /// device word. Mirrors `eta_exec::step`'s commit arithmetic.
     fn mint(&mut self, plan: &ExecPlan, wave: &mut Wave) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
         let mut tickets: Vec<Ticket> = Vec::with_capacity(self.shapes.len());
         let mut taken: Vec<u32> = Vec::new();
         let mut put: Vec<u32> = Vec::new();
-        // Shared rings' prediction is the endpoint's; `commit_bump` never sees them.
         let mut shared_head: Vec<u32> = Vec::new();
         let mut shared_tail: Vec<u32> = Vec::new();
 
@@ -686,20 +514,6 @@ impl Session {
             let slot = channel as u32;
             let shape = self.shapes[channel];
 
-            // A tensor-parallel FOLLOWER's session ignores host-facing channels
-            // entirely: they are rank 0's to publish/consume and the runtime
-            // pumps only rank 0's rings. The follower advances neither their
-            // prediction nor their device word (mismatching the two is the
-            // "cursors advanced between the two" refusal). Device-only channels
-            // (e.g. the decode `tok_in` handoff) are NOT host-facing and run
-            // normally, which is the whole reason the follower runs the guest.
-            //
-            // Skipped BEFORE the cursor is even validated: a host-facing ring's
-            // `head` is read off the SHARED endpoint (which rank 0's host
-            // draining advances) while its `tail` is this follower's frozen
-            // local prediction, so `merge` hands back a `head` that has run
-            // past a `tail` that never moves — a cursor this rank must not
-            // read, let alone fault on.
             if self.shadow
                 && self
                     .rings
@@ -714,10 +528,8 @@ impl Session {
             }
             let takes = plan.takes_channel(slot);
             let puts = plan.puts_channel(slot);
-            // A `read` claims the head like a take, without consuming.
             let addresses_head = takes || plan.reads_channel(slot);
 
-            // A shared ring's durable state is its endpoint's.
             let shared = self
                 .rings
                 .endpoint(channel)
@@ -770,8 +582,6 @@ impl Session {
             }
             if puts {
                 flags |= Ticket::PUBLISH;
-                // A device-only ring also gets a pinned mirror written, so
-                // ports read mapped memory instead of a blocking D2H copy.
                 if matches!(endpoint.role(), HostRole::Reader | HostRole::None) {
                     flags |= Ticket::HOST_READER;
                 }
@@ -779,21 +589,16 @@ impl Session {
             if plan.requires_channel_input(slot) {
                 flags |= Ticket::REQUIRE_INPUT;
             }
-            // Bump the engine-owned counter of a slot whose prediction moved.
             if moved_head && endpoint.engine_owns_head() {
                 flags |= Ticket::ADVANCE_HEAD;
             }
             if moved_tail && endpoint.engine_owns_tail() {
                 flags |= Ticket::ADVANCE_TAIL;
             }
-            // A shared ring's endpoint is native-width; packing bools would
-            // write a cell an eighth the expected width.
             if shape.dtype == eta_ir::Dtype::Bool && endpoint.role() != HostRole::None {
                 flags |= Ticket::PACKED_BOOL;
             }
             if flags & Ticket::SHADOW != 0 {
-                // Rank 0 votes on, advances and publishes into the shared
-                // ring; a follower's ticket only locates cells.
                 flags &= !(Ticket::REQUIRE_INPUT
                     | Ticket::HOST_READER
                     | Ticket::ADVANCE_HEAD
@@ -828,9 +633,6 @@ impl Session {
         let rings = self.rings.device();
         let commit = self.commit.device();
 
-        // One copy for the whole boundary: every lane appends to the same
-        // six control lists; the wave fills in offsets once the arena base
-        // is known.
         let _lane = wave.stage(
             &tickets,
             &taken,
@@ -840,7 +642,6 @@ impl Session {
                 pass_commit: commit,
                 ticket_offset: 0,
                 ticket_count: 0,
-                // No reason yet to refuse: admission passed, no stage ran.
                 initial_commit: 1,
                 diagnose: 0,
             },
@@ -858,8 +659,6 @@ impl Session {
         );
 
         self.cursors = next;
-        // Shared rings' predictions advance on the endpoint too, so the next
-        // mint (this attachment's or another's) counts what this fire minted.
         for slot in &shared_head {
             if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
                 endpoint.predict_head();
@@ -878,11 +677,6 @@ impl Session {
         })
     }
 
-    /// The verdict, off the pinned commit word: one host load, no
-    /// synchronize. On commit, counters were already advanced on the device.
-    /// On refusal, predictions are rolled back; a stage clearing the word is
-    /// [`Fired::Declined`], and a ticket mismatch after admission passed is
-    /// a fault, never a silent retry.
     fn settle(&mut self, minted: &Minted) -> Result<Fired> {
         let word = self.commit.read(0, size_of::<u32>());
         let committed = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) != 0;
@@ -890,7 +684,6 @@ impl Session {
             self.fires += 1;
             return Ok(Fired::Committed);
         }
-        // A refused fire takes its shared predictions back.
         for slot in &minted.shared_head {
             if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
                 endpoint.unpredict_head(1);
@@ -919,10 +712,8 @@ impl Session {
         Ok(Fired::Declined)
     }
 
-    /// The first ticket whose claim the live pinned words do not bear out.
     fn stale_ticket(&self, tickets: &[Ticket]) -> Option<u32> {
         for ticket in tickets {
-            // A shadow ticket never voted, so the words prove nothing about it.
             if ticket.flags & Ticket::SHADOW != 0 {
                 continue;
             }
@@ -946,8 +737,6 @@ impl Session {
         None
     }
 
-    /// The first channel whose declared requirement a fire right now would
-    /// not meet, or `None` when ready.
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
         for channel in 0..self.shapes.len() {
@@ -980,8 +769,6 @@ impl Session {
     }
 }
 
-/// The wire cells a host-half instance's rings hold, as [`Session::bind`]
-/// takes them. Returned oldest first, so republishing reproduces order.
 #[must_use]
 pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
     let mut seeds = Vec::new();
@@ -1006,8 +793,6 @@ pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32,
     seeds
 }
 
-/// `compiled.stages` and `compiled.plans` must be parallel: a fire builds
-/// one `Prepared` per launching stage from `compiled.plans[i]`.
 fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
     stage_plans_are_parallel(
         &compiled
@@ -1023,7 +808,6 @@ fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
     )
 }
 
-/// The decision [`stages_and_plans_agree`] makes, over the facts it reads.
 fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()> {
     if stages.len() != plans.len() {
         return Err(Fault::program(
@@ -1038,7 +822,6 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
         ));
     }
     for (index, (&(signature, launches), &plan)) in stages.iter().zip(plans).enumerate() {
-        // Only a launching stage is prepared, so only its signature must match.
         if launches && signature != plan {
             return Err(Fault::program(
                 "program::session",
@@ -1056,7 +839,6 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
 #[cfg(test)]
 mod tests {
 
-    /// A launching stage paired with the wrong plan is refused.
     #[test]
     fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {
         let refusal =

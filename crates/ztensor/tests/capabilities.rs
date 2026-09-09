@@ -1,13 +1,3 @@
-//! What a tensor reports it can do, against what it actually does.
-//!
-//! Every [`Caps`] field is named after an operation and is meant to be that
-//! operation's own precondition. The test that matters here is the one that
-//! holds them together: for every tensor of every file, the report and the
-//! outcome agree. A capability report that is a hand-written summary of the
-//! real rules is a report that drifts, and the last one did: it demanded a
-//! digest before admitting a tensor could be evicted, which eviction never
-//! needed.
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -33,6 +23,16 @@ fn canonical_file(name: &str) -> PathBuf {
     path
 }
 
+fn capabilities_every_case() {
+    canonical_placement_reaches_every_capability();
+    floor_alignment_still_pages_on_small_pages();
+    the_report_and_the_outcome_agree();
+    a_tensor_without_a_digest_is_still_evictable();
+    an_absent_tensor_is_not_found();
+    a_source_can_be_shared_between_threads();
+    verifying_a_tensor_covers_every_plane();
+}
+
 #[test]
 fn canonical_placement_reaches_every_capability() {
     let src = Source::open(canonical_file("caps.zt")).unwrap();
@@ -42,14 +42,12 @@ fn canonical_placement_reaches_every_capability() {
         assert!(caps.map);
         assert!(caps.verify);
         assert!(caps.alignment >= ALIGN_CANONICAL, "{caps:?}");
-        // On any page size up to 64 KiB, canonical placement is exclusive.
         if page_size() <= ALIGN_CANONICAL {
             assert!(caps.evict, "{caps:?}");
         }
     }
 }
 
-#[test]
 fn floor_alignment_still_pages_on_small_pages() {
     let path = tmp("floor.zt");
     let mut w = Writer::options()
@@ -68,10 +66,6 @@ fn floor_alignment_still_pages_on_small_pages() {
     }
 }
 
-/// The anti-drift test: the report is the precondition, so it cannot disagree
-/// with the operation. Run over files whose tensors land on both sides of
-/// every predicate.
-#[test]
 fn the_report_and_the_outcome_agree() {
     let mut paths = vec![canonical_file("agree-canonical.zt"), no_digest_file()];
 
@@ -107,12 +101,6 @@ fn the_report_and_the_outcome_agree() {
     }
 }
 
-/// A tensor with no digest is still evictable, and says so.
-///
-/// This is exactly what the old ordinal got wrong: it bundled integrity and
-/// memory layout into one number, so this tensor reported one rung below the
-/// operation it could perform.
-#[test]
 fn a_tensor_without_a_digest_is_still_evictable() {
     let path = no_digest_file();
     let src = Source::open(&path).unwrap();
@@ -138,13 +126,11 @@ fn evict_and_reread() {
     if tensor.caps().evict {
         tensor.prefetch().unwrap();
         tensor.evict().unwrap();
-        // Evicted pages re-fault from the file: content is unchanged.
         assert_eq!(&*tensor.bytes().unwrap(), &before[..]);
         assert_eq!(tensor.verify().unwrap(), Verified::Digest);
     }
 }
 
-#[test]
 fn an_absent_tensor_is_not_found() {
     let src = Source::open(canonical_file("nf.zt")).unwrap();
     assert!(matches!(src.tensor("nope"), Err(Error::NotFound(_))));
@@ -152,8 +138,6 @@ fn an_absent_tensor_is_not_found() {
     assert!(src.get("a.weight").is_some());
 }
 
-/// Hand-assembles a file whose single tensor carries no digest. The writer
-/// always writes one, so this shape has to be built by hand.
 fn no_digest_file() -> PathBuf {
     let path = tmp("no-digest.zt");
     let offset = ALIGN_CANONICAL;
@@ -201,9 +185,6 @@ fn no_digest_file() -> PathBuf {
     path
 }
 
-/// A source is shareable across threads, because a loader that reads a
-/// checkpoint from several of them is the ordinary case.
-#[test]
 fn a_source_can_be_shared_between_threads() {
     let path = canonical_file("threaded.zt");
     let src = std::sync::Arc::new(Source::open(&path).unwrap());
@@ -221,14 +202,6 @@ fn a_source_can_be_shared_between_threads() {
     }
 }
 
-/// Verifying a tensor covers every plane, and says so honestly when there is
-/// nothing to cover.
-///
-/// A quantized tensor is one blob: codes, then scales. The digest is over the
-/// whole blob, so a scale that rotted fails verification just as a code would.
-/// The other trap is a tensor with no digest at all: it has nothing to vouch
-/// for, and must not report a verification that never happened.
-#[test]
 fn verifying_a_tensor_covers_every_plane() {
     use ztensor::provide::{Catalog, Entry, Store};
 
@@ -258,7 +231,6 @@ fn verifying_a_tensor_covers_every_plane() {
     let at = q.locate().unwrap();
     drop(src);
 
-    // Corrupt only the *scales*. Checking the codes alone would still pass.
     let mut raw = std::fs::read(&path).unwrap();
     raw[scales_at as usize] ^= 0xff;
     std::fs::write(&path, &raw).unwrap();
@@ -267,7 +239,6 @@ fn verifying_a_tensor_covers_every_plane() {
     let err = src.tensor("q").unwrap().verify().unwrap_err();
     assert_eq!(err.rule(), Some(ztensor::Rule::Digest), "{err}");
 
-    // The same bytes described without a digest have nothing to vouch for.
     let mut catalog = Catalog::new();
     catalog.insert("bare", Entry::at(shape, term, at));
     let store = Store::index(&path, "zt").unwrap();

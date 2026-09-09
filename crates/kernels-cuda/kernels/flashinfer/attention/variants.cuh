@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2024 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_ATTENTION_VARIANTS_CUH_
 #define FLASHINFER_ATTENTION_VARIANTS_CUH_
 #include <cuda_runtime.h>
@@ -38,7 +38,6 @@ struct DefaultAttention : AttentionVariantBase {
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
 
-  // Create closure
   template <typename Params>
   __device__ __host__ DefaultAttention(const Params& params, uint32_t batch_idx,
                                        uint8_t* smem_ptr) {
@@ -92,6 +91,6 @@ struct DefaultAttention : AttentionVariantBase {
   })
 };
 
-};  // namespace flashinfer
+};
 
-#endif  // FLASHINFER_ATTENTION_VARIANTS_CUH_
+#endif

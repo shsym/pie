@@ -1,17 +1,19 @@
-//! EBNF parsing, printing, round-trip, and error behavior.
-//!
-//! Item 1: Round-trip tests (EBNF → Grammar → Display → verify).
-//! Item 2: Error case tests (malformed EBNF → Err with message).
-
 use ::grammar::grammar::Grammar;
 
 fn parse_and_display(input: &str) -> String {
     Grammar::from_ebnf(input, "root").unwrap().to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Item 1: Output format round-trip tests
-// ---------------------------------------------------------------------------
+fn parser_every_case() {
+    test_output_simple_literal();
+    test_output_empty_string();
+    test_output_character_class();
+    test_output_negated_character_class();
+    test_output_string_star();
+    test_output_alternation();
+    test_output_sequence();
+    test_output_repetition_exact();
+}
 
 #[test]
 fn test_output_simple_literal() {
@@ -20,27 +22,22 @@ fn test_output_simple_literal() {
     assert!(g.contains("\"abc\""));
 }
 
-#[test]
 fn test_output_empty_string() {
     let g = parse_and_display(r#"root ::= """#);
     assert!(g.contains("\"\""));
 }
 
-#[test]
 fn test_output_character_class() {
     let g = parse_and_display("root ::= [a-z0-9]");
     assert!(g.contains("[a-z0-9]"));
 }
 
-#[test]
 fn test_output_negated_character_class() {
     let g = parse_and_display("root ::= [^a-z]");
     assert!(g.contains("[^a-z]"));
 }
 
-#[test]
 fn test_output_string_star() {
-    // "a"* DOES need auxiliary rule
     let g = parse_and_display(r#"root ::= "a"*"#);
     assert!(
         g.contains("root_1"),
@@ -49,7 +46,6 @@ fn test_output_string_star() {
     );
 }
 
-#[test]
 fn test_output_alternation() {
     let g = parse_and_display(r#"root ::= "a" | "b" | "c""#);
     assert!(g.contains("\"a\""));
@@ -58,7 +54,6 @@ fn test_output_alternation() {
     assert!(g.contains("|"));
 }
 
-#[test]
 fn test_output_sequence() {
     let g = parse_and_display(r#"root ::= "a" "b" "c""#);
     assert!(g.contains("\"a\""));
@@ -66,10 +61,8 @@ fn test_output_sequence() {
     assert!(g.contains("\"c\""));
 }
 
-#[test]
 fn test_output_repetition_exact() {
     let g = parse_and_display(r#"root ::= "a"{3}"#);
-    // {3} becomes Repeat(root_1, 3, 3) where root_1 ::= "a"
     assert!(
         g.contains("root_1{3,3}"),
         "expected root_1{{3,3}}, got: {}",
@@ -81,8 +74,3 @@ fn test_output_repetition_exact() {
         g
     );
 }
-
-// ---------------------------------------------------------------------------
-// Item 2: Error case tests
-// ---------------------------------------------------------------------------
-

@@ -1,9 +1,3 @@
-//! `Moe`: routers, routed matmuls, and the folds that bring the fan-out
-//! back. One entry per IR variant. The one quantized bank form this plane
-//! stamps is mxfp4, and its bank arrives as the explicit `(codes, scales)`
-//! pair the engine resolved (the metal precedent) — plain pointers, no
-//! by-value descriptor.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -20,26 +14,20 @@ const WARP: u32 = 32;
 
 const GEMV_WARPS: u32 = 4;
 
-/// The router kernels stage every expert score in shared memory.
 const MAX_EXPERTS: u32 = 512;
 
-/// The GEMV puts the route run on the grid's y axis.
 const MAX_GRID_Y: u32 = 65_535;
 
-/// One block per row, warp-shuffle reduction scratch beside it — the ranked
-/// routers' launch.
 const fn rms(rows: u32) -> Launch {
     Launch::per_row(rows, BLOCK).smem((BLOCK / WARP) * 4)
 }
 
-/// One narrow block per token row — the softmax router's launch.
 const fn router_lane(rows: u32) -> Launch {
     const ROUTER_BLOCK: u32 = 64;
 
     Launch::per_row(rows, ROUTER_BLOCK)
 }
 
-/// Rows on their own grid axis, the width chunked across blocks.
 fn elementwise_rows(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     nonzero(op, "width", width)?;
@@ -49,8 +37,6 @@ fn elementwise_rows(op: &'static str, rows: u32, width: u32) -> Result<Launch, E
     ))
 }
 
-/// What every router lands: i32 routes and f32 weights, one row per token
-/// row, `top_k` wide — the trace-time validator's guarantee, restated.
 fn ranked_planes(op: &'static str, logits: Tensor, top_k: u32, routes: &Tensor, weights: &Tensor) {
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{op}` lands i32 routes");
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{op}` lands f32 route weights");
@@ -64,7 +50,6 @@ fn ranked_planes(op: &'static str, logits: Tensor, top_k: u32, routes: &Tensor, 
     );
 }
 
-/// The stated extents every router shares, refused or converted once.
 fn router_extents(
     op: &'static str,
     logits: Tensor,
@@ -110,21 +95,18 @@ pub fn topk_softmax(
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
-            ArgValue::ABSENT, // the activation seat the fused router form fills
-            ArgValue::ABSENT, // the bias seat, likewise
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
             routes.arg(),
             weights.arg(),
             e.arg(),
             k.arg(),
-            0_i32.arg(), // `hidden`, read only by the fused form
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            0_i32.arg(),
             ctx.stage(),
         ],
     )
 }
 
-/// The same router, times the learned per-expert gain.
 pub fn topk_softmax_scaled(
     ctx: &Ctx,
     logits: Tensor,
@@ -156,21 +138,18 @@ pub fn topk_softmax_scaled(
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
-            ArgValue::ABSENT, // the activation seat the fused router form fills
+            ArgValue::ABSENT,
             scale.arg(),
             routes.arg(),
             weights.arg(),
             e.arg(),
             k.arg(),
-            0_i32.arg(), // `hidden`, read only by the fused form
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            0_i32.arg(),
             ctx.stage(),
         ],
     )
 }
 
-/// The ranked routers' shared launch: sigmoid scoring, optionally biased.
 #[allow(clippy::too_many_arguments)]
 fn ranked_router(
     ctx: &Ctx,
@@ -200,8 +179,6 @@ fn ranked_router(
             k.arg(),
             renormalize.arg(),
             scaling.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )
@@ -237,11 +214,6 @@ pub fn topk_sigmoid(
     )
 }
 
-/// Sigmoid routing with `sink` shared experts riding the logit row after the
-/// `experts` routed ones (`Linear::MoeTopkSigmoidSink`): the choice is top-k
-/// over the routed scores plus `bias`; the weights are every chosen score and
-/// every sink score over their common sum, times `scaling` and the bound
-/// `global_scale`. Routes and weights are `top_k + sink` wide.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_sigmoid_sink(
     ctx: &Ctx,
@@ -309,8 +281,6 @@ pub fn topk_sigmoid_sink(
     )
 }
 
-/// Sigmoid routing with a per-expert correction bias; weights pass through
-/// sqrt-softplus.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_sqrt_softplus(
     ctx: &Ctx,
@@ -346,16 +316,11 @@ pub fn topk_sqrt_softplus(
     )
 }
 
-/// The routed fan a selected matmul walks: `tokens x top_k` result rows, the
-/// activation read either once per token or once per route.
 struct Selected {
-    /// `tokens x top_k`, the result's rows and the grid's route axis.
     route_count: u32,
 
     top_k: i32,
 
-    /// Which activation reading the fan implies: `true` when `x` has one row
-    /// per token (the up leg), `false` when one per route (the down leg).
     by_token: bool,
 }
 
@@ -392,67 +357,30 @@ fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<S
     })
 }
 
-/// Grouped matmul over a dense bank: each routed row multiplies the expert
-/// its route selects — the decode GEMV, one warp-column per output tile.
-///
-/// A streamed bank hands the select two device addresses; a fully-resident
-/// one hands two zeros:
-/// * `table` — `expert_id -> base address`, one fixed-address entry per
-///   expert. Points into the device slab when resident, or pinned host
-///   bytes over UVA otherwise, so a miss costs PCIe bandwidth, never a sync.
-/// * `hits` — per-expert usage counters; the select does one `atomicAdd`
-///   per routed expert per fire, and the host reads them between fires to
-///   promote.
-///
-/// [`ExpertTable::RESIDENT`] (both zeros) is the degenerate case, not an
-/// off switch: with no table the kernel computes the same
-/// `bank_base + expert * stride` it always did, and counts nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExpertTable {
-    /// Device address of the `expert_id -> base address` table, or 0.
     pub table: u64,
-    /// Device address of the per-expert usage counters, or 0.
     pub hits: u64,
 }
 
 impl ExpertTable {
-    /// The whole bank is on the device: no table to read, nothing to count.
     pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
 
-    /// Does this bank stream?
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.table != 0
     }
 }
 
-/// [`ExpertTable`]'s twin for the split-plane path, one granularity up: the
-/// mxfp4 select computes each plane's expert base itself and dereferences
-/// no per-expert table, fixing the unit of residency at the group. A
-/// streamed group hands two addresses:
-/// * `cell` — one 16-byte, 16-byte-aligned cell holding this group's
-///   `(codes, scales)` base pair, read with a single `ld.global.v2.u64`
-///   (one extra load per group per launch, an L1 broadcast). Writing it is
-///   how a promotion moves a group.
-/// * `hits` — this group's usage counter; one `atomicAdd` per routed row
-///   per fire, by the block that owns that route's first row tile.
-///
-/// [`GroupSeat::RESIDENT`] (both zeros) is the degenerate case: the kernel
-/// reads the bases it was handed and counts nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupSeat {
-    /// Device address of this group's 16-byte `(codes, scales)` base cell,
-    /// or 0.
     pub cell: u64,
-    /// Device address of this group's `u32` usage counter, or 0.
     pub hits: u64,
 }
 
 impl GroupSeat {
-    /// The whole group is where the launch says it is: no cell, no counter.
     pub const RESIDENT: GroupSeat = GroupSeat { cell: 0, hits: 0 };
 
-    /// Does this group's tier move?
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.cell != 0
@@ -469,10 +397,6 @@ pub fn matmul_select(
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select";
 
-    // A fire wide enough to name each expert many times reads the same bank
-    // back once per route under the GEMV; grouping reads it once per block.
-    // Everything narrower — decode above all — keeps the GEMV, which is
-    // already the right shape there. See [`grouped_worth`].
     #[cfg(feature = "cuda")]
     {
         let fan = selected(OP, x, routes, y)?;
@@ -483,11 +407,6 @@ pub fn matmul_select(
     select_gemv(ctx, OP, x, bank, routes, y, experts)
 }
 
-/// Rows one aligned block carries, chosen per fire: wide enough that most
-/// experts fill exactly one block — the bank is re-read once per block that
-/// names it, so blocks are what the traffic is counted in — and narrow
-/// enough that the padded tail the GEMM computes and nobody reads stays
-/// inside a factor of two.
 #[cfg(feature = "cuda")]
 const fn block_rows(per_expert: u32) -> u32 {
     let want = per_expert.next_power_of_two();
@@ -500,27 +419,12 @@ const fn block_rows(per_expert: u32) -> u32 {
     }
 }
 
-/// Routes per expert at or above which grouping pays for its alignment.
-/// Below it each expert is named about once, so the GEMV already reads each
-/// bank about once and the sort, gather and reorder would buy nothing —
-/// which is exactly the decode case this must never fire on.
 #[cfg(feature = "cuda")]
 const GROUP_AT: u32 = 4;
 
-/// The aligned workspace the grouped leg will stage before it declines.
-/// Scratch slabs are monotone in the widest fire that ever asked, so one
-/// outsized prefill would hold the arena at its width for the life of the
-/// process; past this the GEMV is the cheaper answer overall.
 #[cfg(feature = "cuda")]
 const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
 
-/// Is this fire wide enough, and plain enough, for the grouped leg? Answers
-/// the bank's expert count when it is.
-///
-/// Two indirections the GEMV carries and the grouped leg does not: a bank
-/// whose experts stream in behind a table, and the staged geometry a
-/// captured body arms. Both belong to decode-shaped fires, which are below
-/// the width threshold anyway, so declining them costs nothing.
 #[cfg(feature = "cuda")]
 fn grouped_worth(
     ctx: &Ctx,
@@ -539,12 +443,6 @@ fn grouped_worth(
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F16) || bank.dtype != x.dtype {
         return None;
     }
-    // **ONE ROW PER EXPERT, AND THE ROW IS THE WHOLE PLANE.** The shell hands
-    // a routed bank as `[experts, N * K]` — the `[experts, N, K]` declaration
-    // flattened on its LAST TWO axes, not its first two — which is why the
-    // GEMV is handed `n * k` as its expert stride rather than reading one off
-    // the rectangle. So the expert count is the row count, and the width is
-    // the plane the stride steps over.
     let count = bank.rows;
     if count == 0 || count > MAX_EXPERTS {
         return None;
@@ -556,7 +454,6 @@ fn grouped_worth(
     if per_expert < GROUP_AT {
         return None;
     }
-    // The same arithmetic `select_grouped` does, ahead of taking any slab.
     let block = block_rows(per_expert);
     let blocks = u64::from(count) + u64::from(fan.route_count.div_ceil(block));
     let rows = blocks * u64::from(block);
@@ -566,22 +463,6 @@ fn grouped_worth(
     (staged <= GROUP_WORKSPACE_CAP).then_some(count)
 }
 
-/// The routed matmul as one grouped GEMM per expert block, instead of one
-/// GEMV per route.
-///
-/// The GEMV re-reads a whole expert bank for every route that names it, so
-/// its weight traffic is `routes * N * K` where the work needs
-/// `experts * N * K`. At a prefill's fan-out that ratio is the gap: an
-/// order of magnitude of bandwidth spent reading the same planes back.
-/// Grouping sorts the routes by expert into fixed-width blocks, gathers the
-/// activations behind that permutation, and hands cuBLAS one batched GEMM
-/// in which every block reads its bank exactly once.
-///
-/// The batch count is the PADDED block count, not the live one: cuBLAS
-/// takes `batchCount` by value on the host, and reading the live count off
-/// the device would be the D2H this pipeline refuses. The blocks the
-/// alignment left unused read expert 0's bank against the zeroed rows the
-/// gather wrote, and land in an output region the reorder never reads.
 #[cfg(feature = "cuda")]
 fn select_grouped(
     ctx: &Ctx,
@@ -642,16 +523,11 @@ fn select_grouped(
         "linear.moe_group_out",
         u64::from(rows) * u64::from(y.width) * elem,
     )?;
-    // One slab, three arrays: the batched GEMM's weight, activation and
-    // output bases, in that order.
     let ptrs = slab("linear.moe_group_ptrs", u64::from(blocks) * 3 * 8)?;
     let w_ptrs = ptrs;
     let act_ptrs = ptrs + u64::from(blocks) * 8;
     let out_ptrs = ptrs + u64::from(blocks) * 16;
 
-    // Sort the routes into per-expert blocks. `route_to_aligned_row` and the
-    // live padded count are both left unasked: the reorder below walks
-    // `sorted_route_ids`, and the batch count is the padded one by design.
     ctx.fire(
         op,
         Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>").apply(
@@ -670,10 +546,6 @@ fn select_grouped(
         ],
     )?;
 
-    // Gather the activations behind that permutation. The up leg reads one
-    // row per token, so the gather divides the route by the fan-out; the
-    // down leg already has one row per route, which is the same walk at a
-    // fan-out of one.
     let gather_fan = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
@@ -693,7 +565,7 @@ fn select_grouped(
             aligned_rows.arg(),
             gather_fan.arg(),
             k.arg(),
-            (-1i32).arg(), // no shared expert rides this leg
+            (-1i32).arg(),
             stated(op, x.rows)?.arg(),
         ],
     )?;
@@ -720,8 +592,6 @@ fn select_grouped(
         ],
     )?;
 
-    // `y[m,n] = act[m,k] @ w[n,k]^T`, per block — the same transposition
-    // `linear::dense` states, with pointer arrays in place of one base.
     let alpha = 1.0f32;
     let beta = 0.0f32;
     // SAFETY: `handle` is this context's live cuBLAS handle, already bound
@@ -762,8 +632,6 @@ fn select_grouped(
         ));
     }
 
-    // Undo the permutation: every aligned row lands at the route it was
-    // sorted from, and the padding rows name no route and are dropped.
     ctx.fire(
         op,
         Fire::at(
@@ -788,13 +656,6 @@ fn select_grouped(
     )
 }
 
-/// The routed dense GEMV itself, under the caller's own op name. LoRA's
-/// projection half is a routed matmul-select at fan-out one and nothing
-/// else, so `linear::lora` fires this directly and passes its own `op` so
-/// a refusal is attributed to the correction rather than to an MoE the
-/// plan does not contain. Its staged-geometry seat rides the same path but
-/// is always `ABSENT`, since a grouped region is refused admission to a
-/// body; only `linear.moe_matmul_select` ever arms it.
 pub(crate) fn select_gemv(
     ctx: &Ctx,
     op: &'static str,
@@ -804,7 +665,6 @@ pub(crate) fn select_gemv(
     y: &mut Tensor,
     experts: ExpertTable,
 ) -> Result<(), Error> {
-    /// K in whole float4 loads.
     const VEC_WIDTH: u32 = 8;
 
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -853,22 +713,13 @@ pub(crate) fn select_gemv(
             k.arg(),
             n.arg(),
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
-            // The two seats, both `ABSENT` for a resident bank — see [`ExpertTable`].
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
-            // The staged-geometry seat, read in route space off words
-            // written in token space (the grid's route axis is `top_k` of
-            // the region's rows). `ABSENT` when no body armed one.
             ctx.stage(),
         ],
     )
 }
 
-/// The mxfp4 selects' shared launch — the one quantized bank form this plane
-/// stamps. `codes` are the e2m1 nibbles, `scales` the shared e8m0 exponents,
-/// 32 codes to one scale byte. The per-expert bias is what the two entries
-/// differ in, so it arrives optional and the kernel's own bias seat carries
-/// the absence.
 #[allow(clippy::too_many_arguments)]
 fn matmul_select_mxfp4(
     ctx: &Ctx,
@@ -906,33 +757,15 @@ fn matmul_select_mxfp4(
     }
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    // Each warp decodes `ROWS_PER_WARP` bank rows; a block tiles that many
-    // warps' worth of the output width.
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    // **THE ROUTES SORTED BY EXPERT**, the same pass the affine select
-    // fires and for the same reason — except that here the sorting is not
-    // what pays. At gpt-oss's shapes the per-route select already runs at a
-    // rate past this card's memory ceiling, so the L2 is serving most of
-    // the re-read and there is little traffic left to remove; what it does
-    // not have is any reuse to give its FMAs, and 4.8 TFLOP/s against the
-    // affine grouped select's 34 is the size of that. The order list is
-    // what lets one block hold an expert's plane and apply it to sixteen
-    // routes at a time.
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
     const EXPERT_CAP: u32 = 4096;
-    /// From this many routes on, one block per expert beats a block per
-    /// route — the affine twin's threshold, priced on its own shapes. A
-    /// decode step's handful of routes stays with the per-route select,
-    /// which is the right shape there.
     const GROUPED_FROM: u32 = 16;
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
-    /// The work list's slice width. This entry does not walk the work list
-    /// (that is the tensor-core form's), but `moe_route_order` builds one
-    /// and must be told how wide to cut it.
     const WMMA_ROUTES: u32 = 32;
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
@@ -965,22 +798,12 @@ fn matmul_select_mxfp4(
         ],
     )?;
     if fan.route_count >= GROUPED_FROM && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none() {
-        // bf16 activations take the tensor-core form, f16 the fp32 one —
-        // the affine twin's rule, and for its reason: `mma.sync` here is
-        // `bf16 x bf16 -> f32`.
-        // `PIE_MXFP4_NO_WMMA` takes the fp32 form on a bf16 activation. It
-        // is the only way to reach that kernel on a card whose rows all
-        // carry bf16 — without it the form would ship having never run,
-        // which is how the affine fp32 twin came to declare a shared array
-        // too big to compile.
         let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
         } else {
             format!("::pie::linear::moe_matmul_select_mxfp4_grouped<{t}>")
         };
-        // The tensor-core form walks the work list — one item per (expert,
-        // 32-route slice) — where the fp32 one takes an expert a block.
         let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
         if wmma {
             args.push(ArgValue::Ptr(work));
@@ -1033,19 +856,13 @@ fn matmul_select_mxfp4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            // The two seats, both zero for a group the store holds — see [`GroupSeat`].
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
-            // The staged-geometry seat, read in route space off words
-            // written in token space. `ABSENT` when no body armed one.
             ctx.stage(),
         ],
     )
 }
 
-/// Grouped matmul over an mxfp4 bank, with a per-expert bias — the gate/up
-/// leg, whose bank and bias are cut the same way, so the add belongs inside
-/// the fold.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_select_bias(
     ctx: &Ctx,
@@ -1061,10 +878,6 @@ pub fn matmul_select_bias(
     matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
 }
 
-/// Grouped matmul over an mxfp4 bank with nothing added — the down leg,
-/// whose bank is rows-cut, so a replicated bias folded in here would be
-/// summed once per rank by the all_reduce that follows. Its routed bias is
-/// stated after the reduce instead, by [`bias_sum`].
 pub fn matmul_select_quant(
     ctx: &Ctx,
     x: Tensor,
@@ -1076,21 +889,12 @@ pub fn matmul_select_quant(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    // The companion shape IS the scheme: mxfp4 centres its own blocks and
-    // ships one plane beside the codes, an affine bank ships two. The plane
-    // resolution recorded which this bank is when the loader recorded the
-    // pairing, so the presence of the zero points is the discriminant and a
-    // second statement of the scheme here would be a chance to disagree.
     match biases {
         None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
         Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
     }
 }
 
-/// The MLX affine-U4 select: 4-bit codes, eight to a `u32` word, sixty-four
-/// under one bf16 scale and one bf16 zero point. The dot folds the zero
-/// point through the group's activation sum — `Σ (c·s + b)·x` is
-/// `s·Σ c·x + b·Σ x` — so the kernel reads each activation once.
 #[allow(clippy::too_many_arguments)]
 fn matmul_select_mlxu4(
     ctx: &Ctx,
@@ -1114,9 +918,6 @@ fn matmul_select_mlxu4(
     let fan = selected(op, x, routes, y)?;
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
-    // One expert's planes per row: the code row holds `n * k` codes and the
-    // scale row one bf16 per group of them, so the bit width and the group
-    // come off the row widths.
     let elems = u64::from(x.width) * u64::from(y.width);
     let code_bits = u64::from(codes.width) * 8;
     let bits: u32 = match code_bits {
@@ -1157,32 +958,14 @@ fn matmul_select_mlxu4(
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    // The routes sorted by expert, so consecutive blocks share an expert's
-    // bank and a wide fire reads it out of L2 rather than once per route
-    // (`moe_route_order`). One block sorts; the order lives in a named
-    // scratch slab sized by the route run, so a capture holds one address.
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
     const EXPERT_CAP: u32 = 4096;
-    /// From this many routes on, the grouped kernel (one block per expert
-    /// × 128 rows, the bank decoded once per expert) beats the per-route
-    /// GEMV; below it a decode step's handful of routes is the GEMV's.
-    /// Priced on an L40S at gemma-4-26B-A4B's shapes
-    /// (`the_expert_select_is_priced_by_its_bytes`, u4 up leg): 16 routes
-    /// 0.058 vs 0.063 ms, 32 routes 0.096 vs 0.115, 64 routes 0.134 vs
-    /// 0.220, 160 routes 0.299 vs 0.533 — the GEMV re-reads an expert per
-    /// route, the grouped kernel once per expert. One token's eight routes
-    /// stay the GEMV's.
     const GROUPED_FROM: u32 = 16;
     const GROUPED_TILE_N: u32 = 128;
     const GROUPED_BLOCK: u32 = 256;
-    /// Routes a tensor-core block takes at once (the kernel's `kRoutes`);
-    /// the work list slices every expert's run this wide.
     const WMMA_ROUTES: u32 = 32;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    // The order slab: `route_count` route ids, `experts + 2` offsets (the
-    // last one the work count), then the work list — at most one slice
-    // per `WMMA_ROUTES` routes plus one per expert, whatever the routing.
     let order_words = fan.route_count as usize;
     let offsets_at = order_words.next_multiple_of(64);
     let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
@@ -1212,7 +995,6 @@ fn matmul_select_mlxu4(
         ],
     )?;
     if fan.route_count >= GROUPED_FROM {
-        // bf16 activations take the tensor-core form; f16 the fp32 one.
         let entry = if x.dtype == Dtype::Bf16 {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
@@ -1223,8 +1005,6 @@ fn matmul_select_mlxu4(
                  ::pie::i32({group})>"
             )
         };
-        // The tensor-core form launches over the work list (a level grid);
-        // the fp32 form still walks an expert per block.
         let wmma = x.dtype == Dtype::Bf16;
         let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
         if wmma {
@@ -1278,13 +1058,11 @@ fn matmul_select_mlxu4(
             k.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
-            // The twin's staged-geometry seat, on the twin's terms.
             ctx.stage(),
         ],
     )
 }
 
-/// Folds the `top_k` routed rows back to one row per token, weighted.
 pub fn weighted_sum(
     ctx: &Ctx,
     routed: Tensor,
@@ -1326,18 +1104,11 @@ pub fn weighted_sum(
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The routed bias mixture, stated once on an activation that already holds
-/// the fold: `y[t] = x[t] + sum_k weights[t, k] * bias[routes[t, k]]`. Its
-/// own fire because the down-projection is rows-cut under tp — a
-/// replicated bias folded into that partial matmul would land once per
-/// rank, so this is stated after the all_reduce instead.
 pub fn bias_sum(
     ctx: &Ctx,
     x: Tensor,
@@ -1383,15 +1154,11 @@ pub fn bias_sum(
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// `y = routed + sigmoid(gate) * shared`, per element; the gate is one
-/// scalar per token row, read at its row's head.
 pub fn sigmoid_gate_add(
     ctx: &Ctx,
     routed: Tensor,
@@ -1423,12 +1190,7 @@ pub fn sigmoid_gate_add(
             shared.arg(),
             gate.arg(),
             stated(OP, y.width)?.arg(),
-            // The gate's row pitch: handles are dense, so the scalar sits at
-            // the head of a `gate.width`-wide row, whose pitch the handle
-            // states.
             stated(OP, nonzero(OP, "the gate row's pitch", gate.width)?)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )

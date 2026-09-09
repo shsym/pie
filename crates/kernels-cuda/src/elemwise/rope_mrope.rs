@@ -1,13 +1,3 @@
-//! `RopeMrope`: the multimodal rotary — [`rope`](crate::elemwise::rope)'s
-//! partial arm over a position that is a triple. A file of its own beside
-//! `rope.rs` since it reads a different stream (`[rows, 3]`) under a
-//! different section split, not just a differently-shaped position.
-//!
-//! Deliberately not here: the fused `qk_rmsnorm_rotate_mrope` the unit next
-//! door carries, for trunks that norm their heads. This op is the plain
-//! rotation the trace names; both agree on the section formula
-//! (transcribed, not shared).
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -17,26 +7,8 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/rope_mrope.cuh";
 
-/// The axes a multimodal position carries: time, and the patch's row and
-/// column in its grid.
 pub const AXES: u32 = 3;
 
-/// The 3D rotary, section-split and interleaved. `q` and `k` are rotated in
-/// place at their stated head geometry. `positions` is `i32`, one `(t, h, w)`
-/// triple per rotated row — a `[rows, 3]` rectangle. `sections` is the
-/// checkpoint's own `mrope_section`; a trace constant, so it arrives stated
-/// rather than read from device memory.
-///
-/// `rotary_dim` is the rotated prefix of each head, as in
-/// [`rope::partial`](crate::elemwise::rope::partial) — state it equal to
-/// `head_dim` for the full rotation.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16; a refusal for a row
-/// width that is not a whole number of heads, a rotated prefix wider than the
-/// head, a position stream that is not `[rows, 3]` `i32`, or sections whose
-/// interleaved prefix does not fit the head's frequency pairs.
 pub fn interleaved(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -60,17 +32,6 @@ pub fn interleaved(
     )
 }
 
-/// The tower's rotation: contiguous sections, each restarting the ladder.
-/// Same operands and refusals as [`interleaved`], differing only in section
-/// layout: pairs `[0, s0)` turn by `t`, `[s0, s0+s1)` by `h`,
-/// `[s0+s1, s0+s1+s2)` by `w`, and the `i`-th pair of its block turns at
-/// `theta^(-2i / Σsections)`. Both arms pair `(d, d + head_dim/2)`
-/// (`rotate_half`); `mrope_interleaved` selects how the sections are handed
-/// out, not the pairing.
-///
-/// # Errors
-///
-/// As [`interleaved`].
 pub fn blocked(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -94,8 +55,6 @@ pub fn blocked(
     )
 }
 
-/// The two arms' one body: every refusal, and the launch, with the entry name
-/// as the only thing that varies.
 #[allow(clippy::too_many_arguments)]
 fn fire(
     ctx: &Ctx,
@@ -151,9 +110,6 @@ fn fire(
         ));
     }
 
-    // The interleaved prefix is three pairs wide per section step, and it may
-    // not run past the head's own frequency pairs — a checkpoint whose
-    // sections do not fit is a text to fix, not a rotation to truncate.
     let half = head_dim / 2;
     let stated_pairs: u32 = sections.iter().copied().sum();
     if stated_pairs > half {
@@ -182,16 +138,11 @@ fn fire(
             stated(OP, sections[0])?.arg(),
             stated(OP, sections[1])?.arg(),
             stated(OP, sections[2])?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The head count a row's width spells at a stated head width. A zero-wide
-/// row is the `k`-shaped absence `rope::partial_q` already uses — zero
-/// heads, and the unit reads none.
 fn heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
     if width % head_dim != 0 {
         return Err(refuse(

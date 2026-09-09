@@ -1,29 +1,3 @@
-//! **A `PortKind::Voxels` PORT IS FED FROM ITS CHANNEL'S COMMITTED CELL, AND
-//! THE GUEST READS THE PIXELS BACK THROUGH THE `pixels()` INTRINSIC.**
-//! (design D8, `IMAGEGEN_CONTRACT.md` §6)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_channel_fed_voxel_port_lands_the_committed_cell
-//! ```
-//!
-//! The voxel port had one feed: a payload the caller handed the shell beside
-//! its clips, which crosses the host bus and which no guest can reach. This
-//! is the other one — the road a guest actually has. The lane names its port
-//! in `Lane::ports`, the clip's box travels beside it in `StepVoxels::clips`
-//! (a channel cell carries no grid, so the shape of the channel IS the box),
-//! and the shell copies the committed cell into the voxel payload device to
-//! device, casting the f32 ring master into the plan's bf16 port on the way.
-//!
-//! The answer is checked twice over: through the `pixels` seam's readout, and
-//! through the `pixels()` intrinsic the attached epilogue reads — which is
-//! the one that matters, since a guest never sees a `LaneReadout`.
-//!
-//! Fired twice with two different cells, so a feed that read a stale
-//! rectangle would land the first answer again and fail.
-//!
-//! Skipped at run time with no device, as the other device gates are.
-
 #![cfg(feature = "cuda")]
 
 mod common_two_axis;
@@ -35,7 +9,6 @@ use common_two_axis::{
 use engine::Engine;
 use engine::fire::{ReadoutSeam, StepVoxels};
 
-/// One still, `t = 1`.
 const CLIP: [u32; 3] = [1, 5, 7];
 
 const fn voxels() -> u32 {
@@ -55,8 +28,6 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         "a plan planting `seam::PIXELS` states the `pixels()` gate"
     );
 
-    // Channel 0 is the port cell — its shape IS the clip's box (D8) — and
-    // channel 1 is where the epilogue hands the pixels back.
     let program = rig.register(pixel_epilogue(CLIP, voxels()), 1);
     let cell = rig.channel(
         vec![CLIP[1], CLIP[2], C_IN],
@@ -81,8 +52,6 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             .submit(&frame(
                 vec![vae_lane(0, cell)],
                 vec![attach(0, instance)],
-                // No payload: the port is channel-fed, so what travels is
-                // the geometry a channel cell cannot carry.
                 vec![StepVoxels {
                     lane: 0,
                     clips: vec![CLIP],
@@ -113,8 +82,6 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     assert_close(&seam_second, &want_second, "the second fire's pixels seam");
     assert_close(&guest_second, &want_second, "the second fire's `pixels()`");
 
-    // And the two really differ: a feed that re-read the first cell would
-    // have landed the first answer twice and passed every assertion above.
     let moved = guest_first
         .iter()
         .zip(&guest_second)

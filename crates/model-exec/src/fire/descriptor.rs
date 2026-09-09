@@ -1,130 +1,42 @@
-//! [`FireDescriptor`]: the fire's window table, as a struct and as bytes —
-//! the one mutable channel into a recorded graph. The eager walk reads the
-//! struct in place; a CUDA shell packs it into pinned memory and uploads it
-//! once, in front of the launch.
-
 use model_ir::ClassSet;
 
 use crate::fire::Fault;
 use crate::fire::compose::{ClassWindow, Composition, LaneRow, MaskSpan, WindowTable};
 use crate::{Error, Result};
 
-/// `"FIRE"`, big-endian in the spelling and little-endian on the wire — the
-/// first four bytes of any descriptor.
 pub const MAGIC: u32 = 0x4649_5245;
 
-/// The layout's version. Bumped by any change to the wire layout; checked on
-/// unpack, never negotiated. A descriptor carrying an older version is
-/// refused by name ([`Fault::DescriptorAbi`]) and never regenerated, since
-/// nothing persists a descriptor across builds.
 pub const ABI_VERSION: u32 = 3;
 
-/// Bytes before the class table.
 pub const HEADER_BYTES: u64 = 40;
 
-/// Bytes per class record: `row_offset, rows, lane_offset, lanes`.
 pub const CLASS_BYTES: u64 = 16;
 
-/// Bytes per lane record: `word, source, class, row_offset, rows`.
 pub const LANE_BYTES: u64 = 24;
 
-/// Bytes per PATCH lane record: `patch_offset, patches, image_offset, images`.
-/// Not a second copy of the token record — word/source/class are lane
-/// properties, already on the wire once.
 pub const PATCH_LANE_BYTES: u64 = 16;
 
-/// Bytes per VOXEL lane record: `voxel_offset, voxels, clip_offset, clips`.
 pub const VOXEL_LANE_BYTES: u64 = 16;
 
-/// One fire's window table, as the walk and the shells read it: a
-/// [`Composition`] minus the provenance — counts, offsets, words, with no
-/// borrow into the batch that produced it (a shell keeps this resident and
-/// overwrites it in place every fire).
-///
-/// Packed layout ([`pack`](FireDescriptor::pack)/[`unpack`](FireDescriptor::unpack)),
-/// little-endian, fixed-width records, no padding:
-///
-/// ```text
-/// offset  bytes  field
-///      0      4  magic "FIRE"
-///      4      4  abi version
-///      8      4  rows          total token rows this fire carries
-///     12      4  lanes         how many lane records follow the class table
-///     16      4  bucket        the shape bucket, i.e. which graph
-///     20      4  classes       how many class records follow the header
-///     24      4  patch_rows    total PATCH rows this fire carries
-///     28      4  patch_bucket  the patch rung, i.e. which tower graph
-///     32      4  voxel_rows    total VOXEL rows this fire carries
-///     36      4  voxel_bucket  the voxel rung, i.e. which VAE graph
-///     40     16  class[0]      row_offset, rows, lane_offset, lanes
-///    ...     16  class[n-1]
-///    ...     24  lane[0]       word (8), source, class, row_offset, rows
-///    ...     24  lane[m-1]
-///  --- the patch trailer, present iff patch_rows > 0 ---
-///    ...     16  patch_class[0]  patch_offset, patches, image_offset, images
-///    ...     16  patch_class[n-1]
-///    ...     16  patch_lane[0]   patch_offset, patches, image_offset, images
-///    ...     16  patch_lane[m-1]
-///  --- the voxel trailer, present iff voxel_rows > 0 ---
-///    ...     16  voxel_class[0]  voxel_offset, voxels, clip_offset, clips
-///    ...     16  voxel_class[n-1]
-///    ...     16  voxel_lane[0]   voxel_offset, voxels, clip_offset, clips
-///    ...     16  voxel_lane[m-1]
-/// ```
-///
-/// A fire with `patch_rows == 0` packs no patch trailer and one with
-/// `voxel_rows == 0` no voxel trailer; ABI 3 grew the header by the two
-/// voxel words (ABI 2's 32-byte header had none), so ABI 2 bytes are
-/// refused by name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FireDescriptor {
-    /// Total token rows.
     pub rows: u32,
-    /// The shape bucket these rows round up to — which recorded graph runs.
     pub bucket: u32,
-    /// One window per class of the artifact, indexed by class.
     pub classes: WindowTable,
-    /// The lanes in fire order, carrying the permutation back to submission
-    /// order — and, since ABI 2, each lane's place in BOTH seriations.
     pub lanes: Vec<LaneRow>,
-    /// Total PATCH rows. Zero for every fire of a text-only artifact and for
-    /// every text-only fire of a tower one, which is the same number and the
-    /// true one in both cases.
     pub patch_rows: u32,
-    /// How many IMAGES this fire carries — the patch axis's lane count.
     pub images: u32,
-    /// Per region, the most rows one launch of it may cover, `0` for no
-    /// cap. A streamed load caps the region that reads a router's seats
-    /// (`slots / top_k` rows name at most `slots` experts), so a fire whose
-    /// rows would route past the slab is walked as several runs, each seated
-    /// at its own cut — sub-batching the segment. Empty means no region is
-    /// capped; a shell that streams nothing leaves it so.
     pub run_caps: Vec<u32>,
-    /// Per region, the most expert-major passes a capped run is walked in
-    /// (`compose::pass_spans`): `ceil(experts / slots)` for a streamed
-    /// router's segment, `0`/`1` to cut rows instead. Empty means none.
     pub run_passes: Vec<u32>,
-    /// The patch rung these patch rows round up to — which tower graph runs.
     pub patch_bucket: u32,
-    /// One PATCH window per class of the artifact, indexed by class — a
-    /// second table over the same classes, since patch rows and token rows
-    /// don't break at the same places. All-zero, and packed as nothing at
-    /// all, for a fire with no patch rows.
     pub patch_classes: WindowTable,
-    /// Total VOXEL rows (port voxels). Zero for every fire with no clip.
     pub voxel_rows: u32,
-    /// How many CLIPS this fire carries — the voxel axis's lane count.
     pub clips: u32,
-    /// The voxel rung these voxel rows round up to — which VAE graph runs.
     pub voxel_bucket: u32,
-    /// One VOXEL window per class of the artifact — the third table over
-    /// the same classes. All-zero, and packed as nothing at all, for a fire
-    /// with no voxel rows.
     pub voxel_classes: WindowTable,
 }
 
 impl FireDescriptor {
-    /// The descriptor for a composition.
     #[must_use]
     pub fn of(composition: &Composition) -> FireDescriptor {
         FireDescriptor {
@@ -145,26 +57,16 @@ impl FireDescriptor {
         }
     }
 
-    /// Does this fire carry the third row axis at all? The predicate the
-    /// voxel trailer is keyed on, and the one a shell asks before launching
-    /// a VAE exec.
     #[must_use]
     pub fn has_voxels(&self) -> bool {
         self.voxel_rows > 0
     }
 
-    /// Does this fire carry the second row axis at all? The predicate the
-    /// trailer is keyed on, and the one a shell asks before launching a
-    /// tower exec.
     #[must_use]
     pub fn has_patches(&self) -> bool {
         self.patch_rows > 0
     }
 
-    /// This fire's window table on one row axis — the token seriation for a
-    /// trunk region, the patch seriation for a tower one. A region belongs
-    /// to exactly one axis, so cutting its window is a lookup, never a
-    /// merge.
     #[must_use]
     pub fn table(&self, axis: model_ir::RowAxis) -> &WindowTable {
         match axis {
@@ -174,54 +76,34 @@ impl FireDescriptor {
         }
     }
 
-    /// How many PATCH rows a node with this class mask runs over — the
-    /// zero-row question on the second axis, and a forward onto
-    /// [`table`](FireDescriptor::table) for the callers that name the axis in
-    /// the method rather than in an argument.
     #[must_use]
     pub fn patch_rows_of(&self, mask: &ClassSet) -> u32 {
         self.table(model_ir::RowAxis::Patches).rows_of(mask)
     }
 
-    /// How many lanes this fire carries.
     #[must_use]
     pub fn lane_count(&self) -> u32 {
         self.lanes.len() as u32
     }
 
-    /// How many token rows a node with this class mask runs over — the
-    /// zero-row question, asked against the table that crossed to the device.
     #[must_use]
     pub fn rows_of(&self, mask: &ClassSet) -> u32 {
         self.table(model_ir::RowAxis::PRIMARY).rows_of(mask)
     }
 
-    /// The one row-and-lane interval a node with this class mask runs over —
-    /// the window question, asked against the table that crossed to the
-    /// device. [`WindowTable::span`] states what the two answers mean.
-    ///
-    /// # Errors
-    ///
-    /// The number of runs the mask covers, when that is more than one.
     pub fn span(&self, mask: &ClassSet) -> core::result::Result<Option<MaskSpan>, usize> {
         self.table(model_ir::RowAxis::PRIMARY).span(mask)
     }
 
-    /// Every interval a node with this class mask runs over, ascending — the
-    /// slow path's launches, asked against the table that crossed to the
-    /// device. [`WindowTable::spans`] states what the list means.
     #[must_use]
     pub fn spans(&self, mask: &ClassSet) -> Vec<MaskSpan> {
         self.table(model_ir::RowAxis::PRIMARY).spans(mask)
     }
 
-    /// The same, into a buffer the caller keeps — what the walk asks once per
-    /// region ([`WindowTable::spans_into`] says why it is not a `Vec`).
     pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
         self.table(model_ir::RowAxis::PRIMARY).spans_into(mask, out);
     }
 
-    /// How many bytes [`pack`](FireDescriptor::pack) will write.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         HEADER_BYTES
@@ -241,7 +123,6 @@ impl FireDescriptor {
             }
     }
 
-    /// The descriptor, flat.
     #[must_use]
     pub fn pack(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.bytes() as usize);
@@ -269,7 +150,6 @@ impl FireDescriptor {
             put32(&mut out, lane.row_offset);
             put32(&mut out, lane.rows);
         }
-        // The trailer, nothing at all when there are no patch rows.
         if self.has_patches() {
             for window in self.patch_classes.as_slice() {
                 put32(&mut out, window.row_offset);
@@ -284,7 +164,6 @@ impl FireDescriptor {
                 put32(&mut out, lane.images);
             }
         }
-        // The voxel trailer, the same way.
         if self.has_voxels() {
             for window in self.voxel_classes.as_slice() {
                 put32(&mut out, window.row_offset);
@@ -302,16 +181,6 @@ impl FireDescriptor {
         out
     }
 
-    /// The descriptor these bytes carry.
-    ///
-    /// Checks what a device cannot: a malformed descriptor doesn't fault on
-    /// the far side, it computes over whatever rows the wrong numbers name.
-    /// So the length must be exact, and class rows must add up to the
-    /// header's total.
-    ///
-    /// # Errors
-    ///
-    /// One of the five `Descriptor*` faults, naming which of those it was.
     pub fn unpack(bytes: &[u8]) -> Result<FireDescriptor> {
         if (bytes.len() as u64) < HEADER_BYTES {
             return Err(Error::Fire(Fault::DescriptorShort { bytes: bytes.len() }));
@@ -320,8 +189,6 @@ impl FireDescriptor {
         if magic != MAGIC {
             return Err(Error::Fire(Fault::DescriptorMagic { saw: magic }));
         }
-        // Refused by name, both numbers included so the refusal is legible
-        // without a hexdump.
         let saw = take32(bytes, 4);
         if saw != ABI_VERSION {
             return Err(Error::Fire(Fault::DescriptorAbi {
@@ -391,9 +258,6 @@ impl FireDescriptor {
             });
         }
 
-        // The trailer's two halves are checked the way the token halves are:
-        // patch windows must add up to the patch row count the header
-        // claims.
         let mut patch_table = vec![ClassWindow::default(); classes as usize];
         if patch_rows > 0 {
             let at_classes = base + LANE_BYTES * lanes;
@@ -426,7 +290,6 @@ impl FireDescriptor {
         }
         let images = placed.iter().map(|lane| lane.images).sum();
 
-        // And the voxel trailer, checked the same way.
         let mut voxel_table = vec![ClassWindow::default(); classes as usize];
         if voxel_rows > 0 {
             let at_classes = base + LANE_BYTES * lanes + trailer;
@@ -482,10 +345,6 @@ fn put32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// The `u32` at `at`. Every caller has already checked the length against the
-/// header, so a short read here is impossible; the `unwrap_or` is what that
-/// impossibility costs, and it reads zero rather than panicking in a fire
-/// path.
 fn take32(bytes: &[u8], at: usize) -> u32 {
     bytes
         .get(at..at + 4)
@@ -513,7 +372,6 @@ mod tests {
         Budget::new(8, 64)
     }
 
-    // A decode/prefill split, in four nodes.
     fn plan() -> Build {
         let mut b = Build::new();
         let x = b.input(4);
@@ -526,7 +384,6 @@ mod tests {
         b
     }
 
-    // That fire, as a descriptor.
     fn descriptor() -> FireDescriptor {
         let b = plan();
         let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
@@ -538,6 +395,13 @@ mod tests {
             Lane::new(1, 1),
         ];
         FireDescriptor::of(&compose(&compiled, &budget(), &lanes).expect("composes"))
+    }
+
+    fn descriptor_every_case() {
+        a_descriptor_survives_the_round_trip_whole();
+        the_header_says_fire_and_which_layout_it_is();
+        bytes_that_are_not_a_descriptor_are_refused_and_named();
+        an_older_descriptor_is_refused_by_name_and_not_regenerated();
     }
 
     #[test]
@@ -553,27 +417,20 @@ mod tests {
         assert_eq!(FireDescriptor::unpack(&bytes), Ok(before));
     }
 
-    #[test]
     fn the_header_says_fire_and_which_layout_it_is() {
         let bytes = descriptor().pack();
         assert_eq!(&bytes[0..4], &MAGIC.to_le_bytes());
         assert_eq!(&bytes[4..8], &ABI_VERSION.to_le_bytes());
-        // rows, lanes, bucket, classes.
         assert_eq!(&bytes[8..12], &13u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &5u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &13u32.to_le_bytes());
         assert_eq!(&bytes[20..24], &2u32.to_le_bytes());
-        // Words 6/7 were one reserved `u64` under ABI 1; ABI 2 spends them as
-        // `patch_rows`/`patch_bucket`, and ABI 3 adds `voxel_rows`/
-        // `voxel_bucket` as words 8/9. No image and no clip here, so all four
-        // read zero.
         assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
         assert_eq!(&bytes[28..32], &0u32.to_le_bytes());
         assert_eq!(&bytes[32..36], &0u32.to_le_bytes());
         assert_eq!(&bytes[36..40], &0u32.to_le_bytes());
     }
 
-    #[test]
     fn bytes_that_are_not_a_descriptor_are_refused_and_named() {
         let good = descriptor().pack();
 
@@ -600,8 +457,6 @@ mod tests {
             Err(Error::Fire(Fault::DescriptorAbi { .. })),
         ));
 
-        // A header that claims one more class than the bytes carry: the record
-        // after it would be read half out of the lane table.
         let mut miscounted = good.clone();
         miscounted[20..24].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
@@ -609,8 +464,6 @@ mod tests {
             Err(Error::Fire(Fault::DescriptorLength { .. })),
         ));
 
-        // Windows that do not add up to the total the header claims — the
-        // corruption that does not fault on the far side, it computes.
         let mut wrong = good;
         wrong[8..12].copy_from_slice(&12u32.to_le_bytes());
         assert!(matches!(
@@ -619,8 +472,6 @@ mod tests {
         ));
     }
 
-    // Older bytes are refused by name, never regenerated into version 3.
-    #[test]
     fn an_older_descriptor_is_refused_by_name_and_not_regenerated() {
         let before = descriptor();
         for older in [1u32, 2] {

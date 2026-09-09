@@ -1,19 +1,3 @@
-//! **ONE STAMPED ARTIFACT, FIRED OVER A PROBE BATTERY, ITS ROWS DUMPED** for
-//! an external reference to be read against — the family-agnostic half of
-//! `the_two_bit_miniature_is_read_against_its_reference`. It asserts nothing
-//! about the numbers: the comparison is
-//! `scripts/dsv4_mini_parity_compare.py OUT --a pie --b ref`, against rows a
-//! reference wrote for the same probes (`scripts/gemma4_parity_ref.py`).
-//!
-//! Two arms per probe, as the dsv4 gate fires them: teacher-forced (one
-//! token a fire, the decode class over the prompt) and prefill + greedy.
-//!
-//! ```text
-//! PIE_PARITY_ARTIFACT=<stamped .zt> PIE_PARITY_PROBES=OUT/probes.json \
-//! PIE_PARITY_OUT=OUT [PIE_PARITY_STEPS=16] [PIE_PARITY_CONTEXT=512] \
-//!   cargo test -p engine-metal --release --test a_family_is_read_against_its_reference -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use std::io::Write;
@@ -61,9 +45,6 @@ fn every_probe_is_dumped() {
     let steps: usize = std::env::var("PIE_PARITY_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
     let context: u32 = std::env::var("PIE_PARITY_CONTEXT").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
 
-    // Either a stamped artifact (its own SKU, its own planes), or a raw
-    // snapshot read through a named SKU's import — what a miniature row
-    // over a full checkpoint needs, since identification never picks it.
     let (artifact, sku, contract) = match (std::env::var("PIE_PARITY_ARTIFACT"), std::env::var("PIE_PARITY_SNAPSHOT")) {
         (Ok(artifact), _) => {
             let artifact = PathBuf::from(artifact);
@@ -81,9 +62,6 @@ fn every_probe_is_dumped() {
             let snapshot = PathBuf::from(snapshot);
             let name = std::env::var("PIE_PARITY_SKU").expect("PIE_PARITY_SKU names the row that reads the snapshot");
             let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
-            // Every container under the snapshot, joined into one name space
-            // (`runtime::engine::load::open_source`'s reading, which this
-            // crate cannot call).
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
                     .expect("the snapshot lists")
@@ -113,6 +91,7 @@ fn every_probe_is_dumped() {
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: &artifact,

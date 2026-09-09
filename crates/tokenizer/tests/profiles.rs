@@ -52,6 +52,18 @@ fn assert_exact(json: &serde_json::Value, texts: &[&str]) {
     }
 }
 
+fn profiles_every_case() {
+    qwen3_profile_is_exact();
+    qwen36_string_merges_are_exact();
+    glm_and_nemotron_ignore_merges_are_exact();
+    deepseek_multi_regex_profile_is_exact();
+    gemma_byte_fallback_profile_is_exact();
+    grammar_bytes_are_decoder_aware_and_exclude_specials();
+    a_unigram_walks_and_wraps_exactly_as_hugging_face_does();
+    a_unigram_survives_being_baked_and_read_back();
+    a_bpe_tokenizer_writes_no_score_plane();
+}
+
 #[test]
 fn qwen3_profile_is_exact() {
     let tokenizer = byte_level_json(
@@ -64,7 +76,6 @@ fn qwen3_profile_is_exact() {
     assert_exact(&tokenizer, &["abc", "1234", "a\u{0301}", "<|special|>abc"]);
 }
 
-#[test]
 fn qwen36_string_merges_are_exact() {
     let tokenizer = byte_level_json(
         json!({"type": "NFC"}),
@@ -76,7 +87,6 @@ fn qwen36_string_merges_are_exact() {
     assert_exact(&tokenizer, &["abc", "1234", "a\u{0301}", "Hello!"]);
 }
 
-#[test]
 fn glm_and_nemotron_ignore_merges_are_exact() {
     let tokenizer = byte_level_json(
         serde_json::Value::Null,
@@ -92,7 +102,6 @@ fn glm_and_nemotron_ignore_merges_are_exact() {
     assert_eq!(pie.encode("1234"), vec![257, b'4' as u32]);
 }
 
-#[test]
 fn deepseek_multi_regex_profile_is_exact() {
     let tokenizer = byte_level_json(
         json!({"type": "Sequence", "normalizers": []}),
@@ -108,7 +117,6 @@ fn deepseek_multi_regex_profile_is_exact() {
     assert_exact(&tokenizer, &["abc", "1234", "你好1234", "<|special|>abc"]);
 }
 
-#[test]
 fn gemma_byte_fallback_profile_is_exact() {
     let tokenizer = gemma_json();
     assert_exact(&tokenizer, &["a b", "叫", "<special>a b"]);
@@ -117,7 +125,6 @@ fn gemma_byte_fallback_profile_is_exact() {
     assert_eq!(pie.decode(&[0xE5 + 6, 0x8F + 6], false), "��");
 }
 
-#[test]
 fn grammar_bytes_are_decoder_aware_and_exclude_specials() {
     let byte_level = byte_level_json(
         serde_json::Value::Null,
@@ -137,30 +144,6 @@ fn grammar_bytes_are_decoder_aware_and_exclude_specials() {
     assert_eq!(gemma.decoded_token_bytes(6 + 0xE5), Some(&[0xE5][..]));
 }
 
-/// **THE UNIGRAM WALK AND ITS WRAPPING, AGAINST HUGGING FACE ITSELF.**
-///
-/// `assert_exact` is the judge: pie's ids must equal `tokenizers`' ids and
-/// both decodes must agree, for every string. What each string is for:
-///
-/// - `"ab"` — the walk must not be greedy. `ab` is one piece and matches
-///   further, and it scores worse than `a` + `b`.
-/// - `"a red"` and `"red"` — `prepend_scheme = "always"` means a leading word
-///   and an interior one take the SAME piece, which is the whole point of the
-///   scheme and the thing a `FirstSegment` prefix would get wrong.
-/// - `"a  b"` — the normalizer collapses the run of spaces before anything
-///   else sees it.
-/// - `""` — a template post-processor still appends its tail; the answer is
-///   `[</s>]` and not nothing.
-/// - `"aQb"` — `Q` is in no piece, so it is one `unk` and the walk carries on
-///   past it. Byte fallback is off, so it is not a run of `<0xNN>`.
-///
-/// Compared against `tokenizers` WITH special tokens, unlike `assert_exact`'s
-/// other callers. That is not a loosening: a `TemplateProcessing` post-
-/// processor is part of what the model reads, and umT5's answer for any
-/// string ends with `</s>`. The BPE families here have no post-processor —
-/// their specials arrive as chat-template TEXT — which is why the shared
-/// helper asks for none.
-#[test]
 fn a_unigram_walks_and_wraps_exactly_as_hugging_face_does() {
     let json = unigram_json();
     let bytes = serde_json::to_vec(&json).unwrap();
@@ -183,16 +166,6 @@ fn a_unigram_walks_and_wraps_exactly_as_hugging_face_does() {
     }
 }
 
-/// **A UNIGRAM SURVIVES THE CANONICAL FORM.** Loading one from
-/// `tokenizer.json` is one thing; carrying it into a `.zt` and back is what
-/// `pie model import` does, and it needs a sixth object — the per-piece
-/// scores — that no BPE tokenizer writes.
-///
-/// The claim is the round trip, on the same eight strings: bake, rebuild,
-/// and the rebuilt tokenizer must spell every one of them identically. A
-/// score plane that was written in the wrong order, or truncated, or read
-/// back as the wrong type, changes the WALK and therefore the ids.
-#[test]
 fn a_unigram_survives_being_baked_and_read_back() {
     let bytes = serde_json::to_vec(&unigram_json()).unwrap();
     let pie = std::str::from_utf8(&bytes)
@@ -205,7 +178,6 @@ fn a_unigram_survives_being_baked_and_read_back() {
         baked.unigram_scores.is_some(),
         "a Unigram writes its score plane; without it the walk cannot be rebuilt"
     );
-    // And the plane is one f32 a token id, which is what the reader checks.
     assert_eq!(baked.unigram_scores.as_ref().unwrap().len(), 12 * 4);
 
     let names: Vec<&str> = baked.objects().iter().map(|(name, _)| *name).collect();
@@ -221,10 +193,6 @@ fn a_unigram_survives_being_baked_and_read_back() {
     }
 }
 
-/// A BPE tokenizer writes NO score plane, and that absence is what says it is
-/// not a Unigram. Every artifact written before Unigram was read depends on
-/// this staying true.
-#[test]
 fn a_bpe_tokenizer_writes_no_score_plane() {
     let bytes = serde_json::to_vec(&gemma_json()).unwrap();
     let pie = std::str::from_utf8(&bytes)

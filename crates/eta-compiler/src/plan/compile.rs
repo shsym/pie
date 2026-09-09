@@ -1,9 +1,3 @@
-//! Backend-neutral ETA compiler planning.
-//!
-//! Rust owns normalization, stage signatures, value-domain analysis, region
-//! partitioning, and the lane-table ABI. Engines consume the serialized plan
-//! and provide backend code generation and library implementations.
-
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,57 +21,29 @@ pub use region::*;
 pub use signature::*;
 pub use symbolic::*;
 
-/// Cache-identity tokens, not wire-format versions. Both engines fold these
-/// into their compiled-module cache keys, so bumping one invalidates
-/// everything a device already built.
 pub const COMPILER_VERSION: u16 = 3;
-/// Bumped when region partitioning changes shape. See [`COMPILER_VERSION`].
 pub const REGION_PLAN_VERSION: u16 = 8;
 
-/// The complete plan for one stage, handed to `eta-compiler` as a value.
-///
-/// Produced by [`compile_stage_at`]. Both partitions are carried so a backend
-/// can emit the [`fused`](Self::fused) form yet fall back to the
-/// always-correct [`singleton`](Self::singleton) one without re-planning.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledStage {
-    /// The normalized op DAG every other field was derived from.
     pub normalized: NormalizedStage,
-    /// The canonical signature; two stages sharing it may share an executable.
     pub signature: StageSignature,
-    /// One region per op — the always-correct fallback partition.
     pub singleton: RegionPartition,
-    /// Ops grouped by schedule with recognized library dataflows lifted out.
     pub fused: RegionPartition,
 }
 
-/// Static, backend-independent counts summarizing a [`CompiledStage`].
-///
-/// Diagnostic only — no planning decision reads these. The byte totals count
-/// only fully-static values; anything with a symbolic extent contributes zero,
-/// because its size is unknown until launch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanMetrics {
-    /// ETA ops in the stage before normalization.
     pub source_ops: u32,
-    /// Ops left after normalization dropped, folded and merged them.
     pub normalized_ops: u32,
-    /// Regions in the singleton partition — one per normalized op.
     pub singleton_regions: u32,
-    /// Regions in the fused partition.
     pub fused_regions: u32,
-    /// Fused regions dispatched to a library rather than generated inline.
     pub library_regions: u32,
-    /// Bytes of every statically-shaped value that is not a direct channel
-    /// sink — the stage's scratch footprint.
     pub static_scratch_bytes: u64,
-    /// Bytes of statically-shaped values a fused region writes straight to a
-    /// channel.
     pub direct_channel_sink_bytes: u64,
 }
 
 impl CompiledStage {
-    /// Summarizes this stage as [`PlanMetrics`] for diagnostics.
     pub fn metrics(&self) -> PlanMetrics {
         let static_bytes = |value_type: &SymbolicType| {
             let mut elements = 1u64;
@@ -125,17 +91,12 @@ impl CompiledStage {
     }
 }
 
-/// Compile every stage in container order.
 pub fn compile_bound(bound: &BoundTrace) -> Vec<CompiledStage> {
     (0..bound.container.stages.len())
         .map(|stage_index| compile_stage_at(bound, stage_index))
         .collect()
 }
 
-/// Compiles the stage of the given [`Stage`] kind, or `None` when the
-/// container has no stage of that kind.
-///
-/// A thin wrapper over [`compile_stage_at`] that first locates the stage.
 pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> {
     let stage_index = bound
         .container
@@ -145,14 +106,6 @@ pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> 
     Some(compile_stage_at(bound, stage_index))
 }
 
-/// Compiles the stage at `stage_index` in container order.
-///
-/// The core of the crate: it normalizes the stage body, localizes its channels
-/// and names, signs it, and builds both the singleton and fused partitions.
-///
-/// # Panics
-///
-/// Panics if `stage_index` is out of range for the container's stage list.
 pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage {
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
@@ -169,8 +122,6 @@ pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage
     }
 }
 
-/// Human-readable normalized DAG and partition dump for diagnostics without a
-/// backend or GPU.
 pub fn debug_stage_plan(stage: &CompiledStage) -> String {
     use core::fmt::Write;
 
@@ -219,11 +170,6 @@ pub fn debug_stage_plan(stage: &CompiledStage) -> String {
     output
 }
 
-/// The graph-cache identity of one compiled stage. Every engine is handed
-/// the bytes rather than deriving them, so an engine-side copy can never
-/// drift into a second definition of the same key. A stale key is silent
-/// (reuses a graph built by a different planner), so [`COMPILER_VERSION`]
-/// must be bumped alongside any change here.
 pub fn stage_identity(stage: &CompiledStage) -> u64 {
     let mut hash = Fnv1a::new();
     hash.byte(stage.normalized.stage as u8);

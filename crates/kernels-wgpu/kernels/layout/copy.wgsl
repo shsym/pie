@@ -15,4 +15,3 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[i] = src[i];
 }
 
-// pie:instantiate copy_words PIE_GROUP_X=256

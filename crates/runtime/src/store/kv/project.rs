@@ -1,68 +1,36 @@
-//! KV forward-prepare projection: a pure view over the store's resolved physical pages, living in `store/kv/` even though `pipeline/fire/` is what calls it.
-//!
-//! Takes the resolved physical pages plus the inferlet's `kv-output` per-page valid lengths and produces the `(physical_page_ids, last_page_len, active_page_idx)` triple the scheduler/`wire` build path consumes. Enforces the v1 dense-array contiguity rule (the v1 engine ABI's `kv_page_indices`/`kv_last_page_lens` express only a contiguous ordered active page run) and owns the seal-eligibility split (full vs partial pages).
-//!
-//! `PrepareError` lives here, not `pipeline::fire::kv`, because it is `project_kv`'s error type and `store/` must not import upward into `pipeline/`.
-
-/// Physical block id within one pool's id-space.
 pub type BlockId = u32;
 
-/// A physical KV page id the engine consumes (arena `KvPage` block = one page).
 pub type PhysicalPageId = BlockId;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrepareError {
-    /// A `kv-output` descriptor was built against a since-mutated working set
-    /// (captured generation no longer matches). Rejected before any arena work.
     StaleGeneration { captured: u32, current: u32 },
-    /// A per-page valid length is 0 or exceeds `page_size`.
     InvalidValidLen {
         index: u32,
         valid_len: u32,
         page_size: u32,
     },
-    /// An output slot index appears more than once in one pass.
     DuplicateOutputIndex(u32),
-    /// The active run `[0, active_len)` has a slot covered by neither context
-    /// nor output — the v1 ABI's contiguous ordered page list can't express it.
     NonContiguousActiveRun { gap_at: u32 },
-    /// Nothing to read and nothing to write.
     EmptyForward,
-    /// A forward pass supplied no input rows (no text tokens, image, or audio
-    /// span): the engine `qo_indptr` would collapse to `[0, 0]` and the pass
-    /// would be a no-op. The old context API rejected this as "empty input".
     NoInputTokens,
 }
 
-/// One resolved KV write target (post-CoW physical page) for this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvWrite {
-    /// Relative slot index in the dense `kv-working-set` array.
     pub slot_index: u32,
-    /// Resolved (post-CoW) physical page the engine writes into.
     pub page: PhysicalPageId,
-    /// Tokens written into this page (`kv-output.per-page-valid-lens[i]`).
     pub valid_len: u32,
 }
 
-/// The triple the downstream submit path expects, plus seal-eligibility.
 #[derive(Debug, PartialEq, Eq)]
 pub struct KvProjection {
-    /// Ordered active page run `[0, active_len)`.
     pub physical_page_ids: Vec<PhysicalPageId>,
-    /// Valid tokens in the final active page.
     pub last_page_len: u32,
-    /// Index (in `physical_page_ids`) of the last page that receives writes;
-    /// `None` for a read-only forward (no `kv-output`).
     pub active_page_idx: Option<usize>,
-    /// Output slot indices whose page is full (`valid_len == page_size`) and is
-    /// therefore CAS-seal-eligible at commit. Partial pages stay private (W7).
     pub full_page_writes: Vec<u32>,
 }
 
-/// Project explicit KV read/write descriptors onto the engine's contiguous active page run.
-///
-/// `context_pages` are the resolved physical pages for read slots `[0, context_pages.len())` (v1 requires the read window to start at slot 0; RoPE positions run from 0). `active_len = max(context_len, max_output_slot + 1)`; every slot in `[0, active_len)` must be backed by an output target or a context page (no gaps).
 pub fn project_kv(
     context_pages: &[PhysicalPageId],
     context_valid_tokens: u32,
@@ -93,7 +61,6 @@ pub fn project_kv(
 
     let active_len = context_len.max(max_write_slot.map_or(0, |m| m + 1));
 
-    // Assemble the contiguous active page run.
     let mut physical_page_ids = Vec::with_capacity(active_len as usize);
     for slot in 0..active_len {
         if let Some(wr) = writes.iter().find(|w| w.slot_index == slot) {
@@ -105,12 +72,10 @@ pub fn project_kv(
         }
     }
 
-    // last_page_len = valid tokens in the final active page.
     let last_slot = active_len - 1;
     let last_page_len = if let Some(wr) = writes.iter().find(|w| w.slot_index == last_slot) {
         wr.valid_len
     } else {
-        // Final slot is a read-only context tail page.
         let consumed = last_slot * page_size;
         let rem = context_valid_tokens.saturating_sub(consumed);
         if rem == 0 || rem > page_size {

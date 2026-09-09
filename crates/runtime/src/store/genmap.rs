@@ -1,13 +1,7 @@
-//! Minimal generational slot map for typed store ids. Keys are
-//! generation-tagged so a recycled slot never aliases a stale handle. `M` is
-//! a zero-sized marker type; keys of maps with different markers are
-//! mutually untypable. Some methods are not yet called by the live
-//! single-model fire path but are exercised by this module's own tests.
 #![allow(dead_code)]
 
 use std::marker::PhantomData;
 
-/// Generation-tagged key into a [`GenMap`].
 pub struct GenKey<M> {
     index: u32,
     generation: u32,
@@ -53,7 +47,6 @@ struct Slot<T> {
     value: Option<T>,
 }
 
-/// Generational slot map.
 pub struct GenMap<M, T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -120,7 +113,6 @@ impl<M, T> GenMap<M, T> {
             return None;
         }
         let value = slot.value.take();
-        // Bump the generation on removal so stale keys can never resolve.
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(key.index);
         self.len -= 1;

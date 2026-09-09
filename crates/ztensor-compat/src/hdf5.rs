@@ -1,20 +1,3 @@
-//! HDF5 → zTensor object model projection.
-//!
-//! A self-contained parser for the subset that covers Keras/h5py weight
-//! files: superblock v0/v1, v1 B-trees and object headers, contiguous and
-//! chunked layouts, deflate + shuffle filters, IEEE little-endian
-//! float/integer datatypes.
-//!
-//! A contiguous dataset is a plain range of the file, so it gets an address
-//! and a borrow. A chunked one is scattered across the file behind filters, so
-//! it is reassembled once at open and served as an opaque payload. There is
-//! no range of this file that holds those bytes in order, and pretending
-//! otherwise would be the one lie this crate does not tell.
-//!
-//! Datasets with unsupported datatype classes (strings, compounds) are skipped
-//! and listed in the `hdf5.skipped` file attribute; big-endian numeric data is
-//! refused rather than reinterpreted.
-
 use std::borrow::Cow;
 use std::io::Read;
 
@@ -28,11 +11,7 @@ use crate::project::Projection;
 const MAGIC: &[u8; 8] = b"\x89HDF\r\n\x1a\n";
 const MAX_DEPTH: usize = 64;
 const MAX_NAME: usize = 1024;
-/// Global budget on parsed header messages and visited B-tree/SNOD nodes.
-/// Depth limits alone do not bound *work*: a self-referential structure can
-/// branch within the depth cap and explore exponentially many paths.
 const MAX_NODES: u32 = 100_000;
-/// Cap on a single decompressed chunk (defends zip-bomb filter pipelines).
 const MAX_CHUNK: u64 = 256 << 20;
 
 const MSG_DATASPACE: u16 = 0x0001;
@@ -49,11 +28,6 @@ fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("hdf5: {}", detail.into()))
 }
 
-// ---- primitive readers ------------------------------------------------
-
-/// Turns a file-declared address into an in-bounds index, requiring `need`
-/// readable bytes there. Every `u64` address in an HDF5 file is attacker
-/// controlled, so this is the only way addresses enter the parser.
 fn at(data: &[u8], addr: u64, need: usize) -> Result<usize> {
     let start = crate::safe::to_usize("hdf5 address", addr)?;
     start
@@ -93,7 +67,6 @@ fn u64_at(data: &[u8], pos: usize) -> Result<u64> {
     uint(data, pos, 8)
 }
 
-/// Reads a NUL-terminated name at a file-declared address.
 fn cstring(data: &[u8], addr: u64) -> Result<String> {
     let pos = at(data, addr, 0)?;
     let rest = &data[pos..];
@@ -107,11 +80,10 @@ fn cstring(data: &[u8], addr: u64) -> Result<String> {
     String::from_utf8(rest[..len].to_vec()).map_err(|_| bad("invalid UTF-8 in name"))
 }
 
-/// Superblock parameters used throughout.
 #[derive(Clone, Copy)]
 struct Ctx {
-    o: usize, // offset size
-    l: usize, // length size
+    o: usize,
+    l: usize,
 }
 
 impl Ctx {
@@ -121,14 +93,10 @@ impl Ctx {
     fn length(&self, data: &[u8], pos: usize) -> Result<u64> {
         uint(data, pos, self.l)
     }
-    /// The "undefined address" sentinel is all-ones *in this file's offset
-    /// width*: `0xFFFFFFFF` in a 4-byte-offset file, rather than `u64::MAX`.
     fn is_undef(&self, addr: u64) -> bool {
         addr == u64::MAX >> ((8 - self.o.min(8)) * 8)
     }
 }
-
-// ---- parsed structures ------------------------------------------------
 
 #[derive(Clone)]
 struct Filter {
@@ -154,8 +122,6 @@ struct DatasetInfo {
     filters: Vec<Filter>,
 }
 
-/// Chunked datasets, reassembled at open and handed out on request. They have
-/// no address: their bytes are scattered across the file behind filters.
 struct Reassembled {
     buffers: Vec<Vec<u8>>,
 }
@@ -174,8 +140,6 @@ impl Decode for Reassembled {
 }
 
 pub(crate) fn project(store: &Store) -> Result<Projection> {
-    // HDF5 addresses run all over the file and there is no header section to
-    // read on its own, so an unmapped store has to read the file.
     let bytes: Cow<'_, [u8]> = match store.bytes() {
         Some(mapped) => Cow::Borrowed(mapped),
         None => Cow::Owned(store.read(0, store.len())?),
@@ -199,9 +163,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         ..
     } = walker;
 
-    // Skipped datasets are recorded in the projection rather than only behind an
-    // accessor: a consumer that only sees the tensors would otherwise have no
-    // way to notice they exist.
     if !skipped.is_empty() {
         catalog.set_attributes(Some(Value::Map(vec![(
             Value::Text("hdf5.skipped".into()),
@@ -209,9 +170,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         )])));
     }
 
-    // Contiguous datasets are the only ranges we can account for, and an HDF5
-    // file has object headers and B-trees between them that we have not
-    // mapped, so occupancy is not claimed and neither is exclusivity.
     let projection = Projection::new(catalog);
     Ok(if chunked.is_empty() {
         projection
@@ -219,8 +177,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         projection.with_decoder(Box::new(Reassembled { buffers: chunked }))
     })
 }
-
-// ---- superblock -------------------------------------------------------
 
 fn find_superblock(data: &[u8]) -> Result<usize> {
     if data.len() >= 8 && &data[..8] == MAGIC {
@@ -274,24 +230,19 @@ fn heap_data_addr(data: &[u8], ctx: &Ctx, heap_addr: u64) -> Result<u64> {
         return Err(bad("missing HEAP signature"));
     }
     let addr = ctx.offset(data, pos + 4 + 1 + 3 + ctx.l + ctx.l)?;
-    at(data, addr, 0)?; // the heap data segment must be inside the file
+    at(data, addr, 0)?;
     Ok(addr)
 }
 
-// ---- group traversal --------------------------------------------------
-
 struct Walker<'a> {
     data: &'a [u8],
-    /// Remaining node/message budget (see MAX_NODES).
     budget: u32,
     catalog: Catalog,
-    /// Reassembled chunked datasets, indexed by their opaque key.
     chunked: Vec<Vec<u8>>,
     skipped: Vec<String>,
 }
 
 impl Walker<'_> {
-    /// Charges one unit of the global work budget.
     fn spend(&mut self) -> Result<()> {
         self.budget = self
             .budget
@@ -330,7 +281,7 @@ impl Walker<'_> {
             return Err(bad("missing TREE signature"));
         }
         if u8_at(data, pos + 4)? != 0 {
-            return Ok(()); // not a group B-tree
+            return Ok(());
         }
         let level = u8_at(data, pos + 5)?;
         let entries = u16_at(data, pos + 6)? as usize;
@@ -447,8 +398,6 @@ impl Walker<'_> {
                     self.skipped.push(name.to_string());
                     return Ok(());
                 }
-                // The chunk grid must have one dimension per dataspace
-                // dimension; the two come from independent messages.
                 if chunk_dims.len() != info.shape.len()
                     || chunk_dims.contains(&0)
                     || info.shape.contains(&0)
@@ -499,8 +448,6 @@ impl Walker<'_> {
         Ok(())
     }
 }
-
-// ---- object header ----------------------------------------------------
 
 enum Header {
     Dataset(DatasetInfo),
@@ -593,9 +540,6 @@ fn parse_messages(
                 let cont = ctx.offset(data, body)?;
                 let len = ctx.offset(data, body + ctx.o)?;
                 if !ctx.is_undef(cont) && len > 0 {
-                    // Erroring (rather than skipping) at the cap matters:
-                    // a silent skip lets a self-referential header be
-                    // explored along exponentially many paths.
                     if depth >= MAX_DEPTH {
                         return Err(bad("object header continuation too deep"));
                     }
@@ -634,9 +578,6 @@ fn parse_dataspace(data: &[u8], pos: usize) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// Returns `Ok(None)` for datatype classes without a projection (strings,
-/// compounds, where the dataset is skipped); errors for numeric-but-unreadable
-/// (big-endian) data.
 fn parse_datatype(data: &[u8], pos: usize) -> Result<Option<Leaf>> {
     let class = u8_at(data, pos)? & 0x0f;
     let bits0 = u8_at(data, pos + 1)?;
@@ -748,11 +689,8 @@ fn parse_filters(data: &[u8], pos: usize) -> Result<Vec<Filter>> {
     Ok(filters)
 }
 
-// ---- chunked reassembly -----------------------------------------------
-
 struct Chunk {
     linear_offset: u64,
-    /// Chunk origin in element coordinates (validated in range).
     coords: Vec<u64>,
     file_addr: u64,
     size: u32,
@@ -813,8 +751,6 @@ fn collect_chunks(
             let mut coords = vec![0u64; ndims];
             for d in (0..ndims).rev() {
                 let c = u64_at(data, k + 8 + d * 8)?;
-                // A chunk's origin must be inside the dataset and on the
-                // chunk grid; otherwise its bytes have no home.
                 if c >= shape[d] {
                     return Err(bad(format!(
                         "chunk origin {c} outside dimension {d} (size {})",
@@ -844,9 +780,6 @@ fn collect_chunks(
     Ok(())
 }
 
-/// Reverses the filter pipeline for one chunk. Output is capped: a
-/// pipeline may legitimately list several filters, and nested deflate
-/// stages otherwise turn kilobytes into petabytes.
 fn apply_filters(
     mut bytes: Vec<u8>,
     filters: &[Filter],
@@ -908,8 +841,6 @@ fn read_chunked(
     let esize = dtype.width().expect("hdf5 leaves are whole bytes") as usize;
     let elems = crate::safe::product("hdf5 shape", shape)?;
     let total_u64 = crate::safe::mul("hdf5 dataset size", elems, esize as u64)?;
-    // A chunked dataset is materialized in full, so its declared size must
-    // be plausible for the file at hand as well as within the alloc cap.
     let total = crate::safe::alloc_size("hdf5 dataset", total_u64)?;
 
     let mut chunks = Vec::new();
@@ -926,9 +857,6 @@ fn read_chunked(
         &mut budget,
     )?;
 
-    // Every chunk must cover a distinct grid cell, and together they must
-    // cover the whole dataset. Without this a missing chunk would surface
-    // as silently zero-filled data.
     let cells = chunk_dims
         .iter()
         .zip(shape)
@@ -1031,8 +959,6 @@ fn copy_chunk(
             "hdf5 dataset offset",
             crate::safe::mul("hdf5 dataset offset", dst, esize as u64)?,
         )?;
-        // Out-of-range pieces are a malformed file, not something to skip:
-        // skipping would leave zeros behind and call it success.
         let dst_end = dst_byte
             .checked_add(row_len)
             .filter(|&e| e <= out.len())
@@ -1050,26 +976,25 @@ fn copy_chunk(
 mod tests {
     use super::*;
 
+    fn hdf5_every_case() {
+        datatype_parsing();
+        unshuffle_roundtrip();
+    }
+
     #[test]
     fn datatype_parsing() {
-        // f32 (class 1, LE, size 4)
         let f32_msg = [0x11, 0x20, 0, 0, 4, 0, 0, 0];
         assert_eq!(parse_datatype(&f32_msg, 0).unwrap(), Some(Leaf::F32));
-        // signed i64
         let i64_msg = [0x00, 0x08, 0, 0, 8, 0, 0, 0];
         assert_eq!(parse_datatype(&i64_msg, 0).unwrap(), Some(Leaf::I64));
-        // unsigned u32
         let u32_msg = [0x00, 0x00, 0, 0, 4, 0, 0, 0];
         assert_eq!(parse_datatype(&u32_msg, 0).unwrap(), Some(Leaf::U32));
-        // string class -> no projection, skip
         let str_msg = [0x03, 0x00, 0, 0, 8, 0, 0, 0];
         assert_eq!(parse_datatype(&str_msg, 0).unwrap(), None);
-        // big-endian f32 -> refuse
         let be_msg = [0x11, 0x21, 0, 0, 4, 0, 0, 0];
         assert!(parse_datatype(&be_msg, 0).is_err());
     }
 
-    #[test]
     fn unshuffle_roundtrip() {
         let shuffled = [1u8, 5, 9, 2, 6, 10, 3, 7, 11, 4, 8, 12];
         assert_eq!(

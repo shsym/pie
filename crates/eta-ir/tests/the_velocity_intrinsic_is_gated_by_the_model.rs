@@ -1,17 +1,3 @@
-//! **A VELOCITY SEAM THE MODEL DOES NOT HAVE IS A BIND ERROR, NOT A FIRE
-//! ERROR.** `IntrinsicId::Velocity` is the one seam a diffusion sampler
-//! cannot do without, and it exists only on a text whose denoise reading
-//! predicts one. Left ungated it would type-check against every model and
-//! fault on the first fire of a load the guest cannot see; left unchecked in
-//! width it would carry the wrong channel count into the plan's extents the
-//! way `hidden`'s declared width does, and a sampler would step a latent of
-//! the wrong shape. This holds both gates, plus the stage scope that keeps
-//! it out of the per-layer taps.
-//!
-//! ```text
-//! cargo test -p eta-ir --test the_velocity_intrinsic_is_gated_by_the_model
-//! ```
-
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{ModelProfile, Stage, intrinsic_available, intrinsic_stages};
@@ -55,6 +41,12 @@ fn epilogue_reading(shape: Shape, dtype: Dtype) -> TraceContainer {
     }
 }
 
+fn the_velocity_intrinsic_is_gated_by_the_model_every_case() {
+    a_denoising_model_serves_the_velocity_and_a_text_model_refuses_it();
+    the_declared_width_must_be_the_models_own();
+    the_velocity_is_an_epilogue_value_only();
+}
+
 #[test]
 fn a_denoising_model_serves_the_velocity_and_a_text_model_refuses_it() {
     let plane = Shape::matrix(ROWS, CHANNELS);
@@ -78,9 +70,7 @@ fn a_denoising_model_serves_the_velocity_and_a_text_model_refuses_it() {
     );
 }
 
-#[test]
 fn the_declared_width_must_be_the_models_own() {
-    // Unlike `hidden`, whose width the profile does not carry.
     let wrong = Shape::matrix(ROWS, CHANNELS + 1);
     let refusal = bind(epilogue_reading(wrong, Dtype::F32), profile())
         .expect_err("a width that is not the model's must be refused");
@@ -95,8 +85,6 @@ fn the_declared_width_must_be_the_models_own() {
         "refused for the wrong reason: {refusal:?}"
     );
 
-    // Rank and dtype are the rest of the rule: a velocity plane is a rank-2
-    // F32 rectangle of rows, never a vector and never an integer one.
     for (shape, dtype) in [
         (Shape::vector(CHANNELS), Dtype::F32),
         (Shape::matrix(ROWS, CHANNELS), Dtype::I32),
@@ -108,7 +96,6 @@ fn the_declared_width_must_be_the_models_own() {
     }
 }
 
-#[test]
 fn the_velocity_is_an_epilogue_value_only() {
     assert_eq!(
         intrinsic_stages(IntrinsicId::Velocity),
@@ -123,8 +110,6 @@ fn the_velocity_is_an_epilogue_value_only() {
             ..profile()
         }
     ));
-    // The gate is read from one exhaustive match, so `Hidden` staying
-    // ungated is a claim this file makes too.
     assert!(intrinsic_available(
         IntrinsicId::Hidden,
         &ModelProfile {

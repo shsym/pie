@@ -1,41 +1,20 @@
-//! Pinned double-buffered H2D pump: host->device copies partitioned
-//! round-robin across worker lanes, each double-buffering a pinned staging
-//! buffer so the next memcpy overlaps the DMA already in flight. GDS is not
-//! used: a single lane already outruns NVMe O_DIRECT throughput.
-
 use core::ffi::c_void;
 
 use crate::device::alloc::Pinned;
 use crate::device::graph::Event;
 use crate::error::{Fault, Result};
 
-/// How many staging lanes a bulk move opens. Comfortably past every NVMe
-/// reader measured; costs `LANES * 2 * CHUNK` (16 MiB) pinned memory per load.
 pub const LANES: usize = 4;
 
-/// How much each staging buffer holds. Small on purpose: large enough to
-/// overlap memcpy/DMA, small enough not to stall the lane at the seams.
 pub const CHUNK: usize = 2 << 20;
 
-/// One host->device copy: a device address, host bytes, a length.
-///
-/// `src` is a raw pointer, not a slice: sources are mmap'd files whose pages
-/// are faulted in by the memcpy itself. Caller must keep the mapping alive
-/// for the whole call.
 #[derive(Debug, Clone, Copy)]
 pub struct Transfer {
-    /// The device address the bytes land at. Bounds are checked by the
-    /// caller before reaching here.
     pub dst: u64,
-    /// The first host byte. Must stay mapped and unwritten for the call.
     pub src: *const u8,
-    /// How many bytes.
     pub len: u64,
 }
 
-/// The chunk list, shared read-only across worker threads.
-///
-/// SAFETY: built before the scope opens and never mutated inside it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct Cargo(Vec<Transfer>);
 
@@ -44,15 +23,12 @@ unsafe impl Sync for Cargo {}
 // SAFETY: same as Sync.
 unsafe impl Send for Cargo {}
 
-/// One lane: a stream, and the pinned double buffer it feeds.
 #[derive(Debug)]
 struct Lane {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stream: *mut c_void,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pinned: [Pinned; 2],
-    /// Recorded after the H2D that reads `pinned[i]`. A lane waits on it
-    /// before overwriting that buffer.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     done: [Event; 2],
 }
@@ -62,28 +38,16 @@ struct Lane {
 // or event.
 unsafe impl Send for Lane {}
 
-/// A pool of staging lanes, opened once and pumped as many times as the
-/// caller likes. Buffers, streams and events are made in [`Lanes::open`] and
-/// freed in `Drop`.
 #[derive(Debug)]
 pub struct Lanes {
     lanes: Vec<Lane>,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     buf_bytes: usize,
-    /// The ordinal every worker thread binds: `cudaSetDevice` is per-thread
-    /// and does not travel with a spawn.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: i32,
 }
 
 impl Lanes {
-    /// Open `lanes` staging lanes of `buf_bytes` each. Zero lanes opens one.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] for a build with no CUDA runtime,
-    /// [`Fault::Device`] for a stream, allocation, or event the runtime
-    /// refused.
     pub fn open(lanes: usize, buf_bytes: usize) -> Result<Lanes> {
         #[cfg(feature = "cuda")]
         {
@@ -110,30 +74,15 @@ impl Lanes {
         }
     }
 
-    /// The pool [`LANES`] and [`CHUNK`] describe — what a bulk move opens
-    /// unless it has a measured reason to open something else.
-    ///
-    /// # Errors
-    ///
-    /// As [`Lanes::open`].
     pub fn standard() -> Result<Lanes> {
         Lanes::open(LANES, CHUNK)
     }
 
-    /// How many lanes are open.
     #[must_use]
     pub fn width(&self) -> usize {
         self.lanes.len()
     }
 
-    /// Copy every transfer, and block until all DMAs have landed. Sliced into
-    /// sub-chunks of at most one staging buffer, one contiguous run per lane
-    /// so each lane's host reads stay sequential for read-ahead.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], or the first [`Fault::Device`] any lane met.
-    /// Every lane drains its stream before returning.
     pub fn pump(&mut self, copies: &[Transfer]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -176,8 +125,6 @@ impl Lanes {
                 }
                 running
                     .into_iter()
-                    // a panicked lane is a device fault, not resumed: unwinding
-                    // through the scope would free the buffers under a live DMA
                     .map(|handle| {
                         handle.join().unwrap_or(Err(Fault::Device {
                             call: "staged_h2d lane",
@@ -186,7 +133,6 @@ impl Lanes {
                     })
                     .collect()
             });
-            // every lane has drained by now
             outcomes.into_iter().collect::<Result<Vec<()>>>()?;
             Ok(())
         }
@@ -198,8 +144,6 @@ impl Lanes {
     }
 }
 
-/// One lane's whole life: bind, stream the run through the double buffer,
-/// drain.
 #[cfg(feature = "cuda")]
 fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
     use cudarc::runtime::sys as rt;
@@ -213,8 +157,6 @@ fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
     let streamed = (|| -> Result<()> {
         let mut buf = 0usize;
         for chunk in run {
-            // this buffer may still be the source of the H2D two iterations
-            // ago; an event never recorded returns at once
             lane.done[buf].settle()?;
             let take = usize::try_from(chunk.len).unwrap_or(usize::MAX);
             // SAFETY: `take <= buf_bytes` by the chunking above, so the
@@ -242,13 +184,10 @@ fn run_lane(device: i32, lane: &mut Lane, run: &[Transfer]) -> Result<()> {
         Ok(())
     })();
 
-    // drains regardless of outcome: pinned buffers are freed by Drop, and a
-    // free under a live DMA must not happen
     let drained = crate::device::ctx::sync(lane.stream);
     streamed.and(drained)
 }
 
-/// The ordinal this thread is bound to, so the workers can bind the same one.
 #[cfg(feature = "cuda")]
 fn current_device() -> Result<i32> {
     use cudarc::runtime::sys as rt;
@@ -259,7 +198,6 @@ fn current_device() -> Result<i32> {
     Ok(ordinal)
 }
 
-/// A stream for one lane.
 #[cfg(feature = "cuda")]
 fn new_stream() -> Result<*mut c_void> {
     use cudarc::runtime::sys as rt;
@@ -291,7 +229,6 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
 
-    /// No CUDA runtime: every device call returns Fault::Runtimeless.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn a_runtimeless_build_opens_no_lanes() {

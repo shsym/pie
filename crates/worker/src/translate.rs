@@ -1,16 +1,8 @@
-//! Translate the standalone's user-facing TOML config (`crate::config`) into
-//! the runtime's internal `runtime::bootstrap::Config`: scalars from the user
-//! TOML, dirs from [`bootstrap::paths::pie_home`], capability/backend bundles
-//! collected before bootstrap.
-
 use anyhow::Result;
 
 use crate::backend::ModelEngines;
 use crate::config;
 
-/// The one place config units become the runtime's plain numbers: `Duration`
-/// and `ByteSize` carry their unit through the config layer, but the
-/// bootstrap structs still take `_secs`/`_us`/`_mb` scalars.
 pub fn build(
     user: &config::Config,
     engines: ModelEngines,
@@ -42,9 +34,6 @@ pub fn build(
             endpoint: user.telemetry.endpoint.clone(),
             service_name: user.telemetry.service_name.clone(),
         },
-        // `bootstrap::RuntimeConfig` still carries the tokio pool and sandbox
-        // in one bag; `crate::config` splits them into `[server]`/`[sandbox]`,
-        // which is why field names differ from the paths they read.
         runtime: runtime::bootstrap::RuntimeConfig {
             worker_threads: user.server.worker_threads,
             wasm_max_instances: user.sandbox.max_instances,
@@ -59,8 +48,6 @@ pub fn build(
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
-        // The `bootstrap` lib installs the global tracing subscriber;
-        // the runtime must NOT re-init it (double global-init panics on boot).
         skip_tracing: true,
         max_concurrent_processes: user.runtime.max_concurrent_processes,
         python_snapshot: user.sandbox.python_snapshot,
@@ -73,8 +60,6 @@ fn build_model(
     engines: ModelEngines,
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::ModelConfig> {
-    // Arch + kv_page_size + tokenizer come from group 0; all groups serve
-    // the same model so they agree.
     let group0_caps = engines.groups[0].caps.clone();
     let snapshot_dir = engines.groups[0].snapshot_dir.clone();
     let engines_facts = engines.groups[0].facts.trace_name.clone();
@@ -94,12 +79,8 @@ fn build_model(
         .into_iter()
         .map(|g| {
             let backend_kind = g.backend.kind().to_string();
-            // Reads `Capabilities`' three records: pools for capacities,
-            // limits for ceilings, profile for what a guest may name.
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
-                // The host-swap pool is a deployment's, not a load's; no
-                // engine reserves one on the caller's behalf.
                 cpu_pages: 0,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
@@ -113,9 +94,6 @@ fn build_model(
                 draft_bidirectional: g.caps.profile.draft_bidirectional,
                 draft_proposals_from: g.caps.profile.draft_proposals_from,
                 has_value_head: g.caps.profile.has_value_head,
-                // `has_kv_envelopes` has no successor: it advertised a
-                // model-gated ETA intrinsic the profile does not carry, and
-                // the runtime's `EtaCaps` is the only reader.
                 has_kv_envelopes: false,
                 has_attn_page_mask: g.caps.profile.has_attn_page_mask,
                 has_attn_score: g.caps.profile.has_attn_score,
@@ -134,14 +112,11 @@ fn build_model(
 
     Ok(runtime::bootstrap::ModelConfig {
         name: m.name.clone(),
-        // The plan's own name, as the model text declared it; comes off
-        // `LoadFacts` rather than an engine echoing back the operator's string.
         model_id: engines_facts,
         kv_page_size: group0_caps.pools.kv_page_size as usize,
         tokenizer_path,
         metadata,
         engines,
-        // Batching is a deployment's, not a model's; arrives as its own argument.
         scheduler: runtime::bootstrap::SchedulerConfig {
             request_timeout_secs: runtime.request_timeout.as_secs(),
             submit_deadline_us: runtime.submit_deadline.as_micros(),

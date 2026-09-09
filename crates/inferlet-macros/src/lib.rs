@@ -1,7 +1,3 @@
-//! Procedural macros for the inferlet library.
-//!
-//! Provides the `#[inferlet::main]` attribute macro for defining inferlet entry points.
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, parse_macro_input};
@@ -10,7 +6,6 @@ fn is_string(ty: &Type) -> bool {
     matches!(ty, Type::Path(p) if p.path.is_ident("String"))
 }
 
-/// Extracts the inner type `T` from `Result<T>` or `Result<T, E>`.
 fn result_inner(ty: &Type) -> Option<&Type> {
     let Type::Path(p) = ty else { return None };
     let seg = p.path.segments.last()?;
@@ -26,25 +21,6 @@ fn result_inner(ty: &Type) -> Option<&Type> {
     }
 }
 
-/// Marks an async function as the inferlet entry point.
-///
-/// The macro inspects the function signature and generates the appropriate
-/// JSON serialization bridge:
-///
-/// - **Input**: if the parameter type is not `String`, the raw JSON input
-///   string is deserialized via `serde_json::from_str`.
-/// - **Output**: if the `Result<T>` inner type is not `String`, the return
-///   value is serialized via `serde_json::to_string`.
-///
-/// All four combinations of typed/raw input × typed/raw output are supported.
-///
-/// ```ignore
-/// #[inferlet::main]
-/// async fn main(input: MyInput) -> Result<MyOutput> { .. }
-///
-/// #[inferlet::main]
-/// async fn main(input: String) -> Result<String> { .. }
-/// ```
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input_fn = parse_macro_input!(item as ItemFn);
@@ -111,8 +87,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // plain crate root: the expansion reaches generator-internal items
-        // that only the real crate root carries.
         ::inferlet::export!(__PieMain with_types_in ::inferlet);
     };
 

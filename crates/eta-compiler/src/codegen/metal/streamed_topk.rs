@@ -1,33 +1,3 @@
-//! `emit_streamed_topk` — the `top_k` library op as a streamed dispatch table.
-//!
-//! The grouped library kernel gives a row one threadgroup: one GPU core reads
-//! the whole row per pass, and a vocabulary-wide row is a millisecond per
-//! sweep on this device however the sweep is written — the core's memory
-//! parallelism, not the arithmetic, is the ceiling. Here the row is swept by
-//! the whole grid instead. The order is the library kernel's: non-NaN values
-//! descending, then NaNs, ties by index ascending (`-0.0` reads as `+0.0`) —
-//! as a key, `(nan, ~ascending_bits, index)` ascending — and the result is
-//! the same `k` entries in the same order.
-//!
-//! Eleven dispatches, the kernel switching on `M4Step::index`:
-//!
-//! - step 0, one group: zero the histograms and counters, seed each row's
-//!   pick.
-//! - steps 1, 3, 5, 7, the grid: a histogram sweep of the row's keys — the
-//!   NaN flag with the top byte first (512 bins), then each next byte among
-//!   keys matching the prefix so far. Bins are counted in threadgroup memory
-//!   and added to the row's device histogram once per group.
-//! - steps 2, 4, 6, 8, one group: walk the bins to the one holding the
-//!   `k`-th key, extend the prefix, zero the histogram for the next byte.
-//! - step 9, the grid: compaction — every key below the pivot, and the keys
-//!   equal to it while they fit, appended unordered to the row's candidates.
-//! - step 10, one group: bitonic-sort the candidates by `(key, index)` and
-//!   write the first `k`. When the pivot's ties overflowed the room, the
-//!   lowest indices among them are found by an ordered walk first.
-//!
-//! Everything lives in the lane's `temporary`; `k` is bounded by
-//! [`super::topk::SELECT_MAX_K`], the candidates a threadgroup can hold.
-
 use crate::codegen::error::{EmitError, RegionForm};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -42,9 +12,6 @@ use super::validate::{is_library, library_op_byte, library_region_valid, used_ch
 use crate::codegen::op_view::{OpView, result_bases};
 
 const HELPERS: &str = r#"
-// The row's total order as a key: `flag` is 1 for NaN (sorted last, all
-// equal), else `key` is the bitwise-descending image of the value — the bits
-// the library kernel's `m3_topk_order_digit` reads, so the two agree.
 inline uint m4_topk_key(float value, thread uint& flag) {
   if (isnan(value)) { flag = 1u; return 0u; }
   flag = 0u;
@@ -55,7 +22,6 @@ inline uint m4_topk_key(float value, thread uint& flag) {
 }
 "#;
 
-/// The cases, with `kInput`, `kValues`, `kIndices`, `kK`, `kCap` in scope.
 const BODY: &str = r#"
   const M1ValueDesc in_desc = descriptors[kInput];
   const uint rows = in_desc.rows;
@@ -64,7 +30,6 @@ const BODY: &str = r#"
   const device float* input = reinterpret_cast<const device float*>(scratch + offsets[kInput]);
   device float* top_values = reinterpret_cast<device float*>(scratch + offsets[kValues]);
   device uint* top_indices = reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
-  // `temporary`: histograms, picks, fills, then the candidates.
   device atomic_uint* hist = reinterpret_cast<device atomic_uint*>(temporary);
   device uint* pick = reinterpret_cast<device uint*>(temporary) + rows * 512u;      // [row][4]: flag, prefix, remaining, total_lt
   device atomic_uint* fill = reinterpret_cast<device atomic_uint*>(pick + rows * 4u);  // [row][2]: lt, eq
@@ -77,7 +42,6 @@ const BODY: &str = r#"
   threadgroup uint tg_idx[kCap];
   threadgroup uint tg_scan[1024];
   const uint step_index = step.index;
-
 
   if (step_index == 0u) {
     if (m4_group.x != 0u) return;
@@ -212,8 +176,6 @@ const BODY: &str = r#"
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (n_eq > eq_room) {
-        // Ties overflowed the room: the lowest indices among the pivot keys,
-        // by an ordered walk — each thread a contiguous chunk, counts scanned.
         const uint chunk_begin = uint((ulong(last) * m3_tid) / m3_threads);
         const uint chunk_end = uint((ulong(last) * (m3_tid + 1u)) / m3_threads);
         uint mine = 0u;
@@ -283,12 +245,6 @@ const BODY: &str = r#"
   }
 "#;
 
-/// The `top_k` library region as a streamed kernel and its eleven steps.
-///
-/// # Errors
-///
-/// Not a `top_k` library region, its ABI does not hold, or `k` exceeds
-/// [`SELECT_MAX_K`] — the caller then keeps the grouped library kernel.
 pub fn emit_streamed_topk(
     function_name: &str,
     stage: &CompiledStage,
@@ -319,8 +275,6 @@ pub fn emit_streamed_topk(
     }
     let input = topk.args[0];
     let mut source = kernel_head(function_name, used_channel_slots(&ops), "");
-    // The helpers follow the head's runtime text; they only need the
-    // kernel's own scope, so they sit inside it as constexprs and code.
     let _ = writeln!(source, "  constexpr uint kInput = {input}u;");
     let _ = writeln!(source, "  constexpr uint kValues = {}u;", bases[topk_node]);
     let _ = writeln!(source, "  constexpr uint kIndices = {}u;", bases[topk_node] + 1);
@@ -328,7 +282,6 @@ pub fn emit_streamed_topk(
     let _ = writeln!(source, "  constexpr uint kCap = {SELECT_MAX_K}u;");
     source.push_str(BODY);
     source.push_str("}\n");
-    // The key helper is a free function: splice it before the kernel.
     let at = source
         .find("kernel void ")
         .ok_or(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedTopK))?;

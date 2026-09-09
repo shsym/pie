@@ -336,19 +336,6 @@ __global__ void pool_boundary_prefill(
     out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 }
 
-// Scatters this fire's compressor projections into the rolling state
-// `pool_gather_paged` below pools out of: `state_kv[slot] = wkv·x` and
-// `state_score[slot] = wgate·x`, at `slot = w_page[i] * page_size + w_off[i]`
-// — the SOURCE cache's own cell for token row `i`, the cell the latent
-// appender writes in the same fire.
-//
-// **THE STATE IS ADDRESSED BY THE CACHE AND NOT BY THE FIRE**, which is why
-// this is a scatter and not a rectangle: a pooling window closing at this
-// fire's boundary reaches back `coff * ratio` positions and most of those
-// tokens were written earlier. `paged_slot` in the gather and this `slot` are
-// the same arithmetic said two ways.
-//
-// One block per row, one thread per column.
 template <class T>
 __global__ void pool_state_write(
     const T* __restrict__ kv,
@@ -361,7 +348,7 @@ __global__ void pool_state_write(
     int page_size,
     int state_pitch) {
     const int i = blockIdx.x;
-    // A carved fire pads rows past the live ones with no cell to write.
+
     const int page = static_cast<int>(w_page[i]);
     const int off = static_cast<int>(w_off[i]);
     if (page < 0 || off < 0 || off >= page_size) return;
@@ -388,13 +375,7 @@ __global__ void pool_gather_paged(
     int ratio,
     int coff,
     int page_size,
-    // The ROW PITCH the two state slabs are laid out at, which is not always
-    // `coff * head_dim`: one artifact can hold pooled layers at two ratios
-    // (dsv4-flash carries ratio 4 and ratio 128), a reservation may lay one
-    // plane at the widest of them, and a narrower gather must still stride by
-    // the plane's row and read its own `coff * head_dim` columns inside it.
-    // `attn/pool.metal`'s twin took this argument first; the two shaders read
-    // the state at one arithmetic.
+
     int state_pitch) {
     const int c = blockIdx.x;
     const int window = coff * ratio;
@@ -485,14 +466,9 @@ __global__ void pool_lse_paged(
     float scale,
     const u32* __restrict__ win) {
     const int qi = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && qi >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Every
-    // per-token plane below is read there — the lane a row names and the
-    // position that dates it as much as the query itself.
+
     const int qi_row = win != nullptr ? qi + static_cast<int>(win[1]) : qi;
     const int q_head = blockIdx.y;
     const int tid = threadIdx.x;

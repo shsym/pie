@@ -1,26 +1,3 @@
-//! **THE DRAFT HEAD IS THERE, AND THE TRUNK DOES NOT NOTICE IT.**
-//!
-//! `dsv4-flash-mtp` is the miniature with DeepSeek-V4-Flash's own `nextn`
-//! head over it — `mlx-community/DeepSeek-V4-Flash-MTP-bf16`, restated by
-//! `scripts/dsv4_mtp_companion.py` and landed by `pie model import <mini>
-//! --aux <overlay>`. This file asks the two things an engine can ask before
-//! the runtime's verify loop is pointed at it:
-//!
-//! 1. the load advertises a draft head (`Shell::drafts`), and a lane that
-//!    asks for drafts fires — prefill and decode — with finite logits;
-//! 2. the TRUNK's logits with the draft arm running are the trunk's logits
-//!    without it, bit for bit. The head reads the streams and writes its own
-//!    seam; a trunk that changed under it would be a draft window leaking
-//!    into the readout.
-//!
-//! Acceptance is the runtime's to measure (`tests/inferlets/test_eagle.py`).
-//! `PIE_DSV4_MTP_ARTIFACT` names the artifact; unset, the test looks in
-//! `/tmp/warmstream/dsv4-mini-mtp.zt` and skips by name when it is absent.
-//!
-//! ```text
-//! cargo test -p engine-metal --release --test the_miniature_drafts -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
@@ -66,8 +43,6 @@ fn finite(logits: &[f32], what: &str) {
     assert!(spread > 1e-3, "{what} logits span {spread}, which nothing wrote");
 }
 
-/// Prefill the prompt and decode `STEPS` greedy tokens in `slot`, every
-/// fire asking for drafts or not — the rows of trunk logits.
 fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
     shell.open(slot).expect("the slot opens");
     let mut rows = Vec::with_capacity(STEPS + 1);
@@ -112,6 +87,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: &artifact,

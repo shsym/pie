@@ -1,31 +1,3 @@
-//! The device probe and the scratch slabs. Every probe runs once and is
-//! cached; slabs grow and never shrink, since an entry may not allocate per
-//! fire (graph capture forbids it). A slab that would have to grow under a
-//! capturing stream is refused, not grown.
-//!
-//! A grown slab retires its predecessor rather than freeing it: a
-//! `cudaGraphExec_t` recorded at fire N holds the staging pointer the entry
-//! took then, so freeing the old block on growth would leave earlier-recorded
-//! graphs replaying against freed memory. The retired block stays alive,
-//! unreferenced by this map, freed only with the arena. Growth is geometric
-//! (a slab at least doubles), so a name grows a bounded number of times and
-//! everything retired for it sums to less than what it currently holds.
-//!
-//! A slab is keyed by `(arena, name, region, scope)`. The arena is the
-//! shell's own CUDA context (minted by [`Slabs::open`](crate::Slabs::open),
-//! released with it), so two shells in one process never share a slab. The
-//! region is the template region the walk was inside when the entry asked:
-//! two regions are disjoint by construction (two arms of one fork group run
-//! at the same instant), regardless of which stream the walk put them on.
-//! For a caller in no region ([`super::ctx::NO_REGION`]), the stream is the
-//! separation instead — see [`scope_of`].
-//!
-//! The shell warms a load by firing it eagerly on one stream, then records
-//! the same regions across side streams; keying by region (not stream) means
-//! the eager warm pass and the capture of the same region resolve to the
-//! same block regardless of which stream either fires on, so [`take`] never
-//! spuriously answers [`Fault::Unwarmed`] for a properly warmed load.
-
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -39,14 +11,9 @@ struct Slab {
     bytes: usize,
 }
 
-/// One arena: one slab per `(name, region, scope)`. See module docs for what
-/// region and scope key against.
 #[derive(Default)]
 struct Arena {
     slabs: HashMap<(&'static str, u32, usize), Slab>,
-    /// Superseded allocations, still live: a slab that grew handed its old
-    /// block here instead of to `cudaFree`, since a graph recorded before
-    /// the growth still launches against that address. Freed only with the arena.
     retired: Vec<*mut c_void>,
 }
 
@@ -67,16 +34,10 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Tell `arena` that it fires on `stream` too. A no-op now that a slab is
-/// keyed by region rather than stream; kept as a seam for the day a
-/// per-stream fact is needed again.
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
     let _ = (arena, stream);
 }
 
-/// Free every slab this arena holds. Called only at the shell's teardown; a
-/// slab is only ever read by a launch enqueued on one of this arena's
-/// streams, so a synchronized, dropping context has nothing left in flight.
 pub(crate) fn release(arena: u32) {
     let mut arenas = locked();
     let Some(held) = arenas.remove(&arena) else {
@@ -89,8 +50,6 @@ pub(crate) fn release(arena: u32) {
             let _ = unsafe { rt::cudaFree(slab.ptr) };
         }
     }
-    // The blocks growth superseded free the same way: only a launch on a
-    // stream this arena's owner has synchronized ever read one.
     for ptr in held.retired {
         if !ptr.is_null() {
             // SAFETY: as above — an address this map allocated and never
@@ -100,10 +59,6 @@ pub(crate) fn release(arena: u32) {
     }
 }
 
-/// Whether `stream` is mid-capture; `None` when the runtime will not say
-/// (the pending error is cleared). The one `cudaStreamIsCapturing` query
-/// the plane makes — the dense autotuner's guards and [`take`]'s growth
-/// refusal both read it.
 pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptureStatus> {
     let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
     if unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) }
@@ -115,13 +70,6 @@ pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptur
     Some(status)
 }
 
-/// What separates two askers that are not in a region: the stream. Every
-/// caller outside a walk keys [`NO_REGION`](super::ctx::NO_REGION), so
-/// without this they would share one block despite running at once (ad-hoc
-/// contexts — a transform executor, a bench, test threads — share one arena
-/// on `Slabs::PROCESS`). Inside a walk the region separates and the stream
-/// is not asked; outside one the stream separates. Neither subsumes the
-/// other.
 fn scope_of(stream: *mut c_void, region: u32) -> usize {
     if region == super::ctx::NO_REGION {
         stream.addr()
@@ -148,9 +96,6 @@ pub(crate) fn take(
     {
         return Ok(slab.ptr);
     }
-    // Growth allocates (fresh block, old one retired — see `grow` below),
-    // and an allocation under capture is illegal host work, so an un-warmed
-    // slab is a refusal, not a corruption.
     if capture_status(stream)
         .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
     {
@@ -160,17 +105,10 @@ pub(crate) fn take(
             need: bytes,
         });
     }
-    // One block, no broadcast: the eager pass that warms this name warms the
-    // one block the capture pass will bake, since both walks ask for the
-    // same region's slab.
     grow(held, name, region, scope, bytes)?;
     Ok(held.slabs[&(name, region, scope)].ptr)
 }
 
-/// Size one `(name, region, scope)` slab to at least `bytes`, allocating a
-/// fresh block and retiring the old one when short. Never called under
-/// capture — [`take`] refuses there first. Growth is geometric, and a failed
-/// `cudaMalloc` leaves the old slab intact rather than freeing it first.
 fn grow(
     arena: &mut Arena,
     name: &'static str,
@@ -246,8 +184,6 @@ pub(crate) fn compute_capability_major() -> Option<u32> {
     })
 }
 
-/// Unfired until the attn wave: its plan builders size shared-memory tiles
-/// from these two probes.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) fn max_shared_memory_per_sm() -> Option<u32> {
@@ -256,7 +192,6 @@ pub(crate) fn max_shared_memory_per_sm() -> Option<u32> {
         .get_or_init(|| attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor))
 }
 
-/// Unfired until the attn wave, as above.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {

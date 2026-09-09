@@ -1,11 +1,5 @@
-//! The `CustomCuda` family: the escape hatch for a platform-specific
-//! mega-kernel that no portable decomposition covers.
-
 use super::*;
 
-/// Splits packed qkv, head-norms q and k, ropes them, norms v, and appends
-/// k/v in one pass; `q` is the only tensor left over. `positions` feeds
-/// the rope math; `write_page`/`write_offset` address the append.
 pub fn qkv_fused_qknorm_rope_vnorm_write(
     packed: &Value,
     q_norm: &Weight,

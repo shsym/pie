@@ -1,4 +1,3 @@
-//! Unit tests for the KV mapping trie, hashes, pool, and KvStore protocol.
 #![allow(
     clippy::single_range_in_vec_init,
     reason = "`discard`/`page_token_hashes` take `&[Range<u64>]` — a genuinely \
@@ -35,7 +34,6 @@ fn pages(range: std::ops::Range<u32>) -> Vec<PublishedPage> {
     range.map(page).collect()
 }
 
-/// Reserve + publish `range` as one batch.
 fn publish(table: &mut KvPageTable, ws: WorkingSetId, range: std::ops::Range<u32>) {
     let count = (range.end - range.start) as u64;
     table.reserve(ws, count).unwrap();
@@ -64,20 +62,25 @@ fn sorted_backings(mut v: Vec<KvPageBacking>) -> Vec<u32> {
         .collect()
 }
 
-/// A WorkingSet with two owned nodes: N1 = ids 0..5 shared-then-released via a
-/// throwaway fork, N2 = ids 5..10.
 fn two_node_ws(table: &mut KvPageTable) -> WorkingSetId {
     let ws = table.create_working_set();
     publish(table, ws, 0..5);
-    let block = table.fork(ws).unwrap(); // forces the next publish into a child
+    let block = table.fork(ws).unwrap();
     publish(table, ws, 5..10);
     table.release_working_set(block);
     ws
 }
 
-// ----------------------------------------------------------------------
-// Basic mapping
-// ----------------------------------------------------------------------
+fn tests_every_case() {
+    publish_lookup_flatten_roundtrip();
+    fork_shares_prefix_and_diverges_into_children();
+    release_reclaims_exclusive_suffix_but_keeps_shared_prefix();
+    held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not();
+    path_hash_is_independent_of_node_boundaries();
+    path_hash_is_none_while_any_contributing_page_hash_is_pending();
+    store_explicit_index_roundtrip_remove_preserves_loaded_working_set();
+    standing_translation_publishes_immutable_mapping_snapshots();
+}
 
 #[test]
 fn publish_lookup_flatten_roundtrip() {
@@ -92,11 +95,6 @@ fn publish_lookup_flatten_roundtrip() {
     assert_eq!(t.mapped_len(ws).unwrap(), 5);
 }
 
-// ----------------------------------------------------------------------
-// Fork
-// ----------------------------------------------------------------------
-
-#[test]
 fn fork_shares_prefix_and_diverges_into_children() {
     let mut t = KvPageTable::new();
     let a = t.create_working_set();
@@ -106,26 +104,12 @@ fn fork_shares_prefix_and_diverges_into_children() {
     publish(&mut t, b, 100..102);
     assert_eq!(ids(&t, a), vec![0, 1, 2, 3, 4, 5, 6]);
     assert_eq!(ids(&t, b), vec![0, 1, 2, 3, 4, 100, 101]);
-    // Shared root plus one fresh child per branch; no copies.
     assert_eq!(t.node_count(), 3);
     let root_of_a = t.node_parent(t.terminal(a).unwrap().unwrap()).unwrap();
     let root_of_b = t.node_parent(t.terminal(b).unwrap().unwrap()).unwrap();
     assert_eq!(root_of_a, root_of_b);
 }
 
-// ----------------------------------------------------------------------
-// Slice
-// ----------------------------------------------------------------------
-
-// ----------------------------------------------------------------------
-// Discard
-// ----------------------------------------------------------------------
-
-// ----------------------------------------------------------------------
-// Lifetime: reachability, cache roots, pins, compaction
-// ----------------------------------------------------------------------
-
-#[test]
 fn release_reclaims_exclusive_suffix_but_keeps_shared_prefix() {
     let mut t = KvPageTable::new();
     let a = t.create_working_set();
@@ -140,7 +124,6 @@ fn release_reclaims_exclusive_suffix_but_keeps_shared_prefix() {
     assert_eq!(t.node_count(), 0);
 }
 
-#[test]
 fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     let group = |ws| HashSet::from([ws]);
     let mut t = KvPageTable::new();
@@ -150,8 +133,6 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     publish(&mut t, a, 5..10); // a's private suffix
     publish(&mut t, b, 10..12); // b's private suffix
 
-    // Holdings include the shared prefix; the quote counts only the private
-    // suffix that could actually be freed.
     assert_eq!(t.held_pages(&group(a)).unwrap(), 10);
     assert_eq!(t.held_pages(&group(b)).unwrap(), 7);
     assert_eq!(
@@ -159,7 +140,6 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
         vec![ReclaimQuote::Pages(5)]
     );
 
-    // A pin collapses the reclaim quote to zero, but holdings must not move.
     let term_a = t.terminal(a).unwrap().unwrap();
     t.pin(term_a);
     assert_eq!(
@@ -173,22 +153,14 @@ fn held_pages_is_a_durable_fact_where_a_reclaim_quote_is_not() {
     );
     t.unpin(term_a);
 
-    // Quoted together the prefix counts once, exactly as for quotes.
     assert_eq!(t.held_pages(&HashSet::from([a, b])).unwrap(), 12);
     assert_eq!(t.held_pages(&HashSet::new()).unwrap(), 0);
 }
 
-// ----------------------------------------------------------------------
-// Hashes
-// ----------------------------------------------------------------------
-
-#[test]
 fn path_hash_is_independent_of_node_boundaries() {
     let mut t = KvPageTable::new();
-    // x: one node holding pages 0..4.
     let x = t.create_working_set();
     publish(&mut t, x, 0..4);
-    // y: the same page-hash sequence split across two nodes.
     let y = t.create_working_set();
     publish(&mut t, y, 0..2);
     let blocker = t.fork(y).unwrap();
@@ -200,7 +172,6 @@ fn path_hash_is_independent_of_node_boundaries() {
     t.release_working_set(blocker);
 }
 
-#[test]
 fn path_hash_is_none_while_any_contributing_page_hash_is_pending() {
     let mut t = KvPageTable::new();
     let ws = t.create_working_set();
@@ -216,10 +187,6 @@ fn path_hash_is_none_while_any_contributing_page_hash_is_pending() {
     .unwrap();
     assert_eq!(t.terminal_path_hash(ws).unwrap(), None);
 }
-
-// ----------------------------------------------------------------------
-// KvStore: prepare / commit / abort
-// ----------------------------------------------------------------------
 
 fn pc(seed: u32) -> PageCommit {
     PageCommit {
@@ -237,7 +204,6 @@ fn publish_prepared(
     store.settle(seq, intents, true);
 }
 
-/// Prepare+commit `n` fresh pages onto `ws`, returning the committed ids.
 fn commit_fresh(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -255,7 +221,6 @@ fn commit_fresh(
     ids
 }
 
-#[test]
 fn store_explicit_index_roundtrip_remove_preserves_loaded_working_set() {
     let mut store = KvStore::new(4, h(42));
     let source = store.create_working_set();
@@ -301,7 +266,6 @@ fn store_explicit_index_roundtrip_remove_preserves_loaded_working_set() {
     assert_eq!(store.available_pages(), 4);
 }
 
-#[test]
 fn standing_translation_publishes_immutable_mapping_snapshots() {
     let mut store = KvStore::new(4, h(42));
     let ws = store.create_working_set();
@@ -325,12 +289,3 @@ fn standing_translation_publishes_immutable_mapping_snapshots() {
     assert_eq!(shortened.as_ref(), &[ids[0].0]);
     assert_eq!(mapped.len(), 2, "an in-flight reader keeps the old table");
 }
-
-// ----------------------------------------------------------------------
-// Pool
-// ----------------------------------------------------------------------
-
-// ----------------------------------------------------------------------
-// Lock-free page_len mirror
-// ----------------------------------------------------------------------
-

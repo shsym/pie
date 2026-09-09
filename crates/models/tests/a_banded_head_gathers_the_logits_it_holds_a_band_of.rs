@@ -1,19 +1,5 @@
-//! The vocab-parallel readout's one invariant, checked without a checkpoint.
-//!
-//! A head banded across ranks lands only THIS rank's columns of the logits, so
-//! every readout through one owes an `all_gather` before anything reads the
-//! result. Miss it on one model and that model is silently wrong at tp > 1 —
-//! the plan reads a shard as if it were the whole vocabulary, and no shape
-//! check catches it because the declared width is what the gather would have
-//! produced.
-//!
-//! Six models band their head today and only one of them (gemma-4) has a
-//! checkpoint small enough to run here, so this is the check that covers the
-//! other five, and the one that will catch a seventh model added later.
-
 use model_dsl::{Collective, Def, Linear, Operation, Platform, Shard, Trace, ValueId};
 
-/// Is `w` a weight the loader bands across ranks — cut on the vocabulary axis?
 fn banded(trace: &Trace, w: ValueId) -> bool {
     match trace.values[w.0 as usize].def {
         Def::Weight(at) => matches!(
@@ -24,6 +10,11 @@ fn banded(trace: &Trace, w: ValueId) -> bool {
     }
 }
 
+fn a_banded_head_gathers_the_logits_it_holds_a_band_of_every_case() {
+    a_banded_head_gathers_the_logits_it_holds_a_band_of();
+    a_single_rank_bands_nothing_and_gathers_nothing();
+}
+
 #[test]
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     let mut faults = Vec::new();
@@ -31,7 +22,6 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     for row in models::skus() {
         let trace = (row.trace)(Platform::Cuda);
 
-        // Every value some `all_gather` consumes.
         let gathered: Vec<ValueId> = trace
             .nodes
             .iter()
@@ -59,9 +49,6 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-/// The mirror: a single rank has no band, so nothing may be cut and nothing
-/// gathered. Catches a banding predicate that forgot to ask about `tp`.
-#[test]
 fn a_single_rank_bands_nothing_and_gathers_nothing() {
     let mut faults = Vec::new();
 

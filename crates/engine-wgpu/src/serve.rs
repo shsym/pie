@@ -236,7 +236,6 @@ pub struct FireCost {
 }
 
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
     classes.adapter_fact(corrected)
 }
 
@@ -477,9 +476,6 @@ impl Shell {
         });
 
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
-        // A block-diffusion text's denoiser input: this shell stages no seat
-        // for it (and lifts no causal bound), so the plan is refused here
-        // rather than at its first denoise fire.
         if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
             return Err(Fault::Program {
                 at: "serve::load",
@@ -1060,7 +1056,6 @@ impl Shell {
 
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
-        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
         self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
@@ -1448,9 +1443,6 @@ impl Shell {
             if seated.adapter.is_some() && self.corrected.is_empty() {
                 return Err(Fault::Adapterless { lane: row.source });
             }
-            // A block drafter's draft fire carries an adapted lane's id and no
-            // trunk row: the correction cannot reach its class, so nothing is
-            // owed and nothing is refused (`ClassTable::correction_reaches`).
             let unreachable = seated.adapter.is_some()
                 && !runs_correction
                 && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);

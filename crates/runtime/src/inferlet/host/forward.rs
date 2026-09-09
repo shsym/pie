@@ -1,6 +1,3 @@
-//! WIT host glue for `pie:inferlet/forward`: `Host`/`HostChannel`/
-//! `HostForwardPass` impls over the pipeline-owned `Channel`/`ForwardPass`.
-
 use std::sync::{Arc, Mutex};
 
 use wasmtime::component::{Accessor, HasSelf, Resource};
@@ -27,8 +24,6 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// Which forward interface this model requires; must match `model.pass-kind()`
-/// (`host/model.rs`).
 fn model_pass_kind() -> PassKind {
     let model = crate::model::model();
     if model.diffusion().is_some() {
@@ -41,10 +36,6 @@ fn model_pass_kind() -> PassKind {
     }
 }
 
-/// The reading a pass runs: the one it named, else the family's sole
-/// reading, else `None` (a text row's implicit reading: tokens and KV,
-/// no ports). `Err` when the family declares several and the pass named
-/// none — neither is a default the host may pick.
 fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>, String> {
     let model = crate::model::model();
     if let Some(index) = pass.bindings.reading {
@@ -64,7 +55,6 @@ fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>
     ))
 }
 
-/// `` `a`, `b`, `c` `` for a refusal.
 fn reading_names(readings: &[models::ReadingFact]) -> String {
     readings
         .iter()
@@ -73,7 +63,6 @@ fn reading_names(readings: &[models::ReadingFact]) -> String {
         .join(", ")
 }
 
-/// Does `reading` submit lanes on `stream`? An empty list is `Text` only.
 fn reading_lists_stream(reading: &models::ReadingFact, stream: models::Stream) -> bool {
     if reading.streams.is_empty() {
         return stream == models::Stream::Text;
@@ -81,7 +70,6 @@ fn reading_lists_stream(reading: &models::ReadingFact, stream: models::Stream) -
     reading.streams.contains(&stream)
 }
 
-/// The streams a reading lists, for a refusal.
 fn stream_names(reading: &models::ReadingFact) -> String {
     if reading.streams.is_empty() {
         return "`text`".to_string();
@@ -94,7 +82,6 @@ fn stream_names(reading: &models::ReadingFact) -> String {
         .join(", ")
 }
 
-/// The engine's port kind for a catalog port.
 fn engine_port_kind(kind: models::PortKind) -> ::engine::fire::PortKind {
     use ::engine::fire::PortKind;
     match kind {
@@ -106,10 +93,6 @@ fn engine_port_kind(kind: models::PortKind) -> ::engine::fire::PortKind {
     }
 }
 
-/// Is `shape`/`dtype` the channel a port of `kind` and `width` reads? The
-/// rows of a `[rows, width]` port come back; a lane vector is `[width]` or
-/// `[1, width]` and answers `None` rows. Pure, so the port rules are
-/// testable without a wasm store.
 pub(crate) fn validate_port_channel(
     port: &models::PortFact,
     shape: &[u32],
@@ -139,7 +122,6 @@ pub(crate) fn validate_port_channel(
                 )),
             }
         }
-        // A voxel port's channel IS the clip: its shape is the box.
         models::PortKind::Voxels => match shape {
             [h, w, width] if *width == port.width && *h > 0 && *w > 0 => Ok(Some(h * w)),
             [t, h, w, width] if *width == port.width && *t > 0 && *h > 0 && *w > 0 => {
@@ -154,11 +136,6 @@ pub(crate) fn validate_port_channel(
     }
 }
 
-/// The clip box a `Voxels` port's channel states (design D8): its shape IS
-/// the box, `[h, w, C]` for a still and `[t, h, w, C]` for a clip, so the
-/// geometry a channel cell cannot carry travels beside the feed as
-/// `StepVoxels::clips`. `None` for any other port kind, and for a shape
-/// `validate_port_channel` would have refused.
 pub(crate) fn port_clip(port: &models::PortFact, shape: &[u32]) -> Option<[u32; 3]> {
     if port.kind != models::PortKind::Voxels {
         return None;
@@ -170,15 +147,8 @@ pub(crate) fn port_clip(port: &models::PortFact, shape: &[u32]) -> Option<[u32; 
     }
 }
 
-/// The rows a pass's `[rows, ·]` ports agree on, or the first pair that
-/// disagree. Context ports are a context lane's own rows and need not
-/// match the latents'. A voxel port states none: its channel's rows are its
-/// clip's VOXELS, which are not the lane's token rows (design D8).
 pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
     let mut rows: Option<(u32, &str)> = None;
-    // Latents and positions state the lane's rows; a context port does too
-    // when it is the only row port a lane binds (a context-stream lane's
-    // rows ARE its context cell), but never overrules the others.
     let mut context_rows: Option<u32> = None;
     for port in ports {
         let Some(these) = port.rows else { continue };
@@ -218,10 +188,6 @@ fn page_span(
     Ok(crate::pipeline::instance::KvPageSpan { start, end })
 }
 
-/// The first field by which `next` departs from `existing`, named as the guest
-/// sees it in `kv-geometry` (`kv-working-set` for the working set itself), or
-/// `None` when a rebind re-states the attention binding exactly. Reps are
-/// compared, not values: a bound program's ports are tied to these channels.
 fn attention_rebind_diff(
     existing: &AttentionBinding,
     next: &AttentionBinding,
@@ -270,8 +236,6 @@ fn validate_descriptor_bindings(
     validate_bindings(container, channel_reps, expected, false)
 }
 
-/// RS geometry ports are optional: absent-but-attached is legal here (unlike
-/// the KV family); present-but-mismatched is an error for both.
 fn validate_optional_descriptor_bindings(
     container: &TraceContainer,
     channel_reps: &[u32],
@@ -397,7 +361,6 @@ fn poll_channel(
         Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
     }
 
-    // Only pops an already-settled FIFO entry; caller holds the finalizer gate.
     if pop_settled && let Some(op) = crate::pipeline::fire::pop_settled(fires.as_ref()) {
         return Ok(ChannelPoll::Finalize(op));
     }
@@ -444,7 +407,6 @@ async fn materialize_channel(
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
-                // Idle channel wait holds no pooled state; planner may evict around it.
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
@@ -455,13 +417,6 @@ async fn materialize_channel(
     }
 }
 
-/// `take-blocking` / `read-blocking`: the same polling loop as
-/// [`materialize_channel`], driven from a plain `async fn(&mut self)` host
-/// import rather than an `Accessor`. Holding the store across the awaits is
-/// what "blocking" means here: the guest's task is suspended inside the
-/// call, nothing else in the instance runs, and every await below is on
-/// engine-side progress (fire settlement, the reader wait slot) that never
-/// needs the store to advance.
 pub(crate) async fn materialize_channel_blocking(
     ctx: &mut ProcessCtx,
     this: Resource<Channel>,
@@ -506,14 +461,9 @@ pub(crate) async fn materialize_channel_blocking(
     }
 }
 
-// `add_to_linker` requires the interface-level `Host` bound even though
-// `channel` declares no free functions, so this impl is empty by construction.
 impl pie::inferlet::channel::Host for ProcessCtx {}
 
 impl ProcessCtx {
-    /// `submit(on, slots)`: exactly `model.frame-size()` ordered slots; slot i
-    /// executes in wave i; `none` is a no-op. Shared by all three forward
-    /// interfaces (WIT duplicates the signature, not the implementation).
     async fn core_submit(
         &mut self,
         on: Resource<crate::pipeline::Pipeline>,
@@ -541,8 +491,6 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // Construction never fails; a channel/decl mismatch errors later at
-        // forward-pass.new / submit instead (the WIT constructor has no Result).
         use pie::inferlet::types::Dtype;
         let dtype = match dtype {
             Dtype::F32 => eta_ir::types::Dtype::F32,
@@ -585,28 +533,21 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
         Ok(result)
     }
 
-    /// The sync-lowerable `take`; see the WIT door for who needs it.
     async fn take_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         materialize_channel_blocking(self, this, ChannelReadMode::Take).await
     }
 
-    /// The sync-lowerable `read`.
     async fn read_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         materialize_channel_blocking(self, this, ChannelReadMode::Read).await
     }
 
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
-        // A bound pass holds its own Arc, so dropping the guest handle never
-        // dangles an in-flight fire; storage releases when the instance closes.
         self.ctx().table.delete(this)?;
         Ok(())
     }
 }
 
 impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
-    /// While empty: drains already-settled pipeline ops, then parks on the
-    /// channel's reader wait slot. Store access stays scoped to synchronous
-    /// polls; never holds an `Accessor` borrow across an await.
     async fn take(
         accessor: &Accessor<ProcessCtx, Self>,
         this: Resource<Channel>,
@@ -614,7 +555,6 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
         materialize_channel(accessor, this, ChannelReadMode::Take).await
     }
 
-    /// Non-consuming peek; same await discipline as `take`.
     async fn read(
         accessor: &Accessor<ProcessCtx, Self>,
         this: Resource<Channel>,
@@ -623,18 +563,12 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
     }
 }
 
-/// Single host implementation behind all three WIT forward interfaces; WIT
-/// duplicates the interface so cross-kind states are unrepresentable in the
-/// guest, but all three map to this one Rust type.
 impl ProcessCtx {
     async fn core_new(&mut self, kind: PassKind) -> Anyhow<Resource<ForwardPass>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         Ok(self.ctx().table.push(ForwardPass::new(kind))?)
     }
 
-    /// Interface-selection gate, checked on the first state-binding call since
-    /// `constructor()` is infallible in WIT. `named` is the reading the call
-    /// is in the act of setting, which the pass does not carry yet.
     fn core_gate(
         &mut self,
         this: &Resource<ForwardPass>,
@@ -642,17 +576,6 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = model_pass_kind();
-        // AN ATTENTION PASS OVER A READING THAT BINDS NO KV SPACE IS NOT A KV
-        // ALGORITHM. A generative family's `denoise` reading binds neither
-        // tokens nor a KV space — its rows are a latents port's — so the
-        // attention interface's KV-editing verbs (`discard`, `fork`, `slice`)
-        // have nothing to act on and there is no fold to be wrong about. The
-        // kind above is `hybrid` or `recurrent` for ANY row that carries
-        // recurrent state, and `wan22-ti2v-5b` carries some: its VAE's causal
-        // convolutions each own a frame-cache slab, a fact about the decoder
-        // arms that says nothing about a denoise step. `validate_count`
-        // refuses a `kv` binding on such a pass, so the leniency ends where
-        // the KV does.
         if kind == PassKind::Attention {
             let reading = match named {
                 Some(reading) => Ok(Some(reading)),
@@ -664,17 +587,6 @@ impl ProcessCtx {
                 return Ok(Ok(()));
             }
         }
-        // A HYBRID PASS WITH NO RECURRENT STATE IS AN ATTENTION PASS. The
-        // hybrid interface already makes one half of its state optional
-        // (`kv: none` for a recurrent-only fire); this is the other half. A
-        // program that only reads logits binds `rs = []` and runs on every
-        // KV-carrying model, and its fold policy is a value it states rather
-        // than a type it picks. The gate stays for the attention interface on
-        // a folding model: that interface carries the KV-editing verbs
-        // (`discard`, `fork`, `slice`) which are wrong on a fold, and the
-        // hybrid interface has none of them. `validate_count` refuses a
-        // non-empty `rs` on an attention model, so the leniency ends where
-        // the state does.
         if kind == PassKind::Hybrid && actual == PassKind::Attention {
             return Ok(Ok(()));
         }
@@ -771,14 +683,6 @@ impl ProcessCtx {
         };
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
-            // A rebind. The hybrid `attention` verb states both halves of the
-            // state in one call, and a guest that only wants new recurrent
-            // working sets (a beam fork) re-states the KV half with it; the
-            // SDK already treats a post-attach `attention` as a rebind and
-            // claims no ports. The compiled program's ports are tied to these
-            // channels, so the KV half may be re-stated but never changed:
-            // an identical statement is a no-op, a differing one is refused
-            // by the field that differs.
             let Some(existing) = pass.bindings.attention else {
                 return Ok(Err("forward pass program is already attached".to_string()));
             };
@@ -809,9 +713,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-pass.reading`: which declared reading this pass runs.
-    /// Resolved against `model.readings()` here, so an unknown name is
-    /// refused at the call; set once, before `program`.
     async fn core_reading(
         &mut self,
         this: Resource<ForwardPass>,
@@ -831,9 +732,6 @@ impl ProcessCtx {
                 )
             }));
         };
-        // The gate reads the reading this call is setting: which interface a
-        // pass belongs on is a fact about the reading it runs, and a pass that
-        // names one before binding anything must be judged by it.
         if let Err(error) = self.core_gate(&this, Some(reading))? {
             return Ok(Err(error));
         }
@@ -847,8 +745,6 @@ impl ProcessCtx {
                     .to_string(),
             ));
         }
-        // A binding made before the reading was named is checked here
-        // instead, so the order of the two calls does not matter.
         if !reading.takes_tokens && pass.bindings.embed.is_some() {
             return Ok(Err(format!(
                 "reading `{}` embeds no tokens, but this pass already bound `embed`",
@@ -885,9 +781,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-pass.input`: bind a channel to one of the reading's float
-    /// ports. The channel's shape is checked against the port's fact here;
-    /// `program` checks that it is bound into the pass's program.
     async fn core_input(
         &mut self,
         this: Resource<ForwardPass>,
@@ -906,9 +799,6 @@ impl ProcessCtx {
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        // With no reading named yet, the port is looked up in every
-        // reading that declares it; `reading()` re-checks the binding when
-        // it is named, and `program` demands agreement.
         let model = crate::model::model();
         let candidates: Vec<&models::ReadingFact> = match reading_of(pass) {
             Ok(Some(reading)) => vec![reading],
@@ -986,7 +876,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-pass.stream`: which lane stream this pass's rows are.
     async fn core_stream(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1019,7 +908,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-pass.group`: the attention group this pass's lanes join.
     async fn core_group(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1039,10 +927,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-pass.peer`: which OTHER attention group holds this lane's
-    /// guidance peer. Set once, before `program`, and only on a pass that
-    /// named a group of its own — guidance is two groups of ONE fire, and a
-    /// lane with no group has nothing to be the other of.
     async fn core_peer(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1076,8 +960,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-diffusion.canvas`: which reading the pass runs. Set once,
-    /// before `program`; a pass keeps one mode for its life.
     async fn core_canvas(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1100,9 +982,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// `forward-diffusion.self-conditioning`: stage the taps the pass's next
-    /// submit consumes. Checked here against the model's canvas, so a
-    /// malformed payload is refused at the call and never reaches a lane.
     async fn core_self_conditioning(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1162,13 +1041,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// The self-conditioning taps read off two of the pass's own channels at
-    /// every submit — the ids `[canvas, taps]` u32, the weights `[canvas,
-    /// taps]` f32 — so a denoiser's epilogue can hand its next step the
-    /// signal without a host round trip. A persistent binding: set once,
-    /// before the loop; the committed cell of each channel at submit is the
-    /// signal, so the epilogue keeps them loop-carried (`take` then `put`)
-    /// and seeds them with zeros for the first step.
     async fn core_self_conditioning_from(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1272,10 +1144,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// Spans are cloned by handle (`Arc`), so a decoded image submitted to two
-    /// passes decodes once. Their position in the sequence is not recorded
-    /// here — it's scanned out of the submitted tokens at submit time
-    /// (`pipeline::media::scan`).
     async fn core_media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1330,11 +1198,6 @@ impl ProcessCtx {
             port_bindings,
             float_rows,
         ) = {
-            // The port channels' shapes, looked up before the pass is
-            // borrowed: `input` validated each against the reading it found
-            // the port in, which may not be the reading `program` resolves
-            // (a port bound before `reading` was named), so every port is
-            // re-checked against the resolved reading's fact below.
             let port_cells: Vec<(String, Vec<u32>, Dtype)> = {
                 let pass = self.ctx().table.get(&this)?;
                 pass.bindings
@@ -1351,10 +1214,6 @@ impl ProcessCtx {
                 Ok::<_, anyhow::Error>((name, cell.shape.clone(), cell.dtype))
             })
             .collect::<Result<_, _>>()?;
-            // How many ids the embed channel holds, read before the pass is
-            // borrowed. A CACHELESS ENCODER's lane is as tall as its ids
-            // (see the float-rows decision below); every other pass ignores
-            // this.
             let embed_ids: Option<usize> = {
                 let rep = self
                     .ctx()
@@ -1377,10 +1236,6 @@ impl ProcessCtx {
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
             }
-            // The reading decides what the pass must bind (design D1): a
-            // text row's implicit reading takes tokens and KV; a declared
-            // reading states each. `embed`/`attention` are required where
-            // the reading declares them and refused where it does not.
             let reading = match reading_of(pass) {
                 Ok(reading) => reading,
                 Err(error) => return Ok(Err(error)),
@@ -1418,10 +1273,6 @@ impl ProcessCtx {
                 }
                 (None, false) => None,
             };
-            // Every port the reading declares FOR THIS PASS'S STREAM is
-            // bound, and nothing else is: a port listing no stream is every
-            // lane's; one listing streams belongs to those lanes only (the
-            // image lane's latents are not the caption lane's to bind).
             let pass_stream = pass.bindings.stream.unwrap_or_default();
             let carried = |port: &models::PortFact| {
                 port.streams.is_empty() || port.streams.contains(&pass_stream)
@@ -1469,18 +1320,6 @@ impl ProcessCtx {
                     stream_names(reading)
                 )));
             }
-            // A lane fires through its KV working set (tokens plus geometry
-            // ports: a sequence) or as a FLOAT lane (no sequence). A float
-            // lane usually embeds no tokens either — its rows are a port's —
-            // but ONE shape does: a CACHELESS ENCODER, `takes_tokens` with
-            // no KV space, which is what a bidirectional text encoder is
-            // (Wan 2.2's umT5). Its rows attend each other inside the arm,
-            // over the lane's own indptr, and it holds nothing between
-            // fires, so a page table would be a table of nothing. It rides
-            // the float path with the ids in `Lane::tokens`.
-            //
-            // The other half is still refused: KV without tokens is a
-            // sequence with nothing to seat.
             if wants_kv && !wants_tokens {
                 return Ok(Err(format!(
                     "reading `{}` embeds no tokens but declares a KV space; a sequence's rows \
@@ -1488,7 +1327,6 @@ impl ProcessCtx {
                     reading.map_or("", |reading| reading.name)
                 )));
             }
-            // Neither reading is a default the host may pick for the guest.
             if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
                 return Ok(Err(
                     "forward pass canvas mode must be set before program on a diffusion pass"
@@ -1499,7 +1337,7 @@ impl ProcessCtx {
             if let Some(reading) = reading {
                 for binding in &mut port_bindings {
                     let Some((index, fact)) = reading.port(&binding.name) else {
-                        continue; // refused above
+                        continue;
                     };
                     let Some((_, shape, dtype)) =
                         port_cells.iter().find(|(name, _, _)| *name == binding.name)
@@ -1531,19 +1369,11 @@ impl ProcessCtx {
                     return Ok(Err(error));
                 }
             }
-            // The clips a VAE reading's `Voxels` ports state (design D8), in
-            // binding order: a channel cell carries no grid, so the box its
-            // shape declares travels beside the feed.
             let clips: Vec<[u32; 3]> = port_bindings
                 .iter()
                 .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
                 .filter_map(|binding| binding.clip)
                 .collect();
-            // A float lane's rows are its latents port's. A VAE reading binds
-            // no `[rows, ·]` port at all — its rows are its clips' voxels, on
-            // the third axis — and takes ONE dummy token row so that its lane
-            // exists in the fire's composition. A CACHELESS ENCODER's rows
-            // are its IDS, read off the embed channel's cell.
             let float_rows = if wants_tokens && wants_kv {
                 None
             } else if wants_tokens {
@@ -1603,7 +1433,6 @@ impl ProcessCtx {
             )
         };
         {
-            // Hash-deduped compile/bind cache; a malformed trace fails here.
             let prog = match crate::pipeline::program::register(
                 container_bytes,
                 &crate::pipeline::program::model_profile(),
@@ -1611,12 +1440,8 @@ impl ProcessCtx {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
-            // Everything from here on creates per-instance engine state or
-            // claims pooled KV, so admission is required first.
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
-            // Validate every handle before stamping any, so a failed
-            // attachment binds nothing.
             let decls = prog.bound.container.channels.clone();
             let extern_bindings = decls
                 .iter()
@@ -1643,9 +1468,6 @@ impl ProcessCtx {
                 )));
             }
             let channel_reps = channels.iter().map(Resource::rep).collect::<Vec<_>>();
-            // A port the pass did not bind must be absent from the trace
-            // too (`None` expected), so a float lane's program cannot
-            // smuggle in geometry the fire path would never read.
             let expected = [
                 (Port::EmbedTokens, embed.map(|embed| embed.tokens)),
                 (Port::EmbedIndptr, embed.map(|embed| embed.indptr)),
@@ -1672,8 +1494,6 @@ impl ProcessCtx {
             {
                 return Ok(Err(error));
             }
-            // A port-fed channel is read by the engine off the instance's
-            // channel arena, so it must be one of this program's channels.
             if let Some(port) = port_bindings
                 .iter()
                 .find(|port| !channel_reps.contains(&port.channel_rep))
@@ -1684,8 +1504,6 @@ impl ProcessCtx {
                     port.name
                 )));
             }
-            // A pass that folds unconditionally claims no port, so the
-            // program may legitimately lack this binding.
             if let Some(fold_len) = rs_fold_len_rep
                 && let Err(error) = validate_optional_descriptor_bindings(
                     &prog.bound.container,
@@ -1705,25 +1523,15 @@ impl ProcessCtx {
                 }
                 {
                     let c = cell.lock().unwrap();
-                    // A channel may bind to several passes; decl equality
-                    // across sharing passes is still validated as a conflict.
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
                     if let Err(e) = c.validate_attachment(&decls[i], extern_binding) {
-                        // The handle-list index alone cannot be chased: it says
-                        // WHERE in this pass the channel sits, never WHICH
-                        // channel it is. `global_id` is the object's identity,
-                        // so two passes naming the same id is visible from the
-                        // message instead of needing a debugger.
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
                         )));
                     }
-                    // Pre-bind staged puts must fit the declared role: a
-                    // Writer drains them per fire, a seeded non-Writer holds
-                    // exactly its one seed, anything else never drains.
                     let staged = c.staged_len();
                     let staged_ok = match decls[i].host_role {
                         HostRole::Writer => true,
@@ -1766,18 +1574,9 @@ impl ProcessCtx {
                     if let Err(error) = writable.resolve(page_len) {
                         return Ok(Err(error));
                     }
-                    // Derivability decides the geometry class, not op-pattern arity:
-                    // host-derivable geometry is Host class on every engine; a
-                    // device-dependent envelope classifies DecodeEnvelope only when
-                    // the engine has the needed device geometry ports, else it falls
-                    // back to Host and blocks loudly on the first undecidable value.
                     let device_port_mask =
                         crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
 
-                    // Device-geometry pass: the program traces its full explicit
-                    // geometry in-graph; the runtime only leases physical pages. If
-                    // AttnMask binds a channel, the engine must be able to resolve it
-                    // per-step (CUDA today cannot); otherwise it falls back to Host.
                     let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                         matches!(binding.port, eta_ir::registry::Port::AttnMask)
                             && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
@@ -1807,7 +1606,6 @@ impl ProcessCtx {
                                     .to_string(),
                             ));
                             }
-                            // Seed the lease with `B` fire-0 pages, one per lane.
                             let reserved = crate::store::registry::with_kv_lock(
                                 &stores.kv,
                                 "host-other",
@@ -1841,14 +1639,6 @@ impl ProcessCtx {
                     };
 
                     let taint = prog.geometry_taint();
-                    // A device-carried decode that re-publishes EVERY descriptor port
-                    // — tokens, positions, pages, page bounds, kv length, write
-                    // targets — states its whole geometry in-graph, so the engine
-                    // resolves it there and the host only leases the pool. Asked
-                    // before the envelope class: an envelope still folds every port
-                    // but the token on the host, and a loop whose accepted count is
-                    // device-decided (a speculative window) has nothing for the host
-                    // to fold.
                     let devgeo = match devgeo {
                 Some(devgeo) => Some(devgeo),
                 None if devgeo_capable
@@ -1935,10 +1725,6 @@ impl ProcessCtx {
                         geometry_class,
                     )
                 } else {
-                    // A float lane has no sequence, but the fire path seats
-                    // lanes and holds fire leases by working set, so the host
-                    // mints a SCRATCH one the guest never sees: no pages, no
-                    // geometry, released with the pass.
                     let open = crate::pipeline::instance::KvPageSpan {
                         start: 0,
                         end: None,
@@ -1995,8 +1781,6 @@ impl ProcessCtx {
                         .unwrap_or_default(),
                 });
             }
-            // Capture ids and stage seeds before the combined register+bind:
-            // bind consumes only pre-known ids and host-staged seed bytes.
             let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = ::engine::ProgramRegistration {
@@ -2021,9 +1805,6 @@ impl ProcessCtx {
                     channel: dense as u32,
                     data: bytes.clone(),
                 });
-                // Native cell is one byte per bool; the engine wire ABI is
-                // bit-packed, sized (numel + 7) / 8. Every other dtype is four
-                // bytes either way and needs no repacking.
                 let wire = if cell.dtype == eta_ir::types::Dtype::Bool {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
@@ -2052,9 +1833,6 @@ impl ProcessCtx {
                     channel_ids.clone(),
                     seed_values,
                     geometry_class,
-                    // sampled_rows is how many readout rows the program reads,
-                    // taken from the pricing already computed at registration
-                    // rather than recomputed. Every other role stays at one row.
                     ::engine::BindExtents {
                         sampled_rows: pricing_rows.max(1),
                         ..::engine::BindExtents::default()
@@ -2095,8 +1873,6 @@ impl ProcessCtx {
                 if cell.seeded {
                     cell.commit_seed();
                 }
-                // A seeded Writer held staging until the seed settled; flush
-                // now so direct ring puts take over.
                 if cell.role == Some(HostRole::Writer)
                     && let Err(error) = cell.flush_writer_staging()
                 {
@@ -2135,16 +1911,11 @@ impl ProcessCtx {
                 lane: lane_facts,
                 float: float_rows.map(|rows| FloatLane {
                     rows,
-                    // The boxes this lane's `Voxels` ports declared (D8), in
-                    // binding order — a channel cell carries no grid, so the
-                    // geometry travels beside the feed.
                     clips: port_bindings
                         .iter()
                         .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
                         .filter_map(|binding| binding.clip)
                         .collect(),
-                    // A cacheless encoder's rows ARE its ids; every other
-                    // float lane seats a rectangle of zeros.
                     embed: embed.is_some(),
                 }),
                 closed: false,
@@ -2156,10 +1927,6 @@ impl ProcessCtx {
         }
     }
 
-    /// A working set the host owns for a float lane's seats and fire
-    /// lease. Installed like the guest's (`kv-working-set` constructor),
-    /// registered with the process so residency accounting sees it, and
-    /// kept in the resource table under a rep the pass alone holds.
     fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
         let stores = crate::store::registry::get(0, 0);
         let prepared = crate::store::kv::PreparedWorkingSet::new();
@@ -2171,7 +1938,6 @@ impl ProcessCtx {
         Ok(self.ctx().table.push(ws)?.rep())
     }
 
-    /// Release a scratch working set a float pass held.
     fn release_scratch_working_set(&mut self, rep: u32) -> Anyhow<()> {
         let resource: Resource<KvWorkingSet> = Resource::new_own(rep);
         let ws = self.ctx().table.delete(resource)?;
@@ -2190,9 +1956,6 @@ impl ProcessCtx {
             return Ok(Err(error));
         }
         if rs_working_sets.is_empty() {
-            // The attention case of a hybrid pass (see `core_gate`): nothing to
-            // bind, and `RsGeometry` is a policy over a state this model does
-            // not fold. A folding model still needs one set per request row.
             if model_pass_kind() == PassKind::Attention {
                 return Ok(Ok(()));
             }
@@ -2296,10 +2059,6 @@ impl ProcessCtx {
         Ok(result)
     }
 
-    /// Host-known value of `rs-geometry.fold-len`, one entry per bound working
-    /// set. `Ok(None)` means the fold length is computed on device instead
-    /// (reaches the engine via the `rs_fold_len` descriptor port); the host
-    /// then keeps only an upper bound (see `store::rs::Occupancy`).
     fn read_fold_len(
         &mut self,
         geometry: &RsGeometryBinding,
@@ -2342,8 +2101,6 @@ impl ProcessCtx {
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-        // Drain the shared FIFO first so every callback and KV/RS transaction
-        // completes before mirror pointers are detached or pages reused.
         let fires = self
             .ctx()
             .table
@@ -2355,7 +2112,6 @@ impl ProcessCtx {
             crate::pipeline::fire::finalize_all(self, &fires, false).await?;
         }
 
-        // close_native is idempotent, shared with the Drop fallback.
         let mut pass = self.ctx().table.delete(this)?;
         let scratch = pass
             .bound()
@@ -2373,8 +2129,6 @@ impl ProcessCtx {
     }
 }
 
-/// Shared body of the three `HostForwardPass` impls; only the state-binding
-/// call differs per interface.
 macro_rules! forward_pass_common {
     ($iface:ident, $kind:expr) => {
         async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
@@ -2429,8 +2183,6 @@ macro_rules! forward_pass_common {
     };
 }
 
-/// The reading-and-ports verbs (`reading` / `input` / `stream` / `group`),
-/// shared by the interfaces that carry them (`forward`, `forward-diffusion`).
 macro_rules! forward_pass_readings {
     () => {
         async fn reading(
@@ -2466,8 +2218,6 @@ macro_rules! forward_pass_readings {
             self.core_group(this, id).await
         }
 
-        /// The guidance verb, beside `group` for the same reason: a peer is
-        /// a fact about a lane, not about an interface.
         async fn peer(
             &mut self,
             this: Resource<ForwardPass>,
@@ -2478,9 +2228,6 @@ macro_rules! forward_pass_readings {
     };
 }
 
-/// Converts an interface-local `rs-geometry` record into the host binding.
-/// A macro, not a trait, because each interface generates its own nominally
-/// distinct record type.
 macro_rules! rs_geometry_binding {
     ($self:ident, $geom:expr) => {{
         let geom = $geom;
@@ -2495,10 +2242,6 @@ macro_rules! rs_geometry_binding {
         }
     }};
 }
-
-// ---------------------------------------------------------------------------
-// pie:inferlet/forward — attention only.
-// ---------------------------------------------------------------------------
 
 impl pie::inferlet::forward::Host for ProcessCtx {
     async fn submit(
@@ -2518,9 +2261,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward, PassKind::Attention);
     forward_pass_readings!();
 
-    /// `media` rides the attention and hybrid interfaces (a hybrid tower
-    /// family exists: qwen3.8-flash-next); recurrent-only gets it when one
-    /// of those grows a tower.
     async fn media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -2552,10 +2292,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pie:inferlet/forward-recurrent — folded recurrent state only.
-// ---------------------------------------------------------------------------
-
 impl pie::inferlet::forward_recurrent::Host for ProcessCtx {
     async fn submit(
         &mut self,
@@ -2584,10 +2320,6 @@ impl pie::inferlet::forward_recurrent::HostForwardPass for ProcessCtx {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pie:inferlet/forward-hybrid — attention and recurrent layers in one forward.
-// ---------------------------------------------------------------------------
-
 impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
     async fn submit(
         &mut self,
@@ -2605,8 +2337,6 @@ impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
 impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_hybrid, PassKind::Hybrid);
 
-    /// The attention interface's `media`, same host half: the span type is
-    /// `forward`'s (`use forward.{media-span}`), so nothing is translated.
     async fn media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -2623,9 +2353,6 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
         rs_geom: pie::inferlet::forward_hybrid::RsGeometry,
     ) -> Anyhow<Result<(), String>> {
         let Some(kv) = kv else {
-            // `none` lets a recurrent-only commit fire be expressed without
-            // dummy attention geometry, but BoundForwardPass still requires a
-            // KV working set, so this path errors rather than half-binding.
             return Ok(Err(
                 "forward pass: a hybrid pass with no attention binding is not supported yet; \
                  bind the KV working set even for a recurrent-only fire"
@@ -2656,10 +2383,6 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pie:inferlet/forward-diffusion — paged KV plus a canvas denoised in place.
-// ---------------------------------------------------------------------------
-
 impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
     async fn submit(
         &mut self,
@@ -2678,7 +2401,6 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_diffusion, PassKind::Diffusion);
     forward_pass_readings!();
 
-    /// The attention interface's `media`, same host half and same span type.
     async fn media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -2727,7 +2449,6 @@ impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
         self.core_self_conditioning_from(this, rows, weights).await
     }
 
-    /// The reading: the one call the other three interfaces do not have.
     async fn canvas(
         &mut self,
         this: Resource<ForwardPass>,
@@ -2771,9 +2492,13 @@ mod tests {
         }
     }
 
-    /// A `[rows, width]` port takes exactly that shape in f32 and answers
-    /// its rows; a lane vector takes `[width]` or `[1, width]` and answers
-    /// none; anything else is refused by the port's name.
+    fn forward_every_case() {
+        a_port_channel_is_validated_against_its_fact();
+        a_pass_s_row_ports_agree_on_their_rows();
+        identical_rebind_is_a_no_op();
+        differing_rebind_names_the_field();
+    }
+
     #[test]
     fn a_port_channel_is_validated_against_its_fact() {
         let latents = port("latents", models::PortKind::Latents, 64);
@@ -2809,9 +2534,6 @@ mod tests {
         );
     }
 
-    /// Every `[rows, ·]` port of one pass carries the same rows, except a
-    /// context port, which is another lane's.
-    #[test]
     fn a_pass_s_row_ports_agree_on_their_rows() {
         use ::engine::fire::PortKind;
         let agree = [
@@ -2853,12 +2575,10 @@ mod tests {
         }
     }
 
-    #[test]
     fn identical_rebind_is_a_no_op() {
         assert_eq!(attention_rebind_diff(&binding(), &binding()), None);
     }
 
-    #[test]
     fn differing_rebind_names_the_field() {
         let mut next = binding();
         next.kv_ws = 9;

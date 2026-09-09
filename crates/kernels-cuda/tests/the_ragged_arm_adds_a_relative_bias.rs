@@ -1,11 +1,3 @@
-//! `attention.ragged` under `RaggedMask::RelativeBias` lands what an f32
-//! host reference lands: every scaled logit of a group has
-//! `table[h][kj − qi + max_len − 1]` added before the softmax, per QUERY
-//! head, over three groups of unequal length at 4 and at 64 heads; and a
-//! table of zeros lands the plain arm's answer bit for bit.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_adds_a_relative_bias`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,10 +9,7 @@ use kernels_cuda::tensor::Tensor;
 
 const TOLERANCE: f32 = 1.0e-2;
 const HEAD_DIM: u32 = 64;
-/// Three groups of unequal length: one under a 128-row tile, one past it,
-/// one exactly half of it.
 const SIZES: [u32; 3] = [37, 130, 64];
-/// The longest group, so every distance the fire holds reads its own column.
 const MAX_LEN: u32 = 130;
 
 fn indptr(sizes: &[u32]) -> Vec<i32> {
@@ -31,8 +20,6 @@ fn indptr(sizes: &[u32]) -> Vec<i32> {
     out
 }
 
-/// `[heads, 2·max_len − 1]`, values in `[-2, 2)`: wide enough to move the
-/// softmax visibly, narrow enough to keep it from saturating.
 fn random_table(rng: &mut Lcg, heads: usize, max_len: usize) -> Vec<f32> {
     (0..heads * (2 * max_len - 1))
         .map(|_| 2.0 * rng.unit())
@@ -90,7 +77,6 @@ fn reference(
     o
 }
 
-/// The device's answer under `mask`, as raw bf16 bits.
 #[allow(clippy::too_many_arguments)]
 fn fire(
     gpu: &mut Gpu,
@@ -171,21 +157,22 @@ fn check(q_heads: u32, kv_heads: u32, seed: u64) {
     );
 }
 
+fn the_ragged_arm_adds_a_relative_bias_every_case() {
+    the_relative_bias_lands_the_host_reference_at_four_heads();
+    the_relative_bias_lands_the_host_reference_at_sixty_four_heads();
+    a_zero_table_is_the_plain_arm_bit_for_bit();
+    a_misshapen_table_is_refused();
+}
+
 #[test]
 fn the_relative_bias_lands_the_host_reference_at_four_heads() {
     check(4, 2, 0x5b1a);
 }
 
-#[test]
 fn the_relative_bias_lands_the_host_reference_at_sixty_four_heads() {
     check(64, 16, 0x5b64);
 }
 
-/// At a power-of-two `sm_scale` (every head width's default at 64 and 256)
-/// the bias arm's `(q·k · s) · log2e` and the plain arm's `q·k · (s · log2e)`
-/// are the same reals rounded the same way, so a zero table is the plain
-/// arm bit for bit — which is what makes the arm a strict extension.
-#[test]
 fn a_zero_table_is_the_plain_arm_bit_for_bit() {
     let (q_heads, kv_heads) = (4u32, 2u32);
     let table = indptr(&SIZES);
@@ -230,7 +217,6 @@ fn a_zero_table_is_the_plain_arm_bit_for_bit() {
     assert_eq!(plain, biased, "a zero bias is the plain arm, bit for bit");
 }
 
-#[test]
 fn a_misshapen_table_is_refused() {
     let mut gpu = Gpu::open();
     let q_at = gpu.zeros(8 * 128 * 2);
@@ -241,8 +227,6 @@ fn a_misshapen_table_is_refused() {
     let q = Tensor::new(q_at, 8, 128, Dtype::Bf16);
     let mut o = Tensor::new(o_at, 8, 128, Dtype::Bf16);
     let groups = Tensor::new(table, 3, 1, Dtype::I32);
-    // Two heads of 64; the table is two rows of 7 = 2·4 − 1, but max_len
-    // says 8 (a row of 15).
     let mask = RaggedMask::RelativeBias {
         table: Tensor::new(bias, 2, 7, Dtype::F32),
         max_len: 8,

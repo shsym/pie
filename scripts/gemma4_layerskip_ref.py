@@ -20,7 +20,6 @@ PROMPTS = [
     ("code", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n"),
 ]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
@@ -47,7 +46,6 @@ def main():
             out[f"{name}@{n}"] = gen
             print(f"{name} layers={n}: {gen}")
     json.dump(out, open("/tmp/warmstream/e4b-layerskip-ref.json", "w"))
-
 
 if __name__ == "__main__":
     main()

@@ -1,35 +1,13 @@
-//! Binary Run-Length Encoded (BRLE) boolean sequences. `RunMask` is part of
-//! the submission schema (the engine contract's `fire::Mask` is the same run
-//! encoding) and is also the type the runtime/engines manipulate directly,
-//! so there's no duplicate type or wire-boundary conversion.
-//!
-//! ## Encoding
-//! - `[false, false, true, true, true, false]` -> `[2, 3, 1]`
-//! - `[true, true, false]` -> `[0, 2, 1]` (zero-length false prefix)
-//!
-//! Starts-with-false invariant: a sequence beginning with `true` always has
-//! a leading `0` run, so even buffer indices are false runs, odd are true.
-
 use std::collections::BTreeSet;
 use std::iter::FusedIterator;
 
-/// A Binary Run-Length Encoding (BRLE) structure.
-///
-/// `total_size` is `u64` rather than `usize` because the wire schema
-/// requires fixed width. The accessor methods take/return `usize` for
-/// convenience and cast at the boundary.
 #[derive(Default, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RunMask {
-    /// The buffer of run lengths. Even indices = false-run lengths,
-    /// odd indices = true-run lengths.
     pub buffer: Vec<u32>,
-    /// Total boolean count this BRLE represents.
     pub total_size: u64,
 }
 
-// Public API
 impl RunMask {
-    /// Creates a new `RunMask` instance representing `size` `false` values.
     pub fn new(size: usize) -> Self {
         if size == 0 {
             Self {
@@ -44,9 +22,6 @@ impl RunMask {
         }
     }
 
-    /// Creates a new `RunMask` instance representing `size` `true` values.
-    /// The starts-with-False convention requires a zero-length false-run
-    /// prefix, so the buffer is `[0, size]`.
     pub fn all_true(size: usize) -> Self {
         if size == 0 {
             Self {
@@ -61,16 +36,11 @@ impl RunMask {
         }
     }
 
-    /// Creates a `RunMask` from an owned run-length buffer.
     pub fn from_vec(buffer: Vec<u32>) -> Self {
         let total_size: u64 = buffer.iter().map(|&x| x as u64).sum();
         Self { buffer, total_size }
     }
 
-    /// Creates a `RunMask` from a packed bitmask (`&[u32]`).
-    ///
-    /// Allocates a new buffer each call. For hot paths, prefer
-    /// [`RunMask::fill_from_bitmask`] which reuses an existing buffer.
     pub fn from_bitmask(bitmask: &[u32], total_size: usize) -> Self {
         let mut brle = Self {
             buffer: Vec::with_capacity(32),
@@ -80,11 +50,6 @@ impl RunMask {
         brle
     }
 
-    /// Fills this `RunMask` from a packed bitmask (`&[u32]`), reusing the
-    /// internal buffer to avoid allocation.
-    ///
-    /// Each bit in the bitmask represents a boolean value (bit set = `true`).
-    /// Bit 0 of word 0 is index 0, bit 31 of word 0 is index 31, etc.
     pub fn fill_from_bitmask(&mut self, bitmask: &[u32], total_size: usize) {
         self.buffer.clear();
         self.total_size = total_size as u64;
@@ -99,7 +64,6 @@ impl RunMask {
         let mut prev_pos: u32 = 0;
         let mut prev_msb: u64 = 0;
 
-        // Fuse two adjacent u32s into a u64 (little-endian layout).
         #[inline(always)]
         fn fuse(lo: u32, hi: u32) -> u64 {
             lo as u64 | ((hi as u64) << 32)
@@ -218,7 +182,6 @@ impl RunMask {
         }
     }
 
-    /// Creates a `RunMask` from a slice of booleans.
     pub fn from_slice(v: &[bool]) -> Self {
         if v.is_empty() {
             return Self::new(0);
@@ -250,19 +213,16 @@ impl RunMask {
         }
     }
 
-    /// Returns the total number of booleans in the sequence.
     #[inline]
     pub fn len(&self) -> usize {
         self.total_size as usize
     }
 
-    /// Returns `true` if the sequence is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.total_size == 0
     }
 
-    /// Decodes the `RunMask` into a `Vec<bool>`.
     pub fn to_vec(&self) -> Vec<bool> {
         let mut vec = Vec::with_capacity(self.len());
         for (value, start, end) in self.iter_runs() {
@@ -274,7 +234,6 @@ impl RunMask {
         vec
     }
 
-    /// Checks the boolean values at a given set of indices.
     pub fn is_masked(&self, indices: &[usize]) -> Vec<bool> {
         if indices.is_empty() {
             return Vec::new();
@@ -306,8 +265,6 @@ impl RunMask {
         results
     }
 
-    /// Checks if all boolean values within a specified range `start..end`
-    /// are equal to a given `expected_value`.
     pub fn is_range_all_value(&self, start: usize, end: usize, expected_value: bool) -> bool {
         if start >= end {
             return true;
@@ -341,7 +298,6 @@ impl RunMask {
         pos_covered >= end
     }
 
-    /// Sets a range of booleans to a specified value.
     pub fn mask_range(&mut self, start: usize, end: usize, flag: bool) {
         if start >= end {
             return;
@@ -350,7 +306,6 @@ impl RunMask {
         self.mask_internal(&ranges, flag);
     }
 
-    /// Sets multiple, potentially non-contiguous, indices to a specified value.
     pub fn mask(&mut self, indices: &[usize], flag: bool) {
         if indices.is_empty() {
             return;
@@ -382,7 +337,6 @@ impl RunMask {
         self.mask_internal(&ranges, flag);
     }
 
-    /// Appends a boolean value to the end of the sequence.
     pub fn append(&mut self, flag: bool) {
         if self.buffer.is_empty() {
             if flag {
@@ -401,7 +355,6 @@ impl RunMask {
         self.total_size += 1;
     }
 
-    /// Extends this `RunMask` with another one.
     pub fn extend(&mut self, other: &Self) {
         if other.is_empty() {
             return;
@@ -433,14 +386,12 @@ impl RunMask {
         self.total_size += other.total_size;
     }
 
-    /// Removes the boolean value at a specific index.
     pub fn remove(&mut self, index: usize) {
         if index < self.len() {
             self.remove_range(index, index + 1);
         }
     }
 
-    /// Removes a range of boolean values. The range is exclusive (`start..end`).
     pub fn remove_range(&mut self, start: usize, end: usize) {
         let end = end.min(self.len());
         if start >= end {
@@ -455,10 +406,6 @@ impl RunMask {
         *self = new_brle;
     }
 
-    /// OR-set bits in `out` for pages whose entire
-    /// `[p*page_size, (p+1)*page_size)` range is False under this BRLE
-    /// (including the implicit-False tail past `total_size`). Used by
-    /// the page-trim optimization in the wire-format builder.
     pub fn droppable_page_bits(
         &self,
         page_size: u32,
@@ -481,9 +428,6 @@ impl RunMask {
         }
     }
 
-    /// Append a trimmed copy of this BRLE to `out`, with `skip_ranges` removed.
-    ///
-    /// Returns the new total size (number of bits in the appended BRLE).
     pub fn write_skipping(&self, skip_ranges: &[(u32, u32)], out: &mut Vec<u32>) -> u32 {
         let mut last_value: Option<bool> = None;
         let mut new_total: u32 = 0;
@@ -541,8 +485,6 @@ impl RunMask {
     }
 }
 
-/// OR-set bits in `out` for every page `p` in `[0, num_pages)` such that
-/// the entire range `[p*page_size, (p+1)*page_size)` lies inside `[s, e)`.
 #[inline]
 fn set_page_bits_in_range(s: u32, e: u32, page_size: u32, num_pages: u32, out: &mut [u64]) {
     if s >= e {
@@ -555,11 +497,6 @@ fn set_page_bits_in_range(s: u32, e: u32, page_size: u32, num_pages: u32, out: &
     }
 }
 
-/// OR-set bits `[lo, hi)` in `out` (treated as a packed u64 bitmask).
-///
-/// Shared with runtime callers (e.g. `inference::request::TrimPlan`):
-/// the bit-range stamping pattern recurs whenever we need to OR a
-/// contiguous range of page indices into a packed bitmap.
 #[inline]
 pub fn set_bits(out: &mut [u64], lo: u32, hi: u32) {
     if lo >= hi {
@@ -583,9 +520,7 @@ pub fn set_bits(out: &mut [u64], lo: u32, hi: u32) {
     }
 }
 
-// Internal implementation and iterators
 impl RunMask {
-    /// Returns an iterator over the runs, yielding `(value, start_index, end_index)`.
     pub fn iter_runs(&self) -> RunIterator<'_> {
         RunIterator {
             buffer: &self.buffer,
@@ -594,7 +529,6 @@ impl RunMask {
         }
     }
 
-    /// Creates a new `RunMask` representing a slice of the current one.
     fn slice(&self, start: usize, end: usize) -> Self {
         let end = end.min(self.len());
         if start >= end {
@@ -633,7 +567,6 @@ impl RunMask {
         }
     }
 
-    /// The core masking logic. Processes a set of pre-sorted, disjoint ranges.
     fn mask_internal(&mut self, ranges: &[(usize, usize)], flag: bool) {
         if ranges.is_empty() || self.total_size == 0 {
             return;
@@ -719,7 +652,6 @@ impl RunMask {
     }
 }
 
-/// An iterator over the runs of a `RunMask` instance.
 #[derive(Debug)]
 pub struct RunIterator<'a> {
     buffer: &'a [u32],
@@ -728,7 +660,7 @@ pub struct RunIterator<'a> {
 }
 
 impl<'a> Iterator for RunIterator<'a> {
-    type Item = (bool, usize, usize); // (value, start_index, end_index)
+    type Item = (bool, usize, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.buffer.len() {
@@ -755,7 +687,11 @@ impl FusedIterator for RunIterator<'_> {}
 mod tests {
     use super::*;
 
-    // -- Encoding correctness -------------------------------------------------
+    fn brle_every_case() {
+        roundtrip_complex_pattern();
+        from_slice_leading_true_run();
+        iter_runs_skips_zero_length_prefix();
+    }
 
     #[test]
     fn roundtrip_complex_pattern() {
@@ -768,32 +704,16 @@ mod tests {
         assert_eq!(b.buffer, vec![2, 3, 1, 1, 3]);
     }
 
-    #[test]
     fn from_slice_leading_true_run() {
         let b = RunMask::from_slice(&[true, true, false]);
         assert_eq!(b.buffer, vec![0, 2, 1]);
         assert_eq!(b.to_vec(), vec![true, true, false]);
     }
 
-    #[test]
     fn iter_runs_skips_zero_length_prefix() {
         let b = RunMask::from_slice(&[true, true, true]);
         let runs: Vec<_> = b.iter_runs().collect();
         assert_eq!(runs, vec![(true, 0, 3)]);
     }
-
-    // -- Masking --------------------------------------------------------------
-
-    // -- Queries --------------------------------------------------------------
-
-    // -- Structural mutations -------------------------------------------------
-
-    // -- Stress ---------------------------------------------------------------
-
-    // -- from_bitmask correctness ---------------------------------------------
-
-    // -- droppable_page_bits --------------------------------------------------
-
-    // -- write_skipping --------------------------------------------------------
 
 }

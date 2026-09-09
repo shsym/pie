@@ -10,7 +10,6 @@ use eta_ir::validate::Direction;
 use super::value::{Value, decode_wire};
 use crate::{Error, Result, shape_numel};
 
-/// True iff a channel bound to this port is consumed rather than peeked.
 #[must_use]
 pub fn port_consumes(port: Port) -> bool {
     port.consumes()
@@ -47,14 +46,11 @@ pub struct ExecPlan {
     pub needs_logits: bool,
 
     pub needs_mtp_logits: bool,
-    /// Reads the draft head's token ids (`mtp_drafts`), a plane of its own.
     pub needs_mtp_drafts: bool,
 
-    /// The program reads [`IntrinsicId::AttnScore`]: the shell must bind the
-    /// score rectangle before the epilogue runs, since a program reading
-    /// scores from a fire nobody captured dereferences the side table's zero
-    /// and poisons the CUDA context for the life of the process.
     pub needs_attn_scores: bool,
+
+    pub needs_pixels: bool,
 }
 
 impl ExecPlan {
@@ -93,11 +89,20 @@ impl ExecPlan {
     }
 
     #[must_use]
+    pub fn reads_intrinsic(&self, wanted: IntrinsicId) -> bool {
+        self.package
+            .values
+            .iter()
+            .any(|value| value.intrinsic == Some(wanted))
+    }
+
+    #[must_use]
     pub fn needs_forward(&self) -> bool {
         self.needs_logits
             || self.needs_mtp_logits
             || self.needs_mtp_drafts
             || self.needs_attn_scores
+            || self.needs_pixels
             || !self.package.ports.is_empty()
     }
 }
@@ -190,32 +195,25 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
     plan.needs_mtp_logits = false;
     plan.needs_mtp_drafts = false;
     plan.needs_attn_scores = false;
+    plan.needs_pixels = false;
     plan.reject_reason = None;
 
     for value in &plan.package.values {
-        // `source == Intrinsic` and `intrinsic == Some(_)` are set together by
-        // the lowering, so asking the second is asking both.
         match value.intrinsic {
             None => continue,
-            Some(IntrinsicId::Logits) => plan.needs_logits = true,
+            Some(IntrinsicId::Logits | IntrinsicId::Velocity | IntrinsicId::Hidden) => {
+                plan.needs_logits = true;
+            }
             Some(IntrinsicId::MtpLogits) => {
                 plan.needs_logits = true;
                 plan.needs_mtp_logits = true;
             }
-            // The drafts plane is a rectangle of its own, bound at its own
-            // base beside the logits; reading it still runs the readout.
             Some(IntrinsicId::MtpDrafts) => {
                 plan.needs_logits = true;
                 plan.needs_mtp_drafts = true;
             }
-            // The score rectangle is a column of its own, bound at its own
-            // base, so reading it does not set `needs_logits`.
             Some(IntrinsicId::AttnScore) => plan.needs_attn_scores = true,
-            // Everything else this boundary has no wiring for. Named, not
-            // listed: the list went stale the first time an intrinsic was
-            // added (`velocity` fell here without being mentioned), and a
-            // refusal that names the wrong thing is worse than one that
-            // names nothing.
+            Some(IntrinsicId::Pixels) => plan.needs_pixels = true,
             Some(other) => {
                 plan.executable = false;
                 plan.reject_reason = Some(format!(
@@ -240,6 +238,7 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
         plan.needs_mtp_logits = false;
         plan.needs_mtp_drafts = false;
         plan.needs_attn_scores = false;
+        plan.needs_pixels = false;
     }
 }
 
@@ -251,11 +250,6 @@ pub struct Boundaries {
 }
 
 impl Boundaries {
-    /// `lora` is admitted here because a sink call is a declaration, not an
-    /// op: the interpreter runs nothing for it, and the effect lands on the
-    /// host at instance bind. Admitting it is a claim that this backend
-    /// consumes it, not that it interprets it — so it stays out of
-    /// `kernel_calls` too.
     pub const METAL: Self = Self {
         kernel_calls: &["metal.identity"],
         sink_calls: &["metal.discard", "lora"],
@@ -322,6 +316,7 @@ pub fn adopt_launch_package_with(
         needs_mtp_logits: false,
         needs_mtp_drafts: false,
         needs_attn_scores: false,
+        needs_pixels: false,
     };
     classify_exec_plan(&mut plan);
 

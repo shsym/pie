@@ -1,61 +1,3 @@
-//! **THE TILED FLIP, END TO END** (§J4b) — one model text in two orders, one
-//! prompt, and the same logits.
-//!
-//! ```text
-//! cargo test -p engine-cuda --features cuda \
-//!   --test a_repacked_projection_serves_what_the_row_major_one_serves -- --nocapture
-//! ```
-//!
-//! # What is under test, and what already was
-//!
-//! Both kernels are golden (`kernels-cuda/tests/tiled_matmul.rs`: the tiled
-//! GEMM and the tiled decode point against a host fold, and the repack
-//! against a host un-repack), and so is the import half
-//! (`checkpoint/tests/tiled_repack.rs`: `Expr::Repack` compiled at the
-//! CONVERT target and run by the host executor, against a second
-//! transcription of the same layout). What had never run is the SERVING
-//! chain between a declaration and a launch:
-//!
-//! ```text
-//! Dtype::U4g64tiled                        the text's word
-//!   -> Weight::planes         three planes, rows banded up to TILED_BAND
-//!   -> checkpoint_dsl::claim  the same banded rectangle, so the load agrees
-//!   -> weights::plane_bytes   -> WeightRow::Planes { repacked: true }
-//!   -> Run::maybe_tiled_planes
-//!   -> linear::tiled::{matmul, matmul_gemv, lm_head, lm_head_gemv}
-//! ```
-//!
-//! # THE ORACLE IS THE SAME WEIGHTS, IN THE OTHER ORDER
-//!
-//! One seeded set of affine planes, two containers. The reference text
-//! declares its projections `U4g64` and the container holds the codes
-//! row-major, which takes `linear::quant`'s fused GEMV and its decoded twin —
-//! the roads every affine SKU takes today. The tiled text declares them
-//! `U4g64tiled` and its container holds the SAME codes under the SAME
-//! factors, relabelled by [`repack`] below into m16n8k16 fragment order.
-//!
-//! That is what makes this a gate rather than a self-comparison. The repack
-//! here is written from `linear/tiled.cuh`'s banner and not from any
-//! executor's code, so it is a THIRD independent statement of the layout
-//! beside the kernel's and the host executor's; a wrong witness, a wrong
-//! plane rectangle, a weight bound at the wrong address or a dispatch arm
-//! that took the row-major road on tiled bytes all fail here, and none of
-//! them can be papered over by a matching mistake in an oracle written
-//! beside it.
-//!
-//! **THE SAME NUMBERS, NOT THE SAME BITS.** The fused GEMV never
-//! materialises a weight element and the tiled points materialise every one
-//! of them as a bf16 register, so the two arms round in different places —
-//! §J4a-1's ruling, and `tiled_matmul.rs`'s own cross-arm gate. The ruler is
-//! the logit row's spread.
-//!
-//! # Gating
-//!
-//! Skipped at run time with no device, as `a_stored_k_quant_row_serves_as_
-//! stored.rs` is, and for its reason. Nothing here reads a checkpoint off
-//! disk — both containers are written from the trace's own params into a
-//! scratch directory.
-
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
@@ -65,24 +7,10 @@ use model_dsl::{
 };
 use model_ir::{TILED_BAND, TILED_STEP, Trace};
 
-// ─────────────────────────────────────────────────────────────────────────
-// The text
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Rows of the head, and of the embedding table.
-///
-/// **NOT A MULTIPLE OF [`TILED_BAND`], ON PURPOSE.** The head's rows are the
-/// axis the repack pads, so a thousand of them is sixty-two whole bands and a
-/// sixty-third that is eight columns of weight and eight of zero. That tail
-/// is the one geometric fact the layout adds, and a vocabulary that divided
-/// would never exercise it.
 const VOCAB: u32 = 1000;
 
-/// The contraction both projections walk — eight groups of sixty-four, which
-/// is also eight whole [`TILED_STEP`]-wide steps.
 const HIDDEN: u64 = 512;
 
-/// The fact vocabulary a three-op trace needs: none.
 struct NoFacts;
 
 impl Classify for NoFacts {
@@ -94,12 +22,9 @@ impl Classify for NoFacts {
     }
 }
 
-/// Which order the two projections are declared in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
-    /// `U4g64`: the codes as the checkpoint lays them, low nibble first.
     RowMajor,
-    /// `U4g64tiled`: the same codes in m16n8k16 fragment order.
     Tiled,
 }
 
@@ -112,10 +37,6 @@ impl Arm {
     }
 }
 
-/// **A MODEL NOBODY SHIPS**, for `a_stored_k_quant_row_serves_as_stored.rs`'s
-/// reason: the embedding table stays bf16 because the affine gather is a
-/// different point with a different gate, and what this file is about is the
-/// two `linear` arms.
 struct Micro {
     embed: Weight,
     proj: Weight,
@@ -132,10 +53,6 @@ impl Micro {
         }
     }
 
-    /// The load contract, stated through the same builder a family's `load`
-    /// uses. `read_own` in both arms: each container holds its weights under
-    /// their own names, and the ONLY difference between the two loads is the
-    /// dtype the text declared.
     fn load(&self, src: &ztensor::Source) -> ModelContract {
         let mut b = checkpoint_dsl::Builder::new(src, 1, model_dsl::Platform::Cuda);
         for w in [&self.embed, &self.proj, &self.head] {
@@ -166,14 +83,8 @@ fn trace(arm: Arm) -> (Micro, Trace) {
     (m, trace)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The planes, and the relabelling
-// ─────────────────────────────────────────────────────────────────────────
-
-/// The codes under one factor, which is `U4g64`'s group and `U4g64tiled`'s.
 const GROUP: usize = 64;
 
-/// A seeded stream, so both containers hold the same weights.
 struct Lcg(u64);
 
 impl Lcg {
@@ -189,26 +100,17 @@ impl Lcg {
         ((self.next() >> 33) & 0xF) as u8
     }
 
-    /// Uniform on `[-0.5, 0.5)`.
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
 }
 
-/// f32 to bf16, round-to-nearest-even — the conversion the loader does.
 fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounding = 0x7fff + ((bits >> 16) & 1);
     ((bits + rounding) >> 16) as u16
 }
 
-/// One affine triplet: `[rows, HIDDEN]` codes low-nibble-first, and two
-/// `[rows, HIDDEN / GROUP]` bf16 factor planes.
-///
-/// The scale is near `2^-5` and the bias near zero, which is the band an
-/// affine weight's factors sit in and which keeps a row of 512 summing to
-/// O(1) — tame enough that the comparison measures the layout and not an
-/// overflow.
 struct Planes {
     codes: Vec<u8>,
     scales: Vec<u8>,
@@ -235,18 +137,6 @@ fn planes(rows: usize, seed: u64) -> Planes {
     }
 }
 
-/// **THE RELABELLING, WRITTEN FROM THE BANNER.** Word `lane` of tile
-/// `(band, k tile)` holds, at nibble `s + 4h`, the code at
-/// `k = 16*kt + 2*(lane%4) + 8*(s&1) + h` and
-/// `n = 16*band + lane/4 + 8*(s>=2)`; four k tiles are grouped as one lane's
-/// `uint4`, so the word order is `[band][k quad][lane][4]`. Columns past
-/// `rows` are a zero code beside a zero factor, which decodes to a zero
-/// weight.
-///
-/// This is `linear/tiled.cuh`'s `repack_affine_tiled`, transcribed — a THIRD
-/// statement of the layout beside the kernel's and
-/// `checkpoint::executor::walk`'s, which is what makes agreement here
-/// evidence rather than a coincidence.
 fn repack(codes: &[u8], rows: usize) -> Vec<u8> {
     let band = TILED_BAND as usize;
     let quad = (TILED_STEP / TILED_BAND) as usize;
@@ -290,9 +180,6 @@ fn repack(codes: &[u8], rows: usize) -> Vec<u8> {
     out
 }
 
-/// **THE FACTOR HALF** — `[rows][group]` becomes `[band][group][16]`, a
-/// transpose of the (column, group) rectangle inside each band, with a
-/// band's tail written as a zero factor.
 fn repack_factors(factors: &[u8], rows: usize) -> Vec<u8> {
     let band = TILED_BAND as usize;
     let groups = HIDDEN as usize / GROUP;
@@ -311,16 +198,6 @@ fn repack_factors(factors: &[u8], rows: usize) -> Vec<u8> {
     out
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The containers
-// ─────────────────────────────────────────────────────────────────────────
-
-/// **ONE SET OF WEIGHTS, TWO ORDERS.** The reference container holds the
-/// planes as `planes` drew them; the tiled one holds `repack`'s answer under
-/// the banded rectangle `model_dsl::Weight::planes` publishes, under the
-/// layout id that names that order. Everything else — the names, the profile,
-/// the type, the planes — is identical, which is what leaves the ORDER as the
-/// only difference between two loads.
 fn write_checkpoint(path: &Path, arm: Arm) {
     let mut writer =
         ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
@@ -339,8 +216,6 @@ fn write_checkpoint(path: &Path, arm: Arm) {
         )
         .expect("the table lands");
 
-    // Sorted insertion, which is what canonical `.zt` form requires: `embed`,
-    // then the head's triplet, then the projection's.
     affine_tensor(&mut writer, "lm_head", VOCAB as usize, arm, 0x4ead);
     affine_tensor(&mut writer, "proj", HIDDEN as usize, arm, 0x9401);
 
@@ -349,8 +224,6 @@ fn write_checkpoint(path: &Path, arm: Arm) {
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
 
-/// One affine weight: one object of three planes, codes then scales then
-/// biases — in whichever order `arm` asks for.
 fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm, seed: u64) {
     let drawn = planes(rows, seed);
     let (codes, scales, biases, stated) = match arm {
@@ -366,16 +239,9 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
     assert_eq!(codes.len(), stated * HIDDEN as usize / 2);
     assert_eq!(scales.len(), stated * groups * 2);
 
-    // The type `checkpoint::file::write` states for an MLX bank, which
-    // `file/zt.rs` reads back as `QuantScheme::MlxAffineU4`: u4 codes in
-    // groups of GROUP, a bf16 scale and a bf16 bias stored plain beside it.
-    // The tiled arm is the same planes over the band-padded rectangle under
-    // the layout the writer stamps for a repacked bank, `band`/`step` and all.
     let term = ztensor::Term::parse(&format!("g{GROUP}_u4_bf16_b_bf16"))
         .expect("the affine term parses");
     let shape = vec![stated as u64, HIDDEN];
-    // A named layout takes its blob whole, so the tiled arm lays the same
-    // canonical planes out itself.
     let blob = canonical_blob(&term, &shape, [&codes, &scales, &biases]);
     writer
         .object(name, |o| {
@@ -392,7 +258,6 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
         .unwrap_or_else(|why| panic!("`{name}`: {why}"));
 }
 
-/// The term's planes over `shape`, each at its canonical (64-aligned) offset.
 fn canonical_blob(term: &ztensor::Term, shape: &[u64], planes: [&Vec<u8>; 3]) -> Vec<u8> {
     let laid = term.planes(shape).expect("the term lays out this shape");
     assert_eq!(laid.len(), planes.len());
@@ -405,7 +270,6 @@ fn canonical_blob(term: &ztensor::Term, shape: &[u64], planes: [&Vec<u8>; 3]) ->
     blob
 }
 
-/// A scratch directory of this process's own.
 fn scratch(what: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pie-j4b-{what}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -413,22 +277,6 @@ fn scratch(what: &str) -> PathBuf {
     dir
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The fire
-// ─────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────
-// (0) the host half — no device, and it runs on every `cargo test`
-// ─────────────────────────────────────────────────────────────────────────
-
-/// **THE DECLARATION BANDS THE RECTANGLE, AND BOTH SIDES BAND IT THE SAME.**
-///
-/// The trace is what the engine is handed and the contract is what the load
-/// reads; a repacked plane is `rows` rounded up to a whole band in the first
-/// and would be `rows` in the second if nobody had said so, which is a
-/// tensor arriving shorter than the plane reserved for it. 1008 is 1000
-/// rounded up to sixteen, and it is written nowhere — it falls out of
-/// [`TILED_BAND`].
 #[test]
 fn a_tiled_declaration_bands_the_rows_on_both_sides() {
     let (_, row_major) = trace(Arm::RowMajor);
@@ -445,17 +293,8 @@ fn a_tiled_declaration_bands_the_rows_on_both_sides() {
     assert_eq!(plane(&row_major, "lm_head"), vec![u64::from(VOCAB), HIDDEN]);
     assert_eq!(plane(&tiled, "lm_head"), vec![padded, HIDDEN]);
     assert_eq!(plane(&tiled, "lm_head.scales"), vec![padded, HIDDEN / 64]);
-    // The projection's rows already divide, so the two agree there — which
-    // is the point: the banding is a padding and not a reshape.
     assert_eq!(plane(&tiled, "proj"), vec![HIDDEN, HIDDEN]);
 
-    // And the CONTRACT claims the same rectangle, which is the half a trace
-    // cannot check by itself. Read off the FACTOR plane: a quantized codes
-    // entry is `TensorContract::inferred` — its shape is the expression's,
-    // stated once — while its companions carry the declared rectangle, and
-    // `interned` derives theirs from the codes' by dividing the last axis.
-    // So a factor plane that is 1008 rows deep is a codes plane that was
-    // claimed at 1008 too.
     let dir = scratch("bands");
     let container = dir.join("micro.zt");
     write_checkpoint(&container, Arm::Tiled);
@@ -474,8 +313,3 @@ fn a_tiled_declaration_bands_the_rows_on_both_sides() {
     drop(src);
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// (1) the device half
-// ─────────────────────────────────────────────────────────────────────────
-

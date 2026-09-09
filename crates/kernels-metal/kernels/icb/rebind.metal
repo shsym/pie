@@ -1,53 +1,21 @@
-// icb::rebind — the one shader the indirect-command-buffer plane adds.
-//
-// EVERY OTHER SHADER IN THIS CRATE COMPUTES A MODEL. This one computes the
-// COMMANDS. It reads the fire descriptor (the same bytes
-// `driver::fire::descriptor::pack` writes, header and class table), evaluates
-// the derived `DescriptorAbi` — one law per moving component — and rewrites
-// the indirect command buffer in place: grids, buffer offsets, staged
-// scalars, and the pipeline of a slot whose entry picked another arm. One
-// thread per slot, and no host walk anywhere.
-//
-// What it may write is `MTLIndirectComputeCommand`'s whole vocabulary and
-// nothing beyond it: there is no `set_bytes` on an indirect compute command,
-// which is why a scalar argument lives in a staged cell and this shader
-// writes the CELL rather than the binding.
-//
-// The three law forms are `engine_metal::abi::Law`, and this is the only
-// other place they are evaluated:
-//
-//     kind 0  const   v
-//     kind 1  affine  v = base + Σ slope[k]·coord[k]
-//     kind 2  ceil    v = mul · ⌈(α·rows + β) / div⌉
-//
-// The coordinates are not in the descriptor. They are read OUT of it, by the
-// one linear functional per direction that `engine_metal::abi::Recipe` solves
-// at load — the descriptor carries a class table and the laws are written in
-// a basis of reachable directions, and the recipe is the inverse of the
-// second in terms of the first.
+
 
 #include <metal_stdlib>
 #include <metal_command_buffer>
 
 using namespace metal;
 
-// Mirrored EXACTLY by `kernels_metal::icb` on the host side; the bytes are
-// the interface and this is one half of the one layout.
 #define ICB_MAX_AXES      4
 #define ICB_MAX_PIPELINES 256
 #define ICB_MAX_SLABS     128
 
-// The descriptor's own layout, in 32-bit words — `driver::fire::descriptor`'s
-// table read as `uint[]`, which is legal because every field of it is a
-// little-endian `u32` on a 4-byte boundary and the one 64-bit field (a lane's
-// word) is past everything this shader reads.
 #define ICB_DESC_MAGIC    0u
 #define ICB_DESC_VERSION  1u
 #define ICB_DESC_ROWS     2u
 #define ICB_DESC_LANES    3u
 #define ICB_DESC_BUCKET   4u
 #define ICB_DESC_CLASSES  5u
-#define ICB_DESC_TABLE    8u   // first class record; four words each
+#define ICB_DESC_TABLE    8u
 #define ICB_CLASS_WORDS   4u
 #define ICB_CLASS_ROWS    1u
 #define ICB_CLASS_LANES   3u
@@ -74,20 +42,20 @@ struct IcbLaw {
     long alpha;
     long beta;
     long div;
-    uint kind;      // 0 const, 1 affine, 2 ceil
-    uint at_kind;   // 0 grid axis, 1 threadgroup axis, 2 argument
+    uint kind;
+    uint at_kind;
     uint at_index;
-    uint arg_kind;  // 0 buffer offset, 1 four-byte scalar, 2 eight-byte scalar
+    uint arg_kind;
     uint slab;
-    uint cell;      // byte offset into the scalar arena
+    uint cell;
     uint pad0;
     uint pad1;
 };
 
 struct IcbBind {
-    ulong offset;   // bytes into the reservation, or into the scalar arena
-    uint index;     // the argument index
-    uint kind;      // 0 reservation, 1 scalar cell, 2 absent
+    ulong offset;
+    uint index;
+    uint kind;
     uint slab;
     uint pad0;
 };
@@ -106,7 +74,7 @@ struct IcbArm {
 struct IcbSlot {
     uint arm_at;
     uint arm_count;
-    uint pick;       // 0 one arm always, 1 a threshold on the window's rows
+    uint pick;
     uint threshold;
     uint rows_law;
     uint pad0;
@@ -115,12 +83,10 @@ struct IcbSlot {
 };
 
 struct IcbPipe {
-    uint width;   // threadExecutionWidth
-    uint total;   // maxTotalThreadsPerThreadgroup
+    uint width;
+    uint total;
 };
 
-// The three law forms, evaluated. `rows` is the window's own row count, which
-// is itself a law and is evaluated first.
 static inline long icb_eval(device const IcbLaw& law,
                             thread const long* coord,
                             uint axes,
@@ -143,9 +109,6 @@ static inline long icb_eval(device const IcbLaw& law,
     return law.mul * q;
 }
 
-// The threadgroup a slot that stated none gets — `engine_metal::device::ctx::
-// threadgroup`, in the one other place it has to be computed, because the
-// grid it is derived from is what this shader just rewrote.
 static inline uint3 icb_occupancy(IcbPipe pipe, uint3 lanes) {
     uint w = max(pipe.width, 1u);
     uint t = max(pipe.total, 1u);
@@ -174,10 +137,7 @@ kernel void icb_rebind(device IcbHandle&        handle  [[buffer(0)]],
     if (gid >= plan.slots) {
         return;
     }
-    // THE DESCRIPTOR IS CHECKED, NOT TRUSTED. A malformed one does not fault
-    // on this side — it computes, over whatever rows the wrong numbers name —
-    // so the two words `driver::fire::descriptor::unpack` checks are checked
-    // here too, and a mismatch leaves every command exactly as it was.
+
     if (desc[ICB_DESC_MAGIC] != plan.magic) {
         if (gid == 0) { status[0] = 1u; }
         return;
@@ -191,7 +151,6 @@ kernel void icb_rebind(device IcbHandle&        handle  [[buffer(0)]],
         return;
     }
 
-    // The coordinates, read out of the class table by the solved recipe.
     long coord[ICB_MAX_AXES];
     uint classes = plan.classes;
     for (uint k = 0; k < plan.axes; ++k) {
@@ -210,11 +169,6 @@ kernel void icb_rebind(device IcbHandle&        handle  [[buffer(0)]],
     long rows = icb_eval(lawrow[slot.rows_law], coord, plan.axes, 0);
     compute_command cmd(handle.icb, gid);
 
-    // WALK'S RULE 1, ON THE DEVICE. A region with no rows is not dispatched
-    // at all — the eager walk skips its nodes — so the slots standing in it
-    // are reset. A reset command inside an executed range is skipped with no
-    // error and no cost; a slot left live to exit immediately still costs a
-    // dispatch boundary, which is why this is a reset and not a zero grid.
     if (rows <= 0) {
         if (live[gid] != 0u) {
             cmd.reset();
@@ -228,10 +182,7 @@ kernel void icb_rebind(device IcbHandle&        handle  [[buffer(0)]],
         which = slot.arm_at + 1u;
     }
     IcbArm arm = armrow[which];
-    // The liveness word carries WHICH ARM is encoded, not merely that
-    // something is: a slot that was reset lost every binding it had, and a
-    // slot that switched arms is a different entry with a different argument
-    // list. Both are a full re-encode and one word says so.
+
     uint token = which + 1u;
     bool fresh = (live[gid] != token);
 
@@ -274,9 +225,7 @@ kernel void icb_rebind(device IcbHandle&        handle  [[buffer(0)]],
         group = icb_occupancy(piperow[arm.pipe], grid);
     }
     cmd.concurrent_dispatch_threads(grid, group);
-    // EVERY SLOT CARRIES A BARRIER. An indirect command buffer's dispatches
-    // are concurrent by kind and the walk assumes the serial pass a compute
-    // encoder gives; measured, sixteen chained slots race without this.
+
     cmd.set_barrier();
     live[gid] = token;
 }

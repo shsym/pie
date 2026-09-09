@@ -59,3 +59,29 @@ template <typename T>
 instantiate_q_gate_split(bfloat16, bfloat)
 
 instantiate_attn_gate(bfloat16, bfloat)
+
+template <typename T>
+[[kernel]] void gate_sigmoid_mul_heads(
+    device T* x                   [[buffer(0)]],
+    const device T* gate          [[buffer(1)]],
+    const constant uint& heads    [[buffer(2)]],
+    const constant uint& head_dim [[buffer(3)]],
+    const constant float& scale   [[buffer(4)]],
+    uint2 tid                     [[thread_position_in_grid]]) {
+  const uint width = heads * head_dim;
+  const uint col = tid.x;
+  const uint row = tid.y;
+  if (col >= width) return;
+  const float g = float(gate[size_t(row) * size_t(heads) + size_t(col / head_dim)]);
+  const float s = scale / (1.0f + precise::exp(-g));
+  const size_t at = size_t(row) * size_t(width) + size_t(col);
+  x[at] = static_cast<T>(float(x[at]) * s);
+}
+
+#define instantiate_gate_sigmoid_mul_heads(name, itype)              \
+  template [[host_name("gate_sigmoid_mul_heads_" #name)]]            \
+  [[kernel]] void gate_sigmoid_mul_heads<itype>(                     \
+      device itype*, const device itype*, const constant uint&,      \
+      const constant uint&, const constant float&, uint2);
+
+instantiate_gate_sigmoid_mul_heads(bfloat16, bfloat)

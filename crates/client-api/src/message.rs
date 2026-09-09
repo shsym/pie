@@ -1,21 +1,8 @@
-//! Client ↔ server message vocabulary — the edge wire payloads.
-//!
-//! These are the messages a client exchanges with the server over the
-//! client-facing edge (WebSocket today; gateway/worker tarpc in disaggregated
-//! serving). The [`edge`](crate::edge) frames in this crate embed them, and the
-//! public `pie-client` crate re-exports them.
-//!
-//! Plain serde vocabulary, independent of the local runtime-engine ABI.
-
 use serde::{Deserialize, Serialize};
 
-pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
+pub const CHUNK_SIZE_BYTES: usize = 256 * 1024;
 pub const QUERY_MODEL_STATUS: &str = "model_status";
 
-/// Messages from client -> server
-//
-// `Clone` so the gateway's `Request` (which carries one) is cloneable for
-// idempotent re-dispatch / retry across worker candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -90,10 +77,6 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
-    /// The correlation id the client stamped on this frame, when it is a
-    /// call that expects a `response` — a refusal of such a frame must carry
-    /// the same id back, or the client cannot tell which call failed.
-    /// `signal_process` and `transfer_file` are fire-and-forget and have none.
     pub fn corr_id(&self) -> Option<u32> {
         match self {
             ClientMessage::AuthIdentify { corr_id, .. }
@@ -111,10 +94,6 @@ impl ClientMessage {
     }
 }
 
-/// Messages from server -> client
-//
-// `Clone` so the gateway's `Tokens` chunk (which carries these) is cloneable on
-// the streaming/fan-out path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -140,12 +119,6 @@ pub enum ServerMessage {
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
-        /// The name the inferlet suggested for this file, when it named one
-        /// (`session.send-frames` / `send-pcm` do; `send-file` does not).
-        ///
-        /// `#[serde(default)]` rather than a bare field: the enum is
-        /// internally tagged, so it goes on the wire as a map and a client
-        /// built before this key existed keeps decoding these frames.
         #[serde(default)]
         name: Option<String>,
     },

@@ -1,8 +1,3 @@
-//! pie:instruct/reasoning — Reasoning/thinking block detection
-//!
-//! Imported by inferlets that support reasoning capabilities.
-//! Delegates to the model's `Instruct` implementation.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
@@ -11,11 +6,6 @@ use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Reasoning decoder resource — wraps a model-specific ReasoningDecoder trait object.
-///
-/// A batch can both close a thinking block and carry the reply that follows
-/// it. The WIT `feed` hands back one event, so the surplus queues here and
-/// drains on the following calls rather than being dropped.
 pub struct Decoder {
     inner: Box<dyn ReasoningDecoder>,
     pending: VecDeque<ReasoningEvent>,

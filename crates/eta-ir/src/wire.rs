@@ -1,62 +1,32 @@
-//! [`OpWire`]: the flat wire record of one [`Op`], and the two projections ([`OpWire::of`]/[`OpWire::to_op`], exact inverses) between it and the typed enum.
-
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::op::{IntrinsicId, Op, tags};
 use crate::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, from_wire, wire_dtype};
 
-/// The wire view of one op: its tag plus the payload fields
-/// [`OpSpec::wire`](crate::op::OpSpec::wire) declares, flattened. Positional
-/// immediates land in `imm`, `imm2`, `imm3` in declaration order. A new
-/// payload field needs a `WireField` on the op's row, not just a projection case.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpWire {
-    /// The op's wire tag; what selects the layout the rest of this record
-    /// was filled from.
     pub tag: u8,
-    /// `chan_take` / `chan_read` / `chan_put` target, else `-1`.
     pub chan: i64,
-    /// `kernel_call` / `sink_call` name-table index.
     pub name_idx: u16,
-    /// Value-id operands as the container encodes them — not [`Op::operands`]
-    /// (e.g. `pivot_threshold`'s predicate payload has its own field).
     pub args: Vec<ValueId>,
-    /// SSA ids defined.
     pub results: u32,
-    /// `intrinsic_val` id.
     pub intr: u16,
-    /// First trace-known immediate: `top_k` k / `iota` len / `rng` stream /
-    /// mask len.
     pub imm: u32,
-    /// Second immediate: `sliding_window_mask` window / `sink_window_mask` sink.
     pub imm2: u32,
-    /// Third immediate: `sink_window_mask` window.
     pub imm3: u32,
-    /// `pivot_threshold` predicate tag.
     pub pred_tag: u8,
-    /// `pivot_threshold` predicate payload (a value id for every tag).
     pub pred_payload: u32,
-    /// `const` literal dtype.
     pub lit_dtype: u8,
-    /// `const` literal raw bits, interpreted per `lit_dtype`.
     pub lit_bits: u32,
-    /// `cast` / `rng` / `intrinsic_val` / `kernel_call` element dtype.
     pub dtype: u8,
-    /// `broadcast` / `reshape` / `rng` / `intrinsic_val` / `kernel_call`
-    /// target shape.
     pub shape: Vec<u32>,
-    /// `rng` kind — 0 uniform, 1 gumbel, 2 normal.
     pub kind: u8,
 }
 
-/// The predicate wire tags, in [`Predicate`] declaration order.
 pub mod predicate_tags {
-    /// Keep the entries whose rank is at most `k`.
     pub const RANK_LE: u8 = 0;
-    /// Keep the shortest prefix whose cumulative mass reaches `p`.
     pub const CUMMASS_LE: u8 = 1;
-    /// Keep the entries whose probability is at least the threshold.
     pub const PROB_GE: u8 = 2;
 }
 
@@ -65,9 +35,6 @@ fn wire_shape(shape: &Shape) -> Vec<u32> {
 }
 
 impl OpWire {
-    /// Project one op onto its wire fields. Every payload beyond value
-    /// operands must be set by a named arm here — the general arm at the
-    /// bottom only fills `args`, encoding anything else as zero.
     pub fn of(op: &Op) -> Self {
         let mut wire = OpWire {
             tag: op.tag(),
@@ -76,8 +43,6 @@ impl OpWire {
             ..OpWire::default()
         };
         match *op {
-            // `pivot_threshold` encodes `input` then a 5-byte predicate, so
-            // the predicate operand is NOT an arg — unlike `Op::operands`.
             Op::PivotThreshold { input, predicate } => {
                 wire.args = vec![input];
                 let (tag, payload) = match predicate {
@@ -186,12 +151,10 @@ impl OpWire {
         wire
     }
 
-    /// Project a whole stage body.
     pub fn of_all(ops: &[Op]) -> Vec<OpWire> {
         ops.iter().map(OpWire::of).collect()
     }
 
-    /// The channel index this op names, if any.
     pub fn channel(&self) -> Option<u32> {
         u32::try_from(self.chan).ok()
     }
@@ -219,8 +182,6 @@ impl OpWire {
             Dtype::I32 => Literal::I32(self.lit_bits as i32),
             Dtype::U32 => Literal::U32(self.lit_bits),
             Dtype::Bool => Literal::Bool(self.lit_bits != 0),
-            // Unreachable in practice; `None` (not `unreachable!`) since this
-            // function's job is to answer `None` for a byte naming no literal.
             _ => return None,
         })
     }
@@ -238,9 +199,6 @@ impl OpWire {
         self.args.get(index).copied()
     }
 
-    /// Rebuild the typed op — the inverse of [`OpWire::of`]. `None` when a
-    /// field names something the vocabulary does not have, or a required
-    /// operand is missing.
     pub fn to_op(&self) -> Option<Op> {
         let a0 = || self.arg(0);
         let a1 = || self.arg(1);
@@ -381,7 +339,6 @@ impl OpWire {
     }
 }
 
-/// `bases[node]` — the SSA id each op's first result defines.
 pub fn result_bases(ops: &[OpWire]) -> Vec<u32> {
     let mut bases = Vec::with_capacity(ops.len());
     let mut next_value = 0u32;
@@ -391,4 +348,3 @@ pub fn result_bases(ops: &[OpWire]) -> Vec<u32> {
     }
     bases
 }
-

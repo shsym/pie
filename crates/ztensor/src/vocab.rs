@@ -1,50 +1,20 @@
-//! L2 vocabulary: named layouts and encodings, held as a value.
-//!
-//! A profile is the code form of a registry mini-spec: implementable from its
-//! text alone, and a reader that does not know one refuses to interpret rather
-//! than guessing. The spec calls this layer registry-managed, so the registry
-//! is a [`Vocabulary`] you can extend and hand to a reader or a writer:
-//!
-//! ```no_run
-//! # use ztensor::{Source, Vocabulary};
-//! # fn f(my_layout: impl ztensor::vocab::Layout + 'static) -> ztensor::Result<()> {
-//! let vocab = Vocabulary::standard().with_layout(my_layout);
-//! let src = Source::options().vocabulary(&vocab).open("model.zt")?;
-//! # Ok(()) }
-//! ```
-//!
-//! The canonical layout is not here: it is derived from the type (§5.1) and
-//! every reader knows it. A layout in this registry is a departure from it.
-
 use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result, Rule};
 use crate::format::cbor::Value;
 use crate::format::{align_up, Leaf, Object, Plane, Term, PLANE_ALIGN};
 
-/// A named layout: how an object's bytes lie when they do not follow the
-/// canonical rule (spec §5.2).
-///
-/// `validate` runs at open time (and at write time) on metadata only: the
-/// type it admits, the attributes it needs, its size equation. Data-level
-/// rules run when the object is actually assembled.
 pub trait Layout: Send + Sync {
     fn id(&self) -> &str;
     fn validate(&self, name: &str, obj: &Object) -> Result<()>;
 }
 
-/// An encoding profile: a byte-stream transform for one blob.
 pub trait Encoding: Send + Sync {
     fn id(&self) -> &str;
     fn encode(&self, decoded: &[u8]) -> Result<Vec<u8>>;
-    /// Must produce exactly `decoded_length` bytes or reject.
     fn decode(&self, stored: &[u8], decoded_length: u64) -> Result<Vec<u8>>;
 }
 
-/// The set of profiles a reader or writer knows.
-///
-/// Later registrations shadow earlier ones, so a caller can replace a standard
-/// profile as well as add to it.
 #[derive(Clone, Default)]
 pub struct Vocabulary {
     layouts: Vec<Arc<dyn Layout>>,
@@ -67,10 +37,6 @@ impl std::fmt::Debug for Vocabulary {
 }
 
 impl Vocabulary {
-    /// The profiles this implementation ships: `zt.sparse_csr/2`, the
-    /// `gguf.<type>/2` family, and `zt.zstd-seekable/1` (with the `zstd`
-    /// feature). `Default` knows nothing: every named layout is structural,
-    /// every encoding undecodable.
     pub fn standard() -> Self {
         let mut v = Self::default().with_layout(SparseCsr);
         for row in gguf::TABLE {
@@ -100,8 +66,6 @@ impl Vocabulary {
         self
     }
 
-    /// `None` means structural-only access: the object is readable as bytes,
-    /// its layout rules unchecked.
     pub fn layout(&self, id: &str) -> Option<&dyn Layout> {
         self.layouts
             .iter()
@@ -110,7 +74,6 @@ impl Vocabulary {
             .map(Arc::as_ref)
     }
 
-    /// `None` means the stored bytes can be addressed but not decoded.
     pub fn encoding(&self, id: &str) -> Option<&dyn Encoding> {
         self.encodings
             .iter()
@@ -128,12 +91,6 @@ fn attr_text<'a>(attributes: Option<&'a Value>, key: &str) -> Option<&'a str> {
     attributes?.get(key)?.as_text()
 }
 
-// =======================================================================
-// zt.sparse_csr/2 (spec/profiles/zt.sparse_csr-2.md)
-// =======================================================================
-
-/// The byte plan of a `zt.sparse_csr/2` blob: `indptr`, then `indices`, then
-/// the value planes, each at the next plane boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CsrPlan {
     pub rows: u64,
@@ -142,14 +99,11 @@ pub struct CsrPlan {
     pub index: Leaf,
     pub indptr: Plane,
     pub indices: Plane,
-    /// The value planes, offsets shifted past the index planes.
     pub values: Vec<Plane>,
     pub size: u64,
 }
 
 impl CsrPlan {
-    /// Reads the plan off an object's metadata, checking the profile's
-    /// metadata rules.
     pub fn of(
         name: &str,
         shape: &[u64],
@@ -238,14 +192,7 @@ impl Layout for SparseCsr {
     }
 }
 
-// =======================================================================
-// gguf.<type>/2 (spec/profiles/gguf.md)
-// =======================================================================
-
 pub mod gguf {
-    //! ggml block formats, kept byte for byte. Each row of [`TABLE`] is one
-    //! `gguf.<type>/2` layout: its block geometry and the term its values
-    //! have, or `None` for the codebook types no term expresses.
 
     use super::*;
 
@@ -290,7 +237,6 @@ pub mod gguf {
         row("mxfp4", 32, 17, Some("g32_e2m1_e8m0_n")),
     ];
 
-    /// The row for a ggml type name.
     pub fn row_of(name: &str) -> Option<&'static Row> {
         TABLE.iter().find(|r| r.name == name)
     }
@@ -379,10 +325,6 @@ pub mod gguf {
     }
 }
 
-// =======================================================================
-// zt.zstd-seekable/1 (spec/profiles/zt.zstd-seekable-1.md)
-// =======================================================================
-
 #[cfg(feature = "zstd")]
 mod zstd_seekable {
     use std::io::Write;
@@ -390,8 +332,6 @@ mod zstd_seekable {
     use super::Encoding;
     use crate::error::{Error, Result, Rule};
 
-    /// Decoded bytes per frame. Spec: ≤ 16 MiB, all frames equal-sized
-    /// except the last.
     const CHUNK: usize = 1 << 20;
     const MAX_FRAME: u64 = 16 << 20;
     const LEVEL: i32 = 3;

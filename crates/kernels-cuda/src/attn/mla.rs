@@ -1,10 +1,3 @@
-//! `Mla`: multi-head latent attention. The latent split/absorb math, the
-//! paged latent appender, and the two attention engines — FlashInfer's mla
-//! fa2 (Hopper-class, by-value params, cooperative grid) and the naive
-//! scalar/mma kernels (Blackwell and the selected paths). Engine selection
-//! reads the arch from the context and the smem arms from the plan's device
-//! facts — none of it leaks above these entries.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -15,13 +8,10 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const BLOCK: u32 = 256;
 
-/// One block per row, warp-shuffle reduction scratch beside it.
 const fn rms(rows: u32) -> Launch {
     Launch::per_row(rows, BLOCK).smem((BLOCK / 32) * 4)
 }
 
-/// The pool facts an mla layer reads: latent pages ride `keys`, rope pages
-/// ride `values`.
 #[derive(Clone, Copy, Debug)]
 struct Layer {
     ckv_pages: u64,
@@ -48,15 +38,10 @@ impl Layer {
     }
 }
 
-/// The per-head rope width a row's width spells at a stated head count —
-/// `attn::row_heads`'s mirror (that one divides a width by the head width;
-/// this one divides by the count), kept separate because the two quotients
-/// are different quantities.
 fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Error> {
     if heads <= 0 {
         return Err(refuse(op, "the stated head count is zero"));
     }
-    // Zero is a nope-only MLA: no rotated half at all.
     let width = stated(op, q_pe.width)?;
     if width < 0 || width % heads != 0 {
         return Err(refuse(
@@ -67,7 +52,6 @@ fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Erro
     Ok(width / heads)
 }
 
-/// Splits `kv_a` into the rmsnormed compressed latent and the rope plane.
 fn split_kv_a_norm(
     ctx: &Ctx,
     op: &'static str,
@@ -106,8 +90,6 @@ fn split_kv_a_norm(
             rope.arg(),
             src_row_stride.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -130,7 +112,6 @@ pub fn latents(
     split_kv_a_norm(ctx, OP, kv_a, weight, eps, kv_c, k_pe)
 }
 
-/// [`latents`], then a partial rotation of the rope plane in place.
 #[allow(clippy::too_many_arguments)]
 pub fn latents_rope(
     ctx: &Ctx,
@@ -154,7 +135,6 @@ pub fn latents_rope(
     crate::elemwise::rope::partial_q(ctx, k_pe, positions, rope_dim, rope_dim, theta)
 }
 
-/// Splits `q_b` into per-head nope/rope planes.
 pub fn split_q_b(
     ctx: &Ctx,
     q_b: Tensor,
@@ -192,15 +172,11 @@ pub fn split_q_b(
             heads.arg(),
             nope.arg(),
             rope.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Absorbs `kv_b`'s up-projection into q: per-head strided-batched GEMM,
-/// mapping nope heads into latent space, via cuBLAS.
 pub fn absorb_q(
     ctx: &Ctx,
     q_nope: Tensor,
@@ -248,8 +224,6 @@ pub fn absorb_q(
     }
 }
 
-/// The absorb's other half: latent attention output back through `kv_b`'s
-/// value planes.
 pub fn absorb_out(
     ctx: &Ctx,
     latent: Tensor,
@@ -269,7 +243,6 @@ pub fn absorb_out(
     let tokens = count(OP, "rows", latent.rows)?;
     let handle = ctx.cublas(OP)?;
 
-    // The value planes sit past the nope planes inside kv_b.
     let wv = kv_b
         .ptr
         .wrapping_add(2 * u64::from(nope.unsigned_abs()) * u64::from(rank.unsigned_abs()));
@@ -310,7 +283,6 @@ fn cublas_refused(op: &'static str, status: i32) -> Error {
     )
 }
 
-/// The per-head strided-batched bf16 GEMM both absorbs ride.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn absorb(
@@ -372,11 +344,6 @@ unsafe fn absorb(
     }
 }
 
-/// Appends latent rows (`kv_c` beside `k_pe`) into the pool's pages.
-///
-// The op states its write geometry (`write_page`/`write_offset`), but the
-// latent writer still re-derives each token's cell from the read-side CSR
-// and the fire indptr riding in `kv_c`, so the stated pair goes unread.
 pub fn kv_append(
     ctx: &Ctx,
     kv_c: RaggedTensor,
@@ -405,10 +372,6 @@ pub fn kv_append(
     )
 }
 
-// ── the two attention engines ───────────────────────────────────────────────
-
-/// The naive scalar/mma kernels: the Blackwell path and the only engine the
-/// selected (sparse) variants have.
 mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::Arg;
@@ -478,9 +441,6 @@ mod naive {
         pub selection: u64,
     }
 
-    /// Fires the naive kernel that fits: mma when the shape supports it and
-    /// no selection is stated, scalar otherwise. A shape neither can
-    /// lane-split is refused rather than silently declined.
     pub fn fire(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), Error> {
         const MMA_THREADS: u32 = 256;
 
@@ -528,8 +488,6 @@ mod naive {
                     shape.page_size.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
-                    // Staged-geometry seat: live-rows word when a body replay armed
-                    // one, ABSENT otherwise.
                     ctx.stage(),
                 ],
             );
@@ -594,16 +552,12 @@ mod naive {
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
-                // Staged-geometry seat: live-rows word when a body replay armed
-                // one, ABSENT otherwise.
                 ctx.stage(),
             ],
         )
     }
 }
 
-/// The FlashInfer mla fa2 engine: cooperative grid, one by-value parameter
-/// block, smem arm chosen from the plan's device facts.
 mod mla_fa2 {
     use super::{Ctx, Error, Layer, refuse};
     use crate::attn::fa2_abi::{UintFastdiv, resolve};
@@ -639,9 +593,6 @@ mod mla_fa2 {
         ],
     ];
 
-    /// One `DISPATCH_SMEM_CONFIG` row. `stages`/`qk_shard` restate the
-    /// trait parameters the instantiation strings are stamped with — kept
-    /// as the record even though only `cta_tile_kv` and `smem` are read.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Arm {
         #[allow(dead_code)]
@@ -685,10 +636,6 @@ mod mla_fa2 {
         None
     }
 
-    /// `::flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16,
-    /// int32_t>`, measured at 288 bytes / align 8. Device pointers travel as
-    /// the `u64` the handles carry; the offsets are pinned by the const
-    /// asserts below.
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct MlaParams {
@@ -859,9 +806,6 @@ mod mla_fa2 {
     }
 }
 
-/// The dense-attention dispatch both plan-consuming entries share: naive on
-/// cc >= 10 (the fa2 unit's Hopper intrinsics do not lower there), else the
-/// mla fa2 arm the plan's smem facts admit.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_dense(
     ctx: &Ctx,
@@ -950,7 +894,6 @@ fn dispatch_dense(
     )
 }
 
-/// Latent attention over one token per lane; the fire indptr rides in `q`.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_decode(
     ctx: &Ctx,
@@ -973,7 +916,6 @@ pub fn attention_decode(
     )
 }
 
-/// Latent attention over ragged prefixes, causal.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_prefill(
     ctx: &Ctx,
@@ -996,9 +938,6 @@ pub fn attention_prefill(
     )
 }
 
-/// The selected (sparse) paths: always the naive engine — the fa2 unit has
-/// no selection seat — so the plan goes unread beyond its role as the op's
-/// struct value.
 #[allow(clippy::too_many_arguments)]
 fn selected(
     ctx: &Ctx,
@@ -1060,7 +999,6 @@ fn selected(
     )
 }
 
-/// Decode over the sparse selection `index.topk` produced.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_decode_selected(
     ctx: &Ctx,
@@ -1074,8 +1012,6 @@ pub fn attention_decode_selected(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // The plan is accepted for the op's seat and goes unread — the selected
-    // paths always run the naive engine (see [`selected`]).
     let _ = plan;
     selected(
         ctx,
@@ -1105,8 +1041,6 @@ pub fn attention_prefill_selected(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // As `attention_decode_selected` — the plan goes unread on the selected
-    // paths (see [`selected`]).
     let _ = plan;
     selected(
         ctx,

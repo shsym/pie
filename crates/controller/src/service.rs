@@ -1,9 +1,3 @@
-//! The tarpc `Control` server — the distributed RPC front door. Thin by
-//! design: every state-changing call funnels a command to the single-writer
-//! actor through the shared [`Handle`]; the two `watch_*` calls are a
-//! long-poll read-path bounded by `T_HANG` so a no-change watch returns as a
-//! keepalive before the client's RPC deadline.
-
 use std::io;
 
 use futures::{Stream, StreamExt, future};
@@ -21,7 +15,6 @@ use ids::{GatewayId, NodeId, WorkerId};
 
 use crate::Handle;
 
-/// tarpc server: a cheap clone of the shared [`Handle`] per request.
 #[derive(Clone)]
 struct ControlServer {
     handle: Handle,
@@ -53,9 +46,6 @@ impl Control for ControlServer {
     }
 }
 
-/// Bind the control endpoint (tcp or unix) and spawn the accept loop. The loop
-/// runs until `cancel` is triggered (by [`crate::ControllerHandle::shutdown`]) or
-/// the listener closes.
 pub(crate) async fn serve(
     listen_addr: &str,
     handle: Handle,
@@ -87,7 +77,6 @@ pub(crate) async fn serve(
     }
 }
 
-/// Serve `Control` over any tarpc transport stream (TCP or UDS).
 async fn serve_loop<T>(incoming: impl Stream<Item = io::Result<T>>, server: ControlServer)
 where
     T: tarpc::Transport<tarpc::Response<ControlResponse>, tarpc::ClientMessage<ControlRequest>>

@@ -1,38 +1,3 @@
-//! **A SCHEDULE IS CARVED AT THE CEILINGS OF THE REGION THAT LAUNCHES IT, NOT
-//! THE PREPARE REGION THAT BUILT IT** — so a plan carrying both a KV-carrying
-//! token reading and a KV-less latent reading enqueues when it is fired as the
-//! token reading alone.
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_schedule_is_carved_where_it_is_launched -- --nocapture
-//! ```
-//!
-//! A region holds ONE phase, so the `Phase::Prepare` region an
-//! `attention.plan_prefill` stands in is never the region the
-//! `attention.prefill` reading it stands in. A prepare region holds nothing
-//! but `PLANNED` ops, so `exports::regions_shifting` reads it as shifting for
-//! free — it names no kernel that could address the wrong row — while the
-//! trunk region that LAUNCHES the schedule carries a `linear.matmul`
-//! (`Reads::Nothing`) and does not shift. Carving the schedule at the
-//! builder's standing therefore named the key's whole lane ceiling to a launch
-//! `Run::ragged_q` hands the window's own one-lane boundary vector, and
-//! `kernels_cuda::attn`'s `lanes_carry` refused the pair by name:
-//!
-//! ```text
-//! `attention.prefill` would not enqueue: the fire's indptr spells 1 lanes
-//! and this schedule names 8 requests from lane 0
-//! ```
-//!
-//! It took a plan of this shape to show it. A single-reading text row splits
-//! its trunk into regions per class, and its attention regions carry only
-//! shifted ops, so builder and launcher agreed by accident. Here the token
-//! arm is one contiguous run under one mask — an embed, three projections, a
-//! kv append, the prefill, an output projection — which is one region, and
-//! that region does not shift.
-//!
-//! Skipped at run time with no device, as the other device gates are.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -50,21 +15,14 @@ use model_dsl::{
     ops, seam, trace_hybrid,
 };
 
-/// The token arm's vocabulary.
 const VOCAB: u32 = 64;
-/// One head at the smallest stamped fa2 width.
 const HEAD_DIM: u32 = 64;
 const HEADS: u32 = 1;
 const SM_SCALE: f32 = 0.125;
 const FREQ: u32 = 16;
-/// The kv row both arms of the token reading name.
 const KV_ROW: &str = "trunk.kv";
-/// The lane's rows: fewer than the bucket, so the key's lane carve is wider
-/// than the fire and the two readings of it can disagree.
 const TEXT_ROWS: u32 = 6;
 
-/// Text lanes run a paged-kv encoder (tokens in, `hidden` planted); image
-/// lanes a kv-less denoise arm (`velocity` planted). Facts: the stream bit.
 struct TokensAndLatents;
 
 impl ForwardHybrid for TokensAndLatents {
@@ -84,11 +42,6 @@ impl ForwardHybrid for TokensAndLatents {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
 
-        // ── the KV-carrying token reading ──────────────────────────────
-        // One contiguous run under one mask: embed, projections, append,
-        // prefill, output projection. `linear.matmul` reads nothing, so the
-        // region does not shift; the schedule's builder stands in its own
-        // prepare region, which does.
         let table = Weight::sym("embed", [u64::from(VOCAB), u64::from(WIDTH)], Dtype::Bf16);
         let x = ops::layout::embed(&txt.tokens(), &table, VOCAB);
         let q = ops::linear::matmul(&x, &w("txt.q", HEAD_DIM, WIDTH));
@@ -107,7 +60,6 @@ impl ForwardHybrid for TokensAndLatents {
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
         seam::at(seam::HIDDEN, &[&h]);
 
-        // ── the KV-less latent reading ─────────────────────────────────
         let x_img = img.latents(1, WIDTH, Dtype::Bf16);
         let t = img.lane_vector(0, 1);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0));
@@ -128,9 +80,6 @@ fn plan() -> Trace {
     trace_hybrid(NAME, &TokensAndLatents, Platform::Cuda)
 }
 
-/// An epilogue that puts the hidden intrinsic's rows on its reader channel.
-/// Channels: 0 latent (writer, taken but unfed as a port), 1 timestep, 2
-/// positions, 3 out (reader) — the rig's four, so the rig's lane binder serves.
 fn epilogue(rows: u32, width: u32) -> TraceContainer {
     let decl = |shape: Shape, host_role: HostRole| ChannelDecl {
         shape,
@@ -172,14 +121,6 @@ fn the_token_reading_fires_alone() {
     }
     let plan = plan();
     let weights = Weights::random(&plan, 41);
-    // Buckets well above the fire's rows: the key's lane carve is then wider
-    // than the one lane this fire brings, which is the whole point. And the
-    // arming pass is given nothing to spend, so no body is armed at load and
-    // this fire captures its own — which is the only state in which a launch
-    // resolves its own boundary vector rather than replaying a baked one, and
-    // therefore the only state in which the two readings can be seen to
-    // disagree. (It is also the state a flagship is in: its arming pass
-    // cannot synthesize a reading fed from a channel, so it arms nothing.)
     let mut rig = Rig::load_recording(
         plan,
         &weights,
@@ -199,19 +140,13 @@ fn the_token_reading_fires_alone() {
         .collect();
     rig.publish(handles.instance, 0, &cell);
 
-    // THE FIRE. One text lane, alone: the token reading over the trunk, with
-    // the latent reading's arm present in the same plan and firing nothing.
     let mut text = lane(0, &handles, LaneStream::Text, 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
-    // The token arm reads no float port: it takes its rows off the embed.
     text.ports.clear();
 
     let mut ticket = rig
         .engine
         .submit(&frame(vec![text], vec![attach(0, &handles)]))
-        // THE CLAIM. Before the carve followed the launcher, this refused with
-        // "`attention.prefill` would not enqueue: the fire's indptr spells 1
-        // lanes and this schedule names 8 requests from lane 0".
         .expect("a plan whose token reading carries kv fires that reading alone");
     rig.engine
         .settle_frame(&mut ticket)

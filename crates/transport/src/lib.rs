@@ -1,9 +1,3 @@
-//! `transport`: the worker-to-worker P2P KV-tensor data plane. A controller pairs worker A with worker B and steps out; from that moment KV tensors flow P2P A<->B, bypassing the controller. This crate owns that movement and nothing else — it never makes policy.
-//!
-//! `core/` is the backend-agnostic interface (register -> send/recv -> poll); `backends/local` does same-node device-to-device copy, `backends/nixl` (behind `feature = "nixl"`) cross-node RDMA/TCP/NVMe; `registry/` binds an engine-exported handle to a transfer backend and dispatches. Backends are asymmetric: cuda/rocm cross-node use NIXL, co-located peers use `local`, metal/vulkan never participate (single-node).
-//!
-//! The engine pins its KV buffers and exports a [`engine::KvHandle`]; transport consumes it without owning or interpreting the bytes, and never imports the engine. Transfers are async — transport exposes the start and a completion signal ([`Completion`]); when to await is the scheduler's job.
-
 pub mod backends;
 pub mod core;
 pub mod error;
@@ -18,7 +12,6 @@ pub use backends::nixl::NixlBackend;
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-// A cache row's element type is the model's: `transport::Dtype` is that type.
 pub use engine::{KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 pub use dtype::Dtype;
 
@@ -40,7 +33,6 @@ mod tests {
         }
     }
 
-    /// A handle with one region big enough for `n_pages`, based at `base`.
     fn handle(base: u64, n_pages: u64) -> KvHandle {
         let l = layout();
         KvHandle {
@@ -76,8 +68,6 @@ mod tests {
         }
     }
 
-    /// Records every D2D copy the local backend issues. Cloning shares the log,
-    /// so a test can inspect calls after the copier is moved into the registry.
     #[derive(Clone, Default)]
     struct FakeCopier {
         calls: Arc<Mutex<Vec<(u64, u64, u64)>>>,
@@ -87,6 +77,14 @@ mod tests {
             self.calls.lock().unwrap().push((src_addr, dst_addr, len));
             Ok(())
         }
+    }
+
+    fn lib_every_case() {
+        local_recv_acknowledges_colocated_peer();
+        local_mapped_send_copies_distinct_pages_across_all_regions();
+        send_to_unregistered_peer_is_unknown_peer();
+        routing_to_unbuilt_backend_is_unsupported();
+        local_backend_has_no_connect_metadata();
     }
 
     #[test]
@@ -104,7 +102,6 @@ mod tests {
         assert_eq!(reg.poll(id).unwrap(), Completion::Done);
     }
 
-    #[test]
     fn local_mapped_send_copies_distinct_pages_across_all_regions() {
         let copier = FakeCopier::default();
         let calls = copier.calls.clone();
@@ -132,7 +129,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn send_to_unregistered_peer_is_unknown_peer() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
         let prefill = reg
@@ -144,9 +140,6 @@ mod tests {
         assert!(matches!(err, TransportError::UnknownPeer { worker: 99 }));
     }
 
-    /// A handle tagged for a backend that isn't built (nixl off) routes to an
-    /// `Unsupported` error rather than panicking.
-    #[test]
     fn routing_to_unbuilt_backend_is_unsupported() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
         let nixl_handle = RegisteredHandle {
@@ -160,9 +153,6 @@ mod tests {
         assert!(matches!(err, TransportError::Unsupported(_)));
     }
 
-    /// The local backend has no connect-metadata: `connect` is a no-op and
-    /// `local_metadata` is empty.
-    #[test]
     fn local_backend_has_no_connect_metadata() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
         let peer = PeerConn {

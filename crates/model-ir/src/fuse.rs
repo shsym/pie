@@ -1,23 +1,12 @@
-//! Peepholes over a traced forward: two adjacent nodes become the one
-//! launch that lands both. Every value and every reader survives, so a
-//! fused trace checks and compiles as the traced one did.
-
 use crate::ops::elemwise::{NormKind, PostNorm};
 use crate::operands::Operands;
 use crate::ops::{Attention, Elementwise, Layout, Linear, Operation};
 use crate::trace::{Node, Trace};
 use crate::value::{Def, ValueDecl, ValueId};
 
-/// `residual_add` followed by the `rmsnorm` that reads its result, under
-/// the same guard, becomes `residual_add_rmsnorm`. The pair may straddle a
-/// layer boundary (a block's last fold and the next block's first norm);
-/// the fused node keeps the norm's layer, since that is the weight it
-/// reads.
 #[must_use]
 pub fn residual_norm(mut trace: Trace) -> Trace {
     let mut nodes = Vec::with_capacity(trace.nodes.len());
-    // Where each traced node lands: a value's `Def::Op` names its node by
-    // index, and a fused pair's second node lands on the first's.
     let mut landed = Vec::with_capacity(trace.nodes.len());
     let mut rest = trace.nodes.into_iter().peekable();
     while let Some(node) = rest.next() {
@@ -75,19 +64,6 @@ fn pair(add: &Node, norm: &Node) -> Option<Node> {
     })
 }
 
-/// The chains that run between a block's projection and the next block,
-/// each folded into one node, after [`residual_norm`] has had its turn:
-///
-/// - `rmsnorm` → `residual_add` [→ `scale`] [→ `rmsnorm`/`rmsnorm_plus_one`]
-///   and `rmsnorm` → `residual_add_rmsnorm` become
-///   [`Elementwise::RmsnormResidualAdd`];
-/// - `embed` → `mul_scalar` → `residual_add` → `mul_scalar` (a per-layer
-///   input joining its stream) becomes [`Elementwise::EmbedScaleAdd`].
-///
-/// Every value of the traced nodes is still produced by the fused node, so
-/// readers elsewhere in the trace are untouched; only the in-place fold keeps
-/// its alias, since an alias may name only an input of its node. The fused
-/// node keeps the LAST node's layer — the latest weight it reads.
 #[must_use]
 pub fn residual_chains(mut trace: Trace) -> Trace {
     let mut nodes = Vec::with_capacity(trace.nodes.len());
@@ -104,15 +80,12 @@ pub fn residual_chains(mut trace: Trace) -> Trace {
             continue;
         }
         if let Some((fused, before, took)) = embed_chain(&old[i..]) {
-            // The select emitted ahead keeps its own landing; every other
-            // node of the chain lands on the fused one.
             let ahead = before.is_some();
             if let Some(before) = before {
                 nodes.push(before);
             }
             let at = nodes.len() as u32;
             for k in 0..took {
-                // Traced order: embed, scale, [select], fold, scale.
                 landed.push(if ahead && k == 2 { at - 1 } else { at });
             }
             nodes.push(fused);
@@ -132,11 +105,7 @@ pub fn residual_chains(mut trace: Trace) -> Trace {
     trace
 }
 
-/// `rmsnorm(x) -> t`, then the fold that reads `t`, then what the fold's
-/// row feeds. Answers the fused node and how many traced nodes it covers.
 fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node, usize)> {
-    /// The widest row the fused launch seats (`rmsnorm_residual_add`'s
-    /// register budget: 256 threads at 32 elements each).
     const WIDEST: u64 = 256 * 32;
     let [first, second, ..] = rest else {
         return None;
@@ -147,8 +116,6 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
     if first.guard != second.guard {
         return None;
     }
-    // A row the launch cannot seat stays as traced; a row of unknown width
-    // (no declaration, or a symbolic last dim) too.
     let width = values.get(t.0 as usize).and_then(|decl| match &decl.ty {
         crate::value::Ty::Tensor { shape, .. } => match shape.last() {
             Some(crate::value::Dim::Const(width)) => Some(*width),
@@ -161,7 +128,6 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
     }
     let (x, weight, eps, t) = (*x, *weight, *eps, *t);
     match &second.op {
-        // `t` folded and normed at once: the pair `residual_norm` wrote.
         Operation::Elementwise(Elementwise::ResidualAddRmsnorm {
             x: folded,
             y,
@@ -197,7 +163,6 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
             let mut took = 2;
             let mut layer = second.layer;
             let mut row = y_out;
-            // An optional scale of the folded row by a device-held scalar.
             let scale = match rest.get(took) {
                 Some(node) if node.guard == second.guard => match &node.op {
                     Operation::Elementwise(Elementwise::Scale { s, x: scaled_x, x_out })
@@ -212,7 +177,6 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
                 },
                 _ => None,
             };
-            // An optional norm of what the chain produced.
             let post = match rest.get(took) {
                 Some(node) if node.guard == second.guard => match &node.op {
                     Operation::Elementwise(Elementwise::Rmsnorm { x: normed, weight, eps, y })
@@ -268,12 +232,6 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
     }
 }
 
-/// `embed -> e`, `e *= a`, `y += e`, `y *= b`: four nodes, one gather. The
-/// `select` that produces `y` (a layer's slice of the stacked per-layer
-/// table) may sit between the scale and the fold; it reads nothing the
-/// chain writes, so it is emitted ahead of the fused node. Answers the
-/// fused node, the node to emit before it, and how many traced nodes the
-/// two cover.
 fn embed_chain(rest: &[Node]) -> Option<(Node, Option<Node>, usize)> {
     let (embed, scale_e, fold, scale_y, between) = match rest {
         [embed, scale_e, between, fold, scale_y, ..]
@@ -318,8 +276,6 @@ fn embed_chain(rest: &[Node]) -> Option<(Node, Option<Node>, usize)> {
     if !same_guard || *scaled_x != *e || *folded != *e_scaled || *scaled_y != *y_out {
         return None;
     }
-    // The slice between must be the fold's own residual, or the reorder
-    // would move a read across a write.
     if let Some(between) = between {
         let Operation::Layout(Layout::Select { y: sliced, .. }) = &between.op else {
             return None;
@@ -350,33 +306,16 @@ fn embed_chain(rest: &[Node]) -> Option<(Node, Option<Node>, usize)> {
     ))
 }
 
-/// The GEMM epilogues: a projection and the one pass over its result the
-/// trace runs next, folded into one node so a backend can finish the product
-/// in registers instead of re-reading it:
-///
-/// - `matmul` → `mlp_geglu_tanh_packed` over its output becomes
-///   [`Linear::MatmulGeglu`], when nothing else reads the packed output
-///   (the fused node still owns that value; a backend that lands `y` off the
-///   accumulator leaves it unwritten);
-/// - `lm_head` → `logit_softcap` over its logits becomes
-///   [`Linear::LmHeadSoftcap`], when nothing else reads the raw logits.
-///
-/// Same landing bookkeeping as [`residual_chains`]; run after it.
 #[must_use]
 pub fn gemm_epilogues(trace: Trace) -> Trace {
     fold_pairs(trace, epilogue_pair)
 }
 
-/// The KV-sharing layers' q path: `rmsnorm_per_head` then the
-/// `rope_partial_q` over its result, under one guard, with nothing else
-/// reading the normed value, becomes [`Elementwise::RmsnormRopePartialQ`]
-/// (`q_out` keeps the rope's in-place alias). Run after [`gemm_epilogues`].
 #[must_use]
 pub fn q_norm_rope(trace: Trace) -> Trace {
     fold_pairs(trace, q_pair)
 }
 
-/// Nodes `i` and `i + 1` as one fused q-path node, if they are the pair.
 fn q_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
     let (first, second) = (&nodes[i], &nodes[i + 1]);
     if first.guard != second.guard {
@@ -422,17 +361,11 @@ fn q_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
     })
 }
 
-/// A `select` and the [`Elementwise::EmbedScaleAdd`] that folds the copied
-/// slice, adjacent under one guard with nothing else reading the copy,
-/// become [`Elementwise::EmbedScaleAddSelect`]: the residual is read off
-/// the stacked table in place. Run after [`residual_chains`], which emits
-/// the select ahead of the fused fold.
 #[must_use]
 pub fn embed_select(trace: Trace) -> Trace {
     fold_pairs(trace, embed_select_pair)
 }
 
-/// Nodes `i` and `i + 1` as one select-folded embed node, if they are the pair.
 fn embed_select_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
     let (first, second) = (&nodes[i], &nodes[i + 1]);
     if first.guard != second.guard {
@@ -484,8 +417,6 @@ fn embed_select_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<N
     })
 }
 
-/// Every adjacent pair `pair` folds, folded, with the same landing
-/// bookkeeping as [`residual_chains`].
 fn fold_pairs(mut trace: Trace, pair: fn(&[Node], usize, &[ValueDecl]) -> Option<Node>) -> Trace {
     let old = trace.nodes;
     let mut nodes = Vec::with_capacity(old.len());
@@ -514,20 +445,6 @@ fn fold_pairs(mut trace: Trace, pair: fn(&[Node], usize, &[ValueDecl]) -> Option
     trace
 }
 
-/// The adaLN chains of a generative block (D6), each folded into one node:
-///
-/// - `gated_residual_add` → a scale-free norm of the folded row →
-///   `modulate` of the normed row, all under one guard and one `lane_of_row`,
-///   becomes [`Elementwise::GatedResidualNormModulate`] (three nodes, one
-///   launch, the deferred-residual form the FLUX.2 / LTX references run);
-/// - `layernorm_no_scale` / `rmsnorm_no_scale` → `modulate` of the normed
-///   row becomes [`Elementwise::NormModulate`].
-///
-/// The longer chain is tried first at every node, so a triple never lands
-/// as a fold and a pair. Every value of the traced nodes is still produced
-/// by the fused node (the normed row is written as its own launch would
-/// write it), so readers elsewhere in the trace are untouched; only the fold
-/// keeps its alias. The fused node keeps the LAST node's layer.
 #[must_use]
 pub fn modulation(mut trace: Trace) -> Trace {
     let mut nodes = Vec::with_capacity(trace.nodes.len());
@@ -555,7 +472,6 @@ pub fn modulation(mut trace: Trace) -> Trace {
     trace
 }
 
-/// A scale-free norm node as `(x, kind, normed)`, or `None` for anything else.
 fn scale_free_norm(node: &Node) -> Option<(ValueId, NormKind, ValueId)> {
     match &node.op {
         Operation::Elementwise(Elementwise::LayernormNoScale { x, eps, y }) => {
@@ -578,7 +494,6 @@ fn scale_free_norm(node: &Node) -> Option<(ValueId, NormKind, ValueId)> {
     }
 }
 
-/// `norm(x) -> normed`, then `modulate(normed, m)`: two nodes, one launch.
 fn norm_modulate(rest: &[Node]) -> Option<(Node, usize)> {
     let [first, second, ..] = rest else {
         return None;
@@ -618,8 +533,6 @@ fn norm_modulate(rest: &[Node]) -> Option<(Node, usize)> {
     ))
 }
 
-/// `r += g·y -> r_out`, `norm(r_out) -> normed`, `modulate(normed, m)`:
-/// three nodes, one launch, two outputs a reader wants.
 fn gated_chain(rest: &[Node]) -> Option<(Node, usize)> {
     let [fold, norm_node, modulate, ..] = rest else {
         return None;
@@ -651,9 +564,6 @@ fn gated_chain(rest: &[Node]) -> Option<(Node, usize)> {
     else {
         return None;
     };
-    // One lane map serves the gate and the modulation, or neither has one:
-    // a per-lane gate under a per-token modulation is two broadcasts, and
-    // the fused launch reads one.
     if *modulated != normed || modulate_lanes != lane_of_row {
         return None;
     }
@@ -678,7 +588,6 @@ fn gated_chain(rest: &[Node]) -> Option<(Node, usize)> {
     ))
 }
 
-/// Nodes `i` and `i + 1` as one epilogue-fused node, if they are a pair.
 fn epilogue_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node> {
     let (first, second) = (&nodes[i], &nodes[i + 1]);
     if first.guard != second.guard {
@@ -721,7 +630,6 @@ fn epilogue_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node>
     }
 }
 
-/// Whether any node but the pair at `i` reads `value`, or a merge names it.
 fn read_elsewhere(nodes: &[Node], values: &[ValueDecl], value: ValueId, i: usize) -> bool {
     let mut ins = Vec::new();
     for (j, node) in nodes.iter().enumerate() {
@@ -783,6 +691,25 @@ mod tests {
         }
     }
 
+    fn fuse_every_case() {
+        the_add_and_the_norm_that_reads_it_become_one_node();
+        a_value_defined_past_the_pair_still_names_its_node();
+        a_row_wider_than_the_launch_seats_stays_as_traced();
+        norm_add_scale_norm_becomes_one_node_and_keeps_every_value();
+        a_norm_before_the_pair_residual_norm_wrote_joins_it();
+        a_norm_whose_fold_reads_something_else_stays_apart();
+        the_per_layer_input_gather_and_its_fold_become_one_node();
+        a_select_between_the_scale_and_the_fold_moves_ahead_of_the_gather();
+        a_norm_of_something_else_stays_apart_and_a_layer_boundary_does_not();
+        a_matmul_and_the_geglu_over_it_fold_unless_the_packed_output_has_another_reader();
+        a_per_head_norm_and_the_q_rope_over_it_fold();
+        a_select_and_the_embed_fold_over_its_copy_fold_unless_the_copy_is_read_again();
+        an_lm_head_and_the_softcap_over_it_fold_and_keep_the_alias();
+        a_scale_free_norm_and_the_modulate_over_it_become_one_node();
+        the_gated_fold_its_norm_and_the_modulate_become_one_two_output_node();
+        a_gate_per_lane_under_a_modulate_per_token_stays_apart();
+    }
+
     #[test]
     fn the_add_and_the_norm_that_reads_it_become_one_node() {
         let fused = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(3), Some(0))]));
@@ -798,7 +725,6 @@ mod tests {
         ));
     }
 
-    #[test]
     fn a_value_defined_past_the_pair_still_names_its_node() {
         use crate::value::{Ty, ValueDecl};
         let mut trace =
@@ -826,7 +752,6 @@ mod tests {
         }
     }
 
-    /// Row-shaped decls for values `0..n`, `width` wide, all from node 0.
     fn rows(n: u32, width: u64) -> Vec<crate::value::ValueDecl> {
         use crate::value::{Dim, Ty, ValueDecl};
         (0..n)
@@ -840,7 +765,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
     fn a_row_wider_than_the_launch_seats_stays_as_traced() {
         let mut trace = trace_of(vec![node(rms(10, 1, 11), Some(0)), node(add(3), Some(0))]);
         trace.values = rows(16, 16384);
@@ -856,9 +780,7 @@ mod tests {
         assert_eq!(residual_chains(chain).nodes.len(), 2);
     }
 
-    #[test]
     fn norm_add_scale_norm_becomes_one_node_and_keeps_every_value() {
-        // rmsnorm(10) -> 11; 12 += 11 -> 13; 13 * s(20) -> 14; rmsnorm(14) -> 15
         let mut trace = trace_of(vec![
             node(rms(10, 1, 11), Some(3)),
             node(
@@ -902,7 +824,6 @@ mod tests {
         assert_eq!(outs, vec![ValueId(11), ValueId(13), ValueId(14), ValueId(15)]);
     }
 
-    #[test]
     fn a_norm_before_the_pair_residual_norm_wrote_joins_it() {
         let mut trace = residual_norm(trace_of(vec![
             node(rms(10, 1, 1), Some(0)),
@@ -924,14 +845,12 @@ mod tests {
         ));
     }
 
-    #[test]
     fn a_norm_whose_fold_reads_something_else_stays_apart() {
         let mut trace = trace_of(vec![node(rms(10, 1, 11), Some(0)), node(add(3), Some(0))]);
         trace.values = rows(12, 2560);
         assert_eq!(residual_chains(trace).nodes.len(), 2);
     }
 
-    #[test]
     fn the_per_layer_input_gather_and_its_fold_become_one_node() {
         let trace = trace_of(vec![
             Node {
@@ -984,7 +903,6 @@ mod tests {
         ));
     }
 
-    #[test]
     fn a_select_between_the_scale_and_the_fold_moves_ahead_of_the_gather() {
         use crate::value::{Ty, ValueDecl};
         let mut trace = trace_of(vec![
@@ -1040,7 +958,6 @@ mod tests {
                 dtype: dtype::Dtype::Bf16,
             },
         };
-        // value 4 is the select's (node 2); the rest belong to the chain.
         trace.values = vec![decl(0), decl(0), decl(0), decl(1), decl(2), decl(3), decl(4)];
         let fused = residual_chains(trace);
         assert_eq!(fused.nodes.len(), 2);
@@ -1051,7 +968,6 @@ mod tests {
         assert!(matches!(fused.values[2].def, Def::Op(1)));
     }
 
-    #[test]
     fn a_norm_of_something_else_stays_apart_and_a_layer_boundary_does_not() {
         let other = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(9), Some(0))]));
         assert_eq!(other.nodes.len(), 2);
@@ -1083,10 +999,6 @@ mod tests {
         }
     }
 
-    /// `matmul` then the packed geglu over its output fold into one node
-    /// that owns both values; a third reader of the packed output keeps the
-    /// pair apart, since the fused node may leave that value unwritten.
-    #[test]
     fn a_matmul_and_the_geglu_over_it_fold_unless_the_packed_output_has_another_reader() {
         let fused = gemm_epilogues(trace_of(vec![matmul(0, 1, 2), geglu(2, 3)]));
         assert_eq!(fused.nodes.len(), 1);
@@ -1126,10 +1038,6 @@ mod tests {
         );
     }
 
-    /// `rmsnorm_per_head` then the q-only partial rope over it fold into
-    /// one node keeping the rope's alias; a mismatched head width keeps
-    /// them apart.
-    #[test]
     fn a_per_head_norm_and_the_q_rope_over_it_fold() {
         let norm = |y: u32| Node {
             op: Operation::Elementwise(Elementwise::RmsnormPerHead {
@@ -1173,9 +1081,6 @@ mod tests {
         );
     }
 
-    /// A select and the embed fold over its copy become one node reading
-    /// the stacked table in place; a second reader of the copy keeps them.
-    #[test]
     fn a_select_and_the_embed_fold_over_its_copy_fold_unless_the_copy_is_read_again() {
         let select = Node {
             op: Operation::Layout(Layout::Select {
@@ -1240,9 +1145,6 @@ mod tests {
         );
     }
 
-    /// `lm_head` then the softcap over its logits fold into one node whose
-    /// `y_out` aliases `y`, as the softcap's `x_out` aliased `x`.
-    #[test]
     fn an_lm_head_and_the_softcap_over_it_fold_and_keep_the_alias() {
         let head = Node {
             op: Operation::Linear(Linear::LmHead {
@@ -1303,7 +1205,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn a_scale_free_norm_and_the_modulate_over_it_become_one_node() {
         let fused = modulation(trace_of(vec![
             node(ln(1, 2), Some(0)),
@@ -1322,8 +1223,6 @@ mod tests {
                 ..
             })
         ));
-        // The same pair over an rmsnorm, and a modulate of something else
-        // stays apart.
         let rms = Elementwise::RmsnormNoScale {
             x: ValueId(1),
             head_dim: 8,
@@ -1349,7 +1248,6 @@ mod tests {
         assert_eq!(apart.nodes.len(), 2);
     }
 
-    #[test]
     fn the_gated_fold_its_norm_and_the_modulate_become_one_two_output_node() {
         let mut trace = trace_of(vec![
             node(gated_add(1, 2, 3, Some(4), 5), Some(0)),
@@ -1383,22 +1281,18 @@ mod tests {
         let mut pairs = Vec::new();
         fused.nodes[0].op.aliases(&mut pairs);
         assert_eq!(pairs, vec![(ValueId(5), ValueId(1))], "only the fold is in place");
-        // Every value the chain defined now names the fused node; the one
-        // past it moved up.
         for value in [5usize, 6, 8] {
             assert!(matches!(fused.values[value].def, Def::Op(0)));
         }
         assert!(matches!(fused.values[9].def, Def::Op(1)));
     }
 
-    #[test]
     fn a_gate_per_lane_under_a_modulate_per_token_stays_apart() {
         let fused = modulation(trace_of(vec![
             node(gated_add(1, 2, 3, Some(4), 5), Some(0)),
             node(ln(5, 6), Some(0)),
             node(modulate(6, 7, None, 8), Some(0)),
         ]));
-        // The triple refuses, and the pair behind it still folds.
         assert_eq!(fused.nodes.len(), 2);
         assert!(matches!(
             fused.nodes[0].op,

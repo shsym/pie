@@ -1,42 +1,4 @@
-// **THE SKINNY bf16 PROJECTION WITH ITS EPILOGUE FOLDED IN**: `y = act x
-// w^T` for a few activation rows (m <= 64) against a big weight — the decode
-// GEMM — finished in registers by what the trace would otherwise run as a
-// second pass over the result.
-//
-// The kernel itself is a weight-streaming tensor-core GEMM that runs the
-// decode shapes at the same rate cuBLAS does (the card's ~700 GB/s; see
-// `linear/dense.rs`'s tuner, which it does NOT enter). Its point is the
-// epilogue: the traced `mlp_geglu_tanh_packed` re-read the up/gate output
-// (64 x 20480 bf16) and the traced `logit_softcap` re-read the logits
-// (64 x 262144), ~0.3 ms a step at 64 lanes on gemma-4-E4B, and both are a
-// few flops on values the GEMM already holds.
-//
-//   - one block owns `kWarps * 16` rows of `w` and ALL 64 activation rows
-//     (rows past `m` are zeros in shared memory and never stored);
-//   - each stage is a `kBK`-wide contraction step, the block's weight rows
-//     and the 64 activation rows for that k range `cp.async`ed into a
-//     `kStages`-deep ring;
-//   - each warp holds its 16 weight rows as the mma A fragment and walks
-//     the eight 8-row activation subtiles as B;
-//   - the accumulator is staged through shared memory as `[act row][weight
-//     col]` and drained as whole 128-byte rows, the epilogue applied on
-//     the way.
-//
-// Epilogues (`kEpilogue`):
-//   0  store:   `y[m][n]`, the plain projection;
-//   1  softcap: `y = cap * tanh(y / cap)`, the head's `logit_softcap`, on
-//               the bf16-rounded product exactly as the traced pass saw it;
-//   2  geglu:   `w` is the packed `[2I x k]` up/gate weight, `n = I`, and a
-//               block owns `kWarps * 8` GATE rows and their `kWarps * 8` UP
-//               rows (`I` rows apart), so `y[m][I] = gelu_tanh(gate) * up`
-//               is a whole-row product in the epilogue, again off the bf16
-//               rounded halves so it lands what `mlp_geglu_tanh_packed`
-//               lands.
-//
-// Layouts: `w` row-major `[n][k]` (`[2I][k]` for geglu), `act` row-major
-// `[m][k]`, `y` row-major `[m][n]`, bf16 throughout, f32 accumulation.
-// Preconditions the wrapper enforces: `1 <= m <= 64`, `n` a whole number of
-// the block's output columns, `k % kBK == 0`, 16-byte aligned pointers.
+
 #pragma once
 
 #include "prelude/device.cuh"
@@ -47,22 +9,13 @@
 
 namespace pie::linear {
 
-/// Activation rows a block covers; the mma B extent times eight.
 constexpr int kSkinnyM = 64;
 
-/// The staged row stride for a `kBK`-wide step, in bf16: eight elements of
-/// padding so the eight addresses of one `ldmatrix` land in eight different
-/// bank segments (see `kTiledLdA` in `linear/tiled.cuh`).
 template <int kBK>
 __host__ __device__ constexpr int skinny_ld() {
     return kBK + 8;
 }
 
-/// `ldmatrix.x4` over a row-major 16x16 bf16 tile: lane `l` addresses row
-/// `l & 15`, column `(l >> 4) * 8`; the four registers come back as the
-/// (rows 0-7, k 0-7), (rows 8-15, k 0-7), (rows 0-7, k 8-15), (rows 8-15,
-/// k 8-15) 8x8 tiles — the mma A fragment, and, read off the activation
-/// tile, the B fragments of two 8-row subtiles as {r0, r2} and {r1, r3}.
 __device__ __forceinline__ void skinny_ldmatrix_x4(unsigned (&reg)[4], const bf16* at) {
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -70,8 +23,6 @@ __device__ __forceinline__ void skinny_ldmatrix_x4(unsigned (&reg)[4], const bf1
                  : "r"(addr));
 }
 
-/// An L2 policy: keep (the activation tile every block re-reads) or stream
-/// (the weight, read once).
 __device__ __forceinline__ unsigned long long skinny_policy(bool keep) {
     unsigned long long policy;
     if (keep) {
@@ -82,8 +33,6 @@ __device__ __forceinline__ unsigned long long skinny_policy(bool keep) {
     return policy;
 }
 
-/// One 16-byte `cp.async` under an L2 policy; grouped by the same
-/// `__pipeline_commit` / `__pipeline_wait_prior` as the intrinsic form.
 __device__ __forceinline__ void skinny_cp_async16(void* dst, const void* src, unsigned long long policy) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
@@ -92,12 +41,10 @@ __device__ __forceinline__ void skinny_cp_async16(void* dst, const void* src, un
                  : "memory");
 }
 
-/// Round through bf16: the value the traced second pass would have read.
 __device__ __forceinline__ float skinny_round(float v) {
     return Elem<bf16>::to_f32(Elem<bf16>::from_f32(v));
 }
 
-/// `gelu_tanh(g) * u`, the arithmetic of `mlp_geglu_tanh_packed` verbatim.
 __device__ __forceinline__ float skinny_geglu(float g, float u) {
     constexpr float kAlpha = 0.7978845608028654f;
     constexpr float kBeta = 0.044715f;
@@ -121,13 +68,13 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     constexpr int kSkinnyLd = skinny_ld<kBK>();
     static_assert(kBK % 64 == 0, "a step is whole 128-byte row pieces");
     static_assert(!kGeglu || kWarps % 2 == 0, "geglu halves the block's rows between gate and up");
-    /// Weight rows a block owns: one mma A tile per warp.
+
     constexpr int kN = kWarps * 16;
-    /// Output columns a block lands: every weight row, or the gate half's.
+
     constexpr int kCols = kGeglu ? kN / 2 : kN;
-    /// Activation subtiles of eight rows: the mma B extent.
+
     constexpr int kNSubs = kSkinnyM / 8;
-    /// k16 steps in one stage.
+
     constexpr int kQuad = kBK / 16;
     constexpr int kWStage = kN * kSkinnyLd;
     constexpr int kAStage = kSkinnyM * kSkinnyLd;
@@ -135,7 +82,7 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     constexpr int kChunksPerRow = kBK / 8;
     constexpr int kWChunks = kN * kChunksPerRow;
     constexpr int kAChunks = kSkinnyM * kChunksPerRow;
-    /// The epilogue tile's row stride, padded like the staging rows.
+
     constexpr int kLdC = kN + 8;
     static_assert(kStages >= 2, "one stage in flight while one is multiplied, at least");
     static_assert(kWChunks % kThreads == 0 && kAChunks % kThreads == 0,
@@ -147,15 +94,12 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    /// The block's first output column.
+
     const int n0 = static_cast<int>(blockIdx.x) * kCols;
 
     extern __shared__ __align__(16) unsigned char skinny_smem[];
     bf16* ring = reinterpret_cast<bf16*>(skinny_smem);
 
-    // **ACTIVATION ROWS PAST `m` ARE ZEROS, WRITTEN ONCE.** cp.async never
-    // touches such a row, so zeroing the ring is the whole edge handling;
-    // a full tile skips it.
     if (m < kSkinnyM) {
         u32* z = reinterpret_cast<u32*>(skinny_smem);
         constexpr int kWords = kStages * kStageElems / 2;
@@ -163,8 +107,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
         __syncthreads();
     }
 
-    // Which weight row the block's staged row `r` is: its own run, or for
-    // geglu the gate run then the up run `n` (= I) rows further on.
     auto weight_row = [&](int r) -> int {
         if constexpr (kGeglu) {
             return r < kCols ? n0 + r : n + n0 + (r - kCols);
@@ -173,14 +115,9 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
         }
     };
 
-    // The weight streams through L2 once; the activation tile is what
-    // every block re-reads, so it is the one to keep resident.
     const unsigned long long stream_policy = skinny_policy(false);
     const unsigned long long keep_policy = skinny_policy(true);
 
-    // One stage: the block's weight rows and the live activation rows for
-    // the k range, 16 bytes a chunk, eight adjacent threads per row so a
-    // warp's fetch is four contiguous row pieces.
     auto stage = [&](int buf, int k0) {
         bf16* wdst = ring + buf * kStageElems;
         bf16* adst = wdst + kWStage;
@@ -218,8 +155,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
         for (int i = 0; i < 4; ++i) acc[s][i] = 0.f;
     }
 
-    // The prologue is `kStages - 1` groups, real or empty, so every
-    // iteration's `wait_prior(kStages - 1)` means the same thing.
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) {
         if (s < steps) {
@@ -233,8 +168,7 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
     const int a_col = (lane >> 4) << 3;
 
     for (int step = 0; step < steps; ++step) {
-        // Refill the buffer the previous iteration finished with (the
-        // trailing barrier below is what makes that safe).
+
         const int fetch = step + kStages - 1;
         if (fetch < steps) {
             stage(fetch % kStages, fetch * kBK);
@@ -263,11 +197,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
         __syncthreads();
     }
 
-    // **THE EPILOGUE GOES THROUGH SHARED MEMORY.** The accumulator's lane
-    // map puts one lane's four values on two weight rows (`g`, `g + 8`) and
-    // two adjacent activation rows (`2t`, `2t + 1`): scattered as direct
-    // stores, whole rows once staged as `[act row][weight col]`. Staged
-    // already rounded to bf16 — the value the traced second pass read.
     __pipeline_wait_prior(0);
     __syncthreads();
     bf16* c_tile = ring;
@@ -331,4 +260,4 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_bf16_kernel(
 #endif
 }
 
-}  // namespace pie::linear
+}

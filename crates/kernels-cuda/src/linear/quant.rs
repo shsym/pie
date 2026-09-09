@@ -1,5 +1,3 @@
-//! Dtype casts and the weight quantizers the loader drives.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -14,11 +12,8 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
-/// Scratch key for the decoded bf16 `[n, k]` tile the prefill arm projects
-/// through; grown to the widest projection requested, never shrunk.
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 
-/// One block per row, sized to the row in whole warps.
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;
 
@@ -32,7 +27,6 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     )
 }
 
-/// A 32-bit launch extent; refused rather than truncated.
 fn extent(op: &'static str, n: u64) -> Result<u32, Error> {
     u32::try_from(n).map_err(|_| {
         refuse(
@@ -42,23 +36,15 @@ fn extent(op: &'static str, n: u64) -> Result<u32, Error> {
     })
 }
 
-/// The offset arm: declared by the caller, checked against the bound planes
-/// rather than inferred (a `Post` bias plane and a `PreReal` zero plane are
-/// the same byte rectangle, so only the caller knows which is which).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OffsetKind {
-    /// `s·c + b`, `b` a factor-dtype real per group (value-domain offset).
     Post,
-    /// `s·(c − z)`, `z` an unsigned code-domain integer per group (GPTQ/AWQ).
     PreInt,
-    /// `s·(c − z)`, `z` a factor-dtype real per group (HQQ).
     PreReal,
-    /// `s·(c − 2^(bits−1))`, no offset plane (excess-binary symmetric rows).
     PreConst,
 }
 
 impl OffsetKind {
-    /// The `kOffset` constant this arm is stamped as.
     const fn axis(self) -> &'static str {
         match self {
             Self::Post => "::pie::linear::kOffPost",
@@ -68,7 +54,6 @@ impl OffsetKind {
         }
     }
 
-    /// The arm's name in a refusal, in the algebra's own words.
     const fn spelling(self) -> &'static str {
         match self {
             Self::Post => "a post-offset arm (`s·c + b`)",
@@ -79,10 +64,6 @@ impl OffsetKind {
     }
 }
 
-/// `linear.matmul` over a weight stored as codes plus a per-group factor
-/// plane. The caller states the offset arm and the scales dtype (the scales
-/// plane binds as raw `U8` bytes, so its dtype can't be read back out); the
-/// bit width and group size are inferred from the codes/factor row widths.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul(
     ctx: &Ctx,
@@ -109,7 +90,6 @@ pub fn matmul(
     )
 }
 
-/// [`matmul`] under the head's own op name, `linear::gemm`'s pairing kept.
 #[allow(clippy::too_many_arguments)]
 pub fn lm_head(
     ctx: &Ctx,
@@ -136,22 +116,14 @@ pub fn lm_head(
     )
 }
 
-/// Shared plane geometry, measured once for both [`dense_affine`] and
-/// [`dense_affine_via_dense`] so the two arms can't disagree about it.
 #[derive(Clone, Copy)]
 struct Affine {
-    /// Four or eight, off the codes row against `k`.
     bits: u32,
-    /// The codes under one factor, off the factor row against `k`.
     group: u32,
-    /// The rows this projection lands, which are the weight's rows.
     n: u32,
-    /// The contraction it walks, which is the weight's width.
     k: u32,
 }
 
-/// Measures and checks [`Affine`]. `y`'s row count is not read here: an
-/// empty fire is each caller's own no-op.
 fn affine(
     op: &'static str,
     act: Tensor,
@@ -167,8 +139,6 @@ fn affine(
         biases.is_none_or(|b| b.dtype == Dtype::U8),
         "a packed plane binds as bytes"
     );
-    // The arm and the bound plane must agree: `PreConst` reads no offset
-    // plane, the other three arms require one.
     match (offset, biases) {
         (OffsetKind::PreConst, Some(_)) => {
             return Err(refuse(
@@ -193,8 +163,6 @@ fn affine(
     );
     let n = nonzero(op, "N, the columns this projection lands", y.width)?;
     let k = nonzero(op, "K, the contraction this projection walks", act.width)?;
-    // Group count comes off the factor plane: it is `[n, k / group]`
-    // two-byte factors per row, so half its byte width is the group count.
     if scales.width == 0 || scales.width % 2 != 0 {
         return Err(refuse(
             op,
@@ -227,9 +195,6 @@ fn affine(
             ),
         ));
     };
-    // The kernel reads codes a 32-bit word at a time, so a group is a whole
-    // number of words or its second half would be read against the next
-    // group's factor.
     let per_word = 32 / bits;
     if !group.is_multiple_of(per_word) {
         return Err(refuse(
@@ -237,8 +202,6 @@ fn affine(
             format!("a {group}-code group is not a whole number of {per_word}-code words"),
         ));
     }
-    // `PreInt`'s zero is a `u4` (GPTQ/AWQ) but travels widened to one byte
-    // per group, so the offset plane is the same shape at four and eight bits.
     if let Some(plane) = biases {
         let want = if offset == OffsetKind::PreInt {
             groups
@@ -260,8 +223,6 @@ fn affine(
     Ok(Affine { bits, group, n, k })
 }
 
-/// The one launch behind both dense entries, over all four offset arms.
-/// A fire with no rows is a no-op, matching the dense gemm's behavior.
 #[allow(clippy::too_many_arguments)]
 fn dense_affine(
     ctx: &Ctx,
@@ -308,22 +269,11 @@ fn dense_affine(
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             ArgValue::Ptr(seat.cell),
-            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Prefill arm of [`matmul`]: decodes the stored planes once into a scratch
-/// bf16 tile, then projects through dense cuBLAS instead of the fused
-/// kernel. Faster over many rows; resident weights only, not streamed seats
-/// (refused rather than silently falling back to the fused arm).
-///
-/// The fused arm rounds in f32 inside the dot; this arm rounds to bf16
-/// once during decode, so the two agree in value but not bit-for-bit.
-/// One affine plane decoded to a bf16 `[n, k]` rectangle in fire scratch,
-/// for an entry that reads a dense weight (the MLA absorbs). Resident planes
-/// only; the bit width and group come off the plane widths.
 #[allow(clippy::too_many_arguments)]
 pub fn decoded_plane(
     ctx: &Ctx,
@@ -397,9 +347,6 @@ pub fn decoded_plane(
     Ok(Tensor::new(tile, n, k, Dtype::Bf16))
 }
 
-/// [`decoded_plane`] into a buffer the CALLER owns rather than fire
-/// scratch: the resident decode a load makes once, for a projection every
-/// fire would otherwise re-decode. `dst` holds `n * k` bf16.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_into(
     ctx: &Ctx,
@@ -490,8 +437,6 @@ pub fn matmul_via_dense(
     )
 }
 
-/// [`matmul_via_dense`] under the head's own op name — [`lm_head`]'s prefill
-/// twin, and the same pairing `linear::gemm` keeps.
 #[allow(clippy::too_many_arguments)]
 pub fn lm_head_via_dense(
     ctx: &Ctx,
@@ -518,8 +463,6 @@ pub fn lm_head_via_dense(
     )
 }
 
-/// The two launches behind both prefill entries: `dequant_affine` into the
-/// slab, then `linear::gemm`'s dense point over it.
 #[allow(clippy::too_many_arguments)]
 fn dense_affine_via_dense(
     ctx: &Ctx,
@@ -533,7 +476,6 @@ fn dense_affine_via_dense(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    // Bf16 activations only; refused here, before any decode work.
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if seat.streams() {
@@ -547,10 +489,8 @@ fn dense_affine_via_dense(
     if y.rows == 0 {
         return Ok(());
     }
-    // Tile is bf16: two bytes an element.
     let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
     let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
-    // One thread per code word (each writes `32 / bits` elements).
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
@@ -589,7 +529,6 @@ pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Erro
     )
 }
 
-/// Scales each row of `buf` by the matching row of `l`, in place.
 pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.quant_scale_rows";
     let t = dtype_dispatch!(OP, buf.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });

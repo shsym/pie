@@ -1,9 +1,3 @@
-//! The remote seam — an engine that is not here yet, and says so. A stub
-//! that answered `Ok(())` would silently drop every offloaded request, which
-//! is the failure mode this file exists to prevent: every verb refuses by
-//! name. The disconnect/liveness half is real runtime bookkeeping (the
-//! broker) and is kept live rather than stubbed.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,19 +11,13 @@ use engine::{ChannelId, Engine};
 
 use crate::engine::CompletionBroker;
 
-/// A registered peer whose transport has not been built — a real registry
-/// entry so the offload planner can see it to refuse. Every verb answers
-/// [`Error::Unsupported`].
 pub struct RemoteEngine {
-    /// Who this was meant to reach, for the refusal's message.
     peer: String,
     broker: CompletionBroker,
     connected: Arc<AtomicBool>,
     disconnected: Arc<tokio::sync::Notify>,
 }
 
-/// Closes every outstanding completion when the peer goes away — the
-/// broker's `close_all` behind a handle the link layer can hold.
 #[derive(Clone)]
 pub struct RemoteDisconnectHandle {
     broker: CompletionBroker,
@@ -38,7 +26,6 @@ pub struct RemoteDisconnectHandle {
 }
 
 impl RemoteDisconnectHandle {
-    /// Fail every completion this peer's engine still owes.
     pub fn disconnect(&self, message: impl Into<String>) {
         if self.connected.swap(false, Ordering::AcqRel) {
             self.broker.close_all(message);
@@ -46,7 +33,6 @@ impl RemoteDisconnectHandle {
         }
     }
 
-    /// Whether the peer is still believed to be there.
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
@@ -54,7 +40,6 @@ impl RemoteDisconnectHandle {
 }
 
 impl RemoteEngine {
-    /// An engine for `peer`, with no transport behind it.
     #[must_use]
     pub fn new(peer: impl Into<String>) -> RemoteEngine {
         RemoteEngine {
@@ -65,13 +50,11 @@ impl RemoteEngine {
         }
     }
 
-    /// Which peer this addresses.
     #[must_use]
     pub fn peer(&self) -> &str {
         &self.peer
     }
 
-    /// The handle that fails this peer's outstanding work.
     #[must_use]
     pub fn disconnect_handle(&self) -> RemoteDisconnectHandle {
         RemoteDisconnectHandle {
@@ -81,7 +64,6 @@ impl RemoteEngine {
         }
     }
 
-    /// The refusal every verb answers, with the peer named.
     fn refuse(&self, verb: &'static str) -> Error {
         tracing::warn!(
             peer = %self.peer,
@@ -108,9 +90,6 @@ impl Engine for RemoteEngine {
         Err(self.refuse("submit"))
     }
 
-    // An advisory does not earn a round trip: shipping the hint over a
-    // transport would cost more than the host work it saves, so this is an
-    // explicit no-op rather than a refusal.
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
     }

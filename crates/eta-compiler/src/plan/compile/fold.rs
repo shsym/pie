@@ -1,14 +1,3 @@
-//! Constant folding, algebraic simplification and CSE keying. Conservative:
-//! every function returns `None`/`false` when it cannot prove a rewrite is
-//! sound.
-//!
-//! `Dtype::F32` is excluded from the algebra: IEEE-754 floats are not the
-//! ring the identities are written for (`x + 0.0` does not preserve `-0.0`;
-//! `MaxElem`/`MinElem` propagate operand order under `NaN`, so swapping
-//! operands is observable). A rewrite that moves a sign of zero or flips
-//! which `NaN` survives would change bits a sampler reads, so float cases
-//! are simply not rewritten; integer and boolean cases are.
-
 use alloc::vec::Vec;
 
 use eta_ir::container::{encode_op, put_u32};
@@ -33,7 +22,6 @@ pub(crate) fn simplify_alias(
             _ => {}
         }
     }
-    // not an identity over IEEE-754 (see module docs).
     if result_type.dtype == Dtype::F32 {
         return None;
     }
@@ -166,10 +154,6 @@ pub(crate) fn fold_compare(
     Some(Literal::Bool(predicate(ordering)))
 }
 
-/// Put commutative operands in a canonical order so that `a + b` and `b + a`
-/// share a CSE key and a stage signature.
-///
-/// Skipped for F32: the swap is observable under `NaN` (see module docs).
 pub(crate) fn canonicalize_commutative(op: &mut Op, result_type: Option<&SymbolicType>) {
     if result_type.is_some_and(|result_type| result_type.dtype == Dtype::F32) {
         return;
@@ -191,8 +175,6 @@ pub(crate) fn canonicalize_commutative(op: &mut Op, result_type: Option<&Symboli
     }
 }
 
-/// CSE may merge two identical ops only when neither has an effect, since
-/// merging removes one of them. [`Op::is_effectful`] owns that list.
 pub(crate) fn cse_candidate(op: &Op) -> bool {
     !op.is_effectful()
 }

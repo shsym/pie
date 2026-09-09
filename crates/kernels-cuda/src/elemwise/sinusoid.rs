@@ -1,8 +1,3 @@
-//! `Sinusoid`: the timestep embedding, the one input of a denoise pass that
-//! is arithmetic rather than an activation. Its own file beside the norms
-//! because it reads no rectangle at all — one f32 per row in, a `[rows, dim]`
-//! f32 table out.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -13,22 +8,6 @@ const FILE: &str = "elemwise/sinusoid.cuh";
 
 const BLOCK: u32 = 256;
 
-/// `diffusers.get_timestep_embedding`, transcribed: `half = dim/2`
-/// frequencies `exp(−ln(max_period)·i/half)`, angle `scale·(t·freq)`, row
-/// `[sin | cos]` or `[cos | sin]` when `flip_sin_cos`, and a zero last column
-/// when `dim` is odd.
-///
-/// The denominator is `half`, which is that function's
-/// `downscale_freq_shift = 0` — the value the DiTs pass and the openai
-/// original's. f32 in, f32 out, accurate `expf`/`sincosf`: the row feeds the
-/// adaLN MLP whose product multiplies every activation in the block, and it
-/// costs one row per lane per step.
-///
-/// # Errors
-///
-/// A refusal for a `t` stream that is not one f32 per row, an output that is
-/// not `[rows, dim]` f32, a zero-row or zero-width rectangle, or a
-/// `max_period` a logarithm has no answer for.
 pub fn sinusoid(
     ctx: &Ctx,
     t: Tensor,
@@ -88,8 +67,6 @@ pub fn sinusoid(
             max_period.arg(),
             i32::from(flip_sin_cos).arg(),
             scale.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )

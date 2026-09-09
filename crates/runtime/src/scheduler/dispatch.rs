@@ -1,11 +1,3 @@
-//! Scheduler-affine dispatch trampolines: the engine ABI's per-`engine_id`
-//! verbs. Each looks up [`super::scheduler_handle`] to reach the
-//! `BatchScheduler` that owns that `engine_id`'s native handle and forwards
-//! the call — callers never touch the native engine handle directly.
-//!
-//! `copy_d2h`/`copy_h2d`/`copy_h2h` are part of the complete engine ABI verb
-//! set but aren't yet issued by the single-GPU mock-engine fire path, hence
-//! `#![allow(dead_code)]` rather than deleting a documented ABI verb.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -39,8 +31,6 @@ pub(crate) async fn register_channel(
     let result = handle.register_channel(engine_idx, plan.clone()).await;
     match result {
         Ok(channel) => {
-            // Captures the already-resolved handle rather than doing a
-            // second `scheduler_handle` lookup at close time.
             let closer_handle = handle.clone();
             let closer: crate::engine::ChannelCloser =
                 Arc::new(move |channel_id| closer_handle.close_channel(channel_id));
@@ -74,20 +64,6 @@ pub(crate) async fn register_channels(
     }
 }
 
-/// The seeds, renumbered from the runtime's ids into the contract's.
-///
-/// The runtime's channel plane addresses a channel by its global id
-/// ([`ChannelValue::channel`](crate::engine::ChannelValue), minted when the
-/// guest constructs it); the contract's [`ChannelSeed`](engine::ChannelSeed)
-/// addresses it by index in the package's declaration order (the trace's
-/// `channel_order`). The two do not coincide in general. `binding.channels`
-/// is the declaration order, so a seed's position in it is the seed's number.
-///
-/// # Errors
-///
-/// A seed for a channel this binding does not carry: the caller staged a
-/// value for a ring that is not there, and planting it anywhere else is worse
-/// than refusing.
 fn seeds_in_declaration_order(
     channel_ids: &[u64],
     seed_values: Vec<ChannelValue>,
@@ -113,9 +89,6 @@ fn seeds_in_declaration_order(
         .collect()
 }
 
-/// Register `plans` and bind the instance in ONE scheduler control —
-/// the pair always runs back-to-back at join time with only an ordering
-/// dependency, and two round trips doubled the turnover control convoy.
 #[allow(
     clippy::too_many_arguments,
     reason = "one combined register-channels-and-bind request: the engine and pipeline \
@@ -140,9 +113,6 @@ pub(crate) async fn register_channels_bind_classified(
     BoundInstance,
     super::worker::SchedulerHandle,
 )> {
-    // requested_instance_id does not travel: the engine mints the id. The
-    // argument survives because callers still name the instance they staged
-    // channels for.
     let _ = requested_instance_id;
     let handle = scheduler_handle(engine_idx)?;
     let table = waker::WakerTable::global();
@@ -226,7 +196,6 @@ pub(crate) async fn bind_instance_classified(
     geometry_class: GeometryClass,
     extents: BindExtents,
 ) -> Result<BoundInstance> {
-    // See `register_channels_bind_classified`: the engine mints the id.
     let _ = requested_instance_id;
     let table = waker::WakerTable::global();
     let pacing_wait_id = table.alloc();
@@ -261,8 +230,6 @@ pub(crate) fn close_instance(bound: &BoundInstance) -> Result<()> {
     scheduler_handle(bound.engine_id)?.close_instance(bound.instance_id, bound.pacing_wait_id)
 }
 
-/// Batched channel close for a teardown cohort — one mailbox item for the
-/// whole id set (see `SchedulerItem::CloseChannels`).
 pub(crate) fn close_channels(engine_idx: EngineId, ids: Vec<u64>) -> Result<()> {
     scheduler_handle(engine_idx)?.close_channels(ids)
 }
@@ -394,4 +361,3 @@ pub(crate) async fn copy_rs_d2d(
         .copy_state(StateCopy { moves: slot_ranges })
         .await
 }
-

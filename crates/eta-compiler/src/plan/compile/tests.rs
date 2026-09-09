@@ -1,19 +1,3 @@
-//! Planner tests.
-//!
-//! All twenty-nine of them go through `compile_stage`, the public entry point,
-//! and read the whole `CompiledStage` it returns — normalized ops, both
-//! partitions, the signature. None reach for `normalize_stage`,
-//! `stage_signature` or the partitioners directly, which keeps the tests
-//! pinned to behaviour a caller can observe rather than to the current
-//! decomposition.
-//!
-//! What keeps them in-crate is the fixtures: `program`, `nucleus_program`,
-//! `top_k_program` and friends build `BoundTrace`s at a level of detail that is
-//! only readable next to the planner, and `NucleusMutation` is a crate-private
-//! way to bend one of them. They are shared by nearly all the tests, so they
-//! live together here rather than being copied per module -- and
-//! `normalize::value_domain_tests` reaches for `program` too.
-
 use super::*;
 use alloc::vec;
 use eta_ir::container::{
@@ -194,6 +178,11 @@ fn top_k_program(global_channel_offset: usize) -> BoundTrace {
     .unwrap()
 }
 
+fn tests_every_case() {
+    identical_epilogues_share_signature_across_programs();
+    top_k_has_one_canonical_signature_and_library_kind();
+}
+
 #[test]
 fn identical_epilogues_share_signature_across_programs() {
     let first = program(1, 1);
@@ -207,7 +196,6 @@ fn identical_epilogues_share_signature_across_programs() {
     );
 }
 
-#[test]
 fn top_k_has_one_canonical_signature_and_library_kind() {
     let generic = top_k_program(0);
     let beam_style = top_k_program(3);
@@ -224,12 +212,3 @@ fn top_k_has_one_canonical_signature_and_library_kind() {
         1
     );
 }
-
-// There is deliberately no `runtime_extents_do_not_change_signature` test.
-// `compile_stage` does not take `RuntimeExtents` at all, so extents cannot
-// reach the signature — the function's own type enforces it, and a test
-// cannot strengthen that. What such a test can do is look like proof while
-// asserting nothing: build two `ScheduleBucket`s, assert they differ, then
-// assert `stage.signature == stage.signature.clone()` with nothing in between
-// that could have changed it. Prefer the type.
-

@@ -1,98 +1,28 @@
-//! The D2 packing tables (`crates/model-ir/IMAGEGEN_CONTRACT.md` §1): which
-//! attention group each lane of a fire joins, and — per row [`Selection`] a
-//! plan reads — the packed order of the selected lanes' rows, the group and
-//! lane CSRs over that order, and the reference tags.
-//!
-//! Pure host arithmetic over a [`Composition`]'s placed lanes and the
-//! `(stream, group)` facts the runtime states per lane; nothing here knows a
-//! device. Every shell builds its tables here so the packed order is one
-//! definition.
-//!
-//! # The packed order, and where the packed rectangle lives
-//!
-//! A selection's lanes are sorted by `(group, stream code, fire lane)`, each
-//! lane's rows contiguous. Packed row `j` of selection `S` lives at fire row
-//! `origin_S + j` of a packed rectangle, where `origin_S` is the first fire
-//! row of `S`'s lanes: `layout.pack_rows` is launched over the window of the
-//! class(es) the selection names and writes the rows of that window, so the
-//! packed rectangle stands exactly where the selected lanes' rows stand. For
-//! `Selection::ALL` — the joint attention every text under test reads — the
-//! origin is `0` and the rectangle is indexed from row zero, as the contract
-//! says. A selection whose lanes' rows are not one contiguous run of the
-//! fire (its classes seriated apart) is refused ([`Fault::ScatteredSelection`])
-//! rather than packed into rows another class owns.
-//!
-//! Row indices in every table are fire-absolute: `permutation[origin + j]`
-//! is the fire row packed row `j` was read from, the CSR bounds are rows of
-//! the packed rectangle (`origin + …`), and `reference_tag[origin + j]` is
-//! the fire lane of packed row `j` when its lane is on `Stream::Reference`.
-//!
-//! # Groups are fire-global
-//!
-//! [`group_of_lane`] numbers groups densely from `0` in order of first
-//! appearance in fire lane order. The group CSR of every selection is indexed
-//! by that fire-global id — a group none of the selection's lanes belong to
-//! is an EMPTY segment, not a skipped one — so the query side and the key
-//! side of a cross-attention (`q` from the image lanes, `k`/`v` from the
-//! context lanes) pair segment `g` with segment `g` by construction, even
-//! when one side has no lane in some group.
-
 use model_ir::{Selection, Stream};
 
 use super::Fault;
 use super::compose::LaneRow;
 
-/// What the runtime states about one submitted lane beyond its word: which
-/// stream its rows are, and which attention group it joins (`None` is a
-/// group of its own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneFacts {
-    /// `model_ir::Stream::code()`.
     pub stream: u8,
-    /// The caller's group id, shared by the lanes of one request.
     pub group: Option<u32>,
 }
 
-/// One selection's tables, built by [`pack`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packed {
-    /// The selection these tables are keyed by.
     pub select: Selection,
-    /// The first fire row of the packed rectangle — the selected lanes'
-    /// first row.
     pub origin: u32,
-    /// How many rows the selection has.
     pub rows: u32,
-    /// How many lanes the selection has.
     pub lanes: u32,
-    /// `[groups + 1]`, indexed by fire-global group: group `g`'s packed rows
-    /// are `[indptr[g], indptr[g + 1])` of the packed rectangle (absolute
-    /// rows, `origin`-based); an absent group is an empty segment.
     pub group_indptr: Vec<i32>,
-    /// `[selected lanes + 1]`: packed lane `i`'s rows, likewise absolute.
     pub lane_indptr: Vec<i32>,
-    /// `[fire rows]`: per fire row of the packed rectangle, the fire lane of
-    /// the row when its lane is a reference, else `-1`; `-1` outside the
-    /// rectangle.
     pub reference_tag: Vec<i32>,
-    /// `[fire rows]`: `perm[origin + j]` is the fire row packed row `j` came
-    /// from; `-1` outside the rectangle.
     pub permutation: Vec<i32>,
-    /// `[groups]`: per fire-global group, the row of the group (counted from
-    /// its own first packed row) where its reference rows begin — the
-    /// group's length when it has none. Reference is the highest stream code,
-    /// so its lanes pack last within a group; this is the tail the CUDA
-    /// ragged kernel's `ReferenceSelfOnly` reads.
     pub reference_start: Vec<i32>,
-    /// `[groups]`: how many reference lanes each group has in this
-    /// selection. A kernel with one tail per group serves at most one.
     pub references: Vec<u32>,
 }
 
-/// Which fire-global group each fire lane joins: `[fire lanes]`, dense from
-/// `0` in order of first appearance, a stated group shared by every lane
-/// that states it and an unstated one a group of its own. `facts[source]`
-/// is the submitted lane's facts; `lanes` is the composition's fire order.
 #[must_use]
 pub fn group_of_lane(lanes: &[LaneRow], facts: &[LaneFacts]) -> Vec<i32> {
     let mut stated: Vec<(u32, i32)> = Vec::new();
@@ -121,7 +51,6 @@ pub fn group_of_lane(lanes: &[LaneRow], facts: &[LaneFacts]) -> Vec<i32> {
         .collect()
 }
 
-/// How many groups a `group_of_lane` table names.
 #[must_use]
 pub fn groups_of(group_of_lane: &[i32]) -> u32 {
     group_of_lane
@@ -131,15 +60,6 @@ pub fn groups_of(group_of_lane: &[i32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Build one selection's tables. `lanes` is the composition's fire order,
-/// `facts[source]` the submitted lane's facts, `group_of_lane` the table
-/// [`group_of_lane`] built over the same lanes, and `fire_rows` the fire's
-/// token rows (every `[Tokens]` table is that long).
-///
-/// # Errors
-///
-/// [`Fault::ScatteredSelection`] when the selected lanes' rows are not one
-/// contiguous run of the fire.
 pub fn pack(
     select: Selection,
     lanes: &[LaneRow],
@@ -148,7 +68,6 @@ pub fn pack(
     fire_rows: u32,
 ) -> Result<Packed, Fault> {
     let groups = groups_of(group_of_lane) as usize;
-    // The selected lanes, as (group, stream, fire lane) keys.
     let mut chosen: Vec<(i32, u8, usize)> = lanes
         .iter()
         .enumerate()
@@ -162,7 +81,6 @@ pub fn pack(
         .collect();
     chosen.sort_unstable();
 
-    // Contiguity: sorted by fire row, each lane begins where the last ended.
     let mut by_row: Vec<(u32, u32)> = chosen
         .iter()
         .map(|&(_, _, at)| (lanes[at].row_offset, lanes[at].rows))
@@ -219,8 +137,6 @@ pub fn pack(
         packed += row.rows;
         lane_indptr.push(packed as i32);
     }
-    // The group CSR: each group's rows, in fire-global order; an absent
-    // group repeats the bound before it.
     let mut bound = origin as i32;
     let mut run = 0usize;
     for g in 0..groups {
@@ -271,12 +187,15 @@ mod tests {
     const IMAGE: u64 = 2;
     const REFERENCE: u64 = 32;
 
-    /// Two requests, text and image each: fire order is text lanes then image
-    /// lanes (class-major); the joint packing interleaves by group.
+    fn packing_every_case() {
+        a_joint_selection_packs_by_group_then_stream();
+        a_class_selection_packs_at_its_own_window();
+        a_reference_lane_packs_last_and_is_tagged();
+        a_scattered_selection_is_refused();
+    }
+
     #[test]
     fn a_joint_selection_packs_by_group_then_stream() {
-        // Submitted: A.text(3), A.image(4), B.text(2), B.image(5).
-        // Fire order: A.text, B.text, A.image, B.image.
         let lanes = [
             row(0, TEXT, 0, 3),
             row(2, TEXT, 3, 2),
@@ -314,9 +233,6 @@ mod tests {
         assert_eq!(packed.reference_start, vec![7, 7]);
     }
 
-    /// A selection of one class packs at that class's window and leaves the
-    /// rest of the fire's tables `-1`; an absent group is an empty segment.
-    #[test]
     fn a_class_selection_packs_at_its_own_window() {
         let lanes = [row(0, TEXT, 0, 3), row(2, TEXT, 3, 2), row(1, IMAGE, 5, 4)];
         let facts = [
@@ -344,8 +260,6 @@ mod tests {
         assert_eq!(packed.permutation, vec![-1, -1, -1, -1, -1, 5, 6, 7, 8]);
     }
 
-    /// Reference lanes pack last in their group and tag their rows.
-    #[test]
     fn a_reference_lane_packs_last_and_is_tagged() {
         let lanes = [
             row(0, TEXT, 0, 2),
@@ -374,8 +288,6 @@ mod tests {
         assert_eq!(packed.references, vec![1]);
     }
 
-    /// A selection whose lanes stand apart in the fire is refused by name.
-    #[test]
     fn a_scattered_selection_is_refused() {
         let lanes = [row(0, TEXT, 0, 2), row(1, IMAGE, 2, 3), row(2, TEXT, 5, 2)];
         let facts = [LaneFacts::default(); 3];

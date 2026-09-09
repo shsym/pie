@@ -1,29 +1,3 @@
-//! **NO WAN 2.2 NODE FOLDS IN PLACE INTO A VECTOR A LATER NODE STILL
-//! READS — THE THIRTY BLOCKS ADD THEIR `scale_shift_table` TO A COPY OF
-//! THE ONE SHARED `timestep_proj`, NOT TO THE PROJECTION ITSELF.**
-//!
-//! ```text
-//! cargo test -p models --test every_wan_2_fold_owns_the_vector_it_folds_into
-//! ```
-//!
-//! `elementwise.add_bias` folds its bias IN PLACE: the IR aliases
-//! `out_out` onto `out` (`model_ir::ops::elemwise`, `Operands::aliases`),
-//! so the arena hands both ids one column and the node overwrites its
-//! operand. That is exactly what a biased projection wants — the matmul
-//! output it folds into is its own. It is exactly what a shared
-//! conditioning vector does NOT want: `denoise` computes
-//! `time_proj(silu(temb))` once a fire and every block adds its own
-//! `scale_shift_table` to it, so folding into the projection itself
-//! leaves block `k` modulating by `timestep_proj + sum(table_0..table_k)`.
-//! That reads exact at one block and drifts with every block after: the
-//! flagship answered cos 0.274 against the diffusers `dit.step0.out`
-//! while the two-block miniature still answered 0.9999, which is why the
-//! claim below is about the PLAN and not about a tolerance.
-//!
-//! The claim is general because the hazard is: any in-place fold whose
-//! operand a later node reads is a wrong answer, silently, and the plan
-//! says so without a GPU.
-
 use model_dsl::{Operands, Platform, Trace, ValueId};
 
 const ROWS: [&str; 3] = [
@@ -44,7 +18,6 @@ fn trace(sku: &str, platform: Platform) -> Trace {
     (row.trace)(platform)
 }
 
-/// The last node that lists `id` among its inputs, per value.
 fn last_read(t: &Trace) -> Vec<Option<usize>> {
     let mut last = vec![None; t.values.len()];
     let mut ins = Vec::new();

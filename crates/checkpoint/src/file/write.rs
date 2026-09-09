@@ -1,12 +1,3 @@
-//! Writing a checkpoint: the output side of `convert`. The one writer the
-//! loader has; `.zt` is the one format it writes.
-//!
-//! A quantized weight is one object whose blob holds its planes in canonical
-//! order (codes, then scales, then biases). The planes arrive as the separate
-//! declarations a plan produces, so a caller states the grouping first
-//! ([`Writer::group`]) and then adds the planes in that order; the writer
-//! streams them into one blob with the canonical padding between.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -18,14 +9,11 @@ use crate::serving::{self, Stamp};
 use crate::term::{blob_planes, gguf_name, term_of, MMA_TILED};
 use crate::types::{Encoding, TensorDecl};
 
-/// One tensor of the file: what to call it, and the bytes as stored.
 pub struct WriteTensor<'a> {
     pub decl: &'a TensorDecl,
     pub bytes: &'a [u8],
 }
 
-/// What an object says about itself: its type, and a named layout with its
-/// attributes when the bytes do not lie canonically.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Described {
     pub term: Option<Term>,
@@ -33,8 +21,6 @@ pub(crate) struct Described {
     pub attributes: Option<Value>,
 }
 
-/// The description of the object a declaration heads. A gguf block array
-/// is its own named layout; everything else is a term in canonical layout.
 pub(crate) fn object_of(decl: &TensorDecl, tiled: bool) -> Result<Described, Error> {
     let name = &decl.name;
     if let Encoding::Quant(spec) = &decl.encoding
@@ -75,16 +61,10 @@ pub(crate) fn object_of(decl: &TensorDecl, tiled: bool) -> Result<Described, Err
     })
 }
 
-/// Writes a checkpoint one tensor at a time, payloads in chunks.
-///
-/// Canonical form requires objects in ascending name order; [`write_zt`]
-/// sorts for its caller, this type trusts its caller to add in order.
 pub struct Writer {
     writer: Option<ztensor::Writer>,
     open: Option<Open>,
-    /// Object name -> the plane names it holds, in canonical order.
     groups: BTreeMap<String, Group>,
-    /// Plane name -> the object it belongs to.
     member_of: BTreeMap<String, String>,
     sharding: Option<Sharding>,
     metadata: BTreeMap<String, String>,
@@ -96,22 +76,16 @@ struct Group {
     tiled: bool,
 }
 
-/// One object being streamed: its sink, its planes, and how far along it is.
 struct Open {
     name: String,
     sink: ztensor::Sink,
-    /// `(plane name, where it lies)` in canonical order.
     planes: Vec<(String, Plane)>,
-    /// Bytes of the blob written so far.
     cursor: u64,
     at: At,
 }
 
 enum At {
-    /// Plane `next` is due; the object closes with its last plane, so
-    /// `next` always names one.
     Between { next: usize },
-    /// Plane `plane` is open and has received `written` bytes.
     Inside { plane: usize, written: u64 },
 }
 
@@ -155,8 +129,6 @@ fn text_map(entries: &BTreeMap<String, String>) -> Value {
 }
 
 impl Writer {
-    /// Opens a checkpoint at `path`; `metadata` lands in the file's
-    /// attributes. Publication is atomic.
     pub fn create(path: &Path, metadata: &BTreeMap<String, String>) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
@@ -166,9 +138,6 @@ impl Writer {
         Self::opened(path, metadata, None)
     }
 
-    /// [`create`](Self::create), for a file that is to be a serving artifact
-    /// as well as a checkpoint: objects in the caller's (the boot's) order,
-    /// block digests on every blob, and the stamp under [`serving::PROFILE`].
     pub fn create_serving(
         path: &Path,
         metadata: &BTreeMap<String, String>,
@@ -182,15 +151,6 @@ impl Writer {
         Self::opened(path, metadata, Some(stamp))
     }
 
-    /// [`create_serving`](Self::create_serving) for an artifact that already
-    /// exists: the objects added through this writer land after the ones the
-    /// file holds, and on [`finish`](Self::finish) the file is restamped with
-    /// `stamp`; the provenance is kept with `metadata`'s keys written over it.
-    ///
-    /// **NOT ATOMIC.** The container is extended in place, so a run that dies
-    /// between the first appended byte and the new footer leaves a file whose
-    /// footer is not at its end; the caller holds the length the file had and
-    /// truncates back to it. What that buys: no second copy of the artifact.
     pub fn append_serving(
         path: &Path,
         metadata: &BTreeMap<String, String>,
@@ -255,9 +215,6 @@ impl Writer {
         })
     }
 
-    /// Opens a checkpoint that spills into shards once one file passes
-    /// `max_shard_bytes`. The output is a root `.zt` beside `<stem>-00001.zt`,
-    /// …; a tensor is never split across shards.
     pub fn create_sharded(
         root: &Path,
         metadata: &BTreeMap<String, String>,
@@ -294,11 +251,6 @@ impl Writer {
         })
     }
 
-    /// States that the declarations named `planes` are the planes of one
-    /// object called `object`, in canonical order: the codes first, then the
-    /// gain (scales), then the offset (biases). `tiled` writes the object
-    /// under [`MMA_TILED`]. The planes must then be added consecutively in
-    /// that order.
     pub fn group(
         &mut self,
         object: impl Into<String>,
@@ -331,8 +283,6 @@ impl Writer {
         Ok(())
     }
 
-    /// The order a declaration takes in a sorted write: its object's name,
-    /// then its position among that object's planes.
     #[must_use]
     pub fn order_key(&self, name: &str) -> (String, usize) {
         match self.member_of.get(name) {
@@ -348,8 +298,6 @@ impl Writer {
         }
     }
 
-    /// Declares a tensor and opens it for writing. Its payload is exactly
-    /// `nbytes` bytes, delivered by [`write`](Self::write).
     pub fn begin_tensor(&mut self, decl: &TensorDecl, nbytes: u64) -> Result<(), Error> {
         crate::file::meta::reject_reserved(&decl.name)?;
         if let Some(open) = &mut self.open {
@@ -474,7 +422,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Appends bytes to the open tensor.
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
         let Some(Open {
             name,
@@ -501,8 +448,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Closes the open tensor, which must have received its whole payload.
-    /// The object closes with its last plane.
     pub fn end_tensor(&mut self) -> Result<(), Error> {
         let Some(open) = &mut self.open else {
             return Err(Error::Checkpoint("no tensor is open".into()));
@@ -526,15 +471,12 @@ impl Writer {
         open.sink.close(writer).map_err(Error::from)
     }
 
-    /// Adds a tensor whose payload is already in memory.
     pub fn add_tensor(&mut self, decl: &TensorDecl, bytes: &[u8]) -> Result<(), Error> {
         self.begin_tensor(decl, bytes.len() as u64)?;
         self.write(bytes)?;
         self.end_tensor()
     }
 
-    /// Adds a metadata object at `path` under the reserved namespace, stored
-    /// as a `u8` object so it versions with the weights under one manifest.
     pub fn add_meta(&mut self, path: &str, bytes: &[u8]) -> Result<(), Error> {
         self.nothing_open("a metadata object")?;
         if let Some(sharding) = &mut self.sharding {
@@ -623,7 +565,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Closes the manifest and moves the file into place.
     pub fn finish(mut self) -> Result<(), Error> {
         self.nothing_open("finish")?;
         if let Some(sharding) = self.sharding.take() {
@@ -644,8 +585,6 @@ impl Writer {
     }
 }
 
-/// Zero bytes from `cursor` to `offset`: the canonical padding between one
-/// plane and the next.
 pub(crate) fn pad_to(
     sink: &mut ztensor::Sink,
     writer: &mut ztensor::Writer,
@@ -661,9 +600,6 @@ pub(crate) fn pad_to(
     Ok(())
 }
 
-/// The file attributes of a serving artifact: the stamp under its own key,
-/// and the flat provenance beside it. A provenance key that collides with
-/// the profile's is refused rather than resolved.
 pub(crate) fn serving_attributes(
     stamp: &Stamp,
     metadata: &BTreeMap<String, String>,
@@ -685,7 +621,6 @@ pub(crate) fn serving_attributes(
     Ok(Value::Map(entries))
 }
 
-/// Writes `tensors` as one canonical `.zt` file at `path`, ordered by name.
 pub fn write_zt(
     path: &Path,
     metadata: &BTreeMap<String, String>,
@@ -694,9 +629,6 @@ pub fn write_zt(
     write_zt_grouped(path, metadata, tensors, &[])
 }
 
-/// [`write_zt`] with `groups` stating which declarations are one object's
-/// planes (`(object, [codes, scales, biases])`); the file is ordered by
-/// object name and plane.
 pub fn write_zt_grouped(
     path: &Path,
     metadata: &BTreeMap<String, String>,
@@ -714,4 +646,3 @@ pub fn write_zt_grouped(
     }
     writer.finish()
 }
-

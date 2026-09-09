@@ -1,5 +1,3 @@
-//! `validate_singleton_plan` and the region ABI predicates it shares with the fused emitters.
-
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::wellformed::{op_valid, region_ranges_valid, value_types_valid};
 use alloc::string::String;
@@ -15,9 +13,6 @@ use eta_ir::types::Dtype;
 use super::M1OpMeta;
 use crate::codegen::op_view::OpView;
 
-/// The library kind of a region as the wire encodes it: a `Generated` region
-/// still carries a `library_op` byte, and it is zero. Two C++ guards read that
-/// byte without first testing `region.library`, so the port has to model it.
 pub(crate) fn library_op_byte(region: &Region) -> u8 {
     match region.kind {
         RegionKind::Library(op) => op as u8,
@@ -29,45 +24,58 @@ pub(crate) fn is_library(region: &Region) -> bool {
     matches!(region.kind, RegionKind::Library(_))
 }
 
-/// The intrinsics this backend can actually bind. `ptir_m1_runtime.metal`
-/// reinterprets op tag `0xA0`'s `a0` slot per `p.intr`; an id not in this
-/// list would otherwise be read under the wrong element type or buffer
-/// binding with no fault, just wrong numbers. CUDA's equivalent is a
-/// per-intrinsic slot table raising `"generated fused intrinsic is unavailable"`.
 pub fn metal_intrinsic_supported(intr: u16) -> bool {
     matches!(
         intr,
         intrinsic_tags::LOGITS
+            | intrinsic_tags::VELOCITY
+            | intrinsic_tags::HIDDEN
             | intrinsic_tags::MTP_LOGITS
             | intrinsic_tags::MTP_DRAFTS
             | intrinsic_tags::ATTN_SCORE
+            | intrinsic_tags::PIXELS
     )
 }
 
-/// `Err` naming the offending id when `region` reads an unbindable intrinsic.
-///
-/// Scoped to the region's own nodes: a sibling region in the same stage may
-/// legitimately read `logits`, and rejecting the whole stage for that would
-/// refuse plans the backend can emit.
+pub fn metal_readout_collision(ops: &[OpView], region: &Region) -> Option<u16> {
+    let mut seen: Option<u16> = None;
+    for &node in &region.nodes {
+        let Some(op) = ops.get(node.index()) else {
+            continue;
+        };
+        if op.tag != tags::INTRINSIC_VAL {
+            continue;
+        }
+        if !matches!(
+            op.intr,
+            intrinsic_tags::LOGITS | intrinsic_tags::VELOCITY | intrinsic_tags::HIDDEN
+        ) {
+            continue;
+        }
+        match seen {
+            Some(first) if first != op.intr => return Some(op.intr),
+            _ => seen = Some(op.intr),
+        }
+    }
+    None
+}
+
 pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     unbindable_intrinsic(ops, region, metal_intrinsic_supported)
 }
 
-/// [`intrinsics_bindable`]'s grouped twin. A grouped kernel binds no
-/// per-intrinsic buffer: every rectangle it reads arrives as an address on
-/// the lane record. Stays a separate function since the two forms answer
-/// from two tables that could diverge again.
 pub fn grouped_intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     unbindable_intrinsic(ops, region, super::intrinsics::m3_intrinsic_bindable)
 }
 
-/// The walk both predicates share: the region's own nodes, the first
-/// `INTRINSIC_VAL` whose id `bindable` refuses, named.
 fn unbindable_intrinsic(
     ops: &[OpView],
     region: &Region,
     bindable: fn(u16) -> bool,
 ) -> Result<(), EmitError> {
+    if let Some(second) = metal_readout_collision(ops, region) {
+        return Err(EmitError::UnbindableIntrinsic { intrinsic: second });
+    }
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
@@ -79,16 +87,8 @@ fn unbindable_intrinsic(
     Ok(())
 }
 
-/// Whether `region` is a well-formed grouped nucleus-sampling library region.
-///
-/// Accepts both arities the planner emits: the plain `[logits, top_p, state]`,
-/// and the temperature-scaled `[raw_logits, scale, logits, top_p, state]` left
-/// when the dividing `Div` stays outside the region.
 pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     let value_types = &stage.normalized.value_types;
-    // Plain form is [logits, top_p, state]; when the trace divides logits by
-    // a temperature first, `compile.rs` leaves that Div outside the region
-    // and passes [raw_logits, scale, logits, top_p, state] instead.
     let scaled = region.inputs.len() == 5;
     if !is_library(region)
         || library_op_byte(region) != LibraryOp::NucleusSample as u8
@@ -134,8 +134,6 @@ pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> b
         && output_type.dims == row_dims
 }
 
-/// `library_region_valid` — a generated region is always fine; a library
-/// region must claim the op it actually wraps.
 pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     if !is_library(region) {
         return true;
@@ -160,7 +158,6 @@ pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     }
 }
 
-/// `used_channel_slots` — one past the highest channel slot any op touches.
 pub fn used_channel_slots(ops: &[OpView]) -> usize {
     let mut count = 0usize;
     for op in ops {
@@ -171,8 +168,6 @@ pub fn used_channel_slots(ops: &[OpView]) -> usize {
     count
 }
 
-/// Well-formedness, plus the one rule that is Metal's own: a library region
-/// must match the ABI of the tier-0 kernel this backend will dispatch for it.
 fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result<(), EmitError> {
     for region in &partition.regions {
         region_ranges_valid(stage, region, RegionForm::Unnamed)?;
@@ -183,15 +178,11 @@ fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result
     Ok(())
 }
 
-/// `validate_singleton_plan` — accept a stage for the one-op-per-dispatch
-/// tier, returning the per-op metadata the engine dispatches from.
 pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, EmitError> {
     let (operations, result) = validate_singleton_plan_partial(stage);
     result.map(|()| operations)
 }
 
-/// [`validate_singleton_plan`], but also handing back the ops accepted before
-/// the rejection point — the conformance dump records where validation gave up.
 pub fn validate_singleton_plan_partial(
     stage: &CompiledStage,
 ) -> (Vec<M1OpMeta>, Result<(), EmitError>) {
@@ -227,8 +218,6 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
             return Err(EmitError::SingletonRegionOrderingMismatch);
         }
         if op.tag == tags::KERNEL_CALL {
-            // The C++ indexes `value_types[args[0]]` before it has checked
-            // `args[0] < result_base`; the `get` below is that read made safe.
             let identity = names
                 .get(op.name_idx as usize)
                 .is_some_and(|name| name == "metal.identity")
@@ -247,9 +236,6 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         } else if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
             return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
         }
-        // Checked per op inside this loop rather than as a pre-pass: the
-        // partial `operations` handed back on rejection records how far
-        // validation got, and hoisting these would move that point.
         op_valid(op, result_base, stage)?;
         operations.push(M1OpMeta {
             node: node as u32,

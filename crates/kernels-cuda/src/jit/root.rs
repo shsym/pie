@@ -1,13 +1,7 @@
-//! A compilation root: one carried `.cuh`, the options it compiles under,
-//! the header set it resolves against, and the cache key all of that folds
-//! into. Most units take the defaults; the exceptions are configured by
-//! name.
-
 use core::fmt;
 
 use crate::source::{self, ALL_HEADERS, DEVICE_HEADERS, Header};
 
-/// The NVRTC floor a unit states, `0.0` meaning any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Toolchain {
     pub major: u32,
@@ -43,8 +37,6 @@ impl fmt::Display for Toolchain {
     }
 }
 
-/// Which header closure a unit compiles against: the plane's own text, or
-/// that plus the internalised upstream (FlashInfer/XQA) tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Headers {
     Library,
@@ -79,9 +71,6 @@ pub struct Root {
     pub floor: Toolchain,
 }
 
-/// The units that do not take the defaults. The rows live here rather than
-/// with the entries that fire them, so the configuration travels with the
-/// file name.
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
     (
         "attn/mla.cuh",
@@ -119,8 +108,6 @@ const fn configured_for(file: &str) -> (&'static [&'static str], Headers, Toolch
 }
 
 impl Root {
-    /// The carried unit with this name, or `None` — a [`Fire`](crate::jit::Fire)
-    /// naming a file the binary does not carry is refused, not conjured.
     #[must_use]
     pub fn of(file: &'static str) -> Option<Self> {
         let text = source::text_of(file)?;
@@ -166,7 +153,6 @@ impl Root {
             .any(|o| *o == "--relocatable-device-code=true" || *o == "-dc" || *o == "--device-c")
     }
 
-    /// The disk/memory cache key: everything that can change the cubin.
     #[must_use]
     pub fn key(&self, instantiation: &str, arch: &str) -> String {
         format!(

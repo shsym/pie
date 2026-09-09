@@ -1,18 +1,3 @@
-//! **A PLAN MAY STATE A 65536-ROW TOKEN CEILING (design D13): the load arms
-//! only the buckets the budget names, the inputs store carves no mask slab
-//! for a plan with no masked arm, a lane's rows are bounded by that ceiling
-//! alone (no kv context, no page pool: the load's context is 64 and the
-//! image lane below carries 200 rows), and a fire below the first rung is
-//! served from that rung's body.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_dit_plan_loads_at_a_sixty_four_k_row_ceiling -- --nocapture
-//! ```
-//!
-//! Prints what the load cost (arena, inputs, wall time) so a deployment can
-//! read what a 32k-row DiT bucket buys. Skips when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -33,8 +18,6 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
     }
     let weights = Weights::random(&common_dit::trace(), 17);
     let began = Instant::now();
-    // Two rungs only: the arming pass fires one synthetic per (rung, key),
-    // and a 32768-row joint synthetic is a real DiT step's worth of work.
     let mut rig = Rig::load(&weights, 65536, vec![8192, 32768]);
     let loaded = began.elapsed();
     let facts = &rig.loaded.facts;
@@ -44,9 +27,6 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
         facts.arena_bytes >> 20,
         facts.input_bytes >> 20,
     );
-    // The inputs store carries no mask slab (65536 x 64 context / 8 would be
-    // half a megabyte per pinned mirror at this tiny context; at a real
-    // one it is gigabytes) — the whole store is under a few tens of MiB.
     assert!(
         facts.input_bytes < 64 << 20,
         "the inputs store is {} bytes for a plan with no masked arm",

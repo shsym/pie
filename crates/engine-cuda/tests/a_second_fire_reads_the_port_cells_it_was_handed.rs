@@ -1,17 +1,3 @@
-//! **A FLOAT PORT IS FED FROM THE CHANNEL'S COMMITTED CELL AT EVERY SUBMIT:
-//! the same plan fired twice with different latent cells lands the two
-//! different references, so the device-to-device feed is honoured and
-//! nothing stale is read.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_second_fire_reads_the_port_cells_it_was_handed
-//! ```
-//!
-//! The epilogue attached to each lane takes the latent cell it read, so the
-//! second submit's feed is the cell published between the fires — the
-//! loop-carried discipline a denoiser runs. Skips when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -113,8 +99,6 @@ fn the_second_fire_lands_the_second_cells() {
     assert_close(&got_second[0], &want_second.0, "second fire, text");
     assert_close(&got_second[1], &want_second.1, "second fire, image");
 
-    // And the two really differ: a feed that read the stale cell would have
-    // landed the first answer twice.
     let moved = got_first[1]
         .iter()
         .zip(&got_second[1])

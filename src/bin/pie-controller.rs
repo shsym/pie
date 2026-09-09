@@ -1,27 +1,13 @@
-//! `controller` — standalone control-plane daemon; a thin bin shell.
-//!
-//! Composes the shared [`bootstrap`] process skeleton (global flags, config
-//! sourcing, tracing, `/metrics`, signal lifecycle) with the [`controller`]
-//! role library. Only the two middle lines (`Config::parse` + `run`) are
-//! controller-specific; every pie daemon bin is otherwise identical.
-//!
-//! Single-node deployments do not use this binary — they embed the controller
-//! in-proc via [`controller::embed`] at the `bin/pie` composition root.
-
 use std::process::ExitCode;
 
 use clap::Parser;
 
-/// Pie cluster controller — control-plane coordination (registry, neighbor
-/// assignment, routing-table push, liveness). Never handles tensor data.
 #[derive(Debug, Parser)]
 #[command(name = "pie-controller", version)]
 struct Cli {
     #[command(flatten)]
     global: bootstrap::GlobalArgs,
 
-    /// Control endpoint to bind: `tcp://host:port`, a bare `host:port`, or
-    /// `unix:/path`. Overrides `listen_addr` from the config file.
     #[arg(long, value_name = "ADDR")]
     listen: Option<String>,
 }

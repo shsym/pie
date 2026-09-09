@@ -1,5 +1,4 @@
-// ptir_rng.generated.metal — GENERATED from crates/eta-ir/src/rng.rs.
-// DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract
+
 #ifndef PIE_PTIR_RNG_GENERATED_METAL
 #define PIE_PTIR_RNG_GENERATED_METAL
 
@@ -30,7 +29,7 @@ inline float ptir_rng_hash_uniform(ulong seed_eff, uint index) {
       0x9E3779B97F4A7C15ul * (ulong(index) + 1ul);
   const uint bits = uint(ptir_rng_splitmix64(x) >> 40);
   const float raw = (float(bits) + 0.5f) * (1.0f / 16777216.0f);
-  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f */
+
   return raw < 0.99999994f ? raw : 0.99999994f;
 }
 
@@ -38,7 +37,7 @@ inline float ptir_rng_hash_normal(ulong seed_eff, uint index) {
   const uint lane = index * 2u;
   const float u0 = ptir_rng_hash_uniform(seed_eff, lane);
   const float u1 = ptir_rng_hash_uniform(seed_eff, lane + 1u);
-  const float radius = sqrt(-2.0f * precise::log(u0));
-  return radius * precise::cos(6.2831855f * u1);
+  const float radius = metal::sqrt(-2.0f * metal::precise::log(u0));
+  return radius * metal::precise::cos(6.2831855f * u1);
 }
 #endif

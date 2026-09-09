@@ -1,7 +1,3 @@
-//! Finding the model a worker is configured to serve — load-at-boot only,
-//! never downloaded or converted. Resolves a store name or a path to a `.zt`
-//! artifact (or, as a legacy fallback, an HF snapshot directory).
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,23 +5,13 @@ use runtime::model::ModelMetadata;
 
 use crate::backend::EngineCapabilities;
 use crate::config;
-// By item, not by module. The crate is `checkpoint` and the local below is
-// also called `checkpoint`; spelling the calls `checkpoint::file::read::…`
-// would put a third use of the word between them, and both names here say
-// what they do without the path.
 use checkpoint::file::read::{parse_metadata, read_meta};
 
-/// The artifact object the checkpoint's own `config.json` is written under.
 pub const CONFIG_OBJECT: &str = "model/config";
 
-/// What the worker was pointed at, decided once here and carried, rather
-/// than re-derived downstream from the extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Model {
-    /// A `.zt` artifact: everything the engine needs, in one file.
     Artifact(PathBuf),
-    /// A HuggingFace snapshot directory, or a single checkpoint file. Legacy:
-    /// no compiled metadata, so the engine falls back to `config.json`.
     Snapshot(PathBuf),
 }
 
@@ -36,12 +22,6 @@ impl Model {
         }
     }
 
-    /// Everything the runtime and the engines need, lifted in one open.
-    ///
-    /// The config is always produced (embedded in an artifact, on disk for a
-    /// snapshot) and carried, not parsed: quantization is read off the
-    /// stored tensor encodings instead. The tokenizer half is optional and
-    /// all-or-nothing — a partial one is treated as absent.
     pub fn metadata(&self) -> Result<ModelMetadata> {
         let Model::Artifact(path) = self else {
             return Ok(ModelMetadata {
@@ -49,8 +29,6 @@ impl Model {
                 config: lift_snapshot_config(self.path())?,
             });
         };
-        // One parse. For a sharded artifact the manifest read opens and
-        // validates every shard, so doing it per consumer is not free.
         let checkpoint =
             parse_metadata(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
@@ -72,10 +50,6 @@ impl Model {
             };
             tokenizer.push((name.to_string(), bytes));
         }
-        // The optional planes come after, and only if the required ones were
-        // all there: a Unigram's score plane is absent from every artifact
-        // written before Unigram was read, and its absence is a FACT about
-        // which kind of tokenizer this is, not a missing object.
         if !tokenizer.is_empty() {
             for name in tokenizer::canonical::OPTIONAL_OBJECTS {
                 if let Some(bytes) = read_meta(&checkpoint, name)? {
@@ -90,14 +64,7 @@ impl Model {
     }
 }
 
-/// Lift a snapshot's `config.json`, verbatim: a model's facts (besides
-/// declared quantization) come from the catalog now, matched by tensors
-/// rather than believed from the config, so nothing here parses or
-/// normalizes the document.
-///
-/// A missing or unreadable `config.json` is an error here, not a fallback.
 fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
-    // A snapshot may be the directory or a lone checkpoint file inside it.
     let dir = if path.is_dir() {
         path
     } else {
@@ -117,55 +84,22 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
             config.display(),
         )
     })?;
-    // Parsed only to refuse a config that is not JSON, before a snapshot is
-    // half-opened.
     serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", config.display()))?;
     Ok(raw.into_bytes())
 }
 
-/// `$PIE_HOME/models/` — the store `pie model import` writes into.
-///
-/// The layout is one directory per model: `<name>/archive.zt` is the general
-/// form, `<name>/runtime/<key>.zt` are per-target builds. `src/local/store.rs`
-/// owns it and is where the shape is explained; this repeats only enough of it
-/// to find a file, because the worker cannot depend on the CLI crate.
 fn store_dir() -> PathBuf {
     bootstrap::paths::pie_home().join("models")
 }
 
-/// What this deployment can say about a store name that names more than one
-/// artifact.
-///
-/// **A STORE NAME IS A MODEL, NOT A FILE**: one directory holds every
-/// artifact of one model, which on a box that imported for two shells is one
-/// `.cuda.zt` and one `.vulkan.zt`. A `pie` built `--features vulkan` can
-/// host exactly one of those, so the deployment's own flavor is what picks —
-/// otherwise a config would have to name a file and stop being portable
-/// between the boxes serving the same model.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Want<'a> {
-    /// The engine flavor this binary hosts (`crate::backend::flavor`).
     pub backend: Option<&'a str>,
-    /// `[model] sku`, when the operator stated one.
     pub sku: Option<&'a str>,
 }
 
-/// The artifact of the model stored under `name` this deployment wants, if
-/// the store holds one.
-///
-/// Falls back to a flat `<name>.zt`, which is what pie wrote before the store
-/// gained a directory per model. Read, never written: a store that predates
-/// the change should keep serving rather than report every model missing.
-///
-/// # Errors
-///
-/// The directory holds several artifacts and [`Want`] does not single one
-/// out; the refusal names them, since typing one is the fix.
 fn archive_in(store: &Path, name: &str, want: Want<'_>) -> Result<Option<PathBuf>> {
-    // Every artifact in the directory, asked through the reader's own
-    // discovery so this isn't a second, disagreeing answer to the question
-    // `src/local/store.rs` asks when it lists the same store.
     let model_dir = store.join(name);
     if model_dir.is_dir()
         && let Some(found) = pick(
@@ -176,19 +110,11 @@ fn archive_in(store: &Path, name: &str, want: Want<'_>) -> Result<Option<PathBuf
     {
         return Ok(Some(found));
     }
-    // A fully specified name — `<slug>.<sku>.<backend>`, exactly as `pie
-    // model list` prints it for a model with siblings — addresses one file
-    // inside its model's directory. This is the escape hatch from the
-    // refusal below, and the reason it can be quoted in one.
     if let Ok(parsed) = checkpoint::serving::Name::parse(&format!("{name}.zt")) {
         let file = store.join(&parsed.slug).join(parsed.render());
         if file.is_file() {
             return Ok(Some(file));
         }
-        // The directory can be spelled unslugified — `pie model import` names it
-        // for the source (`q35-Q4KM`) while the artifact inside carries the slug
-        // (`q35-q4km`), so a name `pie model list` prints would not resolve. Ask
-        // the store which directory slugifies to the one named.
         if let Some(file) = std::fs::read_dir(store).ok().and_then(|entries| {
             entries
                 .filter_map(Result::ok)
@@ -209,14 +135,6 @@ fn archive_in(store: &Path, name: &str, want: Want<'_>) -> Result<Option<PathBuf
     Ok(flat.is_file().then_some(flat))
 }
 
-/// Which of `found` this deployment meant.
-///
-/// Narrows by filename, not by opening the files: `pie model import` writes
-/// the name *from* the stamp (`checkpoint::serving::Name::of`), so the name
-/// is a projection of the stamp and reading 100 GB of artifacts to re-derive
-/// it would answer the same question slower. A file renamed out from under
-/// its stamp is caught at load, where the stamp is checked against the
-/// deployment and the mismatch is reported field by field.
 fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBuf>> {
     if found.len() <= 1 {
         return Ok(found.into_iter().next());
@@ -236,10 +154,6 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
     if let Some(backend) = want.backend {
         wanted.retain(|(_, parsed)| parsed.as_ref().is_some_and(|it| it.backend == backend));
     }
-    // The row, when the operator stated one: two artifacts of one model for
-    // one backend is the other half of what the naming is for — a different
-    // degree or precision — and `[model] sku` is where a config already says
-    // which row it serves.
     if wanted.len() > 1
         && let Some(sku) = want.sku
     {
@@ -272,7 +186,6 @@ fn pick(dir: &Path, found: Vec<PathBuf>, want: Want<'_>) -> Result<Option<PathBu
     )
 }
 
-/// Resolves `model` — a store name or a path — to something on disk.
 pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
     if model.trim().is_empty() {
         bail!("[model].model is empty; set it to a store name or a path to a .zt artifact");
@@ -296,8 +209,6 @@ pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
     if let Some(artifact) = archive_in(&store, model, want)? {
         return Ok(Model::Artifact(artifact));
     }
-    // A repo ID is a store name spelled the other way, and typing it is the
-    // obvious mistake — so answer it rather than reporting a missing file.
     if let Some(artifact) = archive_in(&store, &model.replace('/', "--"), want)? {
         return Ok(Model::Artifact(artifact));
     }
@@ -308,23 +219,13 @@ pub fn resolve(model: &str, want: Want<'_>) -> Result<Model> {
     )
 }
 
-/// Whether `path` names a `.zt`. The one place the extension is judged.
 pub(crate) fn is_artifact_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
 }
 
-/// Extensions that make a bare word a file rather than a store name.
-///
-/// A closed list, not "has an extension": model names are full of dots, and
-/// `Qwen--Qwen3-0.6B` would otherwise read as a file with extension `6B`.
 const CHECKPOINT_EXTENSIONS: [&str; 3] = ["zt", "gguf", "safetensors"];
 
-/// Whether a config value is meant as a path rather than a store name.
-///
-/// Syntactic on purpose: a store name and a relative path can be spelled the
-/// same, and letting the filesystem decide would make the meaning of a config
-/// depend on the working directory.
 fn looks_like_path(value: &str) -> bool {
     value.starts_with('/')
         || value.starts_with("./")
@@ -338,9 +239,6 @@ fn looks_like_path(value: &str) -> bool {
         })
 }
 
-/// The engine's self-report, deliberately, not the catalog row: this is the
-/// token two workers compare before they trade KV pages, so what must agree
-/// is what the two engines actually loaded, not what their catalogs claim.
 pub(crate) fn model_identity(
     user_cfg: &config::Config,
     caps: &EngineCapabilities,
@@ -350,9 +248,6 @@ pub(crate) fn model_identity(
     let mut hasher = blake3::Hasher::new();
     hasher.update(user_cfg.model.name.as_bytes());
     hasher.update(artifact_digest);
-    // The engine's answer, whole: no `arch_name` (names the catalog row the
-    // caller resolved, shared by both peers already) or `hidden_size` (no
-    // seat in `ModelProfile`).
     hasher.update(caps.device.backend.as_bytes());
     hasher.update(&caps.profile.vocab.to_le_bytes());
     hasher.update(&caps.profile.num_layers.to_le_bytes());
@@ -361,21 +256,13 @@ pub(crate) fn model_identity(
     hasher.update(&caps.pools.kv_page_size.to_le_bytes());
     hasher.update(format!("{:?}", user_cfg.model.engine.kind).as_bytes());
     hasher.update(user_cfg.model.engine.activation_dtype.as_bytes());
-    // A `[model]` key rather than an engine option: what the checkpoint holds
-    // is a fact about the weights, so it discriminates for every kind.
     hasher.update(user_cfg.model.weight_dtype.as_bytes());
-    // Nothing from the engine options, for any kind: the identity already
-    // carries the kind, and no option changes what the weights are.
     Ok(crate::executor::ModelIdentity {
         hash: *hasher.finalize().as_bytes(),
         component,
     })
 }
 
-/// The identity of a `.zt` artifact, or `None` for anything else.
-///
-/// The loader answers what identifies a checkpoint; this only folds its answer
-/// into the 32-byte shape the identity plumbing expects.
 pub(crate) fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
     let identity = checkpoint::file::zt::artifact_identity(path)
         .map_err(|err| anyhow!("reading the identity of {path:?}: {err}"))?;
@@ -383,14 +270,10 @@ pub(crate) fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
 }
 
 pub(crate) fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
-    // A `.zt` artifact's manifest digest covers every tensor, the compiled
-    // tokenizer and the config together, and survives the file being moved.
     if let Some(digest) = manifest_digest(snapshot_dir)? {
         return Ok(digest);
     }
 
-    // Legacy snapshots: the revision in `snapshots/<rev>/` is HF's own
-    // content identity, beating a full re-hash; the walk is the last resort.
     let components = snapshot_dir.components().collect::<Vec<_>>();
     for pair in components.windows(2) {
         if pair[0].as_os_str() == "snapshots" {
@@ -456,6 +339,16 @@ mod tests {
     use checkpoint::file::write::Writer;
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 
+    fn weights_every_case() {
+        an_artifact_path_resolves_to_itself();
+        a_store_name_finds_the_name_a_stamped_import_wrote();
+        a_store_name_naming_two_shells_resolves_to_the_one_this_build_hosts();
+        two_rows_of_one_backend_are_told_apart_by_the_stated_sku();
+        an_artifact_hands_over_its_compiled_metadata();
+        every_model_form_produces_the_checkpoints_config();
+        a_snapshot_without_a_config_says_so();
+    }
+
     #[test]
     fn an_artifact_path_resolves_to_itself() {
         let dir = tempfile::tempdir().unwrap();
@@ -467,10 +360,6 @@ mod tests {
         );
     }
 
-    // It also finds the specialized name a stamped import writes:
-    // `<slug>.<sku>.<backend>.zt`, so one model at two
-    // quantizations can sit in one directory.
-    #[test]
     fn a_store_name_finds_the_name_a_stamped_import_wrote() {
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
@@ -487,14 +376,6 @@ mod tests {
         );
     }
 
-    /// **THE WHOLE POINT OF THE NAMING**: one store name, one artifact per
-    /// shell, and the binary that can host only one of them gets that one.
-    ///
-    /// A `pie` built `--features vulkan` and a `pie` built `--features cuda`
-    /// read the same `[model] model = "<name>"` out of the same config on
-    /// the same box, and each has to land on its own file. Picking by
-    /// filename is picking by stamp: the import writes the name from it.
-    #[test]
     fn a_store_name_naming_two_shells_resolves_to_the_one_this_build_hosts() {
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
@@ -522,8 +403,6 @@ mod tests {
             );
         }
 
-        // A build that hosts neither is told what is there, by name, rather
-        // than handed an artifact its engine cannot read.
         let why = archive_in(
             store,
             "glm",
@@ -543,8 +422,6 @@ mod tests {
             "{why}"
         );
 
-        // And the fully specified name that refusal quotes resolves exactly,
-        // whatever this build hosts.
         assert_eq!(
             archive_in(
                 store,
@@ -560,9 +437,6 @@ mod tests {
         );
     }
 
-    /// Two rows for one shell: `[model] sku` is the other half of the
-    /// question, and a config already states it.
-    #[test]
     fn two_rows_of_one_backend_are_told_apart_by_the_stated_sku() {
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
@@ -581,14 +455,10 @@ mod tests {
             archive_in(store, "glm", want("glm53-flash-mtp-u8g64-u2g64-kv-bf16")).unwrap(),
             Some(mtp)
         );
-        // The catalog spells a row the way the row is named; the filename
-        // holds its slug, so the comparison slugifies rather than hoping.
         assert_eq!(
             archive_in(store, "glm", want("GLM53-Flash-u8g64-u2g64-kv-bf16")).unwrap(),
             Some(plain)
         );
-        // No `sku` and both rows for this shell: a refusal naming both, not
-        // the alphabetically first.
         let why = archive_in(
             store,
             "glm",
@@ -602,15 +472,12 @@ mod tests {
         assert!(why.contains("[model] sku"), "{why}");
     }
 
-    /// Writes an artifact carrying `config` plus, optionally, the whole
-    /// compiled tokenizer.
     fn artifact(dir: &Path, config: &[u8], whole_tokenizer: bool) -> Model {
         let path = dir.join("model.zt");
         let canonical = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()])
             .to_canonical()
             .unwrap();
         let mut writer = Writer::create(&path, &Default::default()).unwrap();
-        // Ascending names: `model/…` sorts before `tokenizer/…`.
         writer.add_meta(CONFIG_OBJECT, config).unwrap();
         for (name, bytes) in canonical.objects() {
             if !whole_tokenizer && name == tokenizer::canonical::MERGE_TABLE {
@@ -635,9 +502,6 @@ mod tests {
         Model::Artifact(path)
     }
 
-    // An artifact hands over its compiled metadata whole, and the tokenizer
-    // that comes back tokenizes like the one that went in.
-    #[test]
     fn an_artifact_hands_over_its_compiled_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let config = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
@@ -647,8 +511,6 @@ mod tests {
         assert_eq!(objects.len(), tokenizer::canonical::OBJECTS.len());
         assert_eq!(lifted.config, config);
 
-        // The runtime's own reconstruction, exercised here so a break shows up
-        // as a worker test rather than only at serve time.
         let rebuilt = tokenizer::canonical::CanonicalTokenizer::from_objects(|name| {
             objects
                 .iter()
@@ -657,25 +519,17 @@ mod tests {
         })
         .unwrap();
         let rebuilt = tokenizer::Tokenizer::from_canonical(&rebuilt).unwrap();
-        // Against the original, not a literal count, so the comparison holds
-        // whatever the constructor's vocab size is.
         let original = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()]);
         assert_eq!(rebuilt.vocab_size(), original.vocab_size());
     }
 
-    // Both input forms hand over the checkpoint's own config, byte for byte.
-    #[test]
     fn every_model_form_produces_the_checkpoints_config() {
         let dir = tempfile::tempdir().unwrap();
 
-        // The artifact form: the embedded bytes, read back rather than
-        // derived from a `config.json` it does not have.
         let compiled = br#"{"model_type":"llama","vocab_size":7,"num_hidden_layers":4}"#;
         let model = artifact(dir.path(), compiled, true);
         assert_eq!(model.metadata().unwrap().config, compiled);
 
-        // The snapshot form: lifted here, from `config.json`, and with no
-        // compiled tokenizer to hand over.
         let snap = dir.path().join("snapshot");
         std::fs::create_dir(&snap).unwrap();
         std::fs::write(
@@ -690,19 +544,14 @@ mod tests {
         let lifted = Model::Snapshot(snap.clone()).metadata().unwrap();
         assert!(lifted.tokenizer.is_none());
         let doc: serde_json::Value = serde_json::from_slice(&lifted.config).unwrap();
-        // Verbatim: the keys are the checkpoint's own spelling, asserting
-        // only that the bytes arrived unaltered.
         assert_eq!(doc["num_hidden_layers"], 2);
         assert_eq!(doc["vocab_size"], 32);
         assert_eq!(doc["model_type"], "llama");
-        // Absent quantization block is not a defect: most checkpoints
-        // declare none.
         assert!(
             doc.get("quantization_config").is_none() && doc.get("quantization").is_none(),
             "an unquantized snapshot declares nothing"
         );
 
-        // A checkpoint file inside the snapshot reads the config beside it.
         let gguf = snap.join("model.gguf");
         std::fs::write(&gguf, b"x").unwrap();
         assert_eq!(
@@ -711,8 +560,6 @@ mod tests {
         );
     }
 
-    /// A snapshot without a `config.json` is an error, not a silent fallback.
-    #[test]
     fn a_snapshot_without_a_config_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let err = Model::Snapshot(dir.path().to_path_buf())

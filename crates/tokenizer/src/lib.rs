@@ -1,11 +1,3 @@
-//! Top-level Tokenizer struct.
-//!
-//! Provides `encode` / `decode` over a BPE vocabulary. Construction happens
-//! via [`loader`] (Hugging Face `tokenizer.json` and native tiktoken formats).
-//!
-//! External formats compile into one of a small number of supported modern
-//! pipelines. Unsupported legacy combinations are rejected at load time.
-
 mod bpe;
 mod unigram;
 pub mod canonical;
@@ -22,21 +14,15 @@ use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use bpe::BpeTable;
 
-/// Representation of a token added on top of the base vocabulary.
 #[derive(Debug, Clone)]
 pub struct AddedToken {
     pub id: u32,
     pub content: String,
     pub special: bool,
-    /// The whitespace run BEFORE this token is consumed by the match
-    /// (Hugging Face `lstrip`). The consumed whitespace is not encoded.
     pub lstrip: bool,
-    /// The whitespace run AFTER this token is consumed by the match
-    /// (Hugging Face `rstrip`). The consumed whitespace is not encoded.
     pub rstrip: bool,
 }
 
-/// Whether an already-known whole piece bypasses BPE merging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BpeMode {
     Merge,
@@ -50,31 +36,20 @@ impl BpeMode {
     }
 }
 
-/// How the sentencepiece dummy prefix (`normalizer_to` marker) is injected
-/// while encoding a `ByteFallbackReplace` pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DummyPrefix {
-    /// No marker is prepended (Gemma).
     #[default]
     None,
-    /// Prepend one marker to every encoded text segment (legacy Llama-2/Phi-3).
     EverySegment,
-    /// Prepend one marker only to the segment starting the input, and only
-    /// if it isn't already there after space replacement (Mistral).
     FirstSegment,
 }
 
-/// One pre-tokenizer split stage: the regex whose matches become pieces, and
-/// whether the text between matches survives as pieces too (`keep_gaps`).
 #[derive(Debug)]
 pub(crate) struct Splitter {
     pub(crate) regex: fancy_regex::Regex,
     pub(crate) keep_gaps: bool,
 }
 
-/// umT5's one normalizer: `Replace { pattern: Regex " {2,}", content: " " }`.
-/// Written out rather than run as a regex — the pattern is a run of spaces and
-/// nothing else, and a scan is cheaper than a match on every prompt.
 fn collapse_space_runs(text: &str) -> Cow<'_, str> {
     if !text.contains("  ") {
         return Cow::Borrowed(text);
@@ -95,46 +70,26 @@ fn collapse_space_runs(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
-    /// Optional NFC, one or more regex splitters, then byte-level BPE.
     ByteLevelRegex {
         nfc: bool,
         splitters: Vec<Splitter>,
         bpe_mode: BpeMode,
     },
-    /// Sentencepiece-style space marker normalization with byte fallback on
-    /// decode.
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
         dummy_prefix: DummyPrefix,
-        /// Remove one leading `normalizer_from` from the decoded stream,
-        /// undoing the dummy prefix.
         strip_decoder_marker: bool,
     },
-    /// **SentencePiece Unigram** (umT5, and every T5 relative): a Metaspace
-    /// pre-tokenizer, a Viterbi walk over the piece scores, and a template
-    /// post-processor that ends every encode with one token.
-    ///
-    /// No merges and no ranks — see [`crate::unigram`] for why none of the
-    /// BPE machinery applies to the search, and why the symbol table still
-    /// does.
     Unigram {
         scores: crate::unigram::UnigramScores,
-        /// The Metaspace marker (`▁`) spaces become and decode back into.
         replacement: String,
-        /// `prepend_scheme = "always"`: every segment gets a leading marker,
-        /// which is what makes a leading word and an interior one the same
-        /// piece.
         prepend_always: bool,
-        /// The template post-processor's trailing token (`</s>` for umT5).
-        /// `None` for a template that appends nothing.
         eos_id: Option<u32>,
     },
-    /// Minimal char-level path used by grammar fixtures and `from_vocab`.
     RawChar,
 }
 
@@ -142,9 +97,6 @@ impl Pipeline {
     fn grammar_token_bytes(&self, raw: Arc<[u8]>) -> Arc<[u8]> {
         match self {
             Self::ByteLevelRegex { .. } | Self::RawChar => raw,
-            // A Unigram piece is a string with the Metaspace marker where a
-            // space was; the grammar wants the string a reader would see.
-            // No byte fallback to undo — this vocabulary states none.
             Self::Unigram { replacement, .. } => {
                 replace_bytes(raw.as_ref(), replacement.as_bytes(), b" ").into()
             }
@@ -166,27 +118,13 @@ impl Pipeline {
     }
 }
 
-/// A BPE tokenizer for the modern model profiles supported by Pie.
-///
-/// # Example
-///
-/// ```no_run
-/// use std::path::Path;
-/// use tokenizer::Tokenizer;
-///
-/// let tokenizer = Tokenizer::from_file(Path::new("tokenizer.json")).unwrap();
-/// let ids = tokenizer.encode("Hello, world!");
-/// let text = tokenizer.decode(&ids, false);
-/// ```
 pub struct Tokenizer {
     bpe: BpeTable,
 
     pipeline: Pipeline,
 
-    /// Sorted for binary_search.
     special_token_ids: Vec<u32>,
     added_token_matcher: Option<AhoCorasick>,
-    /// Parallel to the matcher's patterns.
     added_tokens: Vec<AddedToken>,
 
     grammar: OnceLock<GrammarVocabulary>,
@@ -198,23 +136,15 @@ struct GrammarVocabulary {
     trie_subtree_end: Vec<usize>,
 }
 
-/// Stateful incremental decoder for streaming generation.
 pub struct TokenizerDecoder {
     tokenizer: Arc<Tokenizer>,
     skip_special: bool,
     pending_utf8: Vec<u8>,
     fallback_run: Vec<u8>,
-    /// Whether the decoder `Strip` still must inspect this stream's first
-    /// output; disarms after the first non-empty chunk.
     strip_armed: bool,
 }
 
 impl Tokenizer {
-    /// Construct a `Tokenizer` from its components.
-    ///
-    /// Prefer [`from_file`] for loading an external tokenizer artifact.
-    /// This constructor is for use by format-specific loaders
-    /// (e.g. [`loader::huggingface`]).
     pub(crate) fn new(
         bpe: BpeTable,
         pipeline: Pipeline,
@@ -249,12 +179,6 @@ impl Tokenizer {
         })
     }
 
-    /// Build a minimal tokenizer from raw token strings.
-    ///
-    /// Each string becomes a token with ID = its index; the 256 single-byte
-    /// tokens are appended after them so stated ids keep their values, and
-    /// so BPE has base symbols to fall back on for any string that isn't
-    /// exactly one whole-word entry. No normalization, no special tokens.
     pub fn from_vocab(vocab: &[String]) -> Self {
         use std::collections::HashMap;
         let mut map: HashMap<u32, Vec<u8>> = vocab
@@ -272,20 +196,14 @@ impl Tokenizer {
             .expect("raw vocabulary must produce a valid tokenizer")
     }
 
-    /// Load a tokenizer from a supported external format.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         loader::from_file(path)
     }
 
-    /// Load a Kimi K2/K2.5 tiktoken rank file (`base64(token_bytes) rank`).
-    ///
-    /// A rank file carries no split regex; the sibling `tokenizer_config.json`
-    /// must identify a known tiktoken tokenizer, or loading is rejected.
     pub fn from_tiktoken_file(path: &std::path::Path) -> anyhow::Result<Self> {
         loader::tiktoken::from_file(path)
     }
 
-    /// Create an incremental decoder sharing this tokenizer.
     pub fn decoder(self: &Arc<Self>, skip_special: bool) -> TokenizerDecoder {
         TokenizerDecoder {
             tokenizer: self.clone(),
@@ -296,18 +214,14 @@ impl Tokenizer {
         }
     }
 
-    /// Encode text into token IDs.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::with_capacity(text.len() / 3 + 1);
         self.encode_into(text, &mut ids);
         ids
     }
 
-    /// Append encoded token IDs to an existing output buffer.
     pub fn encode_into(&self, text: &str, ids: &mut Vec<u32>) {
         if text.is_empty() {
-            // Not nothing: a template post-processor still appends its tail,
-            // and the reference tokenizer answers `[</s>]` for "".
             self.append_template_tail(ids);
             return;
         }
@@ -326,7 +240,6 @@ impl Tokenizer {
                 segment_end = last_end + segment.trim_end_matches(char::is_whitespace).len();
             }
             if segment_end > last_end {
-                // A segment starts the input iff it begins at byte 0.
                 self.encode_text(&text[last_end..segment_end], last_end == 0, ids);
             }
             ids.push(token.id);
@@ -342,16 +255,12 @@ impl Tokenizer {
         self.append_template_tail(ids);
     }
 
-    /// The `TemplateProcessing` post-processor's trailing token, appended once
-    /// per encode — never per segment, which is why it lives here and not in
-    /// `encode_text`. Only a pipeline that states one has one.
     fn append_template_tail(&self, ids: &mut Vec<u32>) {
         if let Pipeline::Unigram { eos_id: Some(id), .. } = &self.pipeline {
             ids.push(*id);
         }
     }
 
-    /// Encode a single piece of text using the appropriate BPE atom mode.
     #[inline]
     fn encode_piece(&self, piece: &str, ids: &mut Vec<u32>) {
         if piece.is_empty() {
@@ -411,11 +320,6 @@ impl Tokenizer {
                     self.encode_piece(&text, ids);
                 }
             }
-            // METASPACE, at `prepend_scheme = "always"`. The normalizer
-            // collapses runs of two or more spaces to one (umT5's only
-            // normalizer), spaces become the marker, and one marker goes in
-            // front of EVERY segment — which is what makes a word the same
-            // piece whether it starts the string or sits inside it.
             Pipeline::Unigram {
                 replacement,
                 prepend_always,
@@ -472,7 +376,6 @@ impl Tokenizer {
                 let mut last_end = 0;
                 for result in splitter.regex.find_iter(piece) {
                     let Ok(matched) = result else {
-                        // Preserve input rather than a partially encoded result.
                         self.encode_piece(text, ids);
                         return;
                     };
@@ -506,7 +409,6 @@ impl Tokenizer {
         )
     }
 
-    /// Decode token IDs back into text.
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         match &self.pipeline {
             Pipeline::ByteFallbackReplace {
@@ -524,9 +426,6 @@ impl Tokenizer {
                     strip_prefix,
                 )
             }
-            // The Metaspace decoder, and nothing else: `prepend_scheme =
-            // "always"` put one marker at the front, so one leading space
-            // comes off.
             Pipeline::Unigram { replacement, .. } => {
                 let text = self.decode_raw(ids, skip_special);
                 let text = text.replace(replacement.as_str(), " ");
@@ -585,23 +484,18 @@ impl Tokenizer {
         bytes_to_string(output)
     }
 
-    /// Get the vocabulary size (including added tokens).
     pub fn vocab_size(&self) -> usize {
         self.bpe.vocab_size()
     }
 
-    /// Look up a token string → ID.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.bpe.bytes_to_id(token.as_bytes())
     }
 
-    /// Look up an ID → token bytes.
     pub fn id_to_token(&self, id: u32) -> Option<Vec<u8>> {
         self.bpe.id_to_bytes(id).map(|s| s.to_vec())
     }
 
-    /// Every token id whose bytes begin with `prefix`, ascending. An empty
-    /// prefix matches the whole vocabulary.
     pub fn ids_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
         (0..self.bpe.vocab_size() as u32)
             .filter(|id| {
@@ -612,17 +506,12 @@ impl Tokenizer {
             .collect()
     }
 
-    /// Look up an ID → token string (lossy UTF-8 conversion).
     pub fn id_to_token_str(&self, id: u32) -> Option<String> {
         self.bpe
             .id_to_bytes(id)
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 
-    /// Get the split regex when the pipeline has exactly one splitter.
-    ///
-    /// Returns an empty string for zero or multiple splitters. Use
-    /// [`split_regexes`](Self::split_regexes) when sequence semantics matter.
     pub fn get_split_regex(&self) -> String {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } if splitters.len() == 1 => {
@@ -632,7 +521,6 @@ impl Tokenizer {
         }
     }
 
-    /// Regex splitters in the order they are applied.
     pub fn split_regexes(&self) -> Vec<&str> {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } => {
@@ -642,7 +530,6 @@ impl Tokenizer {
         }
     }
 
-    /// Get the special token IDs and their byte representations.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         let mut ids = Vec::with_capacity(self.special_token_ids.len());
         let mut bytes = Vec::with_capacity(self.special_token_ids.len());
@@ -655,9 +542,6 @@ impl Tokenizer {
         (ids, bytes)
     }
 
-    /// Decoder-aware bytes contributed by one token.
-    ///
-    /// Returns `None` for special or unmapped tokens.
     pub fn decoded_token_bytes(&self, token_id: u32) -> Option<&[u8]> {
         self.grammar()
             .token_bytes
@@ -666,21 +550,14 @@ impl Tokenizer {
             .filter(|bytes| !bytes.is_empty())
     }
 
-    /// Non-special token IDs sorted lexicographically by decoded bytes.
     pub fn sorted_token_ids(&self) -> &[u32] {
         &self.grammar().sorted_token_ids
     }
 
-    /// Trie subtree ranges over [`sorted_token_ids`](Self::sorted_token_ids).
-    ///
-    /// `trie_subtree_end[i]` is the index of the first entry whose decoded
-    /// bytes do **not** start with the bytes for entry `i`.
-    /// Enables O(1) subtree skipping during token mask generation.
     pub fn trie_subtree_end(&self) -> &[usize] {
         &self.grammar().trie_subtree_end
     }
 
-    /// Sorted list of special token IDs.
     pub fn special_token_ids(&self) -> &[u32] {
         &self.special_token_ids
     }
@@ -721,13 +598,9 @@ impl Tokenizer {
 }
 
 impl TokenizerDecoder {
-    /// Decode newly arrived token IDs and return only the new text.
     pub fn feed(&mut self, ids: &[u32]) -> String {
         let mut output = Vec::with_capacity(ids.len() * 4);
         match &self.tokenizer.pipeline {
-            // A Unigram piece is whole UTF-8 with the Metaspace marker where
-            // a space was, so it drains like the raw path; the marker comes
-            // off the drained text, never off a partial code point.
             Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar | Pipeline::Unigram { .. } => {
                 for &id in ids {
                     if self.skip_special
@@ -773,8 +646,6 @@ impl TokenizerDecoder {
         bytes_to_string(output)
     }
 
-    /// Applies the decoder's leading-marker strip once, to the stream's
-    /// first non-empty chunk.
     fn apply_stream_strip(&mut self, output: &mut Vec<u8>) {
         if !self.strip_armed || output.is_empty() {
             return;
@@ -789,7 +660,6 @@ impl TokenizerDecoder {
         }
     }
 
-    /// Flush an incomplete trailing byte sequence.
     pub fn finish(&mut self) -> String {
         let mut output = Vec::new();
         match &self.tokenizer.pipeline {
@@ -803,7 +673,6 @@ impl TokenizerDecoder {
         bytes_to_string(output)
     }
 
-    /// Reset decoder state for a new stream.
     pub fn reset(&mut self) {
         self.pending_utf8.clear();
         self.fallback_run.clear();
@@ -811,7 +680,6 @@ impl TokenizerDecoder {
     }
 }
 
-/// Implement FromStr so `"json".parse::<Tokenizer>()` works idiomatically.
 impl std::str::FromStr for Tokenizer {
     type Err = anyhow::Error;
 
@@ -820,8 +688,6 @@ impl std::str::FromStr for Tokenizer {
     }
 }
 
-/// Build trie subtree ranges for a sorted vocabulary: `result[i]` is the
-/// index of the first entry whose string does not start with `sorted[i]`'s.
 fn build_subtree_ranges(sorted_ids: &[u32], vocab: &[Option<Arc<[u8]>>]) -> Vec<usize> {
     let n = sorted_ids.len();
     let mut ranges = vec![n; n];
@@ -854,7 +720,6 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
     result
 }
 
-/// Append `haystack`, replacing every `needle` with `replacement`.
 fn append_replaced(output: &mut Vec<u8>, haystack: &[u8], needle: &[u8], replacement: &[u8]) {
     if needle.is_empty() {
         output.extend_from_slice(haystack);
@@ -931,4 +796,3 @@ fn drain_utf8(pending: &mut Vec<u8>, output: &mut Vec<u8>, finish: bool) {
         pending.clear();
     }
 }
-

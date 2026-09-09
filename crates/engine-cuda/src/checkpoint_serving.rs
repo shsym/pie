@@ -1,11 +1,3 @@
-//! Addressing adapter that reads model planes out of a serving `.zt`
-//! checkpoint by trace param name, rather than by file position.
-//!
-//! A trace names planes (`w`, `w.scales`, `w.biases`); the artifact holds
-//! objects (`w`, one blob of three planes). [`Serving`] resolves the one to
-//! the other through the artifact, and the deferred fill reads whole objects
-//! so that every block digest is checked against the bytes it covers.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -15,7 +7,6 @@ use checkpoint::file::serve::Artifact;
 use checkpoint::serving::{DigestAlgorithm, Digesting};
 use model_ir::Trace;
 
-/// One mapping of a serving artifact, shared by every seat that reads it.
 #[derive(Clone)]
 pub struct Serving {
     artifact: Arc<Artifact>,
@@ -33,8 +24,6 @@ impl std::fmt::Debug for Serving {
 }
 
 impl Serving {
-    /// Opens `path` as this trace's serving artifact, or `None` if it isn't
-    /// one. The stamp is checked once, before any plane lands; not re-checked here.
     #[must_use]
     pub fn open(path: &Path, trace: &Trace) -> Option<Serving> {
         let artifact = Artifact::open(path).ok()?;
@@ -50,25 +39,17 @@ impl Serving {
         &self.path
     }
 
-    /// One plane's bytes, borrowed from the mapping, or `None` if this
-    /// artifact does not carry that name.
     #[must_use]
     pub fn plane(&self, id: u32) -> Option<&[u8]> {
         let name = self.names.get(id as usize)?;
         self.artifact.plane(name).ok()
     }
 
-    /// The trace's name for this ordinal, or `None` past the end.
     #[must_use]
     pub fn name(&self, id: u32) -> Option<&str> {
         self.names.get(id as usize).map(String::as_str)
     }
 
-    /// A plane for a seat that hands out a pointer `reserved` bytes wide:
-    /// the plane's own bytes, answered only when they fit the reservation
-    /// and the mapping extends `reserved` bytes past the plane's start. No
-    /// kernel reads past the plane; what lies beyond it (the next plane, or
-    /// the file's tail) only keeps the pointer inside the mapping.
     #[must_use]
     pub fn plane_reserved(&self, id: u32, reserved: u64) -> Option<&[u8]> {
         let name = self.names.get(id as usize)?;
@@ -81,8 +62,6 @@ impl Serving {
         blob.get(located.plane.range())
     }
 
-    /// Verifies the objects holding these planes, before a kernel is pointed
-    /// at one. Each object is checked against its own block digests.
     pub fn verify_planes(&self, params: &[u32]) -> Result<(), String> {
         let mut objects = BTreeSet::new();
         for id in params {
@@ -106,46 +85,31 @@ impl Serving {
     }
 }
 
-/// One plane of a T1 object as the background fill needs it.
 pub struct PlaneLanding {
-    /// Where the plane starts within its object's blob.
     pub offset: u64,
-    /// The plane's length: what the block digests cover.
     pub len: u64,
-    /// Where it lands in the page-locked image.
     pub into: u64,
-    /// What the seat reserved for it; the tail past `len` is zeroed.
     pub reserved: u64,
 }
 
-/// One T1 object: where its blob is, its blocks, and which of its planes
-/// the seat holds.
 pub struct Landing {
     pub object: String,
-    /// Where the blob starts in the file.
     pub at: u64,
     pub algorithm: DigestAlgorithm,
-    /// Every block of the blob: its blob-local range and its stated digest.
     pub blocks: Vec<(Range<u64>, Vec<u8>)>,
     pub planes: Vec<PlaneLanding>,
 }
 
-/// The whole background fill, stated before a thread is spawned for it.
 pub struct Landings {
     pub path: PathBuf,
     pub landings: Vec<Landing>,
 }
 
 impl Serving {
-    /// Whether this artifact can fill `layout`: every plane carried at the
-    /// length the plan declares, fitting its reservation, in an object whose
-    /// blocks are stated. `layout` is `Plan::host_layout`'s quads:
-    /// `(param, into, bytes, reserved)`.
     pub fn covers(&self, layout: &[(u64, u64, u64, u64)]) -> Result<(), String> {
         self.refill(layout).map(drop)
     }
 
-    /// What the background fill would have to do, or why it cannot.
     pub fn refill(&self, layout: &[(u64, u64, u64, u64)]) -> Result<Landings, String> {
         let mut by_object: BTreeMap<String, Landing> = BTreeMap::new();
         for (param, into, bytes, reserved) in layout.iter().copied() {
@@ -203,22 +167,14 @@ impl Serving {
     }
 }
 
-/// Thread count for reading behind a deferred seat.
 const READERS: usize = 8;
 
-/// A destination pointer a scope thread may carry. Sound to move and share
-/// because `read_into`'s landings are disjoint windows on a mapping the
-/// caller has handed to nobody else, and each lane touches only its own
-/// items.
 struct Carried(*mut u8);
 // SAFETY: see the type doc and `read_into`'s contract.
 unsafe impl Send for Carried {}
 // SAFETY: as above.
 unsafe impl Sync for Carried {}
 
-/// One block of one object: the file window, and where each piece of it
-/// goes (a seated plane's bytes to the image, the rest to a scratch buffer
-/// so the digest still covers the whole block).
 struct Work<'a> {
     object: &'a str,
     which: usize,
@@ -246,25 +202,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Why one block did not land.
 enum Failed {
     Read(String),
     Rotten(String),
 }
 
-/// Reads the whole fill into `into`, hashing each block as its bytes land.
-/// One work item per block rather than per plane, since plane sizes are
-/// very uneven. Each seated plane's reservation past its length is zeroed.
-///
-/// # Safety
-///
-/// `into` must be valid for writes over every plane's `into..into +
-/// reserved`, those windows must be disjoint, and nothing else may name a
-/// byte of them for the duration.
-///
-/// # Errors
-///
-/// A filesystem error first, then the first block whose digest disagrees.
 pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> {
     use std::os::unix::fs::FileExt;
 
@@ -434,7 +376,13 @@ mod tests {
             .collect()
     }
 
-    /// A plane is found by name, not by file position.
+    fn checkpoint_serving_every_case() {
+        a_plane_is_found_by_its_name_and_not_by_where_it_sits();
+        a_reservation_wider_than_the_plane_is_answered_inside_the_mapping();
+        the_fill_rebuilds_the_image_from_one_object_and_sees_a_changed_byte();
+        an_ordinary_checkpoint_is_not_a_serving_artifact();
+    }
+
     #[test]
     fn a_plane_is_found_by_its_name_and_not_by_where_it_sits() {
         let dir = tmp("byname");
@@ -454,9 +402,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A seat reserves more than the plane is long; the plane is answered at
-    /// its own length as long as the mapping runs on past it.
-    #[test]
     fn a_reservation_wider_than_the_plane_is_answered_inside_the_mapping() {
         let dir = tmp("reserved");
         let path = dir.join("m.zt");
@@ -472,10 +417,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An affine weight's three trace planes resolve into one object, and the
-    /// fill rebuilds each plane's image from that object's blocks — catching
-    /// a byte that changed in any of them.
-    #[test]
     fn the_fill_rebuilds_the_image_from_one_object_and_sees_a_changed_byte() {
         let dir = tmp("refill");
         let path = dir.join("m.zt");
@@ -503,7 +444,6 @@ mod tests {
         assert_eq!(serving.plane(1), Some(&scales[..]));
         serving.verify_planes(&[0, 1, 2]).unwrap();
 
-        // Codes at 0 (256 reserved), biases at 256 (64 reserved); scales not seated.
         let layout = vec![(0u64, 0u64, 128u64, 256u64), (2, 256, 8, 64)];
         serving.covers(&layout).unwrap();
         let why = serving.covers(&[(0, 0, 64, 256)]).unwrap_err();
@@ -528,9 +468,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An ordinary checkpoint is not a serving artifact; `Serving::open`
-    /// returns `None`, sending the boot to the tier file instead.
-    #[test]
     fn an_ordinary_checkpoint_is_not_a_serving_artifact() {
         let dir = tmp("plain");
         let path = dir.join("plain.zt");

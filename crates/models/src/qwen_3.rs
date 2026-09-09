@@ -8,12 +8,8 @@ pub mod tokenizer;
 use model::Model;
 use model_dsl::Dtype;
 
-/// Identification order: the first row whose import fits the checkpoint wins.
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
-        // Drafted first: an `-MTP-4bit` checkpoint fits the undrafted row
-        // too (its `mtp.*` planes ignored), so the row that needs them asks
-        // first; a plain checkpoint lacks them and falls through.
         (
             "qwen36-27b-mtp",
             1,
@@ -24,9 +20,6 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
-        // The DFlash block drafter, overlaid by `--aux`. Asks before the
-        // plain row for the reason the MTP row does: an artifact carrying
-        // the drafter's planes fits the undrafted row too.
         (
             "qwen36-27b-dflash",
             1,
@@ -157,8 +150,6 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
         ),
-        // The DFlash2 block drafter overlaid by `--aux`; asks before the
-        // plain rows for the reason the v1 row does.
         (
             "qwen38-27b-dflash2",
             1,

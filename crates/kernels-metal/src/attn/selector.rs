@@ -1,6 +1,3 @@
-//! DFlash2's candidate selector, walked from each request's anchor —
-//! `Attention::SelectorWalk`. One kernel, `attn/selector_walk.metal`.
-
 use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
@@ -9,26 +6,10 @@ use crate::tensor::{RaggedTensor, Tensor};
 
 const FILE: &str = "attn/selector_walk.metal";
 
-/// Threads a request's walk runs at: sixteen lanes for each of up to
-/// sixteen candidates.
 const THREADS: u32 = 256;
 
-/// The most candidates a slot may carry — the threadgroup's lane budget.
 const MAX_K: u32 = THREADS / 16;
 
-/// `picks[row]` for every row of every request: the anchor row's first
-/// candidate, then the chain-argmax walk of
-/// `unary[c] + ⟨pred[prev] ⊙ hp[row], succ[cand[c]]⟩` slot by slot.
-///
-/// `cand` is `[rows, k]` i32 with the request CSR, `unary` `[rows, k]` f32,
-/// `hp` `[rows, rank]`, `tokens` `[rows]` i32 (the anchor is each span's
-/// first), `pred` / `succ` `[vocab, rank]` in `hp`'s element type.
-///
-/// # Errors
-///
-/// Refuses a dtype the kernel is not stamped for, more than sixteen
-/// candidates, codebooks that disagree with `hp` on the rank or with each
-/// other on the vocabulary, and a `unary` or `picks` of the wrong shape.
 #[allow(clippy::too_many_arguments)]
 pub fn walk(
     ctx: &Ctx<'_>,
@@ -95,8 +76,6 @@ pub fn walk(
     {
         return Err(refuse(OP, "hp, tokens and picks carry one row per candidate row"));
     }
-    // With no hidden term the seat is bound to the codebook (never read: the
-    // kernel branches on `has_hp`), so the binding is never nil.
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([THREADS, lanes, 1], [THREADS, 1, 1])),

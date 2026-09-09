@@ -1,5 +1,3 @@
-//! Pins `Windows::of`: a tower region is cut at the patch table, a trunk region carries the patch interval it reads, and both round-trip through the descriptor.
-
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, PatchLadder, RowAxis, compile_axes,
@@ -7,8 +5,6 @@ use model_compiler::{
 use model_exec::fire::{FireDescriptor, Lane, compose_axes};
 use model_ir::ops::Elementwise;
 
-/// Slot ceiling well above any fire built below; last three args bound one
-/// gathered payload (rows, kv spaces, pages).
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
@@ -80,7 +76,6 @@ impl Build {
     }
 }
 
-/// A tower, then a trunk that reads it.
 fn tower_and_trunk() -> Trace {
     let mut b = Build::new();
     let pixels = b.value(Def::Input(RuntimeInput::Patches), patch());
@@ -88,7 +83,6 @@ fn tower_and_trunk() -> Trace {
 
     let tower = b.op(pixels, patch(), Guard::Always);
     let deeper = b.op(tower, patch(), Guard::Always);
-    // The embed merge: patch rows in, token rows out.
     let merged = b.op(deeper, act(), Guard::Always);
     let seeded = b.op(tokens, act(), Guard::Always);
     let d = b.op(merged, act(), Guard::Fact(0));
@@ -138,7 +132,12 @@ fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
     compiled.units[compiled.unit_of(region) as usize]
 }
 
-/// The tower is cut at the patch table, the trunk at the token one.
+fn a_tower_region_reads_the_patch_window_every_case() {
+    each_region_is_cut_at_its_own_axis_s_window();
+    a_fire_with_no_image_gets_the_token_windows_it_always_had();
+    the_table_a_device_reads_carries_both_seriations();
+}
+
 #[test]
 fn each_region_is_cut_at_its_own_axis_s_window() {
     let (trace, compiled) = baked();
@@ -165,8 +164,6 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
 
     let mut towers = 0;
     let mut trunks = 0;
-    // Tracks whether some token region sees the whole patch rectangle
-    // (the embed merge's `layout.scatter_rows` input).
     let mut merge_saw_the_tower = false;
     for (at, region) in compiled.template().iter().enumerate() {
         let window = windows.at(at as u32, 0);
@@ -192,8 +189,6 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                     fire.classes().rows_of(&region.mask),
                     "a trunk region's launch runs over token rows",
                 );
-                // Patch interval is cut at this region's own classes: a
-                // class with token rows and no image contributes none.
                 assert_eq!(
                     window.on(RowAxis::Patches).rows,
                     fire.patch_classes().rows_of(&region.mask),
@@ -211,15 +206,11 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
          would read somebody else's rows",
     );
 
-    // The class with no image has token rows and no patch rows.
     let text_class = compiled.classes.class_of(0).expect("word 0 is a class");
     assert!(fire.classes().as_slice()[text_class].rows > 0);
     assert_eq!(fire.patch_classes().as_slice()[text_class].rows, 0);
 }
 
-/// A fire whose lanes carry no image gets the same token windows as before
-/// the axis existed, and a patch window of nothing.
-#[test]
 fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let (trace, compiled) = baked();
     let budgets = budgets();
@@ -268,8 +259,6 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     assert_eq!(mixed.patch_rows(), 128);
 }
 
-/// The descriptor round-trips both tables through pack/unpack.
-#[test]
 fn the_table_a_device_reads_carries_both_seriations() {
     let (_, compiled) = baked();
     let budgets = budgets();

@@ -1,11 +1,3 @@
-//! Engine selection and the registry: the `EngineSpec`/`EngineBox` store
-//! (`backend`), channel endpoint lifecycle (`channel`), and the launch-side
-//! machinery the rest of the runtime reads. The contract itself
-//! ([`Engine`](engine::Engine) and its verbs) is `engine`'s; this crate
-//! picks a backend, keeps it in a registry under an `EngineId`, and holds
-//! the channel endpoints applications wait on. Strictly leaf: no
-//! `crate::{store,scheduler,pipeline,inferlet,server}` imports.
-
 pub mod backend;
 pub mod channel;
 pub mod completion;
@@ -35,16 +27,10 @@ pub use fire::{
     FireRequest, FrameFire, MaskWords, StepFire, bitmask_words,
 };
 
-/// The four recurrent-state verbs, as a slot's flag byte spells them. The
-/// numbering stays because the runtime's own recurrent store is built on it.
 pub mod rs_flag {
-    /// Clear the slot before the fire writes it.
     pub const RESET: u8 = 1 << 0;
-    /// Fold the slot's history into this fire.
     pub const FOLD: u8 = 1 << 1;
-    /// Write the slot's buffer as well as its state.
     pub const BUFFER_WRITE: u8 = 1 << 2;
-    /// The fold length is resolved on the device, not stated here.
     pub const FOLD_LEN_DEVICE: u8 = 1 << 3;
 }
 
@@ -53,11 +39,8 @@ pub use rs_flag::{
     FOLD_LEN_DEVICE as RS_FLAG_FOLD_LEN_DEVICE, RESET as RS_FLAG_RESET,
 };
 
-/// Which engine, as the registry addresses it.
 pub type EngineId = usize;
 
-/// The three adaptations the scheduler lane makes between the contract's
-/// verbs and the run-ahead machinery around them.
 pub mod verbs {
     use anyhow::Result;
 
@@ -65,7 +48,6 @@ pub mod verbs {
 
     use super::{EngineBox, EngineId, RegisteredChannel, SubmissionCompletion};
 
-    /// Which backend an engine's guest-program codegen emits for.
     #[must_use]
     pub fn codegen_backend(engine: &EngineBox) -> Option<&str> {
         engine
@@ -73,18 +55,6 @@ pub mod verbs {
             .and_then(|facts| facts.codegen_backend.as_deref())
     }
 
-    /// Write one adapter's planes into a loaded engine's banks: one call,
-    /// one id, one plane per bank, forwarded. The read side is
-    /// [`Lane::adapter`](engine::fire::Lane::adapter); no path in this crate
-    /// sets a per-request adapter id yet, since the fire path's port
-    /// vocabulary has no such port.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the engine refused — a bank it does not declare, an id past
-    /// its capacity, a plane that is not one slot's bytes, or
-    /// [`Unsupported`](engine::Error::Unsupported) from a shell
-    /// whose loads seat no bank.
     pub fn register_adapter(
         engine: &mut EngineBox,
         registration: &engine::adapter::AdapterRegistration,
@@ -94,35 +64,12 @@ pub mod verbs {
             .map_err(anyhow::Error::from)
     }
 
-    /// A control verb's answer, as the run-ahead broker wants it. The
-    /// shells are synchronous: `copy_kv`, `copy_state` and `encode` answer
-    /// `Result<()>`, so the completion handed to waiters is already settled
-    /// ([`SubmissionCompletion::ready`]) rather than a live wait slot.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the engine refused, widened to `anyhow` for the scheduler's
-    /// mailbox.
     pub fn settled(result: engine::Result<()>) -> Result<SubmissionCompletion> {
         result
             .map(|()| SubmissionCompletion::ready())
             .map_err(anyhow::Error::from)
     }
 
-    /// Register one channel: the runtime's host ring, and the engine's
-    /// device one if it has a plane for it. Two shapes, picked by the
-    /// engine's answer: a published mirror makes the runtime's ring a view
-    /// of engine-allocated pinned memory (no pump, no copy); no mirror
-    /// falls back to the runtime allocating its own ring and `ChannelJoin`
-    /// pumping cells at the fire boundary.
-    /// [`Unsupported`](engine::Error::Unsupported) is tolerated and treated
-    /// as the no-mirror case; any other refusal is returned. A zero wait id
-    /// from the engine means it keeps no waker table, so the slot is
-    /// allocated here instead.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the engine refused, except [`Unsupported`].
     pub fn register_channel(
         engine: &mut EngineBox,
         engine_id: EngineId,
@@ -195,14 +142,6 @@ pub mod verbs {
     }
 }
 
-/// Not wired to any backend.
-///
-/// A named refusal rather than an absence: a verb that cannot be reached teaches
-/// nothing, and one that says what is missing is a door with a stated hole.
-///
-/// # Errors
-///
-/// Always.
 pub async fn generate_audio(
     _engine_idx: EngineId,
     _prompt: &[u32],

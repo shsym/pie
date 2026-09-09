@@ -1,18 +1,11 @@
-//! Pins that `gpu_mem_utilization` reaches the shell: `engine_cuda::open`
-//! refuses an illegal fraction, `budget_bytes` turns it into pool bytes,
-//! and `Accounting` sums weight tier + pool + safety floor against the card.
-
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::Accounting;
 use engine_cuda::{DeviceBoot, Knobs};
 
-/// The card the gap was measured on: an L40S, 48,305,799,168 bytes.
 const CARD: u64 = 48_305_799_168;
 
-/// What an uncapped gpt-oss load leaves resident on the card.
 const WEIGHTS: u64 = 13_761_281_792;
 
-/// A boot with the operator's fraction stated, everything else the default.
 fn boot_with(fraction: f64) -> DeviceBoot {
     DeviceBoot {
         knobs: Knobs {
@@ -23,9 +16,16 @@ fn boot_with(fraction: f64) -> DeviceBoot {
     }
 }
 
-/// A contract lookup for a gate that never loads: `open` must not need one.
 fn no_contract() -> engine_cuda::ContractFor {
     |_, _| Err("this gate opens a boot and never loads a model".to_string())
+}
+
+fn the_operators_fraction_sizes_the_pool_every_case() {
+    the_boot_carries_the_fraction_and_absence_is_the_configs_default();
+    an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name();
+    the_whole_card_is_the_arithmetic_the_pool_had_before();
+    the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
+    the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
 }
 
 #[test]
@@ -48,7 +48,6 @@ fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
     engine_cuda::open(boot_with(1.0), no_contract(), |name| models::sku(name).map(|sku| sku.classify)).expect("the whole card opens");
 }
 
-#[test]
 fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
     for fraction in [0.0, 1.5, -0.25, f64::NAN, f64::INFINITY] {
         let refusal = engine_cuda::open(boot_with(fraction), no_contract(), |name| models::sku(name).map(|sku| sku.classify))
@@ -65,7 +64,6 @@ fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
     }
 }
 
-#[test]
 fn the_whole_card_is_the_arithmetic_the_pool_had_before() {
     let floor = safety_floor_bytes(CARD);
     for free in [CARD, CARD - WEIGHTS, 1 << 30, floor + 1] {
@@ -77,7 +75,6 @@ fn the_whole_card_is_the_arithmetic_the_pool_had_before() {
     }
 }
 
-#[test]
 fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
     let floor = safety_floor_bytes(CARD);
     assert_eq!(
@@ -86,7 +83,6 @@ fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
         "min(128 MiB, card/10) on this card"
     );
 
-    // The measured situation: an uncapped gpt-oss load, then the pool opens.
     let free = CARD - WEIGHTS;
 
     let uncapped = budget_bytes(free, CARD, 1.0);
@@ -100,11 +96,9 @@ fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
         "the gap this wave closes is nearly five gigabytes: {uncapped} vs {asked}"
     );
 
-    // A fraction under what is already resident is zero, not a wrap.
     assert_eq!(budget_bytes(free, CARD, 0.10), 0);
 }
 
-#[test]
 fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
     let floor = safety_floor_bytes(CARD);
 
@@ -120,7 +114,6 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
     );
     roomy.admit().expect("29.6 GB holds a 2 GiB sequence");
 
-    // A weight tier that leaves the pool below one sequence at the declared context.
     let tight = Accounting::of(CARD, 0.90, 42 << 30, 4 << 30);
     let refusal = tight
         .admit()
@@ -144,8 +137,6 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
         "and it names the two keys that change the answer: {refusal}"
     );
 
-    // The fraction decides too, not only the weights: the same load the
-    // whole card holds is refused at a fraction that does not.
     let demand = 32 << 30;
     Accounting::of(CARD, 1.0, WEIGHTS, demand)
         .admit()

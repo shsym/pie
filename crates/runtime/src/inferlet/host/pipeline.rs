@@ -1,11 +1,3 @@
-//! WIT host glue for `pie:inferlet/pipeline` — thin `Host`/`HostPipeline`
-//! impls over the pipeline-owned [`crate::pipeline::Pipeline`] resource type.
-//! The ordering-domain algorithm (the in-flight fire FIFO, close/drop
-//! draining) lives in [`crate::pipeline::fire`]; these impls only push/get/
-//! delete the WASM resource and delegate through
-//! [`crate::pipeline::fire::FireContext`] (implemented for `ProcessCtx`
-//! below).
-
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 

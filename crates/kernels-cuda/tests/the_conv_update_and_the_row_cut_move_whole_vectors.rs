@@ -1,7 +1,3 @@
-//! The eight-wide forms of the decode conv update and the row cut land what
-//! their scalar forms land: the convolved row with the window shifted one
-//! step, and the two halves of a packed row.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -11,6 +7,12 @@ use dtype::Dtype;
 use kernels_cuda::attn::ssm;
 use kernels_cuda::layout;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
+
+fn the_conv_update_and_the_row_cut_move_whole_vectors_every_case() {
+    the_conv_update_convolves_the_window_and_shifts_it();
+    the_row_cut_lands_both_halves();
+    the_row_cut_lands_both_halves_past_the_grid_y_ceiling();
+}
 
 #[test]
 fn the_conv_update_convolves_the_window_and_shifts_it() {
@@ -89,7 +91,6 @@ fn the_conv_update_convolves_the_window_and_shifts_it() {
     }
 }
 
-#[test]
 fn the_row_cut_lands_both_halves() {
     let (rows, left_w, right_w) = (5u32, 48usize, 80usize);
     let total = left_w + right_w;
@@ -124,15 +125,6 @@ fn the_row_cut_lands_both_halves() {
     }
 }
 
-/// **THE CUT SERVES PAST 65 535 ROWS.** The eight-wide form used to launch
-/// its rows on `grid.y`, which every compute capability caps at 65 535, so a
-/// fire at a 65 536-token ceiling — or a VAE's voxel rectangle, which is
-/// wider still — was refused by the driver rather than served. Rows now ride
-/// `grid.x` and the column tiles `grid.y`; this is the claim, at a row count
-/// the old geometry could not launch. Only the first and last few rows are
-/// compared: the point is that the launch happened at all and that the row
-/// indexing did not transpose.
-#[test]
 fn the_row_cut_lands_both_halves_past_the_grid_y_ceiling() {
     let (rows, left_w, right_w) = (65_600u32, 48usize, 80usize);
     let total = left_w + right_w;

@@ -1,6 +1,3 @@
-//! NIXL backend: moves KV pages between workers over UCX. Built only under `--features nixl`.
-//! Credential is an opaque metadata blob (not an ibverbs rkey); all agent calls are serialized behind one mutex since NIXL is not thread-safe.
-
 mod ffi;
 
 use std::collections::HashMap;
@@ -40,8 +37,6 @@ fn dev_id(domain: MemoryDomain) -> u64 {
     }
 }
 
-/// A connected peer: its NIXL agent name and its exported handle (region
-/// addresses to target).
 struct Remote {
     agent: CString,
     handle: KvHandle,
@@ -50,11 +45,8 @@ struct Remote {
 struct Inner {
     agent: nixl_capi_agent_t,
     backend: nixl_capi_backend_t,
-    /// Locally registered handles, by owning worker.
     locals: HashMap<u64, KvHandle>,
-    /// Connected remote peers, by worker.
     remotes: HashMap<u64, Remote>,
-    /// In-flight transfer requests, by this backend's inner id.
     reqs: HashMap<u64, Request>,
     next_id: u64,
 }
@@ -65,7 +57,6 @@ struct Request {
     released: bool,
 }
 
-/// Cross-node NIXL backend. One NIXL agent + UCX plugin per instance.
 pub struct NixlBackend {
     inner: Mutex<Inner>,
 }
@@ -77,8 +68,6 @@ unsafe impl Send for NixlBackend {}
 unsafe impl Sync for NixlBackend {}
 
 impl NixlBackend {
-    /// Create a NIXL agent named `agent_name` with a UCX backend. The agent
-    /// name must be unique within the cluster (it's how peers address it).
     pub fn new(agent_name: &str) -> Result<Self> {
         let name = CString::new(agent_name)
             .map_err(|_| TransportError::Transfer("agent name contains a nul byte".into()))?;
@@ -163,7 +152,6 @@ impl NixlBackend {
             }
 
             let _post_status = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
-            // A post error can still leave an agent-owned request; keep it pollable so the normal path releases it.
 
             let id = g.next_id;
             g.next_id += 1;
@@ -179,8 +167,6 @@ impl NixlBackend {
     }
 }
 
-/// Build a NIXL transfer descriptor list for every physical region slice of
-/// each logical KV page.
 unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_capi_xfer_dlist_t> {
     let first = handle
         .regions
@@ -384,4 +370,3 @@ impl Drop for NixlBackend {
         }
     }
 }
-

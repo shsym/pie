@@ -1,24 +1,3 @@
-//! **AN AXIS ROPE'S SHAPE RULE: THE POSITION COLUMNS ARE THE STATED AXES,
-//! THE AXES SUM TO THE ROTATED WIDTH, AND THE ROTATED WIDTH FITS THE HEAD.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test the_axis_rope_states_its_axes_once
-//! ```
-//!
-//! `elementwise.rope_axes` (D7) turns `[rows, heads·head_dim]` in place by
-//! `[rows, axes]` f32 positions under `dims: [u32; 4]` channel counts and
-//! `thetas: [f32; 4]`. Every number is stated by the family and the wrapper
-//! checks them against each other at trace time, so a kernel never sees a
-//! rope whose axes disagree with its positions:
-//!
-//! ```text
-//! (a) FLUX's three axes over 128-wide heads trace, in place, positions f32
-//! (b) MiniMax's partial rotation (96 of 128) traces, with rotary_dim < head_dim
-//! (c) three axes of dims under two position columns are refused
-//! (d) axes that do not sum to rotary_dim are refused
-//! (e) a rotary_dim past the head is refused
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, RopeForm, Value, ops,
     seam, trace_hybrid,
@@ -36,7 +15,6 @@ impl Classify for NoFacts {
     }
 }
 
-/// One rope over one rectangle, every number stated by the test.
 struct OneRope {
     axes: u8,
     dims: [u32; 4],
@@ -79,7 +57,12 @@ fn refusal(rope: OneRope) -> String {
     }
 }
 
-/// (a)
+fn the_axis_rope_states_its_axes_once_every_case() {
+    three_axes_over_a_whole_head_trace_in_place();
+    a_partial_rotation_leaves_the_tail_of_the_head_alone();
+    a_rope_whose_numbers_disagree_is_refused_by_name();
+}
+
 #[test]
 fn three_axes_over_a_whole_head_trace_in_place() {
     let trace = trace_hybrid(
@@ -137,8 +120,6 @@ fn three_axes_over_a_whole_head_trace_in_place() {
     );
 }
 
-/// (b)
-#[test]
 fn a_partial_rotation_leaves_the_tail_of_the_head_alone() {
     let trace = trace_hybrid(
         "minimax",
@@ -161,8 +142,6 @@ fn a_partial_rotation_leaves_the_tail_of_the_head_alone() {
     )));
 }
 
-/// (c), (d), (e)
-#[test]
 fn a_rope_whose_numbers_disagree_is_refused_by_name() {
     let message = refusal(OneRope {
         axes: 2,

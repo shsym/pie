@@ -1,5 +1,3 @@
-//! Structured frontend IR shared by non-EBNF grammar sources.
-
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};

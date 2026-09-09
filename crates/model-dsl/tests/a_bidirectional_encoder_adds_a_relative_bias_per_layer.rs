@@ -1,29 +1,3 @@
-//! **A TWO-LAYER T5-STYLE BIDIRECTIONAL ENCODER — per-layer bucket
-//! embedding, one `elementwise.relative_bucket_bias` table per layer,
-//! `attention.ragged` over per-lane CSRs under `RaggedMask::RelativeBias`,
-//! a gated-gelu MLP, a `hidden` readout — TRACES AND VALIDATES, AND ITS
-//! TABLES ARE PLAN CONSTANTS THE ATTENTION NODES NAME.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_bidirectional_encoder_adds_a_relative_bias_per_layer
-//! ```
-//!
-//! What a text-encoder family writes for umT5 (every layer owns its
-//! relative attention bias) and what the validator must accept:
-//!
-//! ```text
-//! (a) the text traces with no kv space and no logits: the hidden seam is
-//!     its float readout
-//! (b) each layer lands one `RelativeBucketBias` node whose output is
-//!     `[Const(heads), Const(2·max_len − 1)]` f32, read from the layer's
-//!     `[num_buckets, heads]` weight, guarded `Always`
-//! (c) each layer's ragged attention carries that layer's table in its
-//!     mask, at `sm_scale = 1` (T5 does not scale), and the table is among
-//!     the node's operands
-//! (d) a table whose width disagrees with `max_len` is refused at the
-//!     wrapper, as is one that is not f32
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
     trace_hybrid,
@@ -114,7 +88,11 @@ impl ForwardHybrid for Encoder {
     }
 }
 
-/// (a), (b), (c).
+fn a_bidirectional_encoder_adds_a_relative_bias_per_layer_every_case() {
+    two_layers_trace_with_one_table_each_and_the_attention_names_it();
+    a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused();
+}
+
 #[test]
 fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
@@ -231,8 +209,6 @@ fn refusal(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
     }
 }
 
-/// (d).
-#[test]
 fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
     struct Misshapen(u32, Dtype);
     impl ForwardHybrid for Misshapen {

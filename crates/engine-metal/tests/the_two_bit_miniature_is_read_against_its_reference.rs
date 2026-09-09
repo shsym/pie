@@ -1,68 +1,3 @@
-//! **THE FIRST EXTERNAL READING OF THIS FAMILY.** Every fidelity claim dsv4
-//! made before this file was self-consistency — streamed == resident, warm ==
-//! cold, one road == another — and the full 89.9 GiB model answered
-//! incoherently through all of them. This file is the other half: the
-//! `mini-l5-e16` snapshot (five of the forty-three layers, sixteen of the 256
-//! experts, real geometry) fired over a probe battery and read against
-//! `scripts/dsv4_mini_parity_ref.py`, an MLX transcription of
-//! `ssd-moe/deepseek-v4-flash-mlx`'s oracle — which was itself graded against
-//! the official ds4 dumps — driven by the miniature's own config.
-//!
-//! # What it found, the first time it ran
-//!
-//! 0 of 239 teacher-forced positions agreed. Six deviations from the
-//! official model were attributed by emulating each in the reference until
-//! the reference met pie at the bf16 floor (`--pie ogroups,rope,comp_rope0,
-//! hash,trunk,no_orope`): the o-projection summed the `o_groups` slices and
-//! projected once where the official `einsum("bsgd,grd->bsgr")` is
-//! block-diagonal; the compressor layers roped q/kv at `rope_theta` without
-//! YaRN where the official `Attention.__init__` uses `compress_rope_theta`
-//! with it; the pooled entries roped at the base theta too; the hash layers
-//! weighted their experts uniformly where `Gate.forward` gathers the
-//! sqrt-softplus scores on every layer; the trunk summed its streams where
-//! `hc_head` folds them under learned sigmoid gates; and the attention output
-//! was never un-rotated (`apply_rotary_emb(o[..., -rd:], freqs, True)` — MLA's
-//! latent is both key and value). With the six fixed: 233 of 239, every
-//! remaining flip a near-tie the reference itself decides by under a tenth
-//! of a logit.
-//!
-//! # Shape
-//!
-//! `tests/dsv4-parity/reference.json` carries, per probe, the reference's
-//! **top-5 (id, logit)** at every teacher-forced position and at every greedy
-//! step (the full rows are 129 280 wide and are not committed). Two arms per
-//! probe:
-//!
-//! * **teacher-forced**, one token per fire in a fresh slot, so every
-//!   position's logits come back — the decode class over the whole prompt;
-//! * **prefill + greedy**, the whole prompt in one fire and `steps` decodes —
-//!   the prefill class, then the decode class over pie's OWN continuation.
-//!
-//! **THE BAR.** At every teacher-forced position pie's argmax is the
-//! reference's, or the reference's own margin between its top choice and
-//! pie's choice is under [`NEAR_TIE`] — a rounding-scale perturbation flips
-//! only a near-tie, and a flip won by more than that is a fault. The greedy
-//! arm is read the same way at every step up to the first divergence and
-//! REPORTED after it: once pie's own token differs, the two continuations
-//! condition on different prefixes and stop being comparable. No token index
-//! is pinned; the split point is printed, not asserted.
-//!
-//! **NOT A LONG-HORIZON GATE.** Prompt plus steps stay under 128 tokens
-//! because the reference models no compressed rows on a ratio-128 layer and
-//! no indexer selection (`index_topk` 512 is far beyond every row here); the
-//! ratio-128 compressor and the top-k branch are outside what this file can
-//! say anything about.
-//!
-//! **DUMP MODE.** `PIE_DSV4_PARITY_OUT=DIR` also writes every full row
-//! (`NAME.pie.{tf,gen}.f32`, `NAME.pie.json`) for
-//! `scripts/dsv4_mini_parity_compare.py`, which is how the attribution above
-//! was measured and how the next fault will be.
-//!
-//! ```text
-//! cargo test -p engine-metal --release \
-//!   --test the_two_bit_miniature_is_read_against_its_reference -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use std::io::Write;
@@ -76,14 +11,8 @@ use model_dsl::{Classify, Platform, Request};
 const SKU: &str = "dsv4-flash-u4g64-u2g64-kv-bf16";
 const REPO: &str = "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ";
 
-/// The reference fixture, relative to the workspace root.
 const REFERENCE: &str = "tests/dsv4-parity/reference.json";
 
-/// A flip is admitted only where the reference itself decided by less than
-/// this many logits between its top choice and the one pie made. Measured:
-/// after the six fixes every flip in the battery sits under 0.1, and the
-/// rows' bf16 noise floor is ~1e-2 in KL; a fault of the kind this file was
-/// written for moves logits by tens.
 const NEAR_TIE: f32 = 0.5;
 
 fn snapshot() -> Option<PathBuf> {
@@ -149,6 +78,7 @@ fn load(checkpoint: &Path, context: u32) -> Shell {
     drop(source);
     let booted = Instant::now();
     let shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint,
@@ -182,7 +112,6 @@ fn write_rows(path: &Path, rows: &[Vec<f32>]) {
     file.write_all(&bytes).expect("the logits are written");
 }
 
-/// The reference's top-k at one position: `(id, logit)`, best first.
 fn top(row: &serde_json::Value) -> Vec<(u32, f32)> {
     row.as_array()
         .expect("a top-k row is a list")
@@ -197,10 +126,6 @@ fn top(row: &serde_json::Value) -> Vec<(u32, f32)> {
         .collect()
 }
 
-/// One position read against the reference's top-k: agreement, or the
-/// reference's margin between its top and pie's choice when they differ.
-/// `None` where pie chose something outside the reference's top-k — a gap
-/// wider than the fixture can measure, and a fault by construction.
 fn read(pie: u32, reference: &[(u32, f32)]) -> Result<(), Option<f32>> {
     let (best, best_logit) = reference[0];
     if pie == best {
@@ -263,7 +188,6 @@ fn every_probe_answers_the_reference_to_the_bf16_floor() {
         assert_eq!(tf_top.len(), ids.len(), "{name}: one reference row per prompt token");
         let started = Instant::now();
 
-        // Arm 1: teacher-forced, one token per fire.
         let tf_slot = next_slot();
         shell.open(tf_slot).expect("the slot opens");
         let mut tf_rows: Vec<Vec<f32>> = Vec::with_capacity(ids.len());
@@ -300,7 +224,6 @@ fn every_probe_answers_the_reference_to_the_bf16_floor() {
             }
         }
 
-        // Arm 2: prefill the prompt in one fire, then greedy decode.
         let gen_slot = next_slot();
         shell.open(gen_slot).expect("the slot opens");
         let got = shell
@@ -326,9 +249,6 @@ fn every_probe_answers_the_reference_to_the_bf16_floor() {
             gen_rows.push(got.into_iter().next().expect("one row"));
         }
         gen_rows.truncate(steps.max(1));
-        // The prefill row is read against the reference outright (same
-        // prefix); each later row only while pie's continuation is still the
-        // reference's, because the first divergence changes the prefix.
         let reference_gen: Vec<u32> = probe["gen"]
             .as_array()
             .expect("the reference's continuation")

@@ -47,10 +47,9 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-MODALITY_NUM = 3  # MINIMAX_H3_ADALN_MODALITY_NUM
+MODALITY_NUM = 3
 ADALN_SLICES = 6
 FINAL_SLICES = 2
-
 
 @dataclass
 class Arch:
@@ -95,9 +94,6 @@ class Arch:
     def rope_dim(self) -> int:
         return 6 * self.rope_inv_freq_len
 
-
-# The study's D.3 miniature: two blocks, one refiner, 64-wide heads,
-# eight frequencies per axis (48 of 64 rotated).
 MINI = Arch(
     hidden_size=128,
     num_layers=2,
@@ -112,16 +108,13 @@ MINI = Arch(
     rope_inv_freq_len=8,
 )
 
-
 def _norm(size: int, *, eps: float) -> nn.RMSNorm:
     """minimax_h3.py:353-357 — affine RMSNorm, fp32 accumulation."""
     return nn.RMSNorm(size, eps=eps)
 
-
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
-
 
 def _modulate_scale_shift(
     x: torch.Tensor,
@@ -132,7 +125,6 @@ def _modulate_scale_shift(
     """`x · (1 + scale[idx]) + shift[idx]` (minimax_h3.py:366-386)."""
     return x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
 
-
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -142,11 +134,9 @@ def _modulate_gate(
     """`x + gate[idx] · other` (minimax_h3.py:389-410)."""
     return x + gate.index_select(0, indices) * other
 
-
 def _silu_mul(hidden: torch.Tensor) -> torch.Tensor:
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
-
 
 class Rope(nn.Module):
     """minimax_h3.py:457-483 — 3-D rope over `(t, h, w)`.
@@ -168,14 +158,12 @@ class Rope(nn.Module):
         half = torch.cat((t_f, h_f, w_f), dim=-1)
         return torch.cat((half, half), dim=-1)
 
-
 def rope_cos_sin_cache(freqs: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
     """minimax_h3.py:485-496 — `[cos(first half) | sin(first half)]`."""
     half = freqs.shape[-1] // 2
     return torch.cat(
         (torch.cos(freqs[:, :half]), torch.sin(freqs[:, :half])), dim=-1
     ).to(dtype=dtype)
-
 
 def apply_rope(x: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
     """minimax_h3.py:540-549 — rotate the cached prefix, pass the tail."""
@@ -187,7 +175,6 @@ def apply_rope(x: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
     x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
     return torch.cat((x_rot, x_pass), dim=-1)
-
 
 class TimeEmbedder(nn.Module):
     """minimax_h3.py:552-604 — `[cos | sin]` sinusoid then a two-layer MLP."""
@@ -209,7 +196,6 @@ class TimeEmbedder(nn.Module):
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         return self.proj_out(nn.functional.silu(self.proj_in(t_freq)))
 
-
 class AdalnProj(nn.Module):
     """minimax_h3.py:1181-1238 — `[M, t_dim] -> [M·modalities, ratio·H]`."""
 
@@ -227,7 +213,6 @@ class AdalnProj(nn.Module):
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))
 
-
 class MLP(nn.Module):
     """minimax_h3.py:1127-1178 — `fc1` lands `[gate | up]`, no biases."""
 
@@ -238,7 +223,6 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(_silu_mul(self.fc1(x)))
-
 
 class Attention(nn.Module):
     """minimax_h3.py:736-1124, the eager path.
@@ -280,7 +264,6 @@ class Attention(nn.Module):
         for lo, hi in zip(cu_seqlens[:-1], cu_seqlens[1:]):
             if lo == hi:
                 continue
-            # `[1, heads, span, head_dim]`, non-causal, no mask.
             qs = q[lo:hi].transpose(0, 1).unsqueeze(0)
             ks = k[lo:hi].transpose(0, 1).unsqueeze(0)
             vs = v[lo:hi].transpose(0, 1).unsqueeze(0)
@@ -289,7 +272,6 @@ class Attention(nn.Module):
             )
             out[lo:hi] = o[0].transpose(0, 1)
         return self.out_proj(out.reshape(rows, self.inner_dim))
-
 
 class TokenRefinerBlock(nn.Module):
     """minimax_h3.py:1240-1280 — pre-norm, no adaLN, no rope."""
@@ -305,7 +287,6 @@ class TokenRefinerBlock(nn.Module):
         x = x + self.attn(self.norm1(x), rope_cache=None, cu_seqlens=cu_seqlens)
         return x + self.mlp(self.norm2(x))
 
-
 class TokenRefiner(nn.Module):
     """minimax_h3.py:1282-1320."""
 
@@ -320,7 +301,6 @@ class TokenRefiner(nn.Module):
         for block in self.blocks:
             x = block(x, cu_seqlens=cu_seqlens)
         return self.final_norm(x)
-
 
 class DiTBlock(nn.Module):
     """minimax_h3.py:1323-1423."""
@@ -360,7 +340,6 @@ class DiTBlock(nn.Module):
         h = self.mlp(h)
         return _modulate_gate(residual, gate_mlp, h, combined_indices)
 
-
 class FinalLayer(nn.Module):
     """minimax_h3.py:1426-1532 — one modality, both heads on every row."""
 
@@ -383,7 +362,6 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(adaln_input)
         h = _modulate_scale_shift(self.norm(x), shift, scale, inverse_indices)
         return self.video_out(h), self.audio_out(h)
-
 
 class MiniMaxH3DiT(nn.Module):
     """The whole transformer over ONE packed row sequence.
@@ -461,7 +439,6 @@ class MiniMaxH3DiT(nn.Module):
         alo, ahi = spans["audio"]
         _ = arch
         return video[vlo:vhi], audio[alo:ahi]
-
 
 def interleave_qkv(weight: torch.Tensor, *, heads: int, head_dim: int) -> torch.Tensor:
     """`[Q | K | V]` back into the official `[q_h | k_h | v_h]` per head.

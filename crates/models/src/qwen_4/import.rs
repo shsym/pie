@@ -1,5 +1,3 @@
-//! Import contracts for qwen4 checkpoints (transformers and mlx_lm layouts) into the model.rs declaration.
-
 use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{Layer, Mixer, Mlp, Model};
@@ -10,11 +8,7 @@ use model_dsl::Weight;
 
 #[derive(Clone, Copy)]
 enum Layout {
-    /// `model.language_model.*` + `lm_head.weight` — transformers.
     Transformers,
-    /// `language_model.model.*` + `language_model.lm_head.weight` — mlx_lm.
-    /// Layout doesn't distinguish dtype width; that's decided by which
-    /// catalog row's declared widths the read matches.
     Mlx,
 }
 
@@ -40,13 +34,10 @@ impl Layout {
         }
     }
 
-    /// The draft head's planes sit at the top level in both spellings.
     fn mtp(self, tail: &str) -> String {
         format!("mtp.{tail}")
     }
 
-    /// The tower is renamed, not just re-rooted: transformers publishes
-    /// `model.visual.*`, `mlx_lm` publishes `vision_tower.*` (qwen_3's rule).
     fn tower(self, leaf: &str) -> String {
         match self {
             Self::Transformers => format!("model.visual.{leaf}"),
@@ -54,7 +45,6 @@ impl Layout {
         }
     }
 
-    /// True for mlx_lm, which stores each plain-RMSNorm weight already offset by +1.0.
     fn folds_the_norm_one(self) -> bool {
         match self {
             Self::Transformers => false,
@@ -99,16 +89,11 @@ impl Model {
         for read in self.reads(layout) {
             match read {
                 Read::One(w, name) => b.read(w, name)?,
-                // read_concat also joins each part's .scales/.biases at the same seam.
                 Read::Concat(w, names) => b.read_concat(w, names)?,
-                // A raw plane stated as the same source stacked along its rows:
-                // no shard seam to join, so a plain concat expression.
                 Read::Stacked(w, names) => b.read_expr(
                     w,
                     Expr::concat(0, names.into_iter().map(Expr::src).collect()),
                 )?,
-                // Undo the MLX fold on the planes the text scales by
-                // `weight + 1`.
                 Read::Norm(w, name) => {
                     let e = Expr::src(name);
                     let e = if layout.folds_the_norm_one() {
@@ -119,10 +104,6 @@ impl Model {
                     b.read_expr(w, e)?;
                 }
                 Read::Squeeze(w, name) => b.read_expr(w, squeezed(src, name)?)?,
-                // `patch_embed.proj.weight` is a Conv3d kernel read as a matmul
-                // bank `[hidden, C*T*P^2]`: a torch conv is already stored in
-                // that byte order (a transmute); an MLX conv is channels-last,
-                // so its columns need a permutation (qwen_3's reading).
                 Read::PatchEmbed(w, name) => {
                     const CHANNELS: i64 = 3;
                     let want = extents(w);
@@ -144,9 +125,6 @@ impl Model {
         Ok(b.build())
     }
 
-    /// Every source name this import reads, in order, paired with the plane
-    /// it lands in. Drives both the actual import and the census below, so
-    /// they cannot drift; a joined bank appears once per stored part.
     #[must_use]
     pub fn mlx_planes(&self) -> Vec<(&Weight, String)> {
         self.reads(Layout::Mlx)
@@ -163,7 +141,6 @@ impl Model {
             .collect()
     }
 
-    /// The same census, names only — checked against a snapshot's `weight_map`.
     #[must_use]
     pub fn mlx_source_names(&self) -> Vec<String> {
         self.mlx_planes()
@@ -172,9 +149,6 @@ impl Model {
             .collect()
     }
 
-    // Deliberately not read: `self_attn.indexer.*` (the QSA indexer, which the
-    // text does not run) and the PLE hash buffers (derived, not stored). The
-    // tower and the draft head are read when the text declares them.
     fn reads(&self, layout: Layout) -> Vec<Read<'_>> {
         let mut reads = Vec::new();
         reads.push(Read::One(&self.embed, layout.embed().to_string()));
@@ -191,21 +165,12 @@ impl Model {
 
         if let Some(mtp) = &self.mtp {
             let n = |tail: &str| layout.mtp(tail);
-            // Plain reads, NOT `Read::Norm`: the mlx conversion folded the
-            // `+1` into every norm it ships EXCEPT these two (measured against
-            // `Qwen/Qwen3.8-Flash-Next`: every `*norm.weight` differs from
-            // the original by exactly 1.0, `pre_fc_norm_*` by 0.0 — the
-            // converter's name pattern missed them). Both layouts therefore
-            // hold the original's zero-centred weight, and the plus-one norm
-            // in the forward puts the one back.
             reads.push(Read::One(
                 &mtp.norm_embed,
                 n("pre_fc_norm_embedding.weight"),
             ));
             reads.push(Read::One(&mtp.norm_hidden, n("pre_fc_norm_hidden.weight")));
             reads.push(Read::One(&mtp.fc_embed, n("fc_embedding.weight")));
-            // `fc_hidden` applies per stream: the one stored plane, `streams`
-            // times over, is the block-diagonal bank the text declares.
             reads.push(Read::Stacked(
                 &mtp.fc_hidden,
                 (0..self.streams).map(|_| n("fc_hidden.weight")).collect(),
@@ -272,7 +237,6 @@ impl Model {
 
         if let Some(p) = &self.ple {
             let n = |tail: &str| layout.trunk(&format!("layers.{}.ple.{tail}", p.layer));
-            // Stored sharded; shards are concatenated back into one row space.
             let shards: Vec<String> = (0..shard_count(p))
                 .map(|i| n(&format!("ple_embedding.ngram_embedding.shard_{i}.weight")))
                 .collect();
@@ -301,8 +265,6 @@ impl Model {
     }
 }
 
-/// One block's reads — the trunk's forty-eight and the draft head's one —
-/// at the name prefix `n` states.
 fn layer_reads<'a>(
     w: &'a Layer,
     layout: Layout,
@@ -311,7 +273,6 @@ fn layer_reads<'a>(
 ) {
     match &w.mixer {
         Mixer::Attn(a) => {
-            // Stored q_proj is the fused query|gate bank: [2 · q_heads · head_dim, hidden].
             reads.push(Read::One(&a.qg_proj, n("self_attn.q_proj.weight")));
             reads.push(Read::One(&a.k_proj, n("self_attn.k_proj.weight")));
             reads.push(Read::One(&a.v_proj, n("self_attn.v_proj.weight")));
@@ -337,7 +298,6 @@ fn layer_reads<'a>(
             reads.push(Read::Squeeze(&g.conv, n("linear_attn.conv1d.weight")));
             reads.push(Read::One(&g.dt_bias, n("linear_attn.dt_bias")));
             reads.push(Read::One(&g.a_log, n("linear_attn.A_log")));
-            // Not plus-one-scaled; mlx_lm does not fold it either.
             reads.push(Read::One(&g.norm, n("linear_attn.norm.weight")));
             reads.push(Read::One(&g.out_proj, n("linear_attn.out_proj.weight")));
         }
@@ -377,8 +337,6 @@ fn layer_reads<'a>(
             ..
         } => {
             reads.push(Read::One(router, n("mlp.gate.weight")));
-            // transformers stores gate_up fused; mlx_lm splits it into
-            // switch_mlp.{gate,up}_proj and this rejoins them.
             match layout {
                 Layout::Transformers => {
                     reads.push(Read::One(gate_up, n("mlp.experts.gate_up_proj")));
@@ -411,27 +369,15 @@ fn layer_reads<'a>(
     }
 }
 
-/// One read of this import: the plane it lands in, and the source name (or
-/// names) it lands from.
 enum Read<'a> {
-    /// A plane read verbatim under its own name.
     One(&'a Weight, String),
-    /// A bank joined from stored parts at the seams the declaration bands.
     Concat(&'a Weight, Vec<String>),
-    /// A plain-RMSNorm plane, whose `+1` the MLX spelling folds in and this
-    /// import takes back out.
     Norm(&'a Weight, String),
-    /// A depthwise convolution stored with a unit axis the read squeezes.
     Squeeze(&'a Weight, String),
-    /// A raw plane read as one source repeated along axis 0 (`fc_hidden`'s
-    /// per-stream bank).
     Stacked(&'a Weight, Vec<String>),
-    /// The tower's Conv3d patch kernel, read as the matmul bank it is
-    /// (columns permuted for the channels-last MLX spelling).
     PatchEmbed(&'a Weight, String),
 }
 
-/// Number of shards declared by the table's own seams.
 fn shard_count(p: &super::model::Ple) -> usize {
     match &p.table.shard {
         model_dsl::Shard::Cut { segments, .. } => segments.len(),

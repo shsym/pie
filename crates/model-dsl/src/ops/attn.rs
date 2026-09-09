@@ -1,17 +1,6 @@
-//! The `Attention` family: paged attention and its plans, the SSM/linear-attn
-//! recurrences, MLA, the DSA index, and the pooled plane.
-
 use super::*;
 use crate::forward::Input;
 
-/// Builds the decode plan off `inputs`' geometry and reading, once per
-/// (reading × class) at the top of `forward`, shared by every layer's decode.
-///
-/// The plan is guarded by the arm it was built off (`Recorder::push` meets
-/// that arm's conds into the plan node's guard), so a query from another arm
-/// is refused. There is no interning or dedup: sharing a plan across layers
-/// is a fact the text states by hoisting it once, not something a cache
-/// inferred from matching numbers.
 pub fn plan_decode<F>(
     inputs: &Input<F>,
     q_heads: u32,
@@ -42,9 +31,6 @@ pub fn plan_decode<F>(
     plan
 }
 
-/// Builds the prefill plan off `inputs`' geometry and its reading. Like
-/// [`plan_decode`], the plan's guard is the arm it was built off, and its
-/// reading is stated here rather than inferred from its readers.
 pub fn plan_prefill<F>(
     inputs: &Input<F>,
     q_heads: u32,
@@ -127,10 +113,6 @@ pub fn prefill(
     o
 }
 
-/// Decode with a learned relative-position bias (`Attention::DecodeRel`):
-/// `bias` is `[rows, heads · extent]` f32 from [`super::linear::rel_bias`];
-/// `log_scaling` is `(floor, alpha)` for the log attention scaling past a
-/// position floor, `None` for a layer without it.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_rel(
     q: &Value,
@@ -165,7 +147,6 @@ pub fn decode_rel(
     o
 }
 
-/// Prefill with the same bias (`Attention::PrefillRel`).
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_rel(
     q: &Value,
@@ -385,7 +366,6 @@ pub fn ssm_causal_conv1d(x: &Value, weight: &Weight, state: ValueId, conv_width:
     ssm_causal_conv1d_dilated(x, weight, state, conv_width, 1)
 }
 
-/// Dilated form: tap `j` reads `dilation · j` positions back.
 pub fn ssm_causal_conv1d_dilated(
     x: &Value,
     weight: &Weight,
@@ -441,8 +421,6 @@ pub fn ssm_causal_conv1d_chunked_dilated(
     y
 }
 
-/// Inkling's short convolution, decode form (`Attention::ShortConv`):
-/// `y = x + conv(x)`, no activation, over the recurrent conv's state slab.
 pub fn short_conv(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -459,7 +437,6 @@ pub fn short_conv(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -
     y
 }
 
-/// Prefill form of [`short_conv`].
 pub fn short_conv_chunked(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -476,10 +453,6 @@ pub fn short_conv_chunked(x: &Value, weight: &Weight, state: ValueId, conv_width
     y
 }
 
-/// DFlash2's two-tap grouped dynamic convolution along each request's rows
-/// (`Attention::BlockDynConv`): `side` 0 convolves a sublayer's input, 1 its
-/// output, both with the coefficients `coeff` projected from that input;
-/// `base` is the learned `[2·taps, channels]` kernel the projection corrects.
 pub fn block_dyn_conv(
     x: &Value,
     coeff: &Value,
@@ -505,10 +478,6 @@ pub fn block_dyn_conv(
     y
 }
 
-/// DFlash2's candidate selector, walked from each request's anchor
-/// (`Attention::SelectorWalk`): the picked id at every slot row, `[rows, 1]`
-/// i32 — a draft readout, planted where [`layout::argmax`](super::layout::argmax)'s
-/// would be.
 pub fn selector_walk(
     cand: &Value,
     unary: &Value,
@@ -539,8 +508,6 @@ pub fn selector_walk(
     picks
 }
 
-/// PLE n-gram hasher: `state` is the lane's trailing-token-id window; `mults`,
-/// `primes`, `offsets` are seed-derived hash constants. Answer is `[rows, primes.len()]` `i32`.
 pub fn ple_ngram_ids(
     ids: &Value,
     state: ValueId,
@@ -568,8 +535,6 @@ pub fn ple_ngram_ids(
     ngram_ids
 }
 
-/// Prefill form of [`ple_ngram_ids`]: walks the fire's ambient request
-/// boundaries, as the chunked convolution does.
 pub fn ple_ngram_ids_chunked(
     ids: &Value,
     state: ValueId,
@@ -740,9 +705,6 @@ pub fn ssm_kda_chunked(
     y
 }
 
-/// Builds the one MLA plan (serves both decode and prefill) off `inputs`'
-/// geometry and reading. Guard and hoisting discipline as [`plan_decode`];
-/// `heads` and `kv_lora_rank` are the absorbed reading the latent launches size against.
 pub fn mla_plan<F>(inputs: &Input<F>, heads: u32, kv_lora_rank: u32) -> Value {
     let kv_indptr = inputs.kv_indptr();
     let kv_indices = inputs.kv_indices();
@@ -873,7 +835,6 @@ pub fn mla_absorb_q(
     q_latent
 }
 
-/// Trailing pair is `nope_dim, v_head_dim`, same order as [`mla_absorb_q`].
 pub fn mla_absorb_out(
     latent: &Value,
     kv_b: &Weight,
@@ -1088,9 +1049,6 @@ pub fn index_rope(
     q_out
 }
 
-/// `ratio` is which cached rows are keys: `1` for a per-token key cache, the
-/// compressor's own ratio for a per-block one. Published ids are positions at
-/// `ratio == 1`, compressed-row indices otherwise.
 #[allow(clippy::too_many_arguments)]
 pub fn index_topk(
     q: &Value,
@@ -1132,9 +1090,6 @@ pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offse
     );
 }
 
-/// `row_valid` masks graph-padding rows out of the boundary math.
-/// Returns `(boundary_pos, boundary_req, boundary_rope)`: the cache cell,
-/// its lane, and the compressed row's roped position (not the same as the cell).
 pub fn pool_boundary_decode(
     positions: &Value,
     row_valid: &Value,
@@ -1158,9 +1113,6 @@ pub fn pool_boundary_decode(
     (boundary_pos, boundary_req, boundary_rope)
 }
 
-/// `row_valid` masks graph-padding rows out of the boundary math.
-///
-/// The prefill twin of [`pool_boundary_decode`], same three outputs.
 pub fn pool_boundary_prefill(
     positions: &Value,
     row_valid: &Value,
@@ -1184,8 +1136,6 @@ pub fn pool_boundary_prefill(
     (boundary_pos, boundary_req, boundary_rope)
 }
 
-/// `dtype` is the pooled entries' element type; stated explicitly since the
-/// wrapper has no data input to infer it from.
 pub fn pool_gather(
     boundary_pos: &Value,
     boundary_req: &Value,
@@ -1212,9 +1162,6 @@ pub fn pool_gather(
     entries
 }
 
-/// Compressor's rolling state, written at the source cache's own slot.
-/// `kv` is `wkv · x`, `score` is `wgate · x`, both `[tokens, coff · head_dim]`;
-/// [`pool_gather`] reads them back at `write_page`/`write_offset`'s cell.
 pub fn pool_state_write(
     kv: &Value,
     score: &Value,
@@ -1267,7 +1214,6 @@ pub fn pool_kv_append(
     );
 }
 
-/// `request_of_token` maps each token row to its owning lane.
 pub fn pool_lse(
     q: &Value,
     positions: &Value,
@@ -1299,8 +1245,6 @@ pub fn pool_lse(
     (o, lse)
 }
 
-/// [`pool_lse`] over the `selection` [`index_topk`] published (NSA fine branch).
-/// `top_k` is the selection's own width.
 #[allow(clippy::too_many_arguments)]
 pub fn pool_lse_selected(
     q: &Value,
@@ -1337,20 +1281,6 @@ pub fn pool_lse_selected(
     (o, lse)
 }
 
-/// Non-causal attention over packed token rows, segment `i` of `q` against
-/// segment `i` of `k`/`v`, no cache, no plan, no window (D2). `q_indptr` and
-/// `kv_indptr` are the two sides' CSRs — `Input::group_indptr` for a joint
-/// attention over a request's lanes, `Input::lane_indptr` for a
-/// lane-block-diagonal one — each over its own arm's packed rows
-/// (`layout::pack_rows`); `mask` is what applies on top. `head_dim` reads
-/// `q`'s head count off its width and `kv_heads` off `k`'s.
-///
-/// **`q` and `(k, v)` may come from different arms**: the one op the
-/// recorder lets span classes, so cross-attention reads queries off one
-/// stream and keys off another; the node runs over both windows, under the
-/// `Or` of the two guards. The answer is handed back under `q`'s own guard
-/// — it is defined on the query rows and nowhere else — so the text reads
-/// it on the arm the queries came from with no split.
 pub fn ragged(
     q: &Value,
     k: &Value,
@@ -1399,13 +1329,6 @@ pub fn ragged(
     o.under(q.cond())
 }
 
-/// The [`RaggedMask::RelativeBias`] a [`ragged`] attention adds from
-/// `table`, a `[heads, 2·max_len − 1]` f32 value
-/// ([`elemwise::relative_bucket_bias`](super::elemwise::relative_bucket_bias),
-/// or any constant the text computes — an ALiBi slope table), checked here
-/// where the value is at hand: one row per query head of the attention it
-/// is handed to (which `ragged` cannot see through an id), the width the
-/// arm reads.
 #[must_use]
 pub fn relative_bias(table: &Value, max_len: u32) -> RaggedMask {
     assert!(
@@ -1435,9 +1358,6 @@ pub fn relative_bias(table: &Value, max_len: u32) -> RaggedMask {
     }
 }
 
-/// Bidirectional attention over the patch window, block-diagonal per image.
-/// `segments` is the patch axis's indptr: patch row `n` attends over the rows
-/// of the image whose span contains it, both ways, and nothing else.
 pub fn dense(
     q: &Value,
     k: &Value,

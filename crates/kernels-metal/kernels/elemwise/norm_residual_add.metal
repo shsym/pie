@@ -35,3 +35,4 @@ instantiate_residual_add_strided(bfloat16, bfloat)
       const device itype*, const device itype*, device itype*, uint);
 
 instantiate_residual_add(bfloat16, bfloat)
+instantiate_residual_add(float32, float)

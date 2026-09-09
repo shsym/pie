@@ -1,9 +1,3 @@
-//! `spatial.grid`: the output grid of one op, computed on the device from
-//! its input grid and a rule — one block, one thread, a serial walk over
-//! the clips with the row offsets prefix-summed. What every wrapper that
-//! changes the box launches ahead of itself, so a chunked decode's grids
-//! are graph-captured data rather than host state.
-
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, stated};
 use crate::spatial::lane_pair;
@@ -13,39 +7,24 @@ const FILE: &str = "spatial/rule.cuh";
 
 const OP: &str = "spatial.grid";
 
-/// How one box maps to the next — the host's spelling of `RuleGeom`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridRule {
-    /// `(n + front + back - k) / stride + 1` per axis, time padded in front
-    /// only under `causal_t`.
     Conv {
         k: [u32; 3],
         stride: [u32; 3],
-        /// The front pad per axis.
         pad: [u32; 3],
-        /// The back pad per axis (equal to `pad` for a symmetric
-        /// convolution); ignored on the time axis under `causal_t`.
         pad_back: [u32; 3],
         causal_t: bool,
     },
-    /// `(t·ft, h·fh, w·fw)`, or `1 + (t-1)·ft` frames under `keep_first_frame`.
     Upsample {
         factor: [u32; 3],
         keep_first_frame: bool,
     },
-    /// `(t·r1 - trim_t, h·r2, w·r3)`; `trim_t` is a causal temporal
-    /// upsampler's anchor drop, the leading frames of the shuffled result
-    /// that are not emitted, and a box it empties lands no rows.
     Shuffle { r: [u32; 3], trim_t: u32 },
-    /// `(t/r1, h/r2, w/r3)`; a box that does not divide lands no rows.
     Unshuffle { r: [u32; 3] },
-    /// `AvgDown3D`'s box: `(ceil(t/ft), h/fh, w/fw)` — the unshuffle with
-    /// the time axis zero-padded IN FRONT to a multiple of `ft`, so a
-    /// chunk shorter than the block still maps. `h`/`w` must divide.
     AvgDown { factor: [u32; 3] },
 }
 
-/// `RuleGeom` in `spatial/rule.cuh`, field for field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Geom {
@@ -62,12 +41,6 @@ fn triple(op: &'static str, v: [u32; 3]) -> Result<[i32; 3], Error> {
     Ok([stated(op, v[0])?, stated(op, v[1])?, stated(op, v[2])?])
 }
 
-/// `o_grid = rule(grid)`: both `[lanes, 4]` i32.
-///
-/// # Errors
-///
-/// A refusal for a table that is not `[lanes, 4]` i32 or two tables of
-/// different lane counts.
 pub fn derive_grid(
     ctx: &Ctx,
     grid: Tensor,

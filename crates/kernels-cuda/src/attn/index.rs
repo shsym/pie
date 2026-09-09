@@ -1,6 +1,3 @@
-//! `Index`: the sparse-attention indexer — a small key cache scored against
-//! queries to select which pages the main attention will read.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -17,8 +14,6 @@ fn q_rope_block(n_heads: i32) -> u32 {
     (n_heads.unsigned_abs().div_ceil(32) * 32).max(32)
 }
 
-/// The index pool stores whole key rows contiguously; its strides must
-/// spell exactly that, and an HND pool cannot.
 fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
     if pool.layout != 0 {
         return Err(refuse(
@@ -42,7 +37,6 @@ fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
     Ok(())
 }
 
-/// Layernorms the index key row and ropes its tail, in place on `k`.
 #[allow(clippy::too_many_arguments)]
 pub fn layernorm_rope(
     ctx: &Ctx,
@@ -72,13 +66,11 @@ pub fn layernorm_rope(
             rope_dim.arg(),
             theta.arg(),
             eps.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Ropes the index query's tail per head, in place on `q`.
 pub fn rope(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -105,15 +97,11 @@ pub fn rope(
             head_dim.arg(),
             rope_dim.arg(),
             theta.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Appends index key rows into the pool's pages: the mla latent writer with
-/// a null rope plane. `write_page`/`write_offset` are stated but unread —
-/// the writer re-derives each token's cell from the CSR and `k`'s indptr.
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -138,9 +126,6 @@ pub fn kv_append(
     )
 }
 
-/// Scores `q` against the cached keys and writes the top-k page ids per
-/// row. The score scratch is a process-global slab (an entry may not
-/// allocate per fire).
 #[allow(clippy::too_many_arguments)]
 pub fn topk(
     ctx: &Ctx,
@@ -219,7 +204,6 @@ pub fn topk(
             max_kv.arg(),
             top_k.arg(),
             count(OP, "the pooling ratio this ranking states", ratio.max(1))?.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

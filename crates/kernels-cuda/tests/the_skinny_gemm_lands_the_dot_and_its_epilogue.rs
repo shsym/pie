@@ -1,8 +1,3 @@
-//! `linear::skinny::skinny_bf16` lands `act x w^T` within bf16 rounding of
-//! the f32 dot at one row, a ragged row count and the full 64; its softcap
-//! and geglu epilogues land what the traced second pass lands off the
-//! bf16-rounded product; and the rows past `m` of the output are untouched.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -27,8 +22,6 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     let mut lcg = Lcg::seeded(0x51 ^ ((m as u64) << 8) ^ n as u64);
     let (w_raw, w) = lcg.row(weight_rows * k);
     let (a_raw, a) = lcg.row(m * k);
-    // The output buffer is one row taller than `m`, prefilled, so a store
-    // past the live rows shows.
     let tall = m + 1;
     let (y_raw, _) = lcg.row(tall * n);
 
@@ -45,8 +38,6 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     let dot = |r: usize, c: usize| -> f32 { (0..k).map(|i| a[r * k + i] * w[c * k + i]).sum() };
     for r in 0..m {
         for c in 0..n {
-            // bf16 output rounding (2^-8 relative) plus the accumulation's
-            // own f32 noise over `k` terms of O(1), on each product.
             let noise = |v: f32| v.abs() * (1.0 / 128.0) + 2e-3 * (k as f32).sqrt() / 16.0;
             let (want, slack) = match epilogue {
                 Epilogue::Store => {
@@ -74,6 +65,13 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     assert_eq!(&got[m * n..], &y_raw[m * n..], "{epilogue:?} m={m} n={n} k={k}: the row past m moved");
 }
 
+fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
+    the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows();
+    the_softcap_epilogue_lands_the_capped_logit();
+    the_geglu_epilogue_lands_the_gated_product();
+    a_shape_the_block_does_not_divide_is_refused_without_firing();
+}
+
 #[test]
 fn the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows() {
     for m in [1usize, 5, ROWS as usize] {
@@ -82,14 +80,12 @@ fn the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows() {
     check(Epilogue::Store, 64, 640, 2560);
 }
 
-#[test]
 fn the_softcap_epilogue_lands_the_capped_logit() {
     for m in [1usize, 64] {
         check(Epilogue::Softcap(30.0), m, 256, 256);
     }
 }
 
-#[test]
 fn the_geglu_epilogue_lands_the_gated_product() {
     for m in [1usize, 5, 64] {
         check(Epilogue::Geglu, m, 96, 256);
@@ -97,7 +93,6 @@ fn the_geglu_epilogue_lands_the_gated_product() {
     check(Epilogue::Geglu, 64, 320, 1280);
 }
 
-#[test]
 fn a_shape_the_block_does_not_divide_is_refused_without_firing() {
     assert!(!covers(1, 96, 128, Epilogue::Store), "n=96 is not whole 64s");
     assert!(!covers(65, 64, 128, Epilogue::Store), "m=65 is past the tile");

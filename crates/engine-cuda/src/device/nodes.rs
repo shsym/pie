@@ -1,26 +1,14 @@
-//! Reads a captured graph's node/edge structure ([`walk`]), prices a per-node
-//! rebind ([`rebind`]), and measures per-exec device-memory cost
-//! ([`exec_footprint`], [`free_bytes`]). Only [`exec_footprint`] runs from a
-//! capture — once per load, to price a body's nodes
-//! (`record::Recorder::node_price`); nothing here runs on a fire/replay path.
-
 use crate::device::graph::Graph;
 use crate::error::{Fault, Result};
 
-/// One parameter of a captured launch: where it sits in the ABI's parameter
-/// block, how wide it is, and the bytes the capture froze.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Param {
-    /// Byte offset in the kernel's parameter block (`cuFuncGetParamInfo`).
     pub offset: usize,
-    /// Width in bytes.
     pub size: usize,
-    /// The captured value.
     pub bytes: Vec<u8>,
 }
 
 impl Param {
-    /// The value as a little-endian `u64`, for widths of at most eight.
     #[must_use]
     pub fn word(&self) -> Option<u64> {
         if self.bytes.len() > 8 {
@@ -32,57 +20,34 @@ impl Param {
     }
 }
 
-/// One node of a captured graph.
 #[derive(Clone, Debug)]
 pub struct Node {
-    /// The canonical index [`walk`] assigned.
     pub at: usize,
-    /// Longest-path depth from a source node.
     pub depth: usize,
-    /// `CUgraphNodeType`.
     pub kind: u32,
-    /// The mangled symbol, when this is a kernel node and the driver names it.
     pub symbol: String,
-    /// The `CUfunction` address — identity of the entrypoint this node runs.
     pub func: u64,
-    /// The live handle `cudaGraphExecKernelNodeSetParams` takes ([`func`](Node::func)
-    /// is only an identity for comparing/printing). Null with no runtime.
     pub node: *mut core::ffi::c_void,
-    /// The live `CUfunction`, for the same reason as [`node`](Node::node).
     pub entry: *mut core::ffi::c_void,
-    /// The launch grid, in blocks.
     pub grid: [u32; 3],
-    /// The block shape, in threads.
     pub block: [u32; 3],
-    /// Dynamic shared memory, in bytes.
     pub smem: u32,
-    /// The parameter block, when it could be read.
     pub params: Vec<Param>,
-    /// Why the parameter block could not be read, if it could not.
     pub opaque: Option<&'static str>,
 }
 
 impl Node {
-    /// Is this a kernel node?
     #[must_use]
     pub fn kernel(&self) -> bool {
         self.kind == 0
     }
 }
 
-/// The canonicalised node list of one captured graph.
 #[derive(Clone, Debug, Default)]
 pub struct Walked {
-    /// Every node, in the canonical order.
     pub nodes: Vec<Node>,
-    /// How many nodes share a `(depth, symbol)` with another — the places the
-    /// canonical order is a guess rather than a fact.
     pub ambiguous: usize,
-    /// How many dependency edges the graph holds.
     pub edges: usize,
-    /// `(from, to)` pairs in canonical order (post-sort [`Node::at`] numbering).
-    /// Edges the enumeration couldn't place (an `index_of` miss) count in
-    /// [`edges`](Walked::edges) but are omitted here.
     pub links: Vec<(usize, usize)>,
 }
 
@@ -92,11 +57,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
     Err(Fault::Runtimeless)
 }
 
-/// Read every node of `graph`, in a canonical order.
-///
-/// # Errors
-///
-/// [`Fault::Device`] if the driver refuses an enumeration call.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_lines)]
 pub fn walk(graph: &Graph) -> Result<Walked> {
@@ -104,7 +64,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
 
     let raw: dr::CUgraph = graph.raw().cast();
 
-    // 1. The node handles.
     let mut count: usize = 0;
     said("cuGraphGetNodes", unsafe {
         dr::cuGraphGetNodes(raw, core::ptr::null_mut(), &raw mut count)
@@ -115,7 +74,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
     })?;
     handles.truncate(count);
 
-    // 2. The edges, so a depth can be computed.
     let mut edge_count: usize = 0;
     said("cuGraphGetEdges_v2", unsafe {
         dr::cuGraphGetEdges_v2(
@@ -151,7 +109,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
         links.push((a, b));
     }
 
-    // 3. Longest-path depth: Kahn, taking the max over predecessors.
     let mut depth = vec![0usize; count];
     let mut ready: Vec<usize> = (0..count).filter(|at| indegree[*at] == 0).collect();
     let mut left = indegree.clone();
@@ -173,7 +130,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
         });
     }
 
-    // 4. Every node's contents.
     let mut nodes = Vec::with_capacity(count);
     for (at, node) in handles.iter().enumerate() {
         let mut kind = dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
@@ -223,7 +179,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
         });
     }
 
-    // 5. Canonical order.
     nodes.sort_by(|a, b| {
         a.depth
             .cmp(&b.depth)
@@ -236,7 +191,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
             ambiguous += 1;
         }
     }
-    // re-base edges to post-sort numbering, or a fingerprint would hash stale pairs
     let mut place = vec![0usize; count];
     for (canonical, node) in nodes.iter().enumerate() {
         place[node.at] = canonical;
@@ -256,7 +210,6 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
     })
 }
 
-/// The mangled symbol behind a `CUfunction`, or an empty string.
 #[cfg(feature = "cuda")]
 fn name_of(func: cudarc::driver::sys::CUfunction) -> String {
     use cudarc::driver::sys as dr;
@@ -270,9 +223,6 @@ fn name_of(func: cudarc::driver::sys::CUfunction) -> String {
         .into_owned()
 }
 
-/// The parameter block of one captured launch. Count/width come from
-/// `cuFuncGetParamInfo`, not the node: `kernelParams` is a bare `void**`
-/// with no length.
 #[cfg(feature = "cuda")]
 fn read_params(
     func: cudarc::driver::sys::CUfunction,
@@ -303,7 +253,6 @@ fn read_params(
         );
     }
 
-    // (a) the `kernelParams` form: one host pointer per argument.
     if !kernel_params.is_null() {
         let mut read = Vec::with_capacity(shape.len());
         for (at, (offset, size)) in shape.iter().copied().enumerate() {
@@ -324,7 +273,6 @@ fn read_params(
         return (read, None);
     }
 
-    // (b) the `extra` form: one packed buffer, indexed by the ABI offsets.
     if !extra.is_null() {
         let mut buffer: *mut u8 = core::ptr::null_mut();
         let mut len: usize = 0;
@@ -334,8 +282,6 @@ fn read_params(
             if entry.is_null() {
                 break;
             }
-            // CU_LAUNCH_PARAM_BUFFER_POINTER == 1, _SIZE == 2, _END == 0,
-            // encoded as the pointer values 1 and 2.
             match entry.addr() {
                 1 => buffer = unsafe { *extra.add(at + 1) }.cast::<u8>(),
                 2 => len = unsafe { *(*extra.add(at + 1)).cast::<usize>() },
@@ -385,38 +331,20 @@ fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     }
 }
 
-/// Probe only: what `cudaGraphExecKernelNodeSetParams` accepts on an
-/// instantiated graph, and its per-node cost.
 #[derive(Clone, Debug)]
 pub struct Rebind {
-    /// Nodes rewritten with their own parameters, unchanged.
     pub identity_nodes: usize,
-    /// Microseconds for that whole pass.
     pub identity_us: f64,
-    /// Did a changed GRID take?
     pub grid: core::result::Result<(), i32>,
-    /// Did a changed ARGUMENT (a scalar cell) take?
     pub arg: core::result::Result<(), i32>,
-    /// Did a changed SHARED MEMORY size take?
     pub smem: core::result::Result<(), i32>,
-    /// Did a changed FUNC take? Decides the rebind design.
     pub func: core::result::Result<(), i32>,
-    /// A NULL func — control for whether the driver validates the field at all.
     pub null_func: core::result::Result<(), i32>,
-    /// A zero grid — the CUDA equivalent of Metal's window-off `reset()`;
-    /// whether this is expressible decides absent-vs-zero-grid handling.
     pub zero_grid: core::result::Result<(), i32>,
-    /// One block instead — the "max-grid + in-kernel early exit" fallback.
     pub one_block: core::result::Result<(), i32>,
-    /// `(symbol, params)` of the node the func probe rewrote, and of the func
-    /// it was rewritten to: if the arities differ and the call still passed,
-    /// the driver did not check.
     pub func_from: (String, usize),
-    /// `(symbol, params)` of the func the probe rewrote TO.
     pub func_to: (String, usize),
-    /// Cost of rewriting only `subset` nodes, in microseconds.
     pub subset_us: f64,
-    /// How many nodes that subset held.
     pub subset_nodes: usize,
 }
 
@@ -430,11 +358,6 @@ pub fn rebind(
     Err(Fault::Runtimeless)
 }
 
-/// Price and probe a per-fire rebind of `exec`, whose topology is `graph`'s.
-///
-/// # Errors
-///
-/// [`Fault::Device`] if the node enumeration itself refuses.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_lines)]
 pub fn rebind(
@@ -473,7 +396,6 @@ pub fn rebind(
         subset_nodes: 0,
     };
 
-    // Read every node's params once, so the timed pass is the WRITE alone.
     let mut held: Vec<(dr::CUgraphNode, dr::CUDA_KERNEL_NODE_PARAMS)> = Vec::new();
     for node in &handles {
         let mut kind = dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
@@ -490,7 +412,6 @@ pub fn rebind(
         held.push((*node, params));
     }
 
-    // 1. The identity pass: the honest price of a blanket rebind.
     let began = std::time::Instant::now();
     for (node, params) in &held {
         let code = unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, params) };
@@ -515,17 +436,12 @@ pub fn rebind(
         } else {
             Err(code as i32)
         };
-        // Put it back, whatever happened.
         let _ = unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, params) };
         answer
     };
 
-    // 2. Grid.
     out.grid = try_one(&|p| p.gridDimX = p.gridDimX.max(1) + 1);
-    // 3. Shared memory.
     out.smem = try_one(&|p| p.sharedMemBytes += 16);
-    // 4. An argument cell: point the first parameter at a local copy of its
-    //    own bytes, which is what a rewritten law would do.
     let stash: std::cell::RefCell<Vec<Box<[u8; 8]>>> = std::cell::RefCell::new(Vec::new());
     let cells: std::cell::RefCell<Vec<Box<[*mut core::ffi::c_void]>>> =
         std::cell::RefCell::new(Vec::new());
@@ -551,7 +467,6 @@ pub fn rebind(
         }
         let at: *mut core::ffi::c_void = cell.as_mut_ptr().cast();
         stash.borrow_mut().push(cell);
-        // A one-entry replacement array is enough: only the first cell moves.
         let mut n = 0usize;
         while unsafe { dr::cuFuncGetParamInfo(p.func, n, &raw mut offset, &raw mut size) }
             == dr::CUresult::CUDA_SUCCESS
@@ -572,11 +487,6 @@ pub fn rebind(
         cells.borrow_mut().push(boxed);
     });
 
-    // 5. func: point one node at another's entrypoint. Prefer a different
-    //    arity, so a success shows the driver doesn't check.
-    // SetParams copies bytes per the NEW func's layout, so the swap must
-    // supply its own correctly-sized param block, or it's an OOB read
-    // (SIGSEGV, not an error code).
     let mine = held.first().map(|(_, p)| arity(p.func)).unwrap_or(0);
     let other = held
         .iter()
@@ -651,7 +561,6 @@ pub fn rebind(
         p.gridDimZ = 1;
     });
 
-    // 6. The SELECTIVE price: rewriting only the nodes named in `subset`.
     let picked: Vec<usize> = subset.iter().copied().filter(|at| *at < held.len()).collect();
     let began = std::time::Instant::now();
     for at in &picked {
@@ -664,7 +573,6 @@ pub fn rebind(
     Ok(out)
 }
 
-/// How many parameters a `CUfunction` declares.
 #[cfg(feature = "cuda")]
 fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
     use cudarc::driver::sys as dr;
@@ -684,20 +592,6 @@ fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
     }
 }
 
-/// Per-exec device-memory and wall-time cost, measured by instantiating
-/// `copies` of `graph` and reading `cudaMemGetInfo` around the batch.
-///
-/// **A RATE, WHICH IS THE WHOLE REASON IT TAKES `copies`.** The driver
-/// sub-allocates an exec out of a reservation it already holds, so the delta
-/// around ONE instantiate is usually zero and occasionally the whole
-/// reservation; over enough of them the boundary cannot dominate. Divided by
-/// the graph's node count it becomes the per-node price
-/// `record::Recorder::node_price` charges every body of a load, and it also
-/// sizes [`crate::serve::DEFAULT_BODIES_MEGABYTES`].
-///
-/// # Errors
-///
-/// [`Fault::Device`] if an instantiation or the memory query refuses.
 #[cfg(feature = "cuda")]
 pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     use cudarc::runtime::sys as rt;
@@ -726,13 +620,6 @@ pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     Err(Fault::Runtimeless)
 }
 
-/// Free device bytes, or `None` with no runtime to ask.
-///
-/// **NOT WHAT PRICES A BODY.** It used to be — one reading either side of
-/// each `instantiate` — and per-instantiation deltas are lumpy, because the
-/// driver may sub-allocate from a reservation it already holds. What replaced
-/// it is a per-node rate taken once ([`exec_footprint`],
-/// `record::Recorder::node_price`).
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn free_bytes() -> Option<usize> {

@@ -1,63 +1,24 @@
-//! Snapshot downloads from the HuggingFace hub.
-//!
-//! This is deliberately a few hundred lines rather than a dependency. The
-//! `hf-hub` crate hard-depends on `hf-xet`, whose client pulls `reqwest` with
-//! its default TLS on -- and reqwest 0.13's `default-tls` *is* rustls with the
-//! aws-lc backend, so no feature flag on our side could keep `aws-lc-sys` out
-//! of the build. That one C/assembly build script was the single most
-//! expensive unit in a cold `pie` build, and the xet stack behind it was six
-//! more crates. What we actually need from a model hub is "list a revision,
-//! fetch these files into the cache the rest of the world reads", which is two
-//! JSON endpoints and a GET.
-//!
-//! The on-disk layout is `huggingface_hub`'s, not ours, and that is the point:
-//! blobs are content-addressed under `blobs/<etag>`, revisions are trees of
-//! symlinks under `snapshots/<sha>/`. A snapshot `huggingface-cli` already
-//! fetched is one this code finds complete and skips, and vice versa.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-/// Files fetched at once. The hub rate-limits per connection rather than per
-/// account, and past ~8 the wall-clock stops improving while the progress
-/// line turns into noise.
 const PARALLEL_FILES: usize = 8;
 
-/// Attempts per file before the download gives up. Hub CDN redirects expire
-/// and connections drop mid-transfer on long fetches; both are retryable and
-/// the retry resumes rather than restarts.
 const ATTEMPTS: u32 = 4;
 
-/// What a caller wants to render while bytes move.
-///
-/// A trait rather than a channel because the only implementation is a terminal
-/// bar that owns its own redraw throttle -- handing it events costs less than
-/// handing it a runtime.
 pub trait Progress: Send + Sync {
-    /// Called once, after the plan is known: what is left to move.
     fn start(&self, files: u64, bytes: u64);
-    /// Called per chunk written to disk.
     fn advance(&self, bytes: u64);
 }
 
-/// One file in a revision, as the tree endpoint describes it.
 #[derive(Debug, Clone)]
 struct Entry {
-    /// Repo-relative path; also the path under `snapshots/<sha>/`.
     path: String,
-    /// Size in bytes of the real content (not the LFS pointer).
     size: u64,
-    /// The blob's name in the cache. For LFS files this is the sha256 the hub
-    /// serves as `x-linked-etag`; for plain files it is the git blob sha1.
-    /// Either way it is what `huggingface_hub` names the blob, which is what
-    /// makes the two caches one cache.
     etag: String,
 }
 
-/// `https://huggingface.co`, or whatever `HF_ENDPOINT` points at (mirrors and
-/// enterprise hubs are the reason the variable exists).
 fn endpoint() -> String {
     std::env::var("HF_ENDPOINT")
         .ok()
@@ -67,10 +28,6 @@ fn endpoint() -> String {
         .to_string()
 }
 
-/// The hub token, if this machine has one.
-///
-/// Same sources `huggingface_hub` reads, in the same order, so `hf auth login`
-/// is enough to make gated repos work here too.
 fn token() -> Option<String> {
     for var in [
         "HF_TOKEN",
@@ -98,8 +55,6 @@ fn token() -> Option<String> {
 fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("pie/", env!("CARGO_PKG_VERSION")))
-        // No total-request timeout: a shard is gigabytes and a slow link is
-        // slow, not broken. The connect timeout is what catches a dead host.
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .context("building HTTP client")
@@ -112,12 +67,6 @@ fn authorized(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest:
     }
 }
 
-/// Turn a hub HTTP status into the sentence a person can act on.
-///
-/// 401 does not mean "gated" on its own: the hub answers unknown, private and
-/// gated repos alike with it, precisely so that a stranger cannot use the
-/// status code to learn which private repos exist. So the message names all
-/// three rather than guessing one and sending the reader after the wrong fix.
 fn hub_error(repo_id: &str, status: reqwest::StatusCode) -> anyhow::Error {
     match status {
         reqwest::StatusCode::NOT_FOUND
@@ -132,10 +81,6 @@ fn hub_error(repo_id: &str, status: reqwest::StatusCode) -> anyhow::Error {
     }
 }
 
-/// Resolve a revision name (`main`, a tag, a branch) to the commit it names.
-///
-/// The sha, not the name, is what the snapshot directory is keyed by -- so a
-/// repo that moved on gets a new directory instead of a half-updated one.
 async fn revision_sha(
     client: &reqwest::Client,
     repo_id: &str,
@@ -159,11 +104,6 @@ async fn revision_sha(
         .ok_or_else(|| anyhow!("{repo_id}: revision {revision} has no commit sha"))
 }
 
-/// Every file in one revision, following the endpoint's pagination.
-///
-/// `recursive=1` flattens subdirectories (multimodal repos keep processor and
-/// tokenizer files a level down), and the cursor loop is what makes repos with
-/// more than a page of shards work.
 async fn list_files(
     client: &reqwest::Client,
     repo_id: &str,
@@ -184,7 +124,6 @@ async fn list_files(
         if !response.status().is_success() {
             return Err(hub_error(repo_id, response.status()));
         }
-        // Read before the body: `Response::text` consumes the response.
         let next = next_page(response.headers());
         let body = response.text().await.context("reading tree response")?;
         let page: Vec<serde_json::Value> =
@@ -197,9 +136,6 @@ async fn list_files(
             let Some(path) = item.get("path").and_then(|v| v.as_str()) else {
                 continue;
             };
-            // The LFS block is the truth for both fields when it is there: a
-            // pointer file's `oid`/`size` describe the 130-byte pointer, not
-            // the weights behind it.
             let lfs = item.get("lfs");
             let etag = lfs
                 .and_then(|l| l.get("oid"))
@@ -228,7 +164,6 @@ async fn list_files(
     Ok(entries)
 }
 
-/// The `rel="next"` target of a `Link` header, if the page has one.
 fn next_page(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
     link.split(',').find_map(|part| {
@@ -241,12 +176,6 @@ fn next_page(headers: &reqwest::header::HeaderMap) -> Option<String> {
     })
 }
 
-/// Does `path` match a shell-style `pattern`?
-///
-/// Segment-aware, like the globset the allow-list was written against: `*` and
-/// `?` stop at `/`, and only `**` crosses a directory boundary. `*.json` and
-/// `**/*.json` therefore mean different things, which is why
-/// [`super::runtime_snapshot_allow_patterns`] lists both.
 fn glob_match(pattern: &str, path: &str) -> bool {
     let pattern: Vec<&str> = pattern.split('/').collect();
     let path: Vec<&str> = path.split('/').collect();
@@ -257,7 +186,6 @@ fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
     match pattern.first() {
         None => path.is_empty(),
         Some(&"**") => {
-            // Zero or more segments: try every split point.
             (0..=path.len()).any(|skip| segments_match(&pattern[1..], &path[skip..]))
         }
         Some(head) => match path.first() {
@@ -269,12 +197,9 @@ fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
     }
 }
 
-/// `*`/`?` matching within one path segment.
 fn segment_match(pattern: &str, segment: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let segment: Vec<char> = segment.chars().collect();
-    // Iterative backtracking rather than recursion: patterns are short but
-    // `*`-heavy, and this keeps the worst case linear in practice.
     let (mut p, mut s) = (0usize, 0usize);
     let (mut star, mut resume) = (None, 0usize);
     while s < segment.len() {
@@ -296,12 +221,6 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
-/// Fetch one revision of a repo into the HuggingFace cache, and return the
-/// snapshot directory holding it.
-///
-/// Idempotent: files already in the cache (by blob name and size) are counted
-/// as done rather than refetched, and a transfer interrupted halfway resumes
-/// from the `.incomplete` blob it left behind.
 pub async fn snapshot_download(
     repo_id: &str,
     allow_patterns: &[String],
@@ -334,8 +253,6 @@ pub async fn snapshot_download(
     std::fs::create_dir_all(&snapshot_dir)
         .with_context(|| format!("creating {}", snapshot_dir.display()))?;
 
-    // Plan before moving anything, so the bar's total is the work that is
-    // actually left rather than the size of the repo.
     let mut pending = Vec::new();
     let mut pending_bytes = 0u64;
     for entry in wanted {
@@ -375,8 +292,6 @@ pub async fn snapshot_download(
             });
         }
         while let Some(joined) = tasks.join_next().await {
-            // Abort the rest on the first failure: the alternative is watching
-            // seven more files finish before being told the fetch failed.
             if let Err(error) = joined.context("download task panicked")? {
                 tasks.abort_all();
                 return Err(error);
@@ -384,8 +299,6 @@ pub async fn snapshot_download(
         }
     }
 
-    // `refs/main` is how `huggingface_hub` answers "which snapshot is main"
-    // without a network call. Written last: it should name a complete tree.
     let refs_dir = repo_dir.join("refs");
     if std::fs::create_dir_all(&refs_dir).is_ok() {
         let _ = std::fs::write(refs_dir.join("main"), &sha);
@@ -398,18 +311,11 @@ fn incomplete_path(blobs_dir: &Path, etag: &str) -> PathBuf {
     blobs_dir.join(format!("{etag}.incomplete"))
 }
 
-/// Is this file already in the cache, whole?
-///
-/// Size against the blob rather than a hash: rehashing a 100 GB checkpoint on
-/// every `import` would cost more than the download it is trying to skip, and
-/// the blob name is already a content hash the hub vouched for.
 fn is_complete(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> bool {
     let linked = snapshot_dir.join(&entry.path);
     if std::fs::symlink_metadata(&linked).is_err() {
         return false;
     }
-    // A dangling link (blob cleared from under the snapshot) reads as
-    // incomplete, which is what it is.
     match std::fs::metadata(blobs_dir.join(&entry.etag)) {
         Ok(meta) => meta.len() == entry.size,
         Err(_) => false,
@@ -456,9 +362,6 @@ async fn download_blob(
 
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
-            // Linear backoff: the failures worth retrying here are expired CDN
-            // signatures and dropped connections, neither of which needs more
-            // than a breath.
             tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
         }
 
@@ -481,15 +384,12 @@ async fn download_blob(
             || status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::NOT_FOUND
         {
-            // Not retryable: no number of attempts produces a token.
             return Err(hub_error(repo_id, status));
         }
         if !status.is_success() {
             last_error = Some(anyhow!("hub returned {status}"));
             continue;
         }
-        // A range request the server ignored restarts the file rather than
-        // appending a second copy of it onto the first.
         let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
         if resuming {
             progress.advance(0);
@@ -518,8 +418,6 @@ async fn download_blob(
                 return Ok(());
             }
             Err(error) => {
-                // The bytes already on disk stay: the next attempt resumes
-                // from them rather than starting the shard again.
                 last_error = Some(error);
             }
         }
@@ -537,8 +435,6 @@ async fn stream_to_file(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    // `chunk()` rather than a `Stream` adapter: it is the one streaming API
-    // reqwest exposes without pulling `futures` in beside it.
     while let Some(chunk) = response.chunk().await.context("reading response body")? {
         file.write_all(&chunk).await.context("writing to cache")?;
         progress.advance(chunk.len() as u64);
@@ -546,23 +442,14 @@ async fn stream_to_file(
     Ok(())
 }
 
-/// Point `snapshots/<sha>/<path>` at the blob holding its content.
-///
-/// A relative symlink, like `huggingface_hub` writes: the cache stays valid
-/// when the whole `hub/` directory is moved or bind-mounted somewhere else.
 fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> Result<()> {
     let linked = snapshot_dir.join(&entry.path);
     if let Some(parent) = linked.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // Replace whatever is there: a dangling link from a cleared blob, or a
-    // stale entry from an interrupted run.
     let _ = std::fs::remove_file(&linked);
 
-    // `snapshots/<sha>/a/b.json` is three levels below the repo root, so it
-    // reaches `blobs/` with one `..` per path segment plus two for
-    // `snapshots/<sha>`.
     let depth = entry.path.matches('/').count() + 2;
     let mut target = PathBuf::new();
     for _ in 0..depth {
@@ -578,8 +465,6 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
     if linked_ok {
         return Ok(());
     }
-    // Windows without developer mode, and filesystems that refuse links, get a
-    // copy: twice the disk, but a snapshot the loaders can read.
     std::fs::copy(blobs_dir.join(&entry.etag), &linked)
         .with_context(|| format!("materializing {}", linked.display()))?;
     Ok(())
@@ -588,6 +473,11 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn download_every_case() {
+        weight_shards_match_and_alternates_do_not();
+        a_pipelines_components_are_fetched_and_its_bundle_is_not();
+    }
 
     #[test]
     fn weight_shards_match_and_alternates_do_not() {
@@ -604,16 +494,6 @@ mod tests {
         assert!(!matches("model.gguf"));
     }
 
-    /// **A DIFFUSERS PIPELINE'S SUBFOLDERS COME DOWN, ITS BUNDLE AND ITS
-    /// PICTURES DO NOT.**
-    ///
-    /// The three real layouts this was written against: Z-Image
-    /// (`transformer/` sharded diffusers weights + a Qwen3 `text_encoder/`),
-    /// FLUX.2-klein (the same plus a top-level ComfyUI bundle), Wan 2.2
-    /// (five transformer shards). Every component's weights, config,
-    /// tokenizer and scheduler must be fetched; the bundle is the same
-    /// weights a second time and the JPEGs are documentation.
-    #[test]
     fn a_pipelines_components_are_fetched_and_its_bundle_is_not() {
         let allow = super::super::runtime_snapshot_allow_patterns();
         let matches = |path: &str| allow.iter().any(|p| glob_match(p, path));
@@ -635,7 +515,6 @@ mod tests {
         assert!(matches("tokenizer/spiece.model"));
         assert!(matches("scheduler/scheduler_config.json"));
 
-        // The ComfyUI bundle beside the components, and the repo's prose.
         assert!(!matches("flux-2-klein-4b.safetensors"));
         assert!(!matches("README.md"));
         assert!(!matches("editing.jpg"));

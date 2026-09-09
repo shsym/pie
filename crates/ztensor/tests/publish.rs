@@ -1,11 +1,3 @@
-//! Publishing: a reader never sees a half-written file.
-//!
-//! The spec puts durable publication in the transport's hands (Appendix B),
-//! and it is right that the format does not mandate an fsync. But every
-//! producer needs the same three steps: write beside the target, sync,
-//! rename, and every producer was writing them again. So the library writes
-//! them once.
-
 use std::path::{Path, PathBuf};
 
 use ztensor::{Leaf, Source, Writer};
@@ -35,6 +27,14 @@ fn read_t(path: &Path) -> Vec<u8> {
         .into_owned()
 }
 
+fn publish_every_case() {
+    nothing_is_at_the_path_until_finish();
+    dropping_an_unfinished_publisher_leaves_nothing();
+    abandon_removes_the_partial();
+    publishing_replaces_atomically();
+    create_writes_in_place();
+}
+
 #[test]
 fn nothing_is_at_the_path_until_finish() {
     let path = tmp("published.zt");
@@ -60,9 +60,6 @@ fn nothing_is_at_the_path_until_finish() {
     );
 }
 
-/// The crash case, as far as a test can stage it: a writer that goes away
-/// without finishing leaves neither a target nor a partial.
-#[test]
 fn dropping_an_unfinished_publisher_leaves_nothing() {
     let path = tmp("abandoned.zt");
     let _ = std::fs::remove_file(&path);
@@ -74,7 +71,6 @@ fn dropping_an_unfinished_publisher_leaves_nothing() {
     assert!(siblings(&path).is_empty(), "{:?}", siblings(&path));
 }
 
-#[test]
 fn abandon_removes_the_partial() {
     let path = tmp("abandon-explicit.zt");
     let _ = std::fs::remove_file(&path);
@@ -85,9 +81,6 @@ fn abandon_removes_the_partial() {
     assert!(siblings(&path).is_empty());
 }
 
-/// Publishing over an existing file replaces it in one step: readers see the
-/// old bytes or the new ones, never a mixture.
-#[test]
 fn publishing_replaces_atomically() {
     let path = tmp("replaced.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -96,15 +89,11 @@ fn publishing_replaces_atomically() {
 
     let mut w = Writer::publish(&path).unwrap();
     w.add("t", [1u64], Leaf::U8, &[2]).unwrap();
-    // The old file is still the whole truth at this point.
     assert_eq!(read_t(&path), [1]);
     w.finish().unwrap();
     assert_eq!(read_t(&path), [2]);
 }
 
-/// A plain `create` still writes in place, for the callers who do not want a
-/// second file to appear in their directory.
-#[test]
 fn create_writes_in_place() {
     let path = tmp("in-place.zt");
     let _ = std::fs::remove_file(&path);

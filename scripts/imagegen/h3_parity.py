@@ -68,15 +68,9 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 TOLERANCES = ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"]
 
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
-
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "h3_mini_config.json")) as f:
         return json.load(f)
-
 
 def numbered(out: str, stem: str) -> list[str]:
     pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.json$")
@@ -86,7 +80,6 @@ def numbered(out: str, stem: str) -> list[str]:
         if match:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
-
 
 def cases(args) -> list[str]:
     cfg = config(args.golden)
@@ -134,11 +127,6 @@ def cases(args) -> list[str]:
     )
     return [path]
 
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
-
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
     name = os.path.basename(os.path.normpath(inferlet))
@@ -160,7 +148,6 @@ def wasm(inferlet: str) -> str:
     if not present:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
-
 
 def run(args) -> None:
     paths = numbered(args.out, "case")
@@ -201,11 +188,6 @@ def run(args) -> None:
             f.write(done.stdout)
         print(f"[run] case {b} -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -218,13 +200,11 @@ def document(path: str) -> dict:
         doc = json.loads(doc)
     return doc
 
-
 KEYS = {
     "refined": ("mini.out.refined_text", "text_rows", "dim"),
     "velocity": ("mini.out.video", "video_rows", "video_features"),
     "audio": ("mini.out.audio", "audio_rows", "audio_channels"),
 }
-
 
 def collect(args) -> str:
     dump = np.load(os.path.join(args.golden, "h3_mini.npz"))
@@ -233,7 +213,6 @@ def collect(args) -> str:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     doc = document(paths[0])
     mine, theirs = {}, {}
-    # The refined caption's golden key is an INPUT of the denoise dump.
     golden_of = {
         "mini.out.refined_text": "mini.in.refined_text",
         "mini.out.video": "mini.out.video",
@@ -256,11 +235,6 @@ def collect(args) -> str:
     print(f"[collect] {path}; golden -> {target}")
     return path
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
 def compare(args) -> int:
     mine = os.path.join(args.out, "h3_mini_pie.npz")
     theirs = os.path.join(args.out, "h3_mini_target.npz")
@@ -273,7 +247,6 @@ def compare(args) -> int:
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -304,7 +277,6 @@ def main() -> int:
         collect(args)
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

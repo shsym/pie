@@ -1,13 +1,3 @@
-//! Build script — only does work under `--features nixl`.
-//!
-//! Under the `nixl` feature it generates the NIXL C-API bindings from the
-//! vendored `backends/nixl/wrapper.h` and links the wheel's precompiled
-//! `libnixl_capi.so` from `$NIXL_PREFIX/lib`. The header is the single file
-//! taken from NIXL source (Apache-2.0); everything else comes from the
-//! `pip download nixl-cu12` wheel assembled into `$NIXL_PREFIX` (see the crate
-//! README). Without the feature this is a no-op, so the default build needs no
-//! NIXL, no `bindgen`, and no native library.
-
 fn main() {
     #[cfg(feature = "nixl")]
     nixl::generate();
@@ -27,8 +17,6 @@ mod nixl {
              See transport/README.md for the `pip download nixl-cu12` recipe.",
         );
 
-        // Link the precompiled C-API shim; rpath so the .so chain resolves at
-        // run time without an install step.
         println!("cargo:rustc-link-search=native={prefix}/lib");
         println!("cargo:rustc-link-lib=dylib=nixl_capi");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");

@@ -1,9 +1,3 @@
-//! The content digest (spec §6.5): identity that layout cannot reach.
-//!
-//! The property worth testing is not "it returns a digest" but that genuinely
-//! different files agree, and that files with different tensors do not. Every
-//! test here writes the same model two ways and demands one answer.
-
 use std::path::PathBuf;
 
 use ztensor::read::shard_identity;
@@ -25,7 +19,15 @@ fn digest_of(path: &PathBuf) -> Digest {
         .unwrap()
 }
 
-/// Alignment is layout, so it must not reach the digest.
+fn content_digest_every_case() {
+    placement_does_not_change_the_content_digest();
+    block_digests_do_not_change_the_content_digest();
+    a_layout_changes_the_content_digest();
+    sharding_does_not_change_the_content_digest();
+    different_models_differ();
+    an_object_without_a_digest_has_no_content_digest();
+}
+
 #[test]
 fn placement_does_not_change_the_content_digest() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
@@ -43,12 +45,10 @@ fn placement_does_not_change_the_content_digest() {
         .align(4096)
         .create(&floor)
         .unwrap();
-    // Also inserted in the other order, which is another thing layout decides.
     w.add("b", [300u64], Leaf::U8, &b).unwrap();
     w.add("a", [4u64], Leaf::F32, &a).unwrap();
     w.finish().unwrap();
 
-    // The files really are different.
     assert_ne!(
         std::fs::read(&canonical).unwrap(),
         std::fs::read(&floor).unwrap()
@@ -61,8 +61,6 @@ fn placement_does_not_change_the_content_digest() {
     assert_eq!(digest_of(&canonical).algorithm, "sha256");
 }
 
-/// Block digests are a property of the artifact, not of the model.
-#[test]
 fn block_digests_do_not_change_the_content_digest() {
     let data = vec![5u8; 1000];
     let plain = tmp("cd-plain.zt");
@@ -88,7 +86,6 @@ fn block_digests_do_not_change_the_content_digest() {
     assert_eq!(digest_of(&plain), digest_of(&blocked));
 }
 
-/// An encoding changes the stored bytes and nothing about the tensor.
 #[cfg(feature = "zstd")]
 #[test]
 fn an_encoding_does_not_change_the_content_digest() {
@@ -112,9 +109,6 @@ fn an_encoding_does_not_change_the_content_digest() {
     assert_eq!(digest_of(&raw), digest_of(&encoded));
 }
 
-/// A named layout is a different statement about the same bytes, so it is a
-/// different model.
-#[test]
 fn a_layout_changes_the_content_digest() {
     let data = vec![1u8; 64];
     let canonical = tmp("cd-layout-canonical.zt");
@@ -136,12 +130,6 @@ fn a_layout_changes_the_content_digest() {
     assert_ne!(digest_of(&canonical), digest_of(&named));
 }
 
-/// Splitting a model across files must not change what the model is.
-///
-/// This is the property that makes a canonical multi-file profile unnecessary:
-/// the reason to pin a shard-partition policy was to keep identity stable, and
-/// identity is stable without one.
-#[test]
 fn sharding_does_not_change_the_content_digest() {
     let payload = f32s(&[7.0; 64]);
 
@@ -151,7 +139,6 @@ fn sharding_does_not_change_the_content_digest() {
     w.finish().unwrap();
     let expected = digest_of(&single);
 
-    // The same tensor, now living in a shard that a root points at.
     let shard = tmp("cd-shard.zt");
     let mut w = Writer::create(&shard).unwrap();
     w.add("w", [64u64], Leaf::F32, &payload).unwrap();
@@ -181,9 +168,6 @@ fn sharding_does_not_change_the_content_digest() {
     );
 }
 
-/// Different tensors must give different digests, or the whole thing says
-/// nothing.
-#[test]
 fn different_models_differ() {
     let base = tmp("cd-base.zt");
     let mut w = Writer::create(&base).unwrap();
@@ -192,7 +176,6 @@ fn different_models_differ() {
     w.finish().unwrap();
     let expected = digest_of(&base);
 
-    // One different value.
     let changed = tmp("cd-changed.zt");
     let mut w = Writer::create(&changed).unwrap();
     w.add("w", [4u64], Leaf::F32, &f32s(&[1.0, 2.0, 3.0, 4.5]))
@@ -200,7 +183,6 @@ fn different_models_differ() {
     w.finish().unwrap();
     assert_ne!(digest_of(&changed), expected, "different bytes");
 
-    // Same bytes, different name.
     let renamed = tmp("cd-renamed.zt");
     let mut w = Writer::create(&renamed).unwrap();
     w.add("v", [4u64], Leaf::F32, &f32s(&[1.0, 2.0, 3.0, 4.0]))
@@ -208,7 +190,6 @@ fn different_models_differ() {
     w.finish().unwrap();
     assert_ne!(digest_of(&renamed), expected, "different tensor name");
 
-    // Same bytes, different shape.
     let reshaped = tmp("cd-reshaped.zt");
     let mut w = Writer::create(&reshaped).unwrap();
     w.add("w", [2u64, 2], Leaf::F32, &f32s(&[1.0, 2.0, 3.0, 4.0]))
@@ -216,7 +197,6 @@ fn different_models_differ() {
     w.finish().unwrap();
     assert_ne!(digest_of(&reshaped), expected, "different shape");
 
-    // Same bytes, different type.
     let retyped = tmp("cd-retyped.zt");
     let mut w = Writer::create(&retyped).unwrap();
     w.add("w", [4u64], Leaf::U32, &f32s(&[1.0, 2.0, 3.0, 4.0]))
@@ -225,9 +205,6 @@ fn different_models_differ() {
     assert_ne!(digest_of(&retyped), expected, "different type");
 }
 
-/// An object with no digest has nothing to stand for its content, so the
-/// answer is "undefined", not a number that looks right.
-#[test]
 fn an_object_without_a_digest_has_no_content_digest() {
     use xxhash_rust::xxh3::xxh3_64;
     use ztensor::format::cbor::{self, Value};

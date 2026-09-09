@@ -1,12 +1,3 @@
-//! `GroupNorm`: per lane, per channel group over every voxel of the lane —
-//! `torch.nn.GroupNorm` over `[N, C, T, H, W]` with a lane for `N`. Three
-//! launches (split moments, fold, apply) that read as two passes: the
-//! statistics never see the output, the apply never re-reduces.
-//!
-//! Numerics: fp32 Welford moments merged by Chan's formula, `eps` inside
-//! the root, the affine as one `fmaf`, an optional SiLU on the fp32 value,
-//! one rounding at the store.
-
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::spatial::{flat_elements, lanes_of};
@@ -17,24 +8,14 @@ const FILE: &str = "spatial/norm.cuh";
 
 const OP: &str = "spatial.group_norm";
 
-/// The statistics block: one thread per channel, so this is the widest
-/// row the entry admits.
 const STATS_BLOCK: u32 = 1024;
 
 const APPLY_BLOCK: u32 = 256;
 
-/// Voxel splits per lane in the moments pass, sized from the fire's rows
-/// (a constant per launch, so the scratch is monotone in rows) and capped.
 const MAX_SPLITS: u32 = 512;
 
 const ROWS_PER_SPLIT: u32 = 256;
 
-/// `y = silu?((x - mean) * rsqrt(var + eps) * weight[c] + bias[c])` with
-/// `mean`/`var` over each lane's voxels times each group's channels.
-///
-/// `x`: `[rows, C]` bf16; `grid`: `[lanes, 4]` i32; `weight`, `bias`: `C`
-/// f32; `o`: `[rows, C]` bf16 at `x`'s shape. `C` must divide by `groups`
-/// and be at most 1024. Rows no lane claims land zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm(
     ctx: &Ctx,

@@ -1,20 +1,4 @@
-// Included by several test binaries via `#[path]`; each uses a different
-// subset, so "never used" here means "unused by *this* binary".
 #![allow(dead_code)]
-
-//! The shared corpus the Metal MSL emitters are exercised over.
-//!
-//! The plan-taking emitters are driven from **real plans**: every golden in
-//! `compiler/tests/golden/` is decoded from its `container:` hex, bound, and
-//! planned by `eta_compiler::plan::compile_bound`.
-//!
-//! These cases were originally pinned against a C++ oracle that ran the
-//! engines' own emitters over the same plans (`compiler/tests/oracle/`, since
-//! deleted with those emitters). What survives is `golden-{msl,cuda}/`: 2,838
-//! cases that now serve as the Rust emitters' regression net. Bless with
-//! `PTIR_REGEN=1` only when the emitted change is the point of the commit —
-//! a blanket re-bless turns this net into a transcript of whatever the
-//! emitters happen to do today.
 
 use eta_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -23,7 +7,6 @@ use eta_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
 use eta_ir::types::{Dtype, RngKind, Shape};
 use eta_ir::validate::bind;
 
-/// Golden names in the order the corpus enumerates them.
 pub const GOLDEN_NAMES: &[&str] = &[
     "beam_epilogue",
     "counter_pingpong",
@@ -61,7 +44,6 @@ pub fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// The `container:` hex line of a golden.
 pub fn golden_container(name: &str) -> TraceContainer {
     let path = format!("{}/{name}.txt", golden_dir());
     let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path} missing"));
@@ -72,12 +54,9 @@ pub fn golden_container(name: &str) -> TraceContainer {
     eta_ir::container::decode(&unhex(line)).unwrap_or_else(|e| panic!("{name}: {e:?}"))
 }
 
-/// The bind-time profile each golden was authored against (mirrors the
-/// `eta_golden.rs` case that produced it — the goldens do not carry it).
 pub fn golden_profile(name: &str) -> ModelProfile {
     let mut profile = ModelProfile::dummy();
     match name {
-        // `ModelProfile::dummy()` verbatim (vocab 32).
         "counter_pingpong"
         | "lora_prologue"
         | "neg_body_type_error"
@@ -86,9 +65,6 @@ pub fn golden_profile(name: &str) -> ModelProfile {
         | "neg_spsc_second_producer"
         | "section3_masked_gumbel"
         | "structured_masks" => {}
-        // Vendored-only trace (no compiler golden): its `Logits` is `[1, 4]`,
-        // so it binds at vocab 4 and nowhere else. It did not "drift" -- the
-        // profile was being guessed at 8 by the catch-all below.
         "staged_dispatch" => profile.vocab = 4,
         "beam_epilogue" => {
             profile.vocab = 8;
@@ -136,9 +112,6 @@ fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
     }
 }
 
-/// Library ops and intrinsics no golden reaches: `sort_desc`, `matmul`, the
-/// `mtp_drafts` intrinsic (its own emission path in the grouped emitter), and
-/// a second-party `sink_call` (the Metal sink-boundary check).
 pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     let mut small = ModelProfile::dummy();
     small.vocab = 8;
@@ -232,27 +205,20 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     ]
 }
 
-/// One corpus entry: a stage plan and where it came from.
 pub struct CorpusStage {
     pub golden: String,
     pub stage_index: usize,
     pub stage_tag: u8,
     pub plan: CompiledStage,
-    /// The plan rendered the way the runtime engine renders it
-    /// (`eta_compiler::plan::debug_stage_plan`). Pinned instead of an encoding so a
-    /// planning change lands in a golden as a readable diff.
     pub debug: String,
 }
 
 impl CorpusStage {
-    /// The stable case id both dumps print.
     pub fn id(&self) -> String {
         format!("{}#{}", self.golden, self.stage_index)
     }
 }
 
-/// Compile every golden that binds, then the synthetic fill-in traces; goldens
-/// whose bind fails contribute no stages (the `neg_*` cases).
 pub fn corpus_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
     let mut push = |name: &str, container: TraceContainer, profile: ModelProfile| {
@@ -279,18 +245,14 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
     stages
 }
 
-/// The op tag byte at `node` — `stage.ops[node].op.tag`.
 pub fn op_tag(stage: &CompiledStage, node: u32) -> u8 {
     eta_compiler::codegen::metal::OpView::of(&stage.normalized.ops[node as usize]).tag
 }
 
-/// Whether the region is a library region — the C++ `region.library` bit.
 pub fn is_library(region: &eta_compiler::plan::Region) -> bool {
     matches!(region.kind, eta_compiler::plan::RegionKind::Library(_))
 }
 
-/// The C++ `region.library_op` byte. Generated regions encode `0`, which
-/// happens to collide with `PTIR_LIBRARY_NUCLEUS_SAMPLE`.
 pub fn library_op_byte(region: &eta_compiler::plan::Region) -> u8 {
     match region.kind {
         eta_compiler::plan::RegionKind::Library(op) => op as u8,
@@ -298,7 +260,6 @@ pub fn library_op_byte(region: &eta_compiler::plan::Region) -> u8 {
     }
 }
 
-/// The `region: ...` line the oracle prints for each case.
 pub fn region_shape(region: &eta_compiler::plan::Region) -> String {
     format!(
         "library={} library_op={} schedule={} nodes={} inputs={} outputs={} sinks={}",
@@ -312,13 +273,6 @@ pub fn region_shape(region: &eta_compiler::plan::Region) -> String {
     )
 }
 
-/// A bound trace to hand `emit_program`, which needs one for the program-wide
-/// Metal effect kernels.
-///
-/// `corpus_stages` deliberately flattens stages across every golden, so there
-/// is no single program the flattened list belongs to. The coverage tests only
-/// care that each kernel *family* is emitted, so any bound trace serves; this
-/// returns the first golden's.
 pub fn corpus_bound() -> eta_ir::validate::BoundTrace {
     let name = GOLDEN_NAMES[0];
     bind(golden_container(name), golden_profile(name)).expect("first golden binds")
@@ -334,16 +288,6 @@ fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContai
     }
 }
 
-/// Traces that exist only to reach what the goldens and `synthetic_traces` do
-/// not: 17 of the 55 ops in `OP_TABLE`, three of the eight intrinsics, the
-/// `HierarchicalRow` schedule, and `Stage::OnAttn`.
-///
-/// Kept apart from [`corpus_stages`] on purpose. That corpus is the input to
-/// `golden-{msl,cuda}/`, whose expected columns were produced by an external
-/// oracle and cannot be re-derived here; adding cases there would change the
-/// case list of files nothing in this repository can regenerate. These are
-/// pinned separately, against this compiler's own output, and their goldens
-/// say so.
 pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     let mut small = ModelProfile::dummy();
     small.vocab = 8;
@@ -497,8 +441,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             small.clone(),
         ),
         (
-            // Reduction over a static extent past the 32 768 the planner uses
-            // to pick `HierarchicalRow`; no other corpus stage reaches it.
             "extended_hierarchical",
             staged(
                 Stage::Epilogue,
@@ -529,9 +471,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             small.clone(),
         ),
         (
-            // `Stage::OnAttn` is reached by `Layer` alone: `intrinsic_stages`
-            // gives `Query | Layer` both attention stages, and they are the
-            // only intrinsics that stand inside the graph at all.
             "extended_on_attn",
             staged(
                 Stage::OnAttn,
@@ -553,28 +492,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             small.clone(),
         ),
         (
-            // `attn_score` is an EPILOGUE read of one rectangle, not a
-            // per-layer peek: `[planes, ATTN_SCORE_KV_MAX]`, where the width
-            // is the published KV pitch the capture arm wrote at and so is
-            // the only width that binds.
-            //
-            // **BOTH METAL HALVES OF THIS PIN HAVE NOW FLIPPED, AND WATCHING
-            // THEM FLIP IS WHY THIS CASE EXISTS.** The single-lane column
-            // recorded a refusal first -- one intrinsic buffer and it was the
-            // logits -- and records emitted MSL since the M2 slot table gave
-            // the id an argument index of its own and the runtime's `0xA0`
-            // arm learned to gather `float` for it
-            // (`.wiki/alto/attn-score.md` §4).
-            //
-            // The GROUPED column was the honest remainder: that form binds no
-            // per-intrinsic buffer at all, so the rectangle had to arrive as
-            // an ADDRESS, and `lane.logits_base` was the only one the record
-            // carried -- while the slab is `engine_metal::scores`'s own
-            // reservation, which no displacement off the readout reaches. The
-            // record carries `attn_score_base` now, so this column is emitted
-            // MSL too. What is left unequal between the two forms is only the
-            // CEILING they read it under: on the M2 form the rectangle costs
-            // two of the twelve argument slots the channels grow into.
             "extended_attn_score",
             staged(
                 Stage::Epilogue,
@@ -592,13 +509,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             attn,
         ),
         (
-            // `validate_singleton_plan` accepts exactly one kernel_call --
-            // `metal.identity`, whose one argument has the result's type -- and
-            // exactly one sink_call, `metal.discard`. Both are magic strings
-            // matched against the container's name table and spelled in one
-            // place each; nothing else in the corpus carries a name that
-            // reaches an *accepted* plan, so both accept arms were unreached
-            // and the name lookup behind them untested.
             "extended_metal_identity",
             TraceContainer {
                 names: vec!["metal.identity".into()],
@@ -628,8 +538,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 channels: vec![read(4)],
                 ports: Vec::new(),
                 stages: vec![StageProgram {
-                    // Prologue: a PassWide sink's effect is consumed for the
-                    // whole pass, which is where bind will take one.
                     stage: Stage::Prologue,
                     ops: vec![
                         Op::ChanRead(0),
@@ -646,7 +554,6 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     ]
 }
 
-/// [`extended_traces`] compiled, in declaration order.
 pub fn extended_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
     for (name, container, profile) in extended_traces() {

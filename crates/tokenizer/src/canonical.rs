@@ -1,7 +1,3 @@
-//! Serialized tokenizer format (`pie.tokenizer/1`): vocab bytes/offsets, merge
-//! quads, byte-fallback table, and a JSON descriptor. `from_canonical` refuses
-//! any other version.
-
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -10,25 +6,15 @@ use crate::{AddedToken, BpeMode, DummyPrefix, Pipeline, Splitter, Tokenizer};
 
 pub const VERSION: &str = "pie.tokenizer/1";
 
-/// Sentinel meaning "no token for this byte"; `u32::MAX` cannot collide with
-/// a real token id.
 pub const NO_TOKEN: u32 = u32::MAX;
 
-/// Object names, relative to the artifact's metadata namespace.
 pub const VOCAB_BYTES: &str = "tokenizer/vocab_bytes";
 pub const VOCAB_OFFSETS: &str = "tokenizer/vocab_offsets";
 pub const MERGE_TABLE: &str = "tokenizer/merge_table";
 pub const BYTE_FALLBACK: &str = "tokenizer/byte_fallback";
 pub const DESCRIPTOR: &str = "tokenizer/descriptor";
-/// **SENTENCEPIECE UNIGRAM ONLY**: one `f32` a token id, little endian, the
-/// score its Viterbi walk maximises. A BPE tokenizer writes no such object,
-/// and its ABSENCE is what says "this is not a Unigram" — which is why it is
-/// [`OPTIONAL_OBJECTS`] and not a sixth entry of [`OBJECTS`]. Every artifact
-/// written before Unigram was read lacks it, and must keep loading.
 pub const UNIGRAM_SCORES: &str = "tokenizer/unigram_scores";
 
-/// Every object a serialized tokenizer MUST carry, in the order they are
-/// written. A reader that finds one missing has no tokenizer at all.
 pub const OBJECTS: [&str; 5] = [
     BYTE_FALLBACK,
     DESCRIPTOR,
@@ -37,31 +23,19 @@ pub const OBJECTS: [&str; 5] = [
     VOCAB_OFFSETS,
 ];
 
-/// Objects only some tokenizers carry. Missing is not an error; missing is a
-/// fact about which kind of tokenizer this is.
 pub const OPTIONAL_OBJECTS: [&str; 1] = [UNIGRAM_SCORES];
 
-/// A compiled tokenizer, serialized. Field order matches [`OBJECTS`]
-/// (ascending by name), required by canonical `.zt` form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalTokenizer {
     pub byte_fallback: Vec<u8>,
     pub descriptor: Vec<u8>,
     pub merge_table: Vec<u8>,
-    /// Present for a Unigram and absent for everything else; see
-    /// [`UNIGRAM_SCORES`]. Sorts between `merge_table` and `vocab_bytes`,
-    /// which is where [`CanonicalTokenizer::objects`] puts it.
     pub unigram_scores: Option<Vec<u8>>,
     pub vocab_bytes: Vec<u8>,
     pub vocab_offsets: Vec<u8>,
 }
 
 impl CanonicalTokenizer {
-    /// The objects to write, paired with their names, in ascending name order.
-    /// A `Vec`, not an array, because the Unigram scores are there only for a
-    /// Unigram — and canonical `.zt` form requires ascending names, which is
-    /// why `unigram_scores` sits between `merge_table` and `vocab_bytes`
-    /// rather than at the end.
     pub fn objects(&self) -> Vec<(&'static str, &[u8])> {
         let mut out: Vec<(&'static str, &[u8])> = vec![
             (BYTE_FALLBACK, &self.byte_fallback),
@@ -76,11 +50,6 @@ impl CanonicalTokenizer {
         out
     }
 
-    /// Collects the objects back from whatever holds them. A missing REQUIRED
-    /// object is a hard error rather than an empty-default guess; a missing
-    /// optional one is a fact, and the fact it states is "not a Unigram" —
-    /// which is what lets every artifact written before Unigram was read keep
-    /// loading unchanged.
     pub fn from_objects(mut read: impl FnMut(&str) -> Option<Vec<u8>>) -> Result<Self> {
         let mut fetch = |name: &str| -> Result<Vec<u8>> {
             read(name).with_context(|| format!("the artifact has no '{name}' object"))
@@ -105,10 +74,6 @@ impl CanonicalTokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Descriptor
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct Descriptor {
     version: String,
@@ -116,15 +81,10 @@ struct Descriptor {
     added_tokens: Vec<AddedTokenDescriptor>,
 }
 
-/// Untagged: a bare string decodes as `Isolated` (the historical form,
-/// still the common case); an object decodes as `Explicit`.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 enum SplitterDescriptor {
-    /// `Split { behavior: Isolated }`.
     Isolated(String),
-    /// `Split { behavior: Removed, invert: true }`: matches become pieces,
-    /// text between them is dropped.
     Explicit { pattern: String, keep_gaps: bool },
 }
 
@@ -144,8 +104,6 @@ impl SplitterDescriptor {
     }
 }
 
-/// Sentencepiece dummy-prefix mode. Defaults to `None` (what every artifact
-/// written before this field existed was).
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 enum DummyPrefixDescriptor {
@@ -155,7 +113,6 @@ enum DummyPrefixDescriptor {
     FirstSegment,
 }
 
-/// Tagged by `kind`; splitter order is semantic (applied as a sequence).
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PipelineDescriptor {
@@ -187,20 +144,13 @@ struct AddedTokenDescriptor {
     id: u32,
     content: String,
     special: bool,
-    /// Absent from old artifacts; defaults to `false`, their actual behavior.
     #[serde(default)]
     lstrip: bool,
     #[serde(default)]
     rstrip: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Writing
-// ---------------------------------------------------------------------------
-
 impl Tokenizer {
-    /// Serializes this tokenizer as `pie.tokenizer/1`. Fails rather than
-    /// writing something lossy (a vocabulary hole, an undecodable encode map).
     pub fn to_canonical(&self) -> Result<CanonicalTokenizer> {
         ensure!(
             self.bpe.encode_map_is_derivable(),
@@ -243,8 +193,6 @@ impl Tokenizer {
         };
         let descriptor = serde_json::to_vec(&descriptor).context("encoding the descriptor")?;
 
-        // A Unigram's scores, one f32 a token id, little endian. `None` for
-        // everything else, which is what the reader keys on.
         let unigram_scores = match &self.pipeline {
             Pipeline::Unigram { scores, .. } => {
                 let by_id = scores.scores_by_id(decode.len());
@@ -267,7 +215,6 @@ impl Tokenizer {
         })
     }
 
-    /// Recovers added tokens in registration order.
     fn added_token_descriptors(&self) -> Vec<AddedTokenDescriptor> {
         self.added_tokens
             .iter()
@@ -289,9 +236,6 @@ impl Tokenizer {
 
 fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
     match pipeline {
-        // The scores themselves ride their OWN object (`UNIGRAM_SCORES`), one
-        // f32 a token id: a descriptor is a description, and 256 300 floats
-        // in one are not a description.
         Pipeline::Unigram {
             replacement,
             prepend_always,
@@ -345,13 +289,7 @@ fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reading
-// ---------------------------------------------------------------------------
-
 impl Tokenizer {
-    /// Rebuilds a tokenizer from its `pie.tokenizer/1` objects; no format
-    /// sniffing, no merge synthesis.
     pub fn from_canonical(objects: &CanonicalTokenizer) -> Result<Self> {
         let descriptor: Descriptor =
             serde_json::from_slice(&objects.descriptor).context("decoding the descriptor")?;
@@ -412,9 +350,6 @@ impl Tokenizer {
             byte_fallback_ids[byte] = (id != NO_TOKEN).then_some(id);
         }
 
-        // The pipeline is rebuilt BEFORE the table takes the vocabulary: a
-        // Unigram's walk needs the piece strings, and the table consumes
-        // them.
         let pipeline = rebuild_pipeline(descriptor.pipeline, &vocab, &objects.unigram_scores)?;
         let bpe = BpeTable::from_canonical(vocab, &merges, byte_fallback_ids)?;
         let added_tokens = descriptor
@@ -432,9 +367,6 @@ impl Tokenizer {
     }
 }
 
-/// `vocab` and `scores` are the two objects only a Unigram reads: its walk
-/// needs the piece STRINGS beside their scores, and both are already decoded
-/// here for the symbol table.
 fn rebuild_pipeline(
     descriptor: PipelineDescriptor,
     vocab: &[Vec<u8>],
@@ -460,8 +392,6 @@ fn rebuild_pipeline(
                 .iter()
                 .zip(raw.chunks_exact(4))
                 .map(|(piece, word)| {
-                    // A piece that is not UTF-8 cannot be a Unigram piece —
-                    // this vocabulary is strings, not bytes.
                     let piece = std::str::from_utf8(piece)
                         .context("a Unigram piece is not UTF-8")?
                         .to_string();
@@ -532,4 +462,3 @@ fn read_u32s(bytes: &[u8], what: &str) -> Result<Vec<u32>> {
         .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }
-

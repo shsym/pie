@@ -1,31 +1,3 @@
-//! Beam search goldens (host-side, pie-dsl + CPU reference interp).
-//!
-//! **Design B: logical mask-out + lazy compaction** (supersedes Design A's eager
-//! freeze / designated-heir / fresh-page-per-fork scheme). The KV cache is a
-//! prefix tree over a shared physical page pool: shared ancestors are written
-//! once and referenced by mask; each surviving beam appends its new token at the
-//! next free flat position in the pool; a beam's ancestry is encoded in its
-//! per-beam attention mask, NOT in a per-fork physical page layout. Pruning is a
-//! mask edit; garbage is reclaimed by a rare batched compaction (out of scope
-//! here — the CompactPlan port is a separate contract item).
-//!
-//! The steady-state epilogue is DRAMATICALLY simpler than Design A: no heir
-//! election, no freeze arithmetic, no per-fork fresh-page selection, no
-//! per-step `gather(pages, parent)` page reorder. It computes:
-//!   1. top-B (parent + token) over the flattened cand block,
-//!   2. each survivor's flat tail-append position `wpos = fill + lane`,
-//!   3. the new per-beam mask = inherit parent's mask (`gather(mask, parent)`)
-//!      OR the new position (`eq(col, wpos)`), and
-//!   4. the explicit write descriptor `w_slot = wpos / PAGE_T`, `w_off = wpos %
-//!      PAGE_T` (consumed by B2's `write_kv_explicit`).
-//!
-//! `Pages`/`PageIndptr` are CONSTANT (the shared pool is fixed between
-//! compactions) — the mask does all the per-beam selection.
-//!
-//! These goldens assert the mask evolution across a fork step and the write
-//! descriptor, on the IR's reference interpreter. They are the Design B contract;
-//! they replaced the retired Design A `ptir_beam.rs`/`beam_goldens` vectors (B5).
-
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
 use eta_ir::registry::{ModelProfile, Port};
 use eta_ir::validate::{BoundTrace, bind};
@@ -34,33 +6,16 @@ use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
 use eta_dsl::{Channel, Dtype, Traced};
 
-const B: u32 = 2; // beams
-const V: u32 = 8; // vocab
-const PAGE_T: u32 = 4; // tokens per pool page
-const POOL_PAGES: u32 = 3; // pool pages (over-allocated; compaction bounds this)
-const POOL: u32 = POOL_PAGES * PAGE_T; // 12 flat token positions in the shared pool
+const B: u32 = 2;
+const V: u32 = 8;
+const PAGE_T: u32 = 4;
+const POOL_PAGES: u32 = 3;
+const POOL: u32 = POOL_PAGES * PAGE_T;
 
 fn leak<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))
 }
 
-/// Build the Design B steady-state beam epilogue via the neutral Builder.
-///
-/// Channel declaration order (host seeds by index):
-///   0 mask[B,POOL] bool (seeded) — per-beam attention mask over the shared pool
-///   1 scores[B] f32 (seeded)
-///   2 toks[B] i32 (seeded)     — current per-beam token (embed)
-///   3 pos[B] u32 (seeded)      — logical depth (RoPE position)
-///   4 fill[1] u32 (seeded)     — next free flat position in the pool
-///   5 klen[B] u32 (seeded)     — physical KV span (bound to KvLen)
-///   6 w_slot[B] u32 (seeded)   — bound to WSlot
-///   7 w_off[B] u32 (seeded)    — bound to WOff
-///   8 out[B] i32 (host-reader) — harvested token
-///   9 out_par[B] u32 (host-reader) — parent permutation (hypothesis backtrack)
-///  10 out_scr[B] f32 (host-reader) — running scores
-///  11 out_mask[B,POOL] bool (host-reader) — the NEW mask, for assertion
-///  12 out_wslot[B] u32 (host-reader) — the write-descriptor page id
-///  13 out_woff[B] u32 (host-reader) — the write-descriptor in-page offset
 fn build_designb() -> Traced {
     let mask = leak(Channel::seeded([B, POOL], dtype::bool).named("mask"));
     let scores = leak(Channel::from(vec![0.0f32; B as usize]).named("scores"));
@@ -77,11 +32,8 @@ fn build_designb() -> Traced {
     let out_wslot = leak(Channel::new([B], dtype::u32).named("out_wslot"));
     let out_woff = leak(Channel::new([B], dtype::u32).named("out_woff"));
 
-    // Constant pool geometry: every beam references all POOL_PAGES pool pages
-    // (the mask restricts which positions it actually attends). Fixed between
-    // compactions — no per-fire Pages computation.
-    let pool_pages: Vec<u32> = (0..B).flat_map(|_| 0..POOL_PAGES).collect(); // [B*POOL_PAGES]
-    let page_indptr: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect(); // [B+1]
+    let pool_pages: Vec<u32> = (0..B).flat_map(|_| 0..POOL_PAGES).collect();
+    let page_indptr: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let pages_c = leak(Channel::from(pool_pages).named("pages"));
     let page_indptr_c = leak(Channel::from(page_indptr).named("page_indptr"));
     let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>()).named("indptr"));
@@ -97,40 +49,32 @@ fn build_designb() -> Traced {
     b.bind_port(Port::WOff, w_off);
     b.bind_port(Port::AttnMask, mask);
     b.stage(Stage::Epilogue, move || {
-        // 1. top-B over the flattened [B,V] cand block.
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, V]),
             log_softmax(intrinsics::logits()),
         );
         let (s, i) = top_k(reshape(cand, [B * V]), B);
-        let parent = div(&i, V); // [B] which beam each survivor came from
-        let tok_i = cast(rem(&i, V), Dtype::I32); // [B] new token
+        let parent = div(&i, V);
+        let tok_i = cast(rem(&i, V), Dtype::I32);
 
-        // 2. flat tail-append positions in the shared pool: fill + lane.
-        let base = fill.take(); // [1]
-        let lane = iota(B); // [B]
-        let base_b = broadcast(reshape(&base, [1]), [B]); // [1] -> [B]
-        let wpos = add(&base_b, &lane); // [B] flat positions
+        let base = fill.take();
+        let lane = iota(B);
+        let base_b = broadcast(reshape(&base, [1]), [B]);
+        let wpos = add(&base_b, &lane);
 
-        // 3. mask evolution: inherit parent's ancestry mask, OR the new position.
-        let inherited = gather(mask.take(), &parent); // bool [B,POOL] row-gather
-        let col = broadcast(reshape(iota(POOL), [1, POOL]), [B, POOL]); // [B,POOL] = 0..POOL-1
-        let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, POOL]); // [B,POOL] = wpos[b]
-        let newpos = eq(col, wpos_b); // bool [B,POOL]: the one new cell per beam
-        let new_mask = or(inherited, &newpos); // bool [B,POOL]
+        let inherited = gather(mask.take(), &parent);
+        let col = broadcast(reshape(iota(POOL), [1, POOL]), [B, POOL]);
+        let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, POOL]);
+        let newpos = eq(col, wpos_b);
+        let new_mask = or(inherited, &newpos);
         mask.put(&new_mask);
 
-        // 4. explicit write descriptor for B2's write_kv_explicit.
         let w_slot_v = div(&wpos, PAGE_T);
         let w_off_v = rem(&wpos, PAGE_T);
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
 
-        // physical KV span after this step's appends (all beams see the filled
-        // prefix of the shared pool; the mask restricts attention).
-        let filled = add(&base, B); // [1]
-        // Explicit drain (no auto-drain synthesis): klen is a peek-port
-        // loop-carry — consume the old cell before the overwrite.
+        let filled = add(&base, B);
         klen.take();
         klen.put(broadcast(reshape(&filled, [1]), [B]));
 
@@ -162,7 +106,6 @@ fn u32s(v: &[u32]) -> Value {
     Value::U32(v.to_vec())
 }
 
-/// A `[B,POOL]` bool mask value with `positions` set true in each beam's row.
 fn mask_of(rows: &[&[u32]]) -> Value {
     let mut m = vec![false; (B * POOL) as usize];
     for (b, positions) in rows.iter().enumerate() {
@@ -173,8 +116,6 @@ fn mask_of(rows: &[&[u32]]) -> Value {
     Value::Bool(m)
 }
 
-/// Craft a `[B,V]` logit block whose top-B over the flattened cand picks both
-/// survivors from beam `parent_beam` with tokens `t0`,`t1`.
 fn logits_forcing_parent(parent_beam: u32, t0: u32, t1: u32) -> PassInputs {
     let mut l = vec![0.0f32; (B * V) as usize];
     let row = (parent_beam * V) as usize;
@@ -186,8 +127,6 @@ fn logits_forcing_parent(parent_beam: u32, t0: u32, t1: u32) -> PassInputs {
     }
 }
 
-/// Harvested host-reader outputs of one committed Design B step (drains all of
-/// channels 8..=13 so the next step's capacity-1 host-reader puts can land).
 struct Harvest {
     tok: Value,
     par: Value,
@@ -212,35 +151,26 @@ fn harvest(inst: &mut Instance, bound: &BoundTrace) -> Harvest {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// GOLDEN — Design B fork from a shared prefix. Prompt occupies positions {0,1}
-// (both beams share it). Both survivors fork from beam 0 (parent=[0,0]); their
-// new tokens append at flat positions wpos=[2,3]. Expect the ancestry masks
-// mask[0]={0,1,2}, mask[1]={0,1,3} (shared prefix {0,1} + own new cell), and the
-// write descriptor w_slot=[0,0], w_off=[2,3] (positions 2,3 in pool page 0).
-// ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn golden_designb_fork_from_shared_prefix() {
     let traced = build_designb();
     let bound = bind(traced.container().clone(), beam_profile()).unwrap();
 
-    // Seed: prompt of length 2 shared by both beams (positions {0,1}); fill=2.
     let seeds: Vec<(u32, Value)> = vec![
-        (0, mask_of(&[&[0, 1], &[0, 1]])), // mask: both beams see the prompt
-        (1, Value::F32(vec![0.0, 0.0])),   // scores
-        (2, Value::I32(vec![1, 1])),       // toks
-        (3, u32s(&[2, 2])),                // pos (logical depth after prompt)
-        (4, u32s(&[2])),                   // fill (2 prompt positions filled)
-        (5, u32s(&[2, 2])),                // klen
-        (6, u32s(&[0, 0])),                // w_slot
-        (7, u32s(&[0, 0])),                // w_off
-        (14, u32s(&[0, 1, 2, 0, 1, 2])),   // pages
-        (15, u32s(&[0, 3, 6])),            // page_indptr
-        (16, u32s(&[0, 1, 2])),            // embed indptr
+        (0, mask_of(&[&[0, 1], &[0, 1]])),
+        (1, Value::F32(vec![0.0, 0.0])),
+        (2, Value::I32(vec![1, 1])),
+        (3, u32s(&[2, 2])),
+        (4, u32s(&[2])),
+        (5, u32s(&[2, 2])),
+        (6, u32s(&[0, 0])),
+        (7, u32s(&[0, 0])),
+        (14, u32s(&[0, 1, 2, 0, 1, 2])),
+        (15, u32s(&[0, 3, 6])),
+        (16, u32s(&[0, 1, 2])),
     ];
     let mut inst = Instance::new(&bound, &seeds).unwrap();
 
-    // Force both survivors from beam 0, tokens 2 and 3.
     let inputs = logits_forcing_parent(0, 2, 3);
     let r0 = inst.step(&bound, &inputs, &mut NoKernels).unwrap();
     assert!(
@@ -252,13 +182,11 @@ fn golden_designb_fork_from_shared_prefix() {
     let h = harvest(&mut inst, &bound);
     assert_eq!(h.par, u32s(&[0, 0]), "out_par: both fork from beam 0");
     assert_eq!(h.tok, Value::I32(vec![2, 3]), "out: tokens [2,3]");
-    // The core Design B mechanism: mask evolution = shared prefix + own new cell.
     assert_eq!(
         h.mask,
         mask_of(&[&[0, 1, 2], &[0, 1, 3]]),
         "mask: beam0={{0,1,2}}, beam1={{0,1,3}} (shared {{0,1}} + own append)"
     );
-    // Explicit write descriptor: positions 2,3 land in pool page 0 at offs 2,3.
     assert_eq!(
         h.wslot,
         u32s(&[0, 0]),
@@ -266,4 +194,3 @@ fn golden_designb_fork_from_shared_prefix() {
     );
     assert_eq!(h.woff, u32s(&[2, 3]), "w_off: offsets 2,3 within page 0");
 }
-

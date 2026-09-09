@@ -1,22 +1,5 @@
-//! Opens a CUDA device from a typed [`DeviceBoot`] — no wire format in between.
-
 use crate::api::{ClassifyFor, ContractFor, Cuda, DeviceBoot};
 
-/// Opens one device from a typed boot.
-///
-/// `contract_for` is a parameter rather than looked up here: resolving a
-/// checkpoint's tensors into a plan's params is the model's declaration,
-/// not this crate's (see [`ContractFor`]).
-///
-/// # Errors
-///
-/// A `gpu_mem_utilization` outside `(0.0, 1.0]` — the fraction of the whole
-/// card, weights included, this deployment may hold. `String` rather than
-/// [`Fault`](crate::Fault): this seam is between an `anyhow` crate and a
-/// `Fault` crate, and nothing here touches a device.
-///
-/// Binding the device happens in [`Engine::load`](engine::Engine::load),
-/// not here.
 pub fn open(
     boot: DeviceBoot,
     contract_for: ContractFor,
@@ -35,8 +18,6 @@ pub fn open(
     Ok(Cuda::new(boot, contract_for, classify_for))
 }
 
-/// Which device ordinal a spelled device names (`"cuda:1"` and `"1"` both
-/// mean 1; `""` means 0).
 #[must_use]
 pub fn ordinal_of(device: &str) -> i32 {
     device

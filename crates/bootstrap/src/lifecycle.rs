@@ -1,14 +1,5 @@
-//! Process lifecycle — panic hook, the boot banner, and the
-//! wait-for-signal-then-drain loop behind [`Ctx::run_until_signal`].
-//!
-//! The shutdown seam is a *future* (a closure the bin builds from its role
-//! `Handle`), never a skeleton-defined trait — so role libs take no
-//! dependency on the skeleton.
-
 use std::net::SocketAddr;
 
-/// Route panics through `tracing` (so they land in the same structured log as
-/// everything else) while preserving the default hook's output.
 pub(crate) fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -17,7 +8,6 @@ pub(crate) fn install_panic_hook() {
     }));
 }
 
-/// One-line boot banner to stderr, plus the resolved `/metrics` address.
 pub(crate) fn banner(name: &str, version: &str, metrics: Option<SocketAddr>) {
     eprintln!("pie-{name} {version}");
     if let Some(addr) = metrics {
@@ -25,7 +15,6 @@ pub(crate) fn banner(name: &str, version: &str, metrics: Option<SocketAddr>) {
     }
 }
 
-/// Block (async) until SIGINT/SIGTERM (Unix) or Ctrl-C (otherwise).
 pub(crate) async fn wait_for_signal() {
     #[cfg(unix)]
     {

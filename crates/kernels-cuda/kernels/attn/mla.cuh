@@ -32,14 +32,9 @@ __global__ void mla_split_q_b(
     const int d = i % per;
     const int h = (i / per) % heads;
     const int n = i / (heads * per);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first element belongs to.
-    // The flat index has to be re-laid on it — the cut reads and writes the
-    // same row axis.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const T v = q_b[(static_cast<long long>(n_row) * heads + h) * per + d];
     if (d < nope) {
@@ -62,13 +57,9 @@ __global__ void mla_latents(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns — the fused
-    // projection and both halves it is cut into share that row axis.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row = kv_a + static_cast<long long>(n_row) * src_row_stride;
@@ -340,16 +331,11 @@ __global__ void mla_naive_paged_kernel(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // PLANES move by it — the qo boundaries this searches are the window's
-    // own, rebased to its zero, so the token ordinal they answer stays `t`.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -578,16 +564,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int warp = tid >> 5;
 
     const int t = blockIdx.y;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // PLANES move by it — the qo boundaries this scans are the window's own,
-    // rebased to its zero, so the token ordinal they answer stays `t`.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h0 = blockIdx.x * kBM;
 

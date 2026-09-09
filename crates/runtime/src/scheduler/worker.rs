@@ -1,5 +1,3 @@
-//! Per-engine direct batch scheduler.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -23,17 +21,10 @@ use super::stats::{self, SchedulerStats};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
-    /// The planner is evicting the process: its lanes stop being awaited, but
-    /// already-submitted frames stay sealable and drain untracked. No purge.
     Suspend,
-    /// A pipeline closed or dropped: its wait-set row releases immediately,
-    /// while already-accepted requests continue untracked to settlement.
     Close,
 }
 
-/// Posts one pipeline-leave to every engine's scheduler thread so each
-/// [`FramePolicy`] drops the leaver from its wait-set (fire-and-forget).
-/// `id` is lane-keyed for Close, process-keyed for Suspend/Terminate.
 fn post_pipeline_leave(id: ProcessId, owner: Option<ProcessId>, kind: LeaveKind) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -41,21 +32,14 @@ fn post_pipeline_leave(id: ProcessId, owner: Option<ProcessId>, kind: LeaveKind)
     }
 }
 
-/// One lane leaves the wait-all quorum gracefully; accepted fires drain
-/// untracked. `owner`, when known, also drops it from process-keyed
-/// `staged`/`joins_in_flight` (needed if the process may block before its first fire).
 pub(crate) fn notify_lane_close(scope: ProcessId, owner: Option<ProcessId>) {
     post_pipeline_leave(scope, owner, LeaveKind::Close);
 }
 
-/// Every lane `pid` owns leaves the wait-all quorum (planner suspend); the
-/// submitted tail stays sealable and drains untracked. Process-keyed.
 pub(crate) fn notify_process_suspend(pid: ProcessId) {
     post_pipeline_leave(pid, Some(pid), LeaveKind::Suspend);
 }
 
-/// `pid` is runnable again; undoes [`notify_process_suspend`].
-/// Fire-and-forget: a missed resume just means the fleet stops waiting for it.
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -63,16 +47,10 @@ pub(crate) fn notify_process_resume(pid: ProcessId) {
     }
 }
 
-/// Terminate `pid`'s lanes, fire-and-forget (queued fires are rejected).
-/// Process-keyed. The waited sibling is [`notify_process_terminate`].
 pub(crate) fn post_process_terminate(pid: ProcessId) {
     post_pipeline_leave(pid, None, LeaveKind::Terminate);
 }
 
-/// Posts `pid`'s Terminate leave to every engine and returns fences that
-/// resolve once each scheduler processes it — split from
-/// [`notify_process_terminate`]'s await so a retiring process can release
-/// its execution seat synchronously while teardown awaits the fence.
 pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFence> {
     let handles = super::handle_registry().read().unwrap();
     handles
@@ -93,12 +71,8 @@ pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFenc
         .collect()
 }
 
-/// One engine's acknowledgement that it has processed a posted Terminate
-/// leave (see [`post_process_terminate_fenced`]).
 pub(crate) type TerminateFence = tokio::sync::oneshot::Receiver<()>;
 
-/// Awaits fences from [`post_process_terminate_fenced`]: once resolved,
-/// every engine has purged the pid's queued work, so pooled resources can be recycled.
 pub(crate) async fn await_terminate_fences(fences: Vec<TerminateFence>) {
     for fence in fences {
         let _ = fence.await;
@@ -134,10 +108,6 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
-/// `forward.park()`: the lane leaves the frame wait-set until it fires
-/// again. Broadcast fire-and-forget, ordered by `seq`. Not routed through
-/// the control path (depth 1): park releases a gather, and a park queued
-/// behind that dispatch could never arrive.
 pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -145,10 +115,6 @@ pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
     }
 }
 
-/// A retiring process released its capped execution permit (capped
-/// deployments only). Broadcasts the retiree's identity so a staged
-/// successor's bind can resolve the departure; caller posts Terminate first
-/// so every engine sees leave-then-release.
 pub(crate) fn notify_execution_slot_released(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -156,9 +122,6 @@ pub(crate) fn notify_execution_slot_released(pid: ProcessId) {
     }
 }
 
-/// Deferred teardown finished: every event the process can produce is
-/// already in each engine's mailbox. Retires the terminate tombstone,
-/// bounding `terminated_processes` by live-plus-draining processes.
 pub(crate) fn notify_process_quiesced(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -166,10 +129,6 @@ pub(crate) fn notify_process_quiesced(pid: ProcessId) {
     }
 }
 
-/// A parked process acquired its execution permit; its first fire is a
-/// named join in flight, keeping the cohort-boundary window open until it
-/// lands. Sent before the fire enters the mailbox so the policy sees
-/// consume-then-fire (a reordered arrival is harmless).
 pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -177,8 +136,6 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     }
 }
 
-/// A process joined the execution-admission FIFO. Announced before the
-/// permit wait so the frame policy can earmark it by identity.
 pub(crate) fn notify_admission_queued(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -186,7 +143,6 @@ pub(crate) fn notify_admission_queued(pid: ProcessId) {
     }
 }
 
-/// A process left the FIFO -- it took its permit, or it was cancelled.
 pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -194,13 +150,9 @@ pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
     }
 }
 
-/// No-op: wait-set rejoin is implicit on the pipeline's next scheduler
-/// submission.
-#[allow(dead_code)] // no live caller — see doc.
+#[allow(dead_code)]
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
-/// Completions the 250ms hang backstop found already settled (a lost
-/// nudge). Should stay zero; any increment is a wake-path regression.
 pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -209,24 +161,12 @@ pub(crate) struct PendingRequest {
     pub(crate) request: crate::engine::FireRequest,
     pub(crate) instance_id: u64,
     pub(crate) completion: WorkItemCompletion,
-    /// The owning process. Process-wide suspend/terminate acts on every
-    /// request with this identity.
     pub(crate) process_id: Option<ProcessId>,
-    /// The submitting pipeline resource's stable scope identity, or `None`
-    /// for an untracked/prebuilt fire; this is the wait-set key (frame lane,
-    /// or at k=1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prelaunch_copy: Option<::engine::KvCopy>,
     pub(crate) prelaunch_state_copy: Option<StateCopy>,
-    /// Frame identity: lane/frame/slot this fire belongs to. At k=1 the
-    /// worker synthesizes a single-slot stamp at admission (`lane` =
-    /// `pipeline_id`, `seq` = the fire id); `None` = untracked/prebuilt,
-    /// dispatched outside sealed-wave order.
     pub(crate) frame: Option<FrameStamp>,
-    /// Whether this fire's program carries attention-stage hooks
-    /// (OnAttnProj/OnAttn); fire planning keeps hook rows in the full-depth prefix.
     pub(crate) hook_program: bool,
-    /// The pass-wide adapter sink (the region table's LORA bit reads it).
     pub(crate) lora_program: bool,
 }
 
@@ -271,18 +211,11 @@ impl PendingRequest {
     }
 }
 
-/// `PIE_WAVE_TRACE` — wave/enqueue observability, resolved once (this sits
-/// on the per-fire enqueue path).
 pub(crate) fn wave_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
 }
 
-/// One `[wave-trace]` line out. `PIE_WAVE_TRACE=buffer` parks lines in
-/// memory and a thread flushes them once a second: a direct `eprintln!` per
-/// enqueue costs ~10 µs on the worker's path, and 64 of them per step is a
-/// delay of the same order as a guest's turnaround — enough to move what
-/// the trace is meant to show.
 pub(crate) fn wave_trace_emit(line: String) {
     static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -309,16 +242,11 @@ pub(crate) fn wave_trace_emit(line: String) {
     }
 }
 
-/// Microseconds since the first trace line — every `[wave-trace]` line
-/// carries one, so a dump reads as a timeline (ramp, steady state, collapse)
-/// and not just as a sequence.
 pub(crate) fn wave_trace_us() -> u128 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_micros()
 }
 
-/// Whether this request lowered its mask to rows the host can see. A mask
-/// lives on its lane (`Lane::mask`), so this asks whether any lane carries one.
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
     request.lanes.iter().any(|lane| lane.mask.is_some())
 }
@@ -354,15 +282,9 @@ enum SchedulerItem {
         plan: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
     },
-    /// One dispatch registering an instance's channels and binding it: the
-    /// two per-join controls run back-to-back, and dispatching them
-    /// separately doubled the turnover control convoy.
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        /// Some on the program cache's first sight (registration rides
-        /// between channels and bind in one dispatch); None when already
-        /// registered, with `bind.program_id()` carrying the cached id.
         program: Option<ProgramRegistration>,
         bind: InstanceBindingPlan,
         response:
@@ -376,8 +298,6 @@ enum SchedulerItem {
         plan: ::engine::KvCopy,
         completion: ControlCompletion,
     },
-    // Only reached via `SchedulerHandle::copy_state`, not yet called by the
-    // mock-engine fire path.
     #[allow(dead_code)]
     CopyState {
         plan: StateCopy,
@@ -390,73 +310,38 @@ enum SchedulerItem {
     CloseChannel {
         id: u64,
     },
-    /// A whole cohort of channel closes in one mailbox item, posted by
-    /// process teardown; one item per departing process (not per channel)
-    /// bounds the epoch a worker pass drains.
     CloseChannels {
         ids: Vec<u64>,
     },
-    /// Event-driven retirement wake sent by [`NudgeWaker`] when an in-flight
-    /// engine submission completion publishes. Carries no work.
     Nudge,
-    /// A pipeline left the fleet ([`notify_pipeline_leave`]'s broadcast),
-    /// handled immediately on dequeue like `Nudge`. `.0` is the leaving
-    /// lane's scope id, `.1` the owning process when known — a different key
-    /// space, and a leaver with no fires yet has no lane to recover it from.
     PipelineLeave(
         ProcessId,
         Option<ProcessId>,
         LeaveKind,
         Option<tokio::sync::oneshot::Sender<()>>,
     ),
-    /// A capped execution slot was released ([`notify_execution_slot_released`]'s
-    /// broadcast); the frame seal waits while the freed slot has a staged
-    /// taker. Uncapped deployments never send this.
     ExecutionSlotReleased(ProcessId),
-    /// The named process's deferred teardown finished; no event from it can
-    /// follow. Retires its terminate tombstone.
     ProcessQuiesced(ProcessId),
-    /// A parked process acquired its execution permit
-    /// ([`notify_execution_slot_consumed`]'s broadcast): the frame seal
-    /// waits for this process's first fire (can arrive before or after the release above).
     ExecutionSlotConsumed(ProcessId),
-    /// A process is queued for an execution permit; it is the identified
-    /// taker of the next slot to free (the semaphore is FIFO-fair).
     AdmissionQueued(ProcessId),
-    /// It took the permit, or went away before it could.
     AdmissionDequeued(ProcessId),
-    /// The planner concluded a suspended process is runnable again; its
-    /// lanes may rejoin the wait-set and batch full frames again. Process-keyed.
     ProcessResume(ProcessId),
-    /// A frame submit failed mid-way host-side: only `submitted` of the
-    /// declared fires exist. The frame policy adjusts the expected count so
-    /// it can still seal (frame mode only).
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
         submitted: u32,
     },
-    /// `forward.park()`: the guest leaves the seal's wait-set until it fires
-    /// again, ordered by `seq` against that lane's submits; a guest may park
-    /// with fires still outstanding (frame mode only).
     LanePark {
         lane: ProcessId,
         seq: u64,
     },
-    /// Snapshots the run loop's state (queue composition, in-flight work,
-    /// barrier membership); answered inline on dequeue so a held wave is inspectable.
     DebugDump {
         response: tokio::sync::oneshot::Sender<String>,
     },
-    /// An engine-lane reply (launch accepted/rejected, control commit),
-    /// handled immediately on dequeue like `Nudge` — mutates only in-flight
-    /// bookkeeping, never queue order.
     Lane(LaneReply),
     Stop,
 }
 
-/// Wakes the scheduler thread through its own queue on a submission
-/// completion, so batch/control retirement is event-driven, not timeout-polled.
 struct NudgeWaker {
     tx: crossbeam::channel::Sender<SchedulerItem>,
 }
@@ -471,9 +356,6 @@ impl std::task::Wake for NudgeWaker {
     }
 }
 
-/// Register the nudge waker on a pending completion's wait slot with
-/// register-then-recheck. Returns false when the completion has already
-/// settled (or its slot is gone) and the caller should retire immediately.
 fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Waker) -> bool {
     if completion.is_settled() {
         return false;
@@ -506,28 +388,9 @@ impl PreLaunchCopy {
     }
 }
 
-// Engine lane: a dedicated thread owns the `EngineBox` and executes every
-// engine call in FIFO order, keeping the engine's single-threaded
-// serialization, off the scheduler worker's critical path.
-//
-// The lane owns the engine and the `channels` registry; the worker keeps
-// all policy/admission state. Control arms split their engine half onto the
-// lane and their map mutation + response onto the worker via
-// `apply_lane_reply`, so a bind's response sends only after the instance is
-// admissible. Replies ride `SchedulerItem::Lane`.
-
-/// A [`FrameSubmission`] in transit to the engine lane.
-///
-/// SAFETY: `!Send` only through raw pointers into the engine's pinned,
-/// thread-independent terminal-cell slots. Built complete on the worker,
-/// moved to the lane, consumed exactly once by `engine.launch`; backing
-/// requests stay alive in `in_flight_launches` until the frame retires
-/// (strictly after the lane's reply).
 struct LaneLaunch(crate::engine::FrameFire);
 unsafe impl Send for LaneLaunch {}
 
-/// Charges one lane request's wall time to `lane_launch_us`/`lane_control_us`
-/// on drop, so an early return/continue still accounts. Diagnostic only.
 struct LaneCharge<'a> {
     stats: &'a SchedulerStats,
     began: Instant,
@@ -562,22 +425,14 @@ enum LaneRequest {
     Launch {
         token: u64,
         submission: LaneLaunch,
-        /// Whether this wave carries a prefill (`tokens > rows`); diagnostic
-        /// only, splitting launch time to compare prefill vs. decode cost.
         prefill: bool,
     },
-    /// A control `QueuedItem` (never `Launch`); the lane runs the engine
-    /// half. Boxed since `QueuedItem` is large and controls are cold traffic,
-    /// keeping every queued launch small.
     Control { token: u64, item: Box<QueuedItem> },
-    /// Drain marker: the lane replies with the engine and its channel set so
-    /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
         response: crossbeam::channel::Sender<(Option<EngineBox>, ChannelJoin)>,
     },
 }
 
-/// Lane → worker replies (via `SchedulerItem::Lane`).
 enum LaneReply {
     LaunchDone {
         token: u64,
@@ -589,39 +444,23 @@ enum LaneReply {
     },
 }
 
-/// The worker-side half of a control that the lane finished executing.
 enum LaneCommit {
-    /// Nothing to commit — the lane already sent the response (pure engine
-    /// ops touching no worker state: registers, channel closes, failed binds).
     None,
-    /// A successful bind: insert the instance, then respond — launch
-    /// admission reads `instances` on the worker thread, so
-    /// respond-after-insert makes the guest's first fire admissible.
     BindInstance {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
         respond: BindRespond,
     },
-    /// A bind control completed without creating an instance.
     BindFinished { pipeline_id: Option<ProcessId> },
-    /// A successful engine-side instance close: remove + close wait slots.
     CloseInstance { id: u64 },
-    /// An async-completing control (copies / pool resizes): installs the
-    /// engine's completion into the pending slot, or clears it on a
-    /// synchronous rejection.
     AsyncControl {
         result: std::result::Result<SubmissionCompletion, String>,
     },
 }
 
-/// What a lane request still owes its caller: one reply, on one token.
-/// Read off before serving, to cover a panic mid-serve: launch/control
-/// slots are keyed by token with no timeout, so an unanswered token never resolves.
 enum Owed {
     Launch(u64),
     Control(u64),
-    /// Shutdown answers on its own channel, and a lane that panicked answers it
-    /// in [`EngineLoop::drain_poisoned`] instead.
     Nothing,
 }
 
@@ -652,7 +491,6 @@ impl Owed {
     }
 }
 
-/// Which response shape a successful bind commits to.
 enum BindRespond {
     Bind(tokio::sync::oneshot::Sender<Result<BoundInstance>>),
     ChannelsBind {
@@ -665,39 +503,22 @@ enum BindRespond {
 }
 
 struct EngineLoop {
-    /// Launch fast path: served before any queued control. A launch and a
-    /// control are always mutually independent (a close posts only after its
-    /// instance quiesces, a fire only after its bind commits), so preferring
-    /// launches never reorders a dependent pair — and avoids control bursts
-    /// head-of-line blocking the wave train.
     launch_tx: crossbeam::channel::Sender<LaneRequest>,
     control_tx: crossbeam::channel::Sender<LaneRequest>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Whose turn the engine lane is serving — the starvation bound on
-/// [`EngineLoop::next_request`]'s launch-first preference (launches are the
-/// device's own work; the counters cap that preference short of absolute priority).
 #[derive(Default)]
 struct LaneTurn {
-    /// Launches served since the last control turn ended.
     launch_run: u32,
-    /// Controls served in the turn now running.
     control_run: u32,
 }
 
 impl LaneTurn {
-    /// Launches served before offering controls a turn. Two (not one)
-    /// bounds a control's wait at roughly one frame while still letting
-    /// launches run back to back.
     const LAUNCH_RUN_BEFORE_CONTROL: u32 = 2;
 
-    /// Controls one turn may serve before launches get the lane back. High
-    /// enough to drain a cohort turnover's whole bind generation in one
-    /// turn; capped against a control flood holding the device off.
     const CONTROL_RUN_MAX: u32 = 32;
 
-    /// Is a control turn owed, and does it have budget left?
     const fn control_due(&self) -> bool {
         self.launch_run >= Self::LAUNCH_RUN_BEFORE_CONTROL
             && self.control_run < Self::CONTROL_RUN_MAX
@@ -714,8 +535,6 @@ impl LaneTurn {
         }
     }
 
-    /// The turn is over — the queue ran dry or the budget did. Launches own
-    /// the lane again until they have had another run.
     fn end_control_turn(&mut self) {
         self.launch_run = 0;
         self.control_run = 0;
@@ -743,8 +562,6 @@ impl EngineLoop {
     }
 
     fn post(&self, request: LaneRequest) {
-        // The lane outlives every poster (shutdown joins it last); a send
-        // failure means the lane thread panicked, which the join reports.
         let _ = match &request {
             LaneRequest::Launch { .. } => self.launch_tx.send(request),
             LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
@@ -753,8 +570,6 @@ impl EngineLoop {
         };
     }
 
-    /// Drains both queues and takes the engine + channel set back for
-    /// teardown; the worker only calls this with `lane_inflight == 0`.
     fn shutdown(&mut self) -> (Option<EngineBox>, ChannelJoin) {
         let (response_tx, response_rx) = crossbeam::channel::bounded(1);
         let _ = self.control_tx.send(LaneRequest::Shutdown {
@@ -769,26 +584,16 @@ impl EngineLoop {
         state
     }
 
-    /// Receives the next request, launches first but bounded so controls
-    /// can't starve indefinitely (a bind control must commit here before its
-    /// guest's first fire can exist, so a starved queue stalls bring-up).
-    /// After [`LaneTurn::LAUNCH_RUN_BEFORE_CONTROL`] launches, drains
-    /// `control_rx` up to [`LaneTurn::CONTROL_RUN_MAX`] controls, then
-    /// returns to launches. Blocks on both queues when idle.
     fn next_request(
         launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
         control_rx: &crossbeam::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
     ) -> std::result::Result<LaneRequest, ()> {
         use crossbeam::channel::TryRecvError;
-        // Stay hot briefly after going empty before parking: a parked lane
-        // pays a thread wake on every submit, which measurably hurt run-ahead pipelining.
         const ENGINE_LANE_HOT_US: u64 = 1_000_000;
         let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
         let mut spin_until = Instant::now() + hot_window;
         loop {
-            // Empty ends the turn (not just skips it), so a lane with
-            // nothing queued pays one failed try_recv per run.
             if turn.control_due() {
                 match control_rx.try_recv() {
                     Ok(request) => {
@@ -806,8 +611,6 @@ impl EngineLoop {
                     turn.took_launch();
                     return Ok(request);
                 }
-                // Both senders drop together (the graceful path is the
-                // Shutdown marker); drain what remains, then stop.
                 Err(TryRecvError::Disconnected) => {
                     return control_rx.try_recv().map_err(|_| ());
                 }
@@ -830,8 +633,6 @@ impl EngineLoop {
             let mut select = crossbeam::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
-            // Only wait; the loop re-runs launch-first try_recv once
-            // something is ready, with a fresh spin window.
             select.ready();
             spin_until = Instant::now() + hot_window;
         }
@@ -846,22 +647,13 @@ impl EngineLoop {
         stats: Arc<SchedulerStats>,
     ) {
         let mut channels = ChannelJoin::new();
-        // Async-completion bookkeeping: a shell may answer `submit` while
-        // the device still runs, resolving a frame later from its own
-        // completion callback on the driver's host-function thread.
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
-        // The engine was opened on the worker's boot thread and moved here,
-        // so per-thread device state (e.g. `cudaSetDevice`) must bind here
-        // before any verb runs; a bind failure surfaces from the first verb.
         if let Some(engine) = engine.as_mut()
             && let Err(error) = engine.bind_thread()
         {
             tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
         }
-        // Completion sink installed once, before the first `submit`. This
-        // callback runs on the driver's own completion thread and must not
-        // block: one uncontended mutex, atomic release stores, then wake.
         if let Some(engine) = engine.as_mut()
             && engine.settles_asynchronously()
         {
@@ -871,19 +663,11 @@ impl EngineLoop {
                 book.settled(at.frame, &outcome, &published);
             }));
         }
-        // A launch already received but not yet served: the next-fire
-        // lookahead in `fire_frame` takes a queued launch out of `launch_rx`
-        // early so the engine can be told its composition before the fire
-        // ahead of it runs. FIFO holds since the stash is always the oldest unserved launch.
         let mut stash: Option<LaneRequest> = None;
-        // Whose turn the lane is serving; see `next_request`.
         let mut lane_turn = LaneTurn::default();
         loop {
             let request = match stash.take() {
                 Some(stashed) => {
-                    // The lookahead took this out of `launch_rx` itself, so
-                    // `next_request` never saw it; count it anyway, or a
-                    // stash chain could hold the lane without owing controls a turn.
                     lane_turn.took_launch();
                     stashed
                 }
@@ -903,14 +687,7 @@ impl EngineLoop {
                 charge: lane_was_work,
                 prefill: lane_was_prefill,
             };
-            // The token this request must be answered with, taken before the
-            // work so a panic can still answer it. Every arm below replies
-            // exactly once; a panic that skips its reply leaves the frame in
-            // flight forever instead of failing the request.
             let owed = Owed::of(&request);
-            // Answering the owed frame is only possible if the panic unwinds
-            // here; under `panic = "abort"` this trades the old stall for
-            // silently killing every other lane and session.
             #[cfg(panic = "abort")]
             compile_error!(
                 "the engine lane answers its owed frame from the panic path, \
@@ -923,14 +700,7 @@ impl EngineLoop {
                         LaneRequest::Launch {
                             token, submission, ..
                         } => {
-                            // Mutable: `fire_frame` moves each step's
-                            // submission into the engine's `FrameSubmission`
-                            // without copying a token vector.
                             let LaneLaunch(mut frame) = submission;
-                            // Does not retry: both refusals are terminal —
-                            // everything a device gate could refuse was
-                            // already proved impossible at `submit_frame`,
-                            // so a refusal here is a contract violation, not back-pressure.
                             let result = match engine.as_mut() {
                                 Some(engine) => {
                                     crate::probe_fire!(stats.fire.execute.engine_fire_us, {
@@ -948,8 +718,6 @@ impl EngineLoop {
                                 None => Err("engine has no backend installed".to_string()),
                             };
                             if let Err(reason) = &result {
-                                // A frame that never reached the device must
-                                // still settle, or its work items park forever.
                                 let _ = reason;
                                 let cells: Vec<_> = frame.terminal_cells().collect();
                                 crate::engine::completion::settle(
@@ -979,19 +747,12 @@ impl EngineLoop {
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(_) => {
-                    // The panic hook has already printed it. What is left is
-                    // the frame nobody will complete, and the queue behind it.
                     tracing::error!(
                         "engine lane panicked mid-request; failing it and every request \
                          behind it rather than leaving them in flight"
                     );
-                    // Every frame the device still owes: a panic leaves
-                    // frames registered whose completion callbacks may never
-                    // arrive, so fail them with the same verdict as `owed`.
                     settlements.close_all(&broker);
                     owed.answer(&reply_tx, "the engine lane panicked serving this request");
-                    // A launch the lookahead stashed is queued work the
-                    // channels no longer hold — fail it with the queue.
                     if let Some(stashed) = stash.take() {
                         Owed::of(&stashed).answer(&reply_tx, "the engine lane is down after a panic");
                     }
@@ -1000,15 +761,9 @@ impl EngineLoop {
                 }
             }
         }
-        // Worker dropped its sender without a shutdown handshake (panic
-        // path): release the engine here.
         drop(engine.take());
     }
 
-    /// Answers every request still queued, and every one that arrives, with
-    /// the same failure. The engine is leaked rather than dropped: a panic
-    /// mid-fire tears state (a half-recorded buffer, a half-resized pool)
-    /// the destructor would run over, and a second panic during unwind aborts the process.
     fn drain_poisoned(
         launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
         control_rx: &crossbeam::channel::Receiver<LaneRequest>,
@@ -1018,8 +773,6 @@ impl EngineLoop {
     ) {
         std::mem::forget(engine);
         drop(channels);
-        // A fresh turn: the drain answers everything on both queues, so the
-        // order it takes them in decides nothing.
         let mut turn = LaneTurn::default();
         while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
             if let LaneRequest::Shutdown { response } = request {
@@ -1030,20 +783,6 @@ impl EngineLoop {
         }
     }
 
-    /// Submits one frame and settles its steps. `submit` is all-or-nothing,
-    /// so retry is around the whole frame, not per-step (a per-step retry
-    /// would be unsound once earlier steps' KV is written).
-    ///
-    /// Settlement branches on `Engine::settles_asynchronously`: a
-    /// synchronous engine (Metal) settles/wakes/retires inline; an
-    /// asynchronous one (CUDA) returns an unsettled completion, and the
-    /// device's own callback later publishes cells and retires the batch —
-    /// this thread does not wait, returning to `next_request` with the
-    /// frame still on the device (run-ahead bounded by `frame_dispatch_depth`).
-    ///
-    /// Never retries: a refusal here means a device gate refused something
-    /// `validate_frame` already proved admissible, which is a contract
-    /// violation — the lane fails the frame, settles it FAILED, and moves on.
     fn fire_frame(
         engine: &mut EngineBox,
         channels: &ChannelJoin,
@@ -1055,10 +794,6 @@ impl EngineLoop {
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
-        // The next launch, stated (`Engine::expect_fire`, advisory): a
-        // prebind wants a successor's composition known before a step
-        // fires. `launch_rx` has no peek, so the lookahead receives a
-        // queued launch into `stash` and the run loop serves it next.
         if stash.is_none()
             && let Ok(queued) = launch_rx.try_recv()
         {
@@ -1070,9 +805,6 @@ impl EngineLoop {
             *stash = Some(queued);
         }
 
-        // The frame as one submission, moved not copied: everything still
-        // needed after the device has it lives beside it, so no token
-        // vector is cloned to reach the engine.
         let submitted = ::engine::FrameSubmission {
             steps: frame
                 .steps
@@ -1081,10 +813,6 @@ impl EngineLoop {
                 .collect(),
         };
 
-        // Channel join, in: cells the guest put into a host ring since the
-        // last fire cross into the device ring here. A frame is admitted
-        // whole or not at all, so every attached pass committed before
-        // `submit` answers `Ok`. An adopted channel moves nothing and only wakes.
         for step in &submitted.steps {
             for attachment in &step.attachments {
                 if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
@@ -1092,9 +820,6 @@ impl EngineLoop {
                 }
             }
         }
-        // `submit` admits or refuses with zero side effects; both refusals
-        // are terminal here (`Exhausted` is a contract violation past
-        // static admission, `Impossible` is a baked-in ceiling).
         let ticket = match engine.submit(&submitted) {
             Ok(ticket) => ticket,
             Err(error) if error.is_retryable() => {
@@ -1106,9 +831,6 @@ impl EngineLoop {
             Err(error) => return Err(format!("{error}")),
         };
 
-        // `submit` answered `Ok`, so every attached pass committed. An
-        // async wake is deferred (waking now would race the still-computing
-        // device), so the ids ride into settlement instead.
         let asynchronous = engine.settles_asynchronously();
         let mut wakes: Vec<u64> = Vec::new();
         for step in &submitted.steps {
@@ -1129,9 +851,6 @@ impl EngineLoop {
             return Ok(SubmissionCompletion::ready());
         }
 
-        // Device running; the receipt is a correlation id. Registers cells
-        // and deferred wakes against `FrameTicket::id`; run-ahead depth
-        // accounting parks on this completion, not on enqueue.
         let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
         let cells: Vec<_> = frame.terminal_cells().collect();
         settlements.expect(
@@ -1213,8 +932,6 @@ impl EngineLoop {
                     return LaneCommit::None;
                 }
                 let result = match engine.as_mut() {
-                    // Host-codegen splice happens here, on the layer
-                    // holding the engine handle that knows the backend.
                     Some(engine) => {
                         let backend = crate::engine::verbs::codegen_backend(engine);
                         let plan = crate::pipeline::program::with_host_codegen(&plan, backend);
@@ -1339,8 +1056,6 @@ impl EngineLoop {
                 match engine.as_mut() {
                     Some(engine) => match engine.bind_instance(&plan.binding).map(|bound| crate::engine::BoundInstance::new(plan.engine_id, &bound, plan.pacing_wait_id)).map_err(anyhow::Error::from) {
                         Ok(bound) => {
-                            // Dense slot order: `InstanceBinding::channels`'
-                            // declaration order is what publish/take_channel address by.
                             channels.bind(bound.instance_id, plan.binding.channels.clone());
                             LaneCommit::BindInstance {
                                 pipeline_id,
@@ -1422,6 +1137,10 @@ impl EngineLoop {
                     match engine.register_program(plan).map_err(anyhow::Error::from) {
                         Ok(program_id) => bind.binding.program = program_id,
                         Err(error) => {
+                            tracing::error!(
+                                ?error,
+                                "register_program refused; rolling the bind's channels back"
+                            );
                             Self::rollback_channel_set(
                                 engine,
                                 channels,
@@ -1458,8 +1177,6 @@ impl EngineLoop {
                 }
                 match engine.bind_instance(&bind.binding).map(|bound| crate::engine::BoundInstance::new(bind.engine_id, &bound, bind.pacing_wait_id)).map_err(anyhow::Error::from) {
                     Ok(bound) => {
-                        // As the `BindInstance` arm above: the dense channel
-                        // order the pump addresses by.
                         channels.bind(bound.instance_id, bind.binding.channels.clone());
                         LaneCommit::BindInstance {
                             pipeline_id,
@@ -1555,8 +1272,6 @@ impl EngineLoop {
                 }
             },
             QueuedItem::CloseInstance { id, .. } => match engine.as_mut() {
-                // The worker already gated existence/pacing/quiescence before
-                // posting; the map removal happens at commit.
                 Some(engine) => match engine.close_instance(id).map_err(anyhow::Error::from) {
                     Ok(()) => {
                         channels.unbind(id);
@@ -1593,8 +1308,6 @@ impl EngineLoop {
         }
     }
 
-    /// Closes one channel, tolerating a shell with no standalone channel to
-    /// close: binding is the registration there, so `Unsupported` means the close already succeeded.
     fn close_channel(engine: &mut EngineBox, id: u64) -> Result<()> {
         match engine.close_channel(id) {
             Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
@@ -1602,8 +1315,6 @@ impl EngineLoop {
         }
     }
 
-    /// Register a set of channels with all-or-nothing rollback (the shared
-    /// body of `RegisterChannels` and `RegisterChannelsBind`).
     fn register_channel_set(
         engine: &mut EngineBox,
         engine_idx: usize,
@@ -1622,9 +1333,6 @@ impl EngineLoop {
             }
             match crate::engine::verbs::register_channel(engine, engine_idx, plan) {
                 Ok(channel) => {
-                    // The pump joining this host ring to the device half
-                    // needs the ring, role, and id to know where cells are
-                    // and which way they travel.
                     channels.insert(channel.clone(), plan.host_role);
                     registered_ids.push(plan.id);
                     registered.push(channel);
@@ -1673,9 +1381,6 @@ impl EngineLoop {
         );
     }
 
-    /// No-op: an unregistered channel never allocated wait slots
-    /// (`RegisteredChannel` is what answers them). Named so the
-    /// cancellation paths pair with `release_registered_channel_wait_slots`, which still has real work.
     fn release_channel_plan_wait_slots(plans: &[ChannelRegistration]) {
         let _ = plans;
     }
@@ -1700,9 +1405,6 @@ impl EngineLoop {
 }
 
 enum QueuedItem {
-    /// Boxed: the queue is rotated/compacted item-by-item every dispatcher
-    /// pass, so an inline `PendingRequest` would move its whole payload;
-    /// boxing makes a queue move a pointer move.
     Launch(QueuedLaunch),
     PreLaunchCopy {
         plan: PreLaunchCopy,
@@ -1727,15 +1429,9 @@ enum QueuedItem {
         plan: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
     },
-    /// One dispatch registering an instance's channels and binding it: the
-    /// two per-join controls run back-to-back, and dispatching them
-    /// separately doubled the turnover control convoy.
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        /// Some on the program cache's first sight (registration rides
-        /// between channels and bind in one dispatch); None when already
-        /// registered, with `bind.program_id()` carrying the cached id.
         program: Option<ProgramRegistration>,
         bind: InstanceBindingPlan,
         response:
@@ -1757,17 +1453,11 @@ enum QueuedItem {
         id: u64,
         pacing_wait_id: u64,
     },
-    /// A coalesced run of channel closes: one lane round trip retires the
-    /// whole batch instead of one control post per channel.
     CloseChannels {
         ids: Vec<u64>,
     },
 }
 
-/// A queued launch, plus the two fields the dispatcher's queue scan reads,
-/// mirrored inline so [`BatchScheduler::scan_queue`] avoids a cache miss per
-/// item read through the box. Cannot go stale: `QueuedLaunch` hands out
-/// only `&PendingRequest` (no `DerefMut`), so neither field can be reassigned while queued.
 struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
@@ -1795,9 +1485,6 @@ impl std::ops::Deref for QueuedLaunch {
     }
 }
 
-/// A posted launch's lane lifecycle: enters `in_flight_launches` at POST;
-/// `LaneReply::LaunchDone` upgrades the state. Retirement only ever
-/// consumes `Accepted`/`Failed` heads — `Posted` isn't ready yet.
 enum LaunchState {
     Posted { token: u64 },
     Accepted(SubmissionCompletion),
@@ -1819,8 +1506,6 @@ struct PendingLaunchBatch {
     total_tokens: usize,
 }
 
-/// The control slot's lane lifecycle (async-completing controls only —
-/// copies and pool resizes; lifecycle controls never occupy the slot).
 enum ControlSlotState {
     Posted { token: u64 },
     Ready(SubmissionCompletion),
@@ -1833,27 +1518,11 @@ struct PendingControl {
     pipeline_id: Option<ProcessId>,
     tracked_completion: Option<ControlCompletion>,
     operation: &'static str,
-    /// Whether launches must wait for this control to settle: true for a
-    /// `PreLaunchCopy` (its consumer fire is queued right behind it) and a
-    /// pool resize (its drain must not admit new frames); false for
-    /// standalone copies, whose grant-pinned pages no queued fire
-    /// references. Also the exclusivity test — a holding control needs the
-    /// in-flight set empty and blocks every other control while it settles.
     holds_launches: bool,
 }
 
-/// How often to re-check a control op holding launches while the device
-/// sits idle; matches the frame policy's own gather poll.
 const CONTROL_SETTLE_POLL_US: u64 = 500;
 
-/// The async-completing controls the worker is waiting on — copies and
-/// pool resizes; lifecycle controls execute on the lane and never enter
-/// here. An exclusive control (`PreLaunchCopy`, pool resize) needs the set
-/// empty and blocks anything else once posted. Standalone copies (the
-/// residency planner's suspend/restore traffic) settle concurrently:
-/// grant-pinned pages that no queued fire can name, so a single slot bought
-/// no safety. No concurrency ceiling needed — the pending queue bounds it
-/// (the planner enqueues at most one copy per suspending/restoring process).
 #[derive(Default)]
 struct InFlightControls {
     settling: Vec<PendingControl>,
@@ -1864,7 +1533,6 @@ impl InFlightControls {
         self.settling.is_empty()
     }
 
-    /// Whether anything is still settling.
     fn is_settling(&self) -> bool {
         !self.settling.is_empty()
     }
@@ -1873,15 +1541,10 @@ impl InFlightControls {
         self.settling.iter()
     }
 
-    /// Whether a standalone copy may be posted now: only an exclusive
-    /// control can refuse one.
     fn admits_copy(&self) -> bool {
         self.settling.iter().all(|control| !control.holds_launches)
     }
 
-    /// Whether `item` may post into this set now. A standalone copy and a
-    /// lifecycle control are each refused only by an exclusive control; a
-    /// lifecycle control never enters this set at all (lane FIFO guarantees its order).
     fn admits(&self, item: &QueuedItem) -> bool {
         if BatchScheduler::standalone_copy(item) || BatchScheduler::lifecycle_control(item) {
             !self.holds_launches()
@@ -1890,7 +1553,6 @@ impl InFlightControls {
         }
     }
 
-    /// Whether any settling control makes queued launches wait.
     fn holds_launches(&self) -> bool {
         self.settling.iter().any(|control| control.holds_launches)
     }
@@ -1906,25 +1568,15 @@ impl InFlightControls {
     }
 }
 
-/// What one pass over the pending queue tells the frame dispatcher — see
-/// [`BatchScheduler::scan_queue`].
 #[derive(Default)]
 struct QueueScan {
-    /// Stamped fire ids still in the queue (the frame policy resolves
-    /// sealed ids that vanished against this set).
     queued_ids: frame::QueuedFireIds,
-    /// Lanes a frame post must hold for: only lanes with a queued
-    /// `PreLaunchCopy` (order-coupled to its consumer fire).
     blocked_lanes: HashSet<ProcessId>,
-    /// The oldest unstamped rider, dispatched as its own batch.
     untracked: Option<u64>,
-    /// Every queued fire id in queue order, for the shutdown drain. Only
-    /// filled while `stopping` — the steady-state scan never allocates it.
     drain_eligible: Vec<u64>,
 }
 
 impl QueueScan {
-    /// Reset for reuse, keeping the allocations.
     fn clear(&mut self) {
         self.queued_ids.clear();
         self.blocked_lanes.clear();
@@ -1933,17 +1585,11 @@ impl QueueScan {
     }
 }
 
-/// The worker's pending queue, plus an epoch that changes on every
-/// mutation, so [`BatchScheduler::scan_queue`] can skip a pass whose answer
-/// hasn't changed. `DerefMut` bumps it, making invalidation total — every
-/// `&mut` reach counts (rotations, in-place edits, rebuilds); over-invalidation just wastes a scan.
 #[derive(Default)]
 struct PendingQueue {
     items: VecDeque<QueuedItem>,
     epoch: u64,
-    /// `(epoch, index of the first non-`Launch` item)`.
     first_other: Option<(u64, Option<usize>)>,
-    /// `(epoch, index of the first queued close)`.
     first_close: Option<(u64, usize)>,
 }
 
@@ -1952,16 +1598,11 @@ impl PendingQueue {
         self.epoch
     }
 
-    /// Replace the contents wholesale, preserving the epoch counter.
     fn replace(&mut self, items: VecDeque<QueuedItem>) {
         self.items = items;
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Offset of the first item that is not a `Launch`, or `None` if the
-    /// queue is all launches. Cached against the epoch, like
-    /// [`Self::first_close`]: both answer "where does the launch run end",
-    /// asked at least once per worker pass.
     fn first_other(&mut self) -> Option<usize> {
         if let Some((epoch, idx)) = self.first_other
             && epoch == self.epoch
@@ -1976,7 +1617,6 @@ impl PendingQueue {
         idx
     }
 
-    /// Offset of the first queued close, or the length when there is none.
     fn first_close(&mut self) -> usize {
         if let Some((epoch, idx)) = self.first_close
             && epoch == self.epoch
@@ -1997,20 +1637,15 @@ impl PendingQueue {
         idx
     }
 
-    /// Moves the leading run of launches behind the rest of the queue:
-    /// equivalent to popping each off the front and pushing it back, but as one rotation.
     fn rotate_launch_run_to_back(&mut self, run_len: usize) {
         self.items.rotate_left(run_len);
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Insert a bring-up control ahead of the trailing close run.
     fn insert_before_closes(&mut self, item: QueuedItem) {
         let index = self.first_close();
         self.items.insert(index, item);
         self.epoch = self.epoch.wrapping_add(1);
-        // The insert shifted the close run right and put a non-close at
-        // `index`, so the next control lands after this one without rescanning.
         self.first_close = Some((self.epoch, index + 1));
         self.first_other = None;
     }
@@ -2052,18 +1687,12 @@ impl FromIterator<QueuedItem> for PendingQueue {
     }
 }
 
-/// A [`QueueScan`] plus the queue epoch it was taken at.
 #[derive(Default)]
 struct ScanCache {
     scan: QueueScan,
-    /// `None` until the first scan; otherwise the (epoch, stopping) the
-    /// cached scan is valid for.
     taken_at: Option<(u64, bool)>,
 }
 
-/// Reused across frames: `post_frame` places each picked fire into its
-/// sealed slot, and a fresh `Vec` per frame would be a ~650 KB allocation on
-/// the critical path. Compaction `take()`s every slot, so it only ever grows.
 type SlotBuffer = Vec<Vec<Option<Box<PendingRequest>>>>;
 
 struct SchedulerControl {
@@ -2074,8 +1703,6 @@ struct SchedulerControl {
     program_ids: Mutex<HashMap<u64, (u64, ::eta_compiler::codegen::launch::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
-    /// Which memory this engine's KV pages live in; carried on the handle
-    /// since the `*_on` submit paths get a handle but no engine id.
     device_domain: ::engine::MemoryDomain,
 }
 
@@ -2085,7 +1712,6 @@ pub(crate) struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    /// The memory this scheduler's engine keeps its KV pages in.
     pub(crate) fn device_domain(&self) -> ::engine::MemoryDomain {
         self.inner.device_domain
     }
@@ -2139,8 +1765,6 @@ impl SchedulerHandle {
             .map_err(|_| anyhow!("scheduler channel closed"))
     }
 
-    /// This engine's lock-free stats snapshot (read by
-    /// `scheduler::get_stats`'s cross-engine aggregation).
     pub(crate) fn stats(&self) -> Arc<SchedulerStats> {
         Arc::clone(&self.inner.stats)
     }
@@ -2230,8 +1854,6 @@ impl SchedulerHandle {
         })
     }
 
-    /// Fire-and-forget frame truncation notice (frame mode): a host frame
-    /// submit failed mid-way, so only `submitted` fires of (lane, seq) exist.
     pub fn frame_truncate(&self, lane: ProcessId, seq: u64, submitted: u32) -> Result<()> {
         self.send(SchedulerItem::FrameTruncate {
             lane,
@@ -2266,9 +1888,6 @@ impl SchedulerHandle {
         Ok(program_id)
     }
 
-    /// `engine_id` is an argument here because the ring is the runtime's:
-    /// `ChannelRegistration` states only what the engine needs, not which
-    /// registry slot a channel's endpoint belongs to.
     pub async fn register_channel(
         &self,
         engine_id: crate::engine::EngineId,
@@ -2279,7 +1898,6 @@ impl SchedulerHandle {
             .await?
     }
 
-    /// As [`SchedulerHandle::register_channel`], for a set.
     pub async fn register_channels(
         &self,
         engine_id: crate::engine::EngineId,
@@ -2368,8 +1986,6 @@ impl SchedulerHandle {
         Ok(completion)
     }
 
-    /// Human-readable snapshot of the run loop's state (see
-    /// [`SchedulerItem::DebugDump`]).
     pub(crate) async fn debug_dump(&self) -> Result<String> {
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -2379,8 +1995,6 @@ impl SchedulerHandle {
         .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
     }
 
-    // Only called from `scheduler::dispatch::copy_rs_d2d` (not yet issued by
-    // the mock-engine fire path) — see `scheduler::dispatch`'s module doc.
     #[allow(dead_code)]
     pub async fn copy_state(&self, plan: StateCopy) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::CopyState { plan, response })
@@ -2395,8 +2009,6 @@ impl SchedulerHandle {
         self.send(SchedulerItem::CloseChannel { id })
     }
 
-    /// Batched form of [`Self::close_channel`] for callers that retire a
-    /// whole cohort of channels at once (process teardown).
     pub fn close_channels(&self, ids: Vec<u64>) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -2494,9 +2106,6 @@ impl BatchScheduler {
         }));
         let engine = crate::engine::take_engine_backend(engine_id).ok();
         let mut lane = EngineLoop::spawn(engine_id, engine, lane_reply_tx, Arc::clone(&stats));
-        // Worker→lane requests not yet replied to (launch posts + control
-        // posts). Shutdown may only tear down once this drains — every lane
-        // request produces exactly one reply.
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
@@ -2507,9 +2116,6 @@ impl BatchScheduler {
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
-        // Wait-for-all-active-lanes frame policy, one instance per engine
-        // thread. At the default k=1 a frame is one wave; density comes
-        // from the sealed epoch, throughput from run-ahead depth within it.
         let mut frame_policy = FramePolicy::new(
             frame_size,
             limits.max_forward_requests,
@@ -2518,17 +2124,11 @@ impl BatchScheduler {
         );
         frame_policy
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
-        // Stall self-diagnosis: after 10s of zero progress with queued or
-        // in-flight work, print the full state dump so the wedge names
-        // itself (then re-print every 60s while it persists).
         let mut stall_since: Option<std::time::Instant> = None;
         let mut stall_dumps: u32 = 0;
 
         loop {
             let mut progress = false;
-            // Epoch drain: a pass consumes only what was queued when it began,
-            // so a sustained producer flood cannot keep `try_recv` non-empty
-            // and hold retire/dispatch hostage behind the live stream.
             let mailbox_epoch = rx.len();
             for _ in 0..mailbox_epoch {
                 let Ok(item) = rx.try_recv() else { break };
@@ -2602,10 +2202,6 @@ impl BatchScheduler {
                 break;
             }
 
-            // Cohort-boundary bind deferral: while a successor's arrival is
-            // imminent, hold back the bind permits retiring processes return,
-            // so the staged cohort's bring-up does not compete with it.
-            // Cleared once this pass has nothing left to do.
             crate::inferlet::process::set_bind_release_hold(
                 !stopping
                     && frame_policy.is_joining()
@@ -2633,20 +2229,13 @@ impl BatchScheduler {
                     }
                 }
             } else {
-                // Event-driven retirement: park the nudge waker on the oldest
-                // in-flight completions so the engine callback wakes this
-                // thread the moment one publishes. The timeout is only a hang
-                // backstop, never the steady-state wake path.
                 let mut armed = true;
                 if let Some(front) = in_flight_launches.front() {
                     match &front.state {
-                        // A posted launch's reply arrives on the scheduler
-                        // channel itself — recv() IS the wake path.
                         LaunchState::Posted { .. } => {}
                         LaunchState::Accepted(completion) => {
                             armed &= arm_completion_nudge(completion, &nudge_waker);
                         }
-                        // A failed launch is retire-ready right now.
                         LaunchState::Failed(_) => armed = false,
                     }
                 }
@@ -2659,23 +2248,14 @@ impl BatchScheduler {
                     }
                 }
                 if !armed {
-                    // Something already settled; retire it on the next pass.
                     continue;
                 }
-                // A pending wait-all hold re-arms the backstop at its own
-                // cadence, never longer than the 250ms hang backstop, so a
-                // held wave still fires on time with no new arrival.
                 let backstop = Duration::from_millis(250);
                 let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
-                // With the device idle and a control holding launches, a
-                // `Posted` control slot arms no nudge, so only the backstop ends the wait.
                 let idle_park = in_flight_launches.is_empty();
                 let control_park = idle_park && in_flight_control.holds_launches();
                 let park_began = Instant::now();
                 let parked = rx.recv_timeout(recv_wait);
-                // `PIE_CONTENTION_TRACE_EVENTS=1`: while nothing arrives and
-                // something is still owed, say what the policy holds — a
-                // stalled gather is otherwise silent.
                 if parked.is_err() && crate::planner::trace_enabled() {
                     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                     let mut last = LAST.lock().unwrap();
@@ -2701,9 +2281,6 @@ impl BatchScheduler {
                             .quorum
                             .idle_park_control_us
                             .fetch_add(slept, Relaxed);
-                        // Name the operation that held the device idle. Same
-                        // env switch as the device-idle census; only the long
-                        // ones are worth a line.
                         if slept >= frame::idle_dump_threshold_us() {
                             let who: Vec<String> = in_flight_control
                                 .iter()
@@ -2744,10 +2321,6 @@ impl BatchScheduler {
                 match parked {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                        // A settled completion discovered by the backstop
-                        // means a wake was lost; steady-state count stays
-                        // zero. Shutdown races and wait-all-hold timeouts
-                        // (the wait's own cadence) never count here.
                         let missed = in_flight_launches.front().is_some_and(|front| {
                             matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
                         }) || in_flight_control.iter().any(|control| {
@@ -2827,9 +2400,6 @@ impl BatchScheduler {
             }
         }
 
-        // The lane has no pending requests here (`lane_inflight == 0` gates
-        // the loop exit), so shutdown returns the quiesced engine and the
-        // channel registry for teardown.
         let (mut engine, mut channels) = lane.shutdown();
         Self::shutdown_instances(&mut engine, &mut instances);
         Self::shutdown_channels(&mut engine, &mut channels);
@@ -2927,17 +2497,10 @@ impl BatchScheduler {
             SchedulerItem::Stop => {
                 *stopping = true;
             }
-            // Answered inline at both dequeue sites in `run` — it never
-            // reaches this queue-mutating path.
             SchedulerItem::DebugDump { .. } => {
                 unreachable!("DebugDump is intercepted before enqueue_item")
             }
-            // A nudge only unblocks the wait; the retire pass at the top of
-            // the loop does the work.
             SchedulerItem::Nudge => {}
-            // Immediate, not queued. Termination rejects queued work; graceful
-            // pipeline close instead releases the wait-set and lets every
-            // already-admitted request drain untracked.
             SchedulerItem::ExecutionSlotReleased(pid) => {
                 frame_policy.on_execution_slot_released(pid);
             }
@@ -2956,18 +2519,11 @@ impl BatchScheduler {
             SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
                 if kind == LeaveKind::Terminate {
                     if !terminated_processes.insert(pid) {
-                        // Duplicate Terminate (exit funnel notifies from the
-                        // terminate entry point and again from deferred
-                        // teardown): the first leave did the work; skip
-                        // straight to the ack a waiting sender may hold.
                         if let Some(response) = response {
                             let _ = response.send(());
                         }
                         return;
                     }
-                    // A departing slot holder's release broadcast is now in
-                    // flight; the seal keeps gathering its successor (the
-                    // ragged-boundary guard — see on_slotted_terminate).
                     frame_policy.on_slotted_terminate(pid);
                     let protected = in_flight_control
                         .iter()
@@ -2980,18 +2536,12 @@ impl BatchScheduler {
                 }
                 match kind {
                     LeaveKind::Close => {
-                        // Graceful close keeps queued frames: their accepted
-                        // fires drain to settlement like any submitted work.
                         frame_policy.on_lane_leave(pid, owner, false);
                     }
                     LeaveKind::Suspend => {
-                        // Process-wide graceful leave (see the variant doc);
-                        // `pid` names the process here.
                         frame_policy.on_process_suspend(pid);
                     }
                     LeaveKind::Terminate => {
-                        // Terminate rejected the lane's queued fires. Both
-                        // ids are the process here, so the owner is `pid`.
                         frame_policy.on_lane_leave(pid, owner.or(Some(pid)), true);
                         frame_policy.on_process_leave(pid);
                     }
@@ -3024,9 +2574,6 @@ impl BatchScheduler {
                     None
                 };
                 if let Some(message) = rejection {
-                    // A rejected mid-frame fire still counts toward its
-                    // frame's arrival completeness, unless its process already
-                    // terminated (recording it would resurrect a ghost lane).
                     if let Some(stamp) = launch.frame
                         && !launch
                             .process_id
@@ -3036,10 +2583,6 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
-                    // Default single-slot deployment: every tracked fire is
-                    // a one-fire frame, stamped at accept so a rejected fire
-                    // never touches the wait-set; an untracked/prebuilt fire
-                    // stays an unstamped rider.
                     if frame_policy.single_slot()
                         && launch.frame.is_none()
                         && let Some(lane) = launch.pipeline_id
@@ -3051,10 +2594,6 @@ impl BatchScheduler {
                             fires: 1,
                         });
                     }
-                    // The gather starts at acceptance, not dispatch: a
-                    // stamped fire counts toward its lane's frame arrival
-                    // even while it sits in `pending` behind an
-                    // in-flight-depth or seal hold.
                     if wave_trace() {
                         wave_trace_emit(format!(
                             "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
@@ -3068,11 +2607,6 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
-                        // A guidance pair gathers under ONE key (the lower
-                        // of the two group ids), so the seal waits for both
-                        // branches rather than firing whichever filled first
-                        // — a peer in another fire is not on this fire's
-                        // velocity plane at all.
                         let cohort = launch
                             .request
                             .lanes
@@ -3153,10 +2687,6 @@ impl BatchScheduler {
                     )));
                     return;
                 }
-                // Binds do not hold the seal. The policy stages bring-up
-                // processes here, and a retiring execution slot earmarks one
-                // staged successor — that earmark is what gathers a cohort
-                // turnover into a dense epoch.
                 frame_policy.on_bind_enqueued(pipeline_id);
                 Self::queue_bind_control(
                     pending,
@@ -3187,8 +2717,6 @@ impl BatchScheduler {
                     Self::queue_close_channel(pending, id);
                 }
             }
-            // Handled on dequeue in the run loop (like DebugDump) before
-            // enqueue_item is reached.
             SchedulerItem::Lane(_) => unreachable!(),
         }
     }
@@ -3198,9 +2726,6 @@ impl BatchScheduler {
         pid: ProcessId,
         protected: Option<&WorkItemCompletion>,
     ) {
-        // Common case first: a naturally-completed process has nothing
-        // queued. A cheap scan decides; only an actual purge pays the
-        // rebuild below.
         let has_queued = pending.iter().any(|item| match item {
             QueuedItem::Launch(request) => request.process_id == Some(pid),
             QueuedItem::PreLaunchCopy { process_id, .. } => *process_id == Some(pid),
@@ -3235,9 +2760,6 @@ impl BatchScheduler {
                             .completion
                             .reject_unsubmitted("pipeline left while queued");
                     }
-                    // A pre-launch copy is order-coupled to its consumer
-                    // launch (one fire, one book entry — the Launch arm
-                    // resolves it).
                     QueuedItem::PreLaunchCopy {
                         logical_completion, ..
                     } => logical_completion
@@ -3275,10 +2797,6 @@ impl BatchScheduler {
         pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
     }
 
-    /// Whether any queued fire still targets `instance_id` (a queued
-    /// `PreLaunchCopy` is covered by its consumer launch queued behind it).
-    /// Together with `TrackedInstance::in_flight` this is the close gate:
-    /// an instance with neither queued nor in-flight work is quiesced.
     fn instance_has_queued_work(pending: &VecDeque<QueuedItem>, instance_id: u64) -> bool {
         pending.iter().any(|item| match item {
             QueuedItem::Launch(request) => request.instance_id == instance_id,
@@ -3286,10 +2804,6 @@ impl BatchScheduler {
         })
     }
 
-    /// A standalone KV/state copy (suspend D2H, restore H2D, graft/CAS):
-    /// touches pages no queued fire references, so it dispatches out-of-band
-    /// once its slot frees, never barriering a queued fire. `PreLaunchCopy`
-    /// is not in this class — it's order-coupled to its own launch.
     const fn standalone_copy(item: &QueuedItem) -> bool {
         matches!(
             item,
@@ -3299,10 +2813,6 @@ impl BatchScheduler {
         )
     }
 
-    /// Items a rotation can usefully expose at the queue front. A `Launch`
-    /// is picked by fire id (reads the whole queue), a standalone copy is
-    /// pulled from any position by the tail sweep, and a close is excluded
-    /// (asked only while the whole close run is held) — none benefit from rotation.
     const fn rotation_target(item: &QueuedItem) -> bool {
         !matches!(
             item,
@@ -3312,12 +2822,6 @@ impl BatchScheduler {
         ) && !Self::standalone_copy(item)
     }
 
-    /// Controls that dispatch without draining in-flight launches:
-    /// registrations create entities nothing in flight can reference yet,
-    /// copies touch only committed/quiesced extents, and closes follow
-    /// their instance closes (the engine rejects closes with live
-    /// attachments). Only pool resizes keep the empty-pipe requirement —
-    /// drain is their ordering mechanism.
     const fn pipe_concurrent_control(item: &QueuedItem) -> bool {
         Self::standalone_copy(item)
             || matches!(
@@ -3332,13 +2836,6 @@ impl BatchScheduler {
             )
     }
 
-    /// Moves held launches behind work that can densify the current wave.
-    /// The whole contiguous launch prefix rotates at once, since
-    /// per-instance launch order is a dispatch invariant a partial rotation
-    /// could split. Never breaks a `PreLaunchCopy`'s copy->consumer coupling
-    /// (the consumer stays behind its copy). Lifecycle controls (registers,
-    /// binds, closes) never order against a queued launch — only
-    /// `PreLaunchCopy` and pool resizes do.
     const fn lifecycle_control(item: &QueuedItem) -> bool {
         matches!(
             item,
@@ -3353,9 +2850,6 @@ impl BatchScheduler {
     }
 
     fn queue_close_channel(pending: &mut PendingQueue, id: u64) {
-        // Coalesce teardown runs: consecutive channel closes ride one
-        // control post. Bounded so a batch's lane occupancy stays a
-        // fraction of a wave (~3-6 us per close engine-side).
         const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
         if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
             && ids.len() < CLOSE_CHANNEL_BATCH_MAX
@@ -3367,17 +2861,9 @@ impl BatchScheduler {
     }
 
     fn queue_bind_control(pending: &mut PendingQueue, item: QueuedItem) {
-        // Queue-priority invariant: execution outranks bring-up outranks
-        // teardown. A bind never delays a queued launch, and jumps the
-        // close tail (bind-vs-bind order preserved) since a bind and a
-        // queued close always target different instances/channels.
         pending.insert_before_closes(item);
     }
 
-    /// Rotates a front launch out only when doing so exposes dispatchable
-    /// work behind it. `allow_lifecycle` is the wider flag: a lifecycle
-    /// control needs no control slot, so a standalone copy in flight does
-    /// not stop it from being worth exposing at the front.
     fn rotate_launch_for_wave_work(
         pending: &mut PendingQueue,
         allow_slot: bool,
@@ -3433,25 +2919,12 @@ impl BatchScheduler {
             stats,
             stopping,
         );
-        // Busy-close rotations this pass: bounded so a queue of nothing but
-        // busy closes breaks out instead of spinning.
         let mut close_rotations = 0usize;
-        // Cohort-boundary close hold: while any bind is in assembly, teardown
-        // closes yield the engine lane to the fresh cohort's registrations.
-        // Held closes rotate and drain during the next generation's
-        // execution. Shutdown never holds (the drain must retire everything).
         let hold_closes = !stopping && frame_policy.has_pending_binds();
-        // The control slot exists for controls that settle asynchronously;
-        // lifecycle controls run on the lane FIFO and never take it. A
-        // standalone copy holding the slot doesn't block them: it addresses
-        // grant-pinned pages no bind/register/close can reference.
         let slot_blocks_lifecycle = in_flight_control.holds_launches();
         while let Some(item) = pending.front() {
             match item {
                 QueuedItem::Launch(_) => {
-                    // Launches dispatch by id (`dispatch_frame_work`), not
-                    // queue position; a launch at the front only needs to
-                    // yield to a dispatchable control behind it.
                     if Self::rotate_launch_for_wave_work(
                         pending,
                         in_flight_control.is_empty(),
@@ -3463,17 +2936,11 @@ impl BatchScheduler {
                     break;
                 }
                 QueuedItem::CloseInstance { id, .. } => {
-                    // A close needs only its own instance quiesced, never a
-                    // global pipe drain or control slot (a settling
-                    // standalone copy addresses pages no close can name).
                     if slot_blocks_lifecycle {
                         break;
                     }
                     let id = *id;
                     if hold_closes {
-                        // Held for the boundary: rotate without claiming
-                        // progress (the bind-completed lane reply that empties
-                        // `pending_binds` is the wake that re-checks).
                         let rot_stop = close_rotations >= pending.len()
                             || !pending.iter().skip(1).any(Self::rotation_target);
                         if rot_stop {
@@ -3502,10 +2969,6 @@ impl BatchScheduler {
                         progress = true;
                         continue;
                     }
-                    // Busy: rotate the close behind the queue so the fires
-                    // quiescing it keep flowing; retirement re-checks it. A
-                    // close only moves backward, so it never overtakes its
-                    // own instance's work. No progress claim: `busy` guarantees a later wake.
                     let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
@@ -3521,8 +2984,6 @@ impl BatchScheduler {
                     pending.push_back(item);
                 }
                 QueuedItem::CloseChannels { .. } if hold_closes => {
-                    // Same bounded rotation as a held instance close; no
-                    // progress claim (see the CloseInstance hold branch).
                     let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(Self::rotation_target);
                     if rot_stop {
@@ -3532,10 +2993,6 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                 }
-                // A settling exclusive control (a `PreLaunchCopy` or a pool
-                // resize) blocks the next control; standalone copies and
-                // lifecycle controls are refused by nothing else — see
-                // `InFlightControls::admits`.
                 _ if !in_flight_control.admits(item) => break,
                 _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
                     break;
@@ -3555,12 +3012,6 @@ impl BatchScheduler {
                 }
             }
         }
-        // Standalone copies dispatch from any queue position once the
-        // control slot frees: their pages are grant-pinned so nothing
-        // queued orders against them, and leaving them positional would
-        // starve the planner's suspend/restore progress on a held frame.
-        // They also pipeline (the sweep keeps posting while no exclusive
-        // control holds the set); the queue bounds depth to what the planner enqueued.
         while in_flight_control.admits_copy() {
             let Some(index) = pending.iter().position(Self::standalone_copy) else {
                 break;
@@ -3582,9 +3033,6 @@ impl BatchScheduler {
         (progress, wait_hint)
     }
 
-    /// Posts a control to the engine lane after worker-side pre-checks. The
-    /// engine half runs on the lane in FIFO order; worker-map effects come
-    /// back as a [`LaneCommit`]. Async controls occupy the single control slot from post.
     fn post_control(
         engine_loop: &EngineLoop,
         lane_inflight: &mut u64,
@@ -3628,11 +3076,6 @@ impl BatchScheduler {
         }
         *lane_token += 1;
         let token = *lane_token;
-        // Async-completing controls enter the in-flight set from post: an
-        // exclusive one must not be passed by any later control. Only
-        // standalone copies do not hold launches — the classification shared
-        // with the out-of-band dispatch and `InFlightControls`'s concurrency
-        // rule.
         let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
@@ -3693,18 +3136,11 @@ impl BatchScheduler {
         });
     }
 
-    /// One queue pass: the stamped ids still queued, the oldest unstamped
-    /// rider, and the lanes a frame post must hold for. Only a queued
-    /// `PreLaunchCopy` blocks a lane; standalone copies never barrier fires
-    /// (their pinned pages are never referenced by a queued fire).
     fn scan_queue<'a>(
         cache: &'a mut ScanCache,
         pending: &PendingQueue,
         stopping: bool,
     ) -> &'a QueueScan {
-        // A pure function of (queue contents, stopping): a pass at an
-        // unchanged epoch would rebuild what's already here, which matters
-        // since passes run many times per wave while the queue rarely changes.
         if cache.taken_at == Some((pending.epoch(), stopping)) {
             return &cache.scan;
         }
@@ -3736,10 +3172,6 @@ impl BatchScheduler {
         &cache.scan
     }
 
-    /// Launch dispatch: posts whole sealed frames to the engine lane at the
-    /// run-ahead depth (the engine executes a frame's waves in slot order
-    /// as one closed system). At k=1 a sealed frame is one wave, so this
-    /// degenerates to per-wave wait-all dispatch.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_frame_work(
         scan_cache: &mut ScanCache,
@@ -3763,10 +3195,6 @@ impl BatchScheduler {
             *hint = Some(hint.map_or(hold, |old| old.min(hold)));
         };
         loop {
-            // A settling control holds launches only when a launch could
-            // depend on it (a `PreLaunchCopy`'s consumer fire queued behind
-            // it, a resize's pipe drain); a settling standalone copy holds
-            // nothing, so frames keep posting while it settles.
             if in_flight_control.holds_launches() {
                 if wave_trace() {
                     wave_trace_emit(format!(
@@ -3775,17 +3203,12 @@ impl BatchScheduler {
                         in_flight_launches.len()
                     ));
                 }
-                // Counted only when the device is idle: the frame policy
-                // isn't even consulted here. See `probe::QuorumProbes`.
                 if in_flight_launches.is_empty() {
                     stats
                         .fire
                         .quorum
                         .idle_break_control
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // The completion nudge is armed but doesn't reliably
-                    // fire, so the park must not sleep the full backstop; a
-                    // hint, not a nudge fix, since the settle is cheap to poll.
                     merge_hint(
                         &mut wait_hint,
                         Duration::from_micros(CONTROL_SETTLE_POLL_US),
@@ -3793,9 +3216,6 @@ impl BatchScheduler {
                 }
                 break;
             }
-            // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
-            // frees a slot; posting never waits on completion beyond this
-            // backpressure.
             if in_flight_launches.len() >= frame::configured_dispatch_depth() {
                 if wave_trace() {
                     wave_trace_emit(format!(
@@ -3825,12 +3245,6 @@ impl BatchScheduler {
             }
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
-                // Shutdown drain: the boundary gate waits for arrivals that
-                // will never come once the host stops, so bypass it and post
-                // every accepted fire in queue order (queue order IS each
-                // lane's submission order, which the device tickets require);
-                // repeated instances and budget overflows split into
-                // successive steps at build.
                 if scan.drain_eligible.is_empty() {
                     break;
                 }
@@ -3864,12 +3278,6 @@ impl BatchScheduler {
                     }
                     FramePlan::Park => break,
                     FramePlan::Terminate(doomed) => {
-                        // A pipeline the policy will not serve any longer:
-                        // abandoned (silent past the timeout without calling
-                        // `forward.park()`), or a stated attention-group
-                        // cohort that never composed. The reason is the
-                        // guest's error verbatim — the policy holds the
-                        // facts, so it words the verdict.
                         for (pid, doom) in doomed {
                             let reason = doom.to_string();
                             tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
@@ -3907,12 +3315,7 @@ impl BatchScheduler {
         (progress, wait_hint)
     }
 
-    /// Extract the frame's fires (all waves) from the queue, drop the
-    /// settled/stale, assemble the frame submission, and post it as one
-    /// launch. Returns (progress, posted-a-frame).
     #[allow(clippy::too_many_arguments)]
-    /// Whether a queued fire still belongs in the frame being built; settles
-    /// it with a rejection if not.
     fn admits_to_frame(
         request: &PendingRequest,
         instances: &HashMap<u64, TrackedInstance>,
@@ -3957,9 +3360,6 @@ impl BatchScheduler {
         waves: &[Vec<u64>],
     ) -> (bool, bool) {
         let mut progress = false;
-        // One map, carrying both the wave and the in-wave position (the
-        // sealed wave's id order / lane admission order), so requests below
-        // are placed by slot rather than sorted.
         let mut slot_of: HashMap<u64, (usize, usize)> =
             HashMap::with_capacity(waves.iter().map(Vec::len).sum());
         for (index, wave) in waves.iter().enumerate() {
@@ -3968,10 +3368,6 @@ impl BatchScheduler {
             }
         }
         let mut kept: VecDeque<QueuedItem> = VecDeque::with_capacity(pending.len());
-        // Place by slot rather than push-then-sort: `position` is already a
-        // permutation of `0..wave.len()`, so the sealed order is recovered by
-        // writing each request straight into its slot. The buffer is
-        // caller-owned and comes back empty from the last frame.
         slot_buffer.resize_with(waves.len(), Vec::new);
         for (slots, wave) in slot_buffer.iter_mut().zip(waves) {
             debug_assert!(slots.iter().all(Option::is_none));
@@ -3979,8 +3375,6 @@ impl BatchScheduler {
                 slots.resize_with(wave.len(), || None);
             }
         }
-        // A fire id repeated across the queue cannot be placed twice; it is
-        // degenerate, but it must still be dispatched rather than dropped.
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
@@ -3999,8 +3393,6 @@ impl BatchScheduler {
             }
         }
         pending.replace(kept);
-        // Compact the slots and drop settled/cancelled/stale fires in one
-        // pass — the frame posts without them.
         let mut survivors: Vec<Vec<Box<PendingRequest>>> = Vec::with_capacity(waves.len());
         for slots in slot_buffer.iter_mut() {
             let mut kept_wave = Vec::with_capacity(slots.len());
@@ -4048,8 +3440,6 @@ impl BatchScheduler {
         engine_loop.post(LaneRequest::Launch {
             token,
             submission: LaneLaunch(submission),
-            // More tokens than requests means at least one lane contributed a
-            // multi-token pass, i.e. this wave carries a prefill.
             prefill: total_tokens > batch_size as usize,
         });
         (true, true)
@@ -4063,9 +3453,6 @@ impl BatchScheduler {
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
-            // A lane-rejected launch retires like a wave (it entered the
-            // pipe at post, so the common unwind applies); only its
-            // requests' settlement differs (rejected, never submitted).
             let launch_failure = match &front.state {
                 LaunchState::Posted { .. } => break,
                 LaunchState::Failed(message) => Some(message.clone()),
@@ -4088,9 +3475,6 @@ impl BatchScheduler {
                     retired.requests.len()
                 ));
             }
-            // The runtime has answered these lanes: re-arm their submit
-            // deadline from here so the wave they waited on is not charged
-            // to them (see `FramePolicy::on_frame_retired`).
             frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
@@ -4122,9 +3506,6 @@ impl BatchScheduler {
                                 outcomes.push("failed");
                             }
                             Ok(WorkItemAttemptOutcome::Retry) => {
-                                // Admitted frames are atomic and stream
-                                // work is success-only, so a surviving RETRY
-                                // violates the engine contract: fail loudly instead of replaying.
                                 outcomes.push("retry");
                                 request.completion.reject(
                                     "engine published RETRY at frame settle; \
@@ -4168,16 +3549,11 @@ impl BatchScheduler {
         progress
     }
 
-    /// Retire every settled control this pass. Concurrent standalone copies
-    /// settle in device order, not post order, so the sweep cannot stop at
-    /// the first control that is still outstanding.
     fn retire_ready_control(in_flight_control: &mut InFlightControls) -> bool {
         let mut retired = false;
         let mut index = 0;
         while index < in_flight_control.settling.len() {
             let ready = match &in_flight_control.settling[index].state {
-                // Still waiting for the lane's reply to install the engine
-                // completion (or drop the entry on rejection).
                 ControlSlotState::Posted { .. } => None,
                 ControlSlotState::Ready(completion) => completion.check(),
             };
@@ -4205,9 +3581,6 @@ impl BatchScheduler {
         retired
     }
 
-    /// Apply an engine-lane reply on the worker thread: fill in a posted
-    /// launch's verdict, commit a control's worker-map effects, or install an
-    /// async control's engine completion. Replies arrive in lane FIFO order.
     fn apply_lane_reply(
         reply: LaneReply,
         lane_inflight: &mut u64,
@@ -4223,16 +3596,11 @@ impl BatchScheduler {
                 let Some(batch) = in_flight_launches.iter_mut().find(
                     |batch| matches!(batch.state, LaunchState::Posted { token: t } if t == token),
                 ) else {
-                    // A Posted batch never retires; a missing token is a bug.
                     tracing::error!(token, "lane launch reply for an unknown batch");
                     return;
                 };
                 match result {
                     Ok(completion) => {
-                        // Commit target epochs at accept: lane replies
-                        // arrive in post (acceptance) order, so the
-                        // per-instance ledger stays gapless and each
-                        // completion's target matches the ordinal the instance slot will publish.
                         for request in &batch.requests {
                             if let Some(instance) = instances.get_mut(&request.instance_id) {
                                 let epoch = instance.next_target_epoch;
@@ -4259,9 +3627,6 @@ impl BatchScheduler {
                 } => {
                     frame_policy.on_bind_completed(pipeline_id);
                     if instances.contains_key(&bound.instance_id) {
-                        // Practically unreachable: engine-assigned ids are
-                        // unique and requested ids are pre-checked at post.
-                        // Refuse loudly; the legit instance stays untouched.
                         tracing::error!(
                             instance_id = bound.instance_id,
                             "bind committed an already-bound instance id"
@@ -4279,9 +3644,6 @@ impl BatchScheduler {
                     }
                     let instance_id = bound.instance_id;
                     instances.insert(instance_id, TrackedInstance::from_bound(&bound));
-                    // Respond after the insert: launch admission reads
-                    // `instances` here, so the guest's first fire (sent
-                    // only after this response) is always admissible.
                     match respond {
                         BindRespond::Bind(response) => {
                             if let Err(Ok(bound)) = response.send(Ok(bound)) {
@@ -4365,9 +3727,6 @@ impl BatchScheduler {
                     }
                 }
                 LaneCommit::AsyncControl { result } => {
-                    // Replies arrive in lane FIFO order, but several
-                    // standalone copies can be posted at once, so the reply
-                    // is matched to its own entry by token.
                     let Some(index) = in_flight_control.position_posted(token) else {
                         tracing::error!(
                             token,
@@ -4380,8 +3739,6 @@ impl BatchScheduler {
                             in_flight_control.settling[index].state =
                                 ControlSlotState::Ready(completion);
                         }
-                        // The lane already rejected/resolved the control's
-                        // completions; the entry just leaves.
                         Err(_) => {
                             in_flight_control.settling.remove(index);
                         }
@@ -4454,8 +3811,6 @@ impl TrackedInstance {
 mod tests {
     use super::*;
 
-    /// An engine whose `launch` panics; every other verb is a stub, since
-    /// what is under test is the lane, not a backend.
     struct PanickingEngine;
 
     impl engine::Engine for PanickingEngine {
@@ -4478,9 +3833,11 @@ mod tests {
         }
     }
 
-    /// A launch the engine panics on is answered, and so is the one behind
-    /// it: the lane replies exactly once per request, so a panic must not
-    /// skip the reply and leave the frame in flight forever.
+    fn worker_every_case() {
+        a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
+        a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
+    }
+
     #[test]
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
         let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
@@ -4494,8 +3851,6 @@ mod tests {
         for token in [7_u64, 8] {
             lane.post(LaneRequest::Launch {
                 token,
-                // One step: a frame with none never reaches `Engine::fire`,
-                // the verb this test's engine panics in.
                 submission: LaneLaunch(crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
                         submission: ::engine::Step {
@@ -4513,8 +3868,6 @@ mod tests {
             });
         }
 
-        // Bounded: the failure this test exists for is a wait with no end,
-        // and an unwrap on a blocking recv would hang the suite rather than fail it.
         for want in [7_u64, 8] {
             let reply = reply_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -4533,15 +3886,11 @@ mod tests {
             );
         }
 
-        // And the lane still answers its shutdown handshake, without touching
-        // the engine it left alone.
         let (engine, channels) = lane.shutdown();
         assert!(engine.is_none(), "a poisoned lane hands back no engine");
         assert!(channels.is_empty());
     }
 
-    /// An engine that answers every `submit` with `Error::Exhausted`, and
-    /// counts how many times it was asked.
     struct ExhaustedEngine {
         submits: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -4571,10 +3920,6 @@ mod tests {
         }
     }
 
-    /// A retryable refusal past static admission is a contract violation,
-    /// not back-pressure — `validate_frame` proves no device gate can
-    /// refuse before admission, so a refusal here fails loudly instead of retrying.
-    #[test]
     fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
         let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (reply_tx, reply_rx) = crossbeam::channel::unbounded();

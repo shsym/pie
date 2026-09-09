@@ -1,10 +1,3 @@
-//! The three modulation shapes — `x·(1+s)+b`, `x·(1+s)`, `tanh(g)·x` — and
-//! the gated residual `r + g·y` answer an f32 host reference, with `m` read
-//! per lane through a `[rows]` lane map and with `m` read per token, and with
-//! the destination aliased onto the source.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_modulate_forms_answer_the_broadcast_and_the_per_token_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -18,7 +11,6 @@ const ROWS: usize = 37;
 const WIDTH: usize = 128;
 const LANES: usize = 4;
 
-/// Which row of `m` each row reads, in the host's own terms.
 fn rows_of(lanes: &Option<Vec<i32>>) -> Vec<usize> {
     (0..ROWS)
         .map(|r| lanes.as_ref().map_or(r, |map| map[r] as usize))
@@ -26,25 +18,19 @@ fn rows_of(lanes: &Option<Vec<i32>>) -> Vec<usize> {
 }
 
 fn close(got: f32, want: f32, what: &str, at: usize) {
-    // One bf16 rounding at the store, and nothing else: the kernel's f32
-    // arithmetic is the reference's, `fmaf` included.
     assert!(
         (got - want).abs() <= 1e-6 + want.abs() / 256.0,
         "{what}[{at}]: {got} against {want}"
     );
 }
 
-/// The four unfused arms against the reference, at one binding of `m`.
 fn check(lane_of_row: Option<Vec<i32>>) {
     let m_rows = if lane_of_row.is_some() { LANES } else { ROWS };
     let mut lcg = Lcg::seeded(0xd17);
     let (x_raw, x) = lcg.row(ROWS * WIDTH);
     let (y_raw, y) = lcg.row(ROWS * WIDTH);
     let (r_raw, r) = lcg.row(ROWS * WIDTH);
-    // `[m_rows, 2·WIDTH]`: scale first, shift second.
     let (m_raw, m) = lcg.row(m_rows * 2 * WIDTH);
-    // The one-vector forms read a rectangle of their own: a tight view over
-    // the wide one would keep the wide row pitch and read every other row.
     let (g_raw, g) = lcg.row(m_rows * WIDTH);
 
     let mut gpu = Gpu::open();
@@ -102,18 +88,22 @@ fn check(lane_of_row: Option<Vec<i32>>) {
     }
 }
 
+fn the_modulate_forms_answer_the_broadcast_and_the_per_token_reference_every_case() {
+    the_forms_answer_the_reference_with_m_read_per_lane();
+    the_forms_answer_the_reference_with_m_read_per_token();
+    a_modulation_may_write_the_rectangle_it_read();
+}
+
 #[test]
 fn the_forms_answer_the_reference_with_m_read_per_lane() {
     let map: Vec<i32> = (0..ROWS).map(|r| (r % LANES) as i32).collect();
     check(Some(map));
 }
 
-#[test]
 fn the_forms_answer_the_reference_with_m_read_per_token() {
     check(None);
 }
 
-#[test]
 fn a_modulation_may_write_the_rectangle_it_read() {
     let mut lcg = Lcg::seeded(0xa11a5);
     let (x_raw, x) = lcg.row(ROWS * WIDTH);

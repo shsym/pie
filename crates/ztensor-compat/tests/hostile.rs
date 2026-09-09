@@ -1,9 +1,3 @@
-//! Regression tests for the adversarial-robustness review.
-//!
-//! Every case here was a verified panic, hang, or silent-wrong-data path.
-//! The contract these lock in: hostile input yields `Err`, never a crash,
-//! never an unbounded allocation, never a fabricated tensor.
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -13,31 +7,31 @@ fn tmp(name: &str) -> PathBuf {
     p
 }
 
-// =======================================================================
-// hdf5
-// =======================================================================
-
 #[cfg(feature = "hdf5")]
 mod hdf5 {
     use super::*;
 
-    /// Superblock v0 with caller-chosen root B-tree and heap addresses.
     fn superblock(btree: u64, heap: u64, len: usize) -> Vec<u8> {
         let mut b = vec![0u8; len.max(96)];
         b[0..8].copy_from_slice(b"\x89HDF\r\n\x1a\n");
-        b[13] = 8; // offset size
-        b[14] = 8; // length size
+        b[13] = 8;
+        b[14] = 8;
         b[16..18].copy_from_slice(&4u16.to_le_bytes());
         b[18..20].copy_from_slice(&16u16.to_le_bytes());
         let eof = b.len() as u64;
         b[40..48].copy_from_slice(&eof.to_le_bytes());
-        b[72..76].copy_from_slice(&1u32.to_le_bytes()); // root cache type: group
+        b[72..76].copy_from_slice(&1u32.to_le_bytes());
         b[80..88].copy_from_slice(&btree.to_le_bytes());
         b[88..96].copy_from_slice(&heap.to_le_bytes());
         b
     }
 
-    /// C1: heap address `u64::MAX`, where `pos + 4` wrapped past the guard.
+    fn hostile_every_case() {
+        heap_address_wraparound();
+        btree_address_wraparound();
+        heap_data_offset_out_of_range();
+    }
+
     #[test]
     fn heap_address_wraparound() {
         let path = tmp("c1.h5");
@@ -45,8 +39,6 @@ mod hdf5 {
         assert!(ztensor_compat::open(&path).is_err());
     }
 
-    /// C2: near-`u64::MAX` addresses in every signature check.
-    #[test]
     fn btree_address_wraparound() {
         for addr in [u64::MAX - 8, u64::MAX - 1, 1 << 62] {
             let path = tmp("c2.h5");
@@ -55,21 +47,16 @@ mod hdf5 {
         }
     }
 
-    /// C3: heap data segment / link-name offsets far past EOF.
-    #[test]
     fn heap_data_offset_out_of_range() {
         let mut b = superblock(96, 144, 416);
-        // group B-tree @96 with one SNOD @192
         b[96..100].copy_from_slice(b"TREE");
         b[102..104].copy_from_slice(&1u16.to_le_bytes());
         b[104..112].copy_from_slice(&[0xff; 8]);
         b[112..120].copy_from_slice(&[0xff; 8]);
         b[128..136].copy_from_slice(&192u64.to_le_bytes());
-        // local heap @144 whose data segment address is 2^40
         b[144..148].copy_from_slice(b"HEAP");
         b[152..160].copy_from_slice(&16u64.to_le_bytes());
         b[168..176].copy_from_slice(&(1u64 << 40).to_le_bytes());
-        // SNOD @192, one symbol
         b[192..196].copy_from_slice(b"SNOD");
         b[196] = 1;
         b[198..200].copy_from_slice(&1u16.to_le_bytes());
@@ -81,10 +68,6 @@ mod hdf5 {
     }
 }
 
-// =======================================================================
-// gguf
-// =======================================================================
-
 #[cfg(feature = "gguf")]
 mod gguf {
     use super::*;
@@ -94,27 +77,28 @@ mod gguf {
         out.extend(s.as_bytes());
     }
 
-    /// C8: alignment rounds the data section past EOF; a zero-length
-    /// tensor then produced an out-of-bounds blob that panicked in view().
+    fn hostile_1_every_case() {
+        data_section_past_eof();
+        lying_counts_do_not_allocate();
+    }
+
     #[test]
     fn data_section_past_eof() {
         let mut b = Vec::new();
         b.extend(b"GGUF");
         b.extend(3u32.to_le_bytes());
-        b.extend(1u64.to_le_bytes()); // tensors
-        b.extend(0u64.to_le_bytes()); // kvs
+        b.extend(1u64.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
         gstr(&mut b, "t");
-        b.extend(1u32.to_le_bytes()); // ndims
-        b.extend(0u64.to_le_bytes()); // shape [0]
-        b.extend(0u32.to_le_bytes()); // F32
-        b.extend(0u64.to_le_bytes()); // offset
-                                      // file ends here: 32-byte alignment rounds data_start past EOF
+        b.extend(1u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
         let path = tmp("c8.gguf");
         fs::write(&path, &b).unwrap();
         match ztensor_compat::open(&path) {
             Err(_) => {}
             Ok(g) => {
-                // If it opens, the blob must at least be in bounds.
                 let _ = g
                     .tensor("t")
                     .unwrap()
@@ -124,23 +108,17 @@ mod gguf {
         }
     }
 
-    /// LOW: a huge declared tensor/KV count must not drive allocation.
-    #[test]
     fn lying_counts_do_not_allocate() {
         let mut b = Vec::new();
         b.extend(b"GGUF");
         b.extend(3u32.to_le_bytes());
-        b.extend(100_000u64.to_le_bytes()); // tensor count, file is ~30 B
-        b.extend(100_000u64.to_le_bytes()); // kv count
+        b.extend(100_000u64.to_le_bytes());
+        b.extend(100_000u64.to_le_bytes());
         let path = tmp("counts.gguf");
         fs::write(&path, &b).unwrap();
         assert!(ztensor_compat::open(&path).is_err());
     }
 }
-
-// =======================================================================
-// npz
-// =======================================================================
 
 #[cfg(feature = "npz")]
 mod npz {
@@ -173,34 +151,28 @@ mod npz {
         path
     }
 
-    /// C9: `')'` before `'('` in the shape tuple sliced backwards.
+    fn hostile_2_every_case() {
+        reversed_shape_parens();
+        huge_declared_shape_rejected();
+        duplicate_names_are_unambiguous();
+    }
+
     #[test]
     fn reversed_shape_parens() {
         let path = write_npz("c9.npz", &[("t", npy("<f4", ")junk(", &[]), false)]);
         assert!(ztensor_compat::open(&path).is_err());
     }
 
-    /// H1: a shape declaring gigabytes must not reserve them.
-    #[test]
     fn huge_declared_shape_rejected() {
         let path = write_npz(
             "h1.npz",
             &[("t", npy("<f8", "(536870864,)", &[0u8; 8]), true)],
         );
-        // Either the size equation rejects it at open, or the read is
-        // bounded, never an unbounded reservation.
         if let Ok(n) = ztensor_compat::open(&path) {
             assert!(n.tensor("t").unwrap().bytes().is_err());
         }
     }
 
-    /// M5: an archive whose entries collide on a tensor name must never
-    /// yield two different meanings for that name. (The ZIP writer refuses
-    /// literal duplicates, so the second entry is renamed in the bytes:
-    /// what a hostile producer would do. The ZIP *reader* then collapses
-    /// them, so the projection sees one entry; the guard in `open` covers
-    /// the case where it does not.)
-    #[test]
     fn duplicate_names_are_unambiguous() {
         let path = write_npz(
             "dup.npz",
@@ -222,8 +194,6 @@ mod npz {
             Err(_) => {}
             Ok(n) => {
                 assert_eq!(n.len(), 1);
-                // Whatever it resolved to, reading it must agree with the
-                // manifest's declared size.
                 let declared = n.tensor("ta").unwrap().nbytes();
                 assert_eq!(
                     n.tensor("ta")
@@ -238,10 +208,6 @@ mod npz {
         }
     }
 }
-
-// =======================================================================
-// pt
-// =======================================================================
 
 #[cfg(feature = "pickle")]
 mod pt {
@@ -261,25 +227,28 @@ mod pt {
         path
     }
 
-    /// H3: `T <- (T, T)` doubled the heap every few opcodes because the
-    /// memo deep-cloned tuples. 24 rounds took ~17 s before the fix.
+    fn hostile_3_every_case() {
+        memo_self_doubling_is_bounded();
+        markless_pop_is_linear();
+    }
+
     #[test]
     fn memo_self_doubling_is_bounded() {
-        let mut p = vec![0x80, 0x02]; // PROTO 2
+        let mut p = vec![0x80, 0x02];
         p.extend([0x8c, 0x01, b'x']); // SHORT_BINUNICODE "x"
-        p.push(0x85); // TUPLE1
-        p.push(0x94); // MEMOIZE
+        p.push(0x85);
+        p.push(0x94);
         for _ in 0..30 {
-            p.extend([0x68, 0x00]); // BINGET 0
-            p.extend([0x68, 0x00]); // BINGET 0
-            p.push(0x86); // TUPLE2
-            p.push(0x94); // MEMOIZE
+            p.extend([0x68, 0x00]);
+            p.extend([0x68, 0x00]);
+            p.push(0x86);
+            p.push(0x94);
         }
-        p.push(0x2e); // STOP
+        p.push(0x2e);
 
         let path = write_pt("h3.pt", &p);
         let start = std::time::Instant::now();
-        let _ = ztensor_compat::open(&path); // errs: no tensors; the point is it returns
+        let _ = ztensor_compat::open(&path);
         assert!(
             start.elapsed().as_secs() < 5,
             "pickle memo blow-up: {:?}",
@@ -287,12 +256,10 @@ mod pt {
         );
     }
 
-    /// H7: mark-less POP_MARKs rescanned the whole stack each time.
-    #[test]
     fn markless_pop_is_linear() {
         let mut p = vec![0x80, 0x02];
-        p.extend(std::iter::repeat_n(0x4eu8, 200_000)); // NONE
-        p.extend(std::iter::repeat_n(0x31u8, 200_000)); // POP_MARK, no mark
+        p.extend(std::iter::repeat_n(0x4eu8, 200_000));
+        p.extend(std::iter::repeat_n(0x31u8, 200_000));
         p.push(0x2e);
         let path = write_pt("h7.pt", &p);
         let start = std::time::Instant::now();

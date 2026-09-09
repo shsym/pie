@@ -1,14 +1,5 @@
-//! Maps the operator-facing config file onto the structs pie reads; the two
-//! are deliberately not the same shape (six file sections: server, model,
-//! engine, runtime, sandbox, cluster). The mapping is data, not code, so
-//! [`reshape`] and `config::schema` cannot disagree about it.
-
 use anyhow::Result;
 
-/// `(file path, internal path)` for every key whose two spellings differ.
-///
-/// Section moves are listed as whole sections where the whole section moves;
-/// individual keys appear only where one key left its neighbours.
 const MOVES: &[(&str, &str)] = &[
     ("engine", "model.engine"),
     ("server.telemetry", "telemetry.enabled"),
@@ -27,17 +18,9 @@ const MOVES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Keys `[engine]` carries that are common to every engine; everything else
-/// in that section goes to the engine-specific options struct.
 const ENGINE_COMMON: &[&str] = &["type", "device", "tensor_parallel_size", "activation_dtype"];
 
-/// The file path a key is written as, given where it lives internally.
-///
-/// Used by `config::schema` so `pie config list` prints the paths `pie config
-/// set` accepts.
 pub fn to_file_path(internal: &str) -> String {
-    // Longest internal prefix first, so a key that left its section on its own
-    // is not rewritten by a whole-section entry that does not apply to it.
     let mut best: Option<(&str, &str)> = None;
     for (file, inner) in MOVES {
         if (internal == *inner || internal.starts_with(&format!("{inner}.")))
@@ -57,14 +40,9 @@ pub fn to_file_path(internal: &str) -> String {
         }
         None => internal.to_string(),
     };
-    // The options table is flattened into its section rather than moved, so
-    // the level disappears after the move rather than instead of it.
     moved.replace(".options.", ".")
 }
 
-/// Turn the file's tables into the shape `Config` deserializes from. One pass
-/// over the leaves, mapping each full path once, so a moved key can't be
-/// swept into a second place by a section rule applied afterward.
 pub fn reshape(file: toml::Table) -> Result<toml::Table> {
     let mut leaves = Vec::new();
     collect_leaves(&toml::Value::Table(file), "", &mut leaves);
@@ -74,8 +52,6 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
         insert_at(&mut out, &to_internal_path(&path), value)?;
     }
 
-    // `[engine]` arrives whole; split it by name into the common fields and the
-    // engine-specific bag that `type` decides the struct for.
     if let Some(engine) = out
         .get_mut("model")
         .and_then(|m| m.get_mut("engine"))
@@ -97,7 +73,6 @@ pub fn reshape(file: toml::Table) -> Result<toml::Table> {
     Ok(out)
 }
 
-/// The internal path for one full file path, longest file prefix first.
 fn to_internal_path(file_path: &str) -> String {
     let mut best: Option<(&str, &str)> = None;
     for (file, inner) in MOVES {
@@ -120,7 +95,6 @@ fn to_internal_path(file_path: &str) -> String {
     }
 }
 
-/// Insert `value` at a dotted path, merging tables rather than replacing them.
 fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<()> {
     let mut parts: Vec<&str> = path.split('.').collect();
     let last = parts.pop().expect("non-empty path");
@@ -133,9 +107,6 @@ fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<(
             .as_table_mut()
             .ok_or_else(|| anyhow::anyhow!("{path}: {part} is not a table"))?;
     }
-    // A section that moves wholesale can land where per-key moves already put
-    // something -- `[server]`'s telemetry keys and `[server]` itself both
-    // target parts of the same tree.
     match (cursor.get_mut(last), value) {
         (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
             for (k, v) in incoming {
@@ -149,7 +120,6 @@ fn insert_at(root: &mut toml::Table, path: &str, value: toml::Value) -> Result<(
     Ok(())
 }
 
-/// Flatten a document to `(dotted path, scalar)` pairs.
 fn collect_leaves(value: &toml::Value, prefix: &str, out: &mut Vec<(String, toml::Value)>) {
     match value {
         toml::Value::Table(table) if !table.is_empty() => {
@@ -162,8 +132,6 @@ fn collect_leaves(value: &toml::Value, prefix: &str, out: &mut Vec<(String, toml
                 collect_leaves(child, &path, out);
             }
         }
-        // An empty table is a section header with nothing under it -- exactly
-        // what `[controller]` and `[gateway]` always were.
         toml::Value::Table(_) => out.push((prefix.to_string(), value.clone())),
         _ => out.push((prefix.to_string(), value.clone())),
     }
@@ -175,7 +143,6 @@ mod tests {
 
     #[test]
     fn a_key_reads_back_as_the_path_the_file_spells_it() {
-        // What `pie config list` prints has to be what `pie config set` takes.
         assert_eq!(
             to_file_path("runtime.request_timeout"),
             "runtime.request_timeout"
@@ -193,7 +160,6 @@ mod tests {
         );
         assert_eq!(to_file_path("telemetry.enabled"), "server.telemetry");
         assert_eq!(to_file_path("offload.enabled"), "cluster.offload");
-        // Unmoved keys are themselves.
         assert_eq!(to_file_path("model.name"), "model.name");
         assert_eq!(to_file_path("server.host"), "server.host");
     }

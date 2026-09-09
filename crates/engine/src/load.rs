@@ -1,56 +1,30 @@
-//! `LoadRequest` in, `Loaded` out: the one door a model comes through. Only
-//! the `serde`-able `Trace` crosses the socket; `CompiledModel` is built on
-//! the shell side by `compile(trace, budgets, profile)`.
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::caps::Capabilities;
 
-/// The ceilings a load is baked against; mirrors `model_compiler::Budget`
-/// without `engine` depending on `model-compiler`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
-    /// The most requests one fire may carry (`Dim::Lanes`).
     pub max_lanes: u32,
-    /// The most token rows one fire may carry (`Dim::Tokens`).
     pub max_tokens: u32,
-    /// The shape lattice a fire's row count is rounded up to — one immutable
-    /// graph per entry. Ascending, each entry at most `max_tokens`.
     pub buckets: Vec<u32>,
-    /// How many adapter banks the device pool holds.
     pub max_adapters: u32,
-    /// Tokens per KV page.
     pub page_size: u32,
-    /// The most tokens one sequence may hold.
     pub max_context: u32,
-    /// How many sequences the pools seat at once.
     pub slots: u32,
-    /// KV pages the pool holds, drawn on by every live sequence.
     pub pages: u32,
-    /// The most patch rows one fire may carry. `None` (default): the shell
-    /// derives a ladder from the loaded text.
     #[serde(default)]
     pub max_patches: Option<u32>,
-    /// The most images one fire may carry, over every lane. `None` derives a
-    /// default; not derivable from `max_patches` alone since an image
-    /// contributes at least one patch row.
     #[serde(default)]
     pub max_images: Option<u32>,
-    /// The most port voxel rows one fire may carry on the voxel axis (D8).
-    /// `None` (default): the shell derives a ceiling for a loaded text that
-    /// states the axis.
     #[serde(default)]
     pub max_voxels: Option<u32>,
-    /// The most clips one fire may carry, over every lane. `None` derives
-    /// one from `max_lanes`.
     #[serde(default)]
     pub max_clips: Option<u32>,
 }
 
 impl Default for Budgets {
-    /// A deployment that runs, for a caller who has measured nothing.
     fn default() -> Budgets {
         Budgets {
             max_lanes: 256,
@@ -69,48 +43,20 @@ impl Default for Budgets {
     }
 }
 
-/// Where a load's weights come from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Checkpoint {
-    /// A snapshot directory, or one container file.
     Path(PathBuf),
-    /// No weights: bind the device and bake the plan, but land nothing.
     None,
 }
 
-/// How much of the weight table this load may keep, as two tier budgets:
-/// T0 device (`device_weight_budget`) and T1 pinned host
-/// (`host_weight_budget`). Both `None` (the default) is full residency.
-///
-/// A budget can only be met by holding less of what the plane can shrink
-/// (e.g. streaming routed expert banks); anything else refuses with
-/// [`Error::Impossible`](crate::Error::Impossible), naming both numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Residency {
-    /// Most weight bytes this load may hold on the device (tier T0). `None`
-    /// is uncapped; met by holding fewer routed experts.
     pub device_weight_budget: Option<u64>,
-    /// Most weight bytes this load may hold in the pinned host cache (tier
-    /// T1) — read over UVA on a device miss instead of stalling on the
-    /// checkpoint. `None` is uncapped.
     pub host_weight_budget: Option<u64>,
-    /// May a warm boot DEFER the pinned tier: verify T1's planes where they
-    /// lie in the artifact and serve them from there while a background
-    /// thread builds the page-locked copy, instead of paying that copy up
-    /// front? **On**, where the device reports `pageableMemoryAccess`
-    /// (CUDA 12.2+ HMM) — which is the mechanism, and which the shell asks
-    /// the device about rather than being told.
-    ///
-    /// Off is the eager arm: the image is page-locked before the load
-    /// answers, so the first fires take no page faults and the boot is
-    /// slower by the copy. It is a load-shape knob and not a diagnostic —
-    /// a deployment that measures its first-token latency may want it —
-    /// which is why it is stated here and not in `[engine] diagnostics`.
     #[serde(default = "deferred_by_default")]
     pub deferred_tier: bool,
 }
 
-/// What `deferred_tier` means when a document does not state it.
 fn deferred_by_default() -> bool {
     true
 }
@@ -121,27 +67,15 @@ impl Default for Residency {
     }
 }
 
-/// What a planned load will hold, tier by tier: T0 device, T1 pinned host,
-/// T2 mapped (whatever neither tier holds, read from the artifact — no
-/// budget, since it's just a file that may or may not exist).
-///
-/// Does not account for the elastic pool or the safety floor; those are
-/// device facts the shell tracks, not this portable statute.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tiers {
-    /// T0: the weight bytes this load will hold on the device.
     pub device: u64,
-    /// T1: the weight bytes it will hold in pinned host memory.
     pub host: u64,
-    /// T2: the weight bytes neither budget holds, read from a mapped source.
     pub spilled: u64,
-    /// Is there a T2 source for `spilled`? `false` with nonzero `spilled` is
-    /// a load that cannot be served.
     pub sourced: bool,
 }
 
 impl Residency {
-    /// Both budgets uncapped: the whole table resident.
     #[must_use]
     pub const fn uncapped() -> Residency {
         Residency {
@@ -151,20 +85,11 @@ impl Residency {
         }
     }
 
-    /// True when neither tier is capped.
     #[must_use]
     pub const fn is_uncapped(&self) -> bool {
         self.device_weight_budget.is_none() && self.host_weight_budget.is_none()
     }
 
-    /// Does this policy admit a checkpoint that demands these bytes
-    /// resident? Delegates to [`Residency::admit_tiers`] with nothing
-    /// spilled.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Impossible`](crate::Error::Impossible) when either demand is
-    /// past its budget.
     pub fn admit(&self, device_demand: u64, host_demand: u64) -> crate::Result<()> {
         self.admit_tiers(Tiers {
             device: device_demand,
@@ -174,15 +99,6 @@ impl Residency {
         })
     }
 
-    /// Does this policy admit a load planned across all three tiers?
-    /// Spilled bytes are admitted only if `sourced` — otherwise nothing the
-    /// deployment frees can conjure a file, so this is `Impossible`, not
-    /// `Exhausted`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Impossible`](crate::Error::Impossible) for a demand past
-    /// either budget, or for spilled bytes with no source to spill to.
     pub fn admit_tiers(&self, tiers: Tiers) -> crate::Result<()> {
         for (budget, demand, tier, field) in [
             (
@@ -212,8 +128,6 @@ impl Residency {
                 }
             }
         }
-        // A model bigger than device+host can still serve from a mapping;
-        // only spilled bytes with nowhere to spill from refuse.
         if tiers.spilled > 0 && !tiers.sourced {
             return Err(crate::Error::Impossible(format!(
                 "a streamed plan spills {} bytes and this deployment has no source for them. \
@@ -228,63 +142,35 @@ impl Residency {
     }
 }
 
-/// Everything a load states.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadRequest {
-    /// The traced supergraph, traced by the runtime.
     pub trace: model_ir::Trace,
-    /// Where the weights are.
     pub checkpoint: Checkpoint,
-    /// The ceilings every fire is baked against.
     pub budgets: Budgets,
-    /// How much of the weight table this load may keep resident, per tier.
-    /// `#[serde(default)]` so an older request still parses as uncapped.
     #[serde(default)]
     pub residency: Residency,
-    /// Which device to bind, when the shell serves more than one.
     pub ordinal: i32,
-    /// How many frames the caller will keep in flight; sizes the staging
-    /// ring, carved once at load. A shell clamps out-of-range rather than
-    /// refusing; zero reads as one.
     pub frames_in_flight: u8,
 }
 
-/// What a load answers with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Loaded {
-    /// The facts this load carries.
     pub facts: LoadFacts,
-    /// What it can do.
     pub caps: Capabilities,
 }
 
-/// What came of a load, as numbers a caller can log and act on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadFacts {
-    /// The trace's own name, as the model text declared it.
     pub trace_name: String,
-    /// Bytes the weight tables occupy on the device.
     pub weight_bytes: u64,
-    /// Is the whole weight table device-resident? `false`: the load is
-    /// streaming some tier, and `weight_bytes` is what is resident rather
-    /// than what the checkpoint holds.
     pub weights_resident: bool,
-    /// Did this load's weight table come off a warm-boot artifact cache
-    /// instead of the checkpoint?
     #[serde(default)]
     pub weights_from_cache: bool,
-    /// Bytes the activation arena occupies.
     pub arena_bytes: u64,
-    /// Bytes the pools occupy.
     pub pool_bytes: u64,
-    /// Bytes the resident fire inputs occupy.
     pub input_bytes: u64,
-    /// Bytes of the pools actually under a physical mapping; on an elastic
-    /// engine this can be less than `pool_bytes`, its reserved ceiling.
     #[serde(default)]
     pub pool_committed_bytes: u64,
-    /// The most that has ever been mapped, since load — what a trim is
-    /// measured against.
     #[serde(default)]
     pub pool_high_water_bytes: u64,
 }

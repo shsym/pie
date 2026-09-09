@@ -1,15 +1,3 @@
-//! The differential oracle: replay a lowering's bytes and see what comes
-//! out. `contract/compile.rs` checks its own lowering against a
-//! per-coordinate oracle in index space; this checks the layer below that,
-//! that the byte offsets and strides the lowering actually carries,
-//! replayed literally, reproduce the tensor the expression names.
-//!
-//! The replay works one byte at a time and tracks where each output byte
-//! came from. That is slower than any real executor and does not care: it
-//! models addresses, which is the only thing a lowering claims, and makes
-//! the three ways a lowering can be wrong (a hole, a double write, a read
-//! past the end) the same check rather than three.
-
 use std::collections::HashMap;
 
 use crate::contract::TensorType;
@@ -39,15 +27,8 @@ impl TensorValue {
     }
 }
 
-/// Where one output byte came from.
 type Provenance = (usize, u64);
 
-/// Materialize what a lowering says the output is.
-///
-/// Refuses a lowering that names a leaf the caller did not supply, one that
-/// reads past the end of a leaf, and one that does not cover its
-/// destination exactly once — a hole with no fill leaves uninitialized
-/// device memory behind, which is why this returns a `Result` and not a `Vec`.
 pub fn replay(
     lowering: &Lowering,
     ty: &TensorType,
@@ -65,8 +46,6 @@ pub fn replay(
         .checked_mul(width as usize)
         .or_overflow("reference output byte size")?;
 
-    // both lowerings say where each destination byte comes from; a gather
-    // states its rectangles rather than folding runs into them.
     let mut from: Vec<Option<Provenance>> = vec![None; bytes];
     let rects = match lowering {
         Lowering::Copy(copies) => copies.byte_pieces(&ty.encoding)?,
@@ -82,7 +61,6 @@ pub fn replay(
         .collect()
 }
 
-/// Walk one rect's loop nest and record where each destination byte came from.
 fn scatter(rect: &Rect, from: &mut [Option<Provenance>]) -> Result<()> {
     let mut at = vec![0i64; rect.dims.len()];
     loop {
@@ -111,8 +89,6 @@ fn scatter(rect: &Rect, from: &mut [Option<Provenance>]) -> Result<()> {
     }
 }
 
-/// Read back one output element, checking that its bytes came from one source
-/// element in order.
 fn element(
     at: usize,
     width: u64,
@@ -163,7 +139,6 @@ fn element(
         })
 }
 
-/// Odometer over a loop nest, innermost last. Returns false when it wraps.
 fn advance(at: &mut [i64], dims: &[crate::extent::Dim]) -> bool {
     for level in (0..at.len()).rev() {
         at[level] += 1;

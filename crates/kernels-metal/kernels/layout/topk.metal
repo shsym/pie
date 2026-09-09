@@ -1,15 +1,4 @@
-// topk.metal — the k largest entries of every row, sorted, indices beside.
-//
-// One threadgroup per row. Every thread walks a strided share of the row
-// keeping its own sorted list of K `(value, index)` pairs — most candidates
-// fail the list's floor and cost one compare — then the lists meet in
-// threadgroup memory and the group pops the global maximum K times: each
-// thread offers its list's head, the simdgroups fold with `simd_max` and a
-// `simd_min` over the indices that hit it (`argmax_rows`' rule: ties to the
-// LOWEST column, a NaN never chosen), thread 0 picks across simdgroups, the
-// owner advances. K rounds of two barriers for a handful of rows a fire.
-//
-// `THREADS x K x 8 bytes` of threadgroup memory: 128 x 16 x 8 = 16 KB.
+
 
 #include <metal_stdlib>
 using namespace metal;
@@ -19,7 +8,6 @@ constant constexpr uint kTopkSimdgroups = kTopkThreads / 32;
 constant constexpr float TOPK_NEG_INF = -INFINITY;
 constant constexpr uint TOPK_NONE = 0xFFFFFFFFu;
 
-/// `a` beats `b` when it is larger, or equal at a lower index.
 inline bool topk_beats(float av, uint ai, float bv, uint bi) {
   return av > bv || (av == bv && ai < bi);
 }
@@ -38,7 +26,6 @@ template <typename T, int K>
   const size_t row = size_t(tid.y);
   const device T* src = x + row * size_t(width);
 
-  // This thread's sorted list, best first.
   float lv[K];
   uint li[K];
   for (int j = 0; j < K; ++j) {
@@ -50,7 +37,7 @@ template <typename T, int K>
     if (isnan(v) || !topk_beats(v, c, lv[K - 1], li[K - 1])) {
       continue;
     }
-    // Insert, shifting the tail down.
+
     int at = K - 1;
     while (at > 0 && topk_beats(v, c, lv[at - 1], li[at - 1])) {
       lv[at] = lv[at - 1];
@@ -75,7 +62,7 @@ template <typename T, int K>
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   for (int j = 0; j < K; ++j) {
-    // Offer this list's head.
+
     const float hv = head < uint(K) ? lists_v[lid * K + head] : TOPK_NEG_INF;
     const uint hi = head < uint(K) ? lists_i[lid * K + head] : TOPK_NONE;
     const float m = simd_max(hv);

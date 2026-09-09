@@ -1,11 +1,3 @@
-//! Symbolic types: the shape vocabulary that keeps one plan valid across
-//! batch shapes.
-//!
-//! A planned value's type is a dtype plus a list of [`Dimension`]s, each
-//! either a concrete `u32` or a [`SymbolicExtent`] the runtime substitutes.
-//! These also serialize, since [`crate::codegen::launch::LaunchPlanValue`]
-//! ships them to an engine.
-
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -16,47 +8,26 @@ use eta_ir::validate::BoundTrace;
 
 eta_ir::declare_tagged_enum! {
     #[derive(serde::Serialize, serde::Deserialize)]
-    /// Runtime-varying dimensions represented symbolically in compiler
-    /// types. Discriminants are the wire encoding, serialized because
-    /// [`crate::codegen::launch::LaunchPlanValue`]'s axes are written in
-    /// this tag space and ship to an engine.
     pub enum SymbolicExtent {
-        /// Number of live KV-cache entries.
         KvLen = 0, "kv_len";
-        /// Number of KV-cache pages.
         PageCount = 1, "page_count";
-        /// Number of rows (requests) in the batch.
         RowCount = 2, "row_count";
-        /// Number of input tokens in the pass.
         TokenCount = 3, "token_count";
-        /// Number of rows read out for sampling.
         SampledRows = 4, "sampled_rows";
-        /// Attention query length.
         QueryLen = 5, "query_len";
-        /// Attention key length.
         KeyLen = 6, "key_len";
     }
 }
 
-/// One dimension of a [`SymbolicType`]: a fixed size or a runtime extent.
-/// Also the launch package's axis type (an element of
-/// [`crate::codegen::launch::LaunchPlanValue`]'s `axes`), hence it
-/// serializes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Dimension {
-    /// A size known at plan time.
     Static(u32),
-    /// A runtime-varying extent the launch substitutes.
     Symbolic(SymbolicExtent),
 }
 
-/// A planned value's type: a dtype and a per-dimension shape that keeps one
-/// plan valid across batch shapes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SymbolicType {
-    /// The element type.
     pub dtype: Dtype,
-    /// The shape, outermost dimension first; empty for a scalar.
     pub dims: Vec<Dimension>,
 }
 
@@ -74,12 +45,10 @@ impl SymbolicType {
         }
     }
 
-    /// The number of dimensions.
     pub fn rank(&self) -> usize {
         self.dims.len()
     }
 
-    /// Whether the type has no dimensions, or every dimension is `1`.
     pub fn is_scalar(&self) -> bool {
         self.dims.is_empty()
             || self
@@ -168,8 +137,6 @@ pub(crate) fn symbolic_result_type(
             let operands = mapped_op.operands();
             let left = &normalized_types[operands[0] as usize];
             let right = &normalized_types[operands[1] as usize];
-            // `MatMul` operands are exactly rank 2 (checked by `validate::bind`),
-            // so `left.dims[0]` and the last of `right.dims` both exist.
             SymbolicType {
                 dtype: value_type.dtype,
                 dims: vec![left.dims[0], *right.dims.last().expect("matmul right rank")],
@@ -213,10 +180,6 @@ pub(crate) fn symbolic_result_type(
             );
             ty
         }
-        // Rank-preserving default: the op's declared shape, with any symbolic
-        // dimension carried from the first operand of equal rank. Named
-        // rather than `_` so a new reducer/gather can't silently fall
-        // through to it.
         Op::Const(..)
         | Op::Exp(..)
         | Op::Log(..)
@@ -292,10 +255,6 @@ pub(crate) fn propagate_preserved_dimensions(
     }
 }
 
-/// The normalized SSA id standing in for `original_value`. Normalization
-/// renumbers, so a shape-changing op's operand must be read off the
-/// normalized op; `_` falls through to the original id since there is no
-/// renumbering to follow for any other op kind.
 pub(crate) fn mapped_value(mapped_op: &Op, original_value: u32) -> u32 {
     match mapped_op {
         Op::ReduceSum(value)
@@ -337,9 +296,6 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
             }
         }
         Port::EmbedIndptr => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
-        // RS buffered-slot family, mirroring KV: slab-id vector page-indexed,
-        // CSR bounds and per-row live length row-indexed, write descriptor
-        // token-indexed.
         Port::RsBufferPages => set_first_symbolic(&mut ty, SymbolicExtent::PageCount),
         Port::RsBufferIndptr | Port::RsBufferLen | Port::RsFoldLen => {
             set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
@@ -355,9 +311,6 @@ pub(crate) fn set_first_symbolic(ty: &mut SymbolicType, extent: SymbolicExtent) 
     }
 }
 
-/// The symbolic type of an intrinsic's result. An exhaustive match, so a new
-/// intrinsic fails to compile here rather than silently falling through to
-/// the static type.
 pub(crate) fn symbolic_intrinsic_type(
     bound: &BoundTrace,
     intrinsic: IntrinsicId,
@@ -370,9 +323,6 @@ pub(crate) fn symbolic_intrinsic_type(
                 ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
             }
         }
-        // These stay static: e.g. `AttnScore`'s width is a declared plane
-        // count bounded by `ATTN_SCORE_KV_MAX`, and lifting it to `KvLen`
-        // would cut one launch per distinct kv length.
         IntrinsicId::MtpLogits
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden
@@ -418,4 +368,3 @@ pub(crate) fn symbolic_dims_match_expected(
                     )
             })
 }
-

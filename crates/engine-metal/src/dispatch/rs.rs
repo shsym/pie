@@ -1,16 +1,3 @@
-//! **The committed recurrent arm of the walk** — how a fire that buffers or
-//! replays recurrent state runs its conv, gate prep, delta scan and n-gram
-//! hasher over EXTENDED rows (`crate::rs`), and lands the lane's own rows
-//! back where the plan expects them.
-//!
-//! Every op below takes the same three steps: assemble the extended input
-//! (buffered tokens gathered ahead of — or in place of — the window's own
-//! rows, and the own rows scattered into the slab), launch the committed
-//! kernel over it, copy the own rows of the output back into the op's
-//! rectangle. The extended output is also kept by value id, so the op
-//! downstream (the scan reading the conv's output and the prepared gates)
-//! finds the extended version rather than the landed one.
-
 use kernels_metal::attn::ssm::Committed;
 use kernels_metal::{Error, Tensor, layout};
 use model_ir::ValueId;
@@ -18,8 +5,6 @@ use model_ir::ValueId;
 use crate::rs::Seat;
 use crate::run::Run;
 
-/// Where lane `r` of this window's extended run begins, and how many of its
-/// rows are replayed.
 fn extended_origin(indptr: &[i32], lanes: &[crate::rs::LanePlan], lane0: u32, r: usize) -> (u32, u32) {
     let mut begin = indptr[r].max(0) as u32;
     for j in 0..r {
@@ -41,7 +26,6 @@ impl Run<'_> {
         }
     }
 
-    /// The fire-wide tables, and this window's first fire lane.
     pub(crate) fn rs_committed(&self, seat: &Seat) -> Committed {
         Committed {
             replay: seat.replay,
@@ -51,7 +35,6 @@ impl Run<'_> {
         }
     }
 
-    /// One device memcpy between two minted offsets.
     fn rs_copy(
         &self,
         op: &'static str,
@@ -78,8 +61,6 @@ impl Run<'_> {
         )
     }
 
-    /// Move `run` between the slab and rows of `rect` starting at row
-    /// `row0`, page piece by page piece; `into_slab` picks the direction.
     #[allow(clippy::too_many_arguments)]
     fn rs_move(
         &self,
@@ -110,10 +91,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// **Assemble the extended input for `value`**: for every lane of this
-    /// window, the replayed (or overriding) buffer tokens, then the lane's
-    /// own rows; and the own rows scattered into the slab where the verb
-    /// says. Answers the plane's extended rectangle.
     pub(crate) fn rs_extend(
         &self,
         op: &'static str,
@@ -162,8 +139,6 @@ impl Run<'_> {
         Ok(ext)
     }
 
-    /// The extended rectangle an op lands `value` into, remembered under
-    /// `value` for the ops downstream.
     pub(crate) fn rs_out(&self, op: &'static str, seat: &Seat, value: ValueId) -> Result<Tensor, Error> {
         let region = *seat.layout.out_of.get(&value.0).ok_or_else(|| Error::Backend {
             op,
@@ -174,7 +149,6 @@ impl Run<'_> {
         Ok(ext)
     }
 
-    /// The extended version of `value` an earlier op of this window landed.
     pub(crate) fn rs_ext_of(&self, op: &'static str, seat: &Seat, value: ValueId) -> Result<Tensor, Error> {
         seat.ext
             .borrow()
@@ -189,8 +163,6 @@ impl Run<'_> {
             })
     }
 
-    /// **Land the lanes' own rows** of extended output `ext` into `dest`'s
-    /// rectangle — the rows the rest of the plan reads.
     pub(crate) fn rs_land(&self, op: &'static str, seat: &Seat, ext: Tensor, dest: ValueId) -> Result<(), Error> {
         let target = self.tensor(dest);
         if crate::diag::on().rs_trace {

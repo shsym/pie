@@ -1,37 +1,20 @@
-//! Seriates a fire's lanes into per-class row/lane windows (one
-//! [`WindowTable`] per row axis), using the class order the compiler already
-//! baked, so every node's window is a contiguous `[offset, offset + rows)`
-//! range. Runs on the host in front of every launch, so it must stay
-//! allocation-light.
-
 use model_compiler::{Budget, Budgets, ClassOrder, CompiledModel, Ladder};
 use model_ir::{ClassSet, PerAxis, RowAxis};
 
 use crate::fire::Fault;
 use crate::{Error, Result};
 
-/// One request inside a fire, as the runtime submits it. `word` decides
-/// which windows this lane is in; `rows` decides how much of them it
-/// occupies. Everything else rides in buffers the engine already binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lane {
-    /// The lane's fact bits. `Guard::Fact(bit)` indexes them.
     pub word: u64,
-    /// How many token rows this lane contributes — 1 for decode, prompt length for prefill.
     pub rows: u32,
-    /// How many images this lane submitted. Zero for every text lane.
     pub images: u32,
-    /// How many patch rows those images total, concatenated.
     pub patches: u32,
-    /// How many clips this lane submitted on the voxel axis. Zero for
-    /// every lane with no VAE tile.
     pub clips: u32,
-    /// How many port voxel rows those clips total (`Σ t·h·w`).
     pub voxels: u32,
 }
 
 impl Lane {
-    /// A lane of `rows` token rows whose facts are `word`, carrying no image.
     #[must_use]
     pub fn new(word: u64, rows: u32) -> Lane {
         Lane {
@@ -44,8 +27,6 @@ impl Lane {
         }
     }
 
-    /// The same lane, carrying `clips` clips of `voxels` port voxel rows
-    /// total on the third axis.
     #[must_use]
     pub fn with_clips(word: u64, rows: u32, clips: u32, voxels: u32) -> Lane {
         Lane {
@@ -58,7 +39,6 @@ impl Lane {
         }
     }
 
-    /// The same lane, carrying `images` images of `patches` patch rows total.
     #[must_use]
     pub fn with_images(word: u64, rows: u32, images: u32, patches: u32) -> Lane {
         Lane {
@@ -71,8 +51,6 @@ impl Lane {
         }
     }
 
-    /// What this request contributes to one row space: `(rows, lanes)`. A
-    /// token lane is always one lane; a patch lane is zero or more images.
     #[must_use]
     pub fn on(self, axis: RowAxis) -> (u32, u32) {
         match axis {
@@ -83,47 +61,22 @@ impl Lane {
     }
 }
 
-/// One class's place in the seriated fire. `Dim::Tokens` columns are
-/// indexed by row offset, `Dim::Lanes` columns by lane offset. A class
-/// with no lanes is the zero window (`rows == 0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClassWindow {
-    /// First row of this class's interval.
     pub row_offset: u32,
-    /// How many rows it has. Zero for a class no lane is in.
     pub rows: u32,
-    /// First lane of this class's interval.
     pub lane_offset: u32,
-    /// How many lanes it has.
     pub lanes: u32,
 }
 
-/// The one row-and-lane interval a class mask covers in a fire — the same
-/// shape as [`ClassWindow`], over a mask's classes rather than one.
 pub type MaskSpan = ClassWindow;
 
-/// Cut every span of `spans` longer than `cap` rows into consecutive pieces
-/// of at most `cap` rows, in place and in order. A piece keeps its span's
-/// lane interval: the ops of a capped region are row-local (a routed
-/// mixture's matmuls and their combine), and read no lane-shaped value. `0`
-/// caps nothing.
-/// **EXPERT-MAJOR PASSES** over a routed segment: instead of cutting a run
-/// into row pieces (`chunk_spans`), every span is walked whole `passes`
-/// times, and at each pass's cut the tier seats ONE GROUP of the distinct
-/// experts the run routes to and masks the routing vector to it (`-1`
-/// elsewhere), so each expert is copied once per run rather than once per
-/// piece it appears in. The pass count is what `cap` would have cut the
-/// widest span into, bounded by `max_passes` (the groups the whole expert
-/// set fills). Returns the passes; `1` leaves the spans alone.
 pub fn pass_spans(spans: &mut Vec<MaskSpan>, cap: u32, max_passes: u32) -> u32 {
     if cap == 0 || max_passes <= 1 {
         return 1;
     }
     let widest = spans.iter().map(|span| span.rows).max().unwrap_or(0);
     let pieces = widest.div_ceil(cap);
-    // A run the cap would not have cut stays one segment. Otherwise the
-    // tier seats HALF the slab per pass (the other half is being filled for
-    // the next pass while this one runs), so the pass count doubles.
     if pieces <= 1 {
         return 1;
     }
@@ -164,19 +117,13 @@ pub fn chunk_spans(spans: &mut Vec<MaskSpan>, cap: u32) {
     }
 }
 
-/// The window table: one [`ClassWindow`] per class, indexed by class
-/// position. [`walk()`](fn@crate::fire::walk) checks the width first, or a
-/// wrong-width table finds the wrong class.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowTable {
     classes: Vec<ClassWindow>,
-    /// The classes with rows, in the order their rows stand.
     order: Vec<u32>,
 }
 
 impl WindowTable {
-    /// A table of one window per class; the seriated order is read back
-    /// off the windows.
     #[must_use]
     pub fn new(classes: Vec<ClassWindow>) -> WindowTable {
         let mut order: Vec<u32> = (0..classes.len() as u32)
@@ -186,60 +133,45 @@ impl WindowTable {
         WindowTable { classes, order }
     }
 
-    /// The same table with the seriated order the composer already had.
     #[must_use]
     pub fn seriated(classes: Vec<ClassWindow>, order: Vec<u32>) -> WindowTable {
         WindowTable { classes, order }
     }
 
-    /// The classes this table has rows in, in order.
     pub fn present_in_order(&self) -> impl Iterator<Item = u32> + '_ {
         self.order.iter().copied()
     }
 
-    /// How many classes it covers.
     #[must_use]
     pub fn len(&self) -> usize {
         self.classes.len()
     }
 
-    /// Does it cover no classes at all? A real plan always has at least one.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
     }
 
-    /// One class's window, or the zero window for a class this table lacks.
     #[must_use]
     pub fn class(&self, class: usize) -> ClassWindow {
         self.classes.get(class).copied().unwrap_or_default()
     }
 
-    /// The windows, in class order.
     #[must_use]
     pub fn as_slice(&self) -> &[ClassWindow] {
         &self.classes
     }
 
-    /// How many token rows a node with this class mask runs over.
     #[must_use]
     pub fn rows_of(&self, mask: &ClassSet) -> u32 {
         mask.iter().map(|c| self.class(c).rows).sum()
     }
 
-    /// How many lanes a node with this class mask runs over.
     #[must_use]
     pub fn lanes_of(&self, mask: &ClassSet) -> u32 {
         mask.iter().map(|c| self.class(c).lanes).sum()
     }
 
-    /// The one interval this mask covers. `Ok(None)` is the empty window;
-    /// `Err(runs)` is a mask that needs more than one launch — use
-    /// [`spans`](WindowTable::spans) instead.
-    ///
-    /// # Errors
-    ///
-    /// The number of runs the mask covers, when that is more than one.
     pub fn span(&self, mask: &ClassSet) -> core::result::Result<Option<MaskSpan>, usize> {
         let runs = self.spans(mask);
         match runs.len() {
@@ -249,9 +181,6 @@ impl WindowTable {
         }
     }
 
-    /// Every interval this mask covers, ascending — one per launch. Two
-    /// classes merge into one run iff the second's rows begin where the
-    /// first's end; a zero-row class is invisible and never breaks a run.
     #[must_use]
     pub fn spans(&self, mask: &ClassSet) -> Vec<MaskSpan> {
         let mut out = Vec::new();
@@ -259,7 +188,6 @@ impl WindowTable {
         out
     }
 
-    /// [`spans`](WindowTable::spans), into a caller-kept, reused buffer.
     pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
         out.clear();
         for class in mask.iter() {
@@ -271,7 +199,6 @@ impl WindowTable {
         }
         out.sort_unstable_by_key(|span| span.row_offset);
 
-        // `open` is how many runs are settled; the entry under it grows.
         let mut open = 0usize;
         for read in 0..out.len() {
             let span = out[read];
@@ -291,157 +218,113 @@ impl WindowTable {
     }
 }
 
-/// One lane, placed. `source` carries the submission-to-fire permutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneRow {
-    /// This lane's index in the submitted slice.
     pub source: u32,
-    /// Its fact word, carried through so the device never re-derives it.
     pub word: u64,
-    /// The class the word resolved to.
     pub class: u32,
-    /// Its first token row in the seriated fire.
     pub row_offset: u32,
-    /// How many rows it contributes.
     pub rows: u32,
-    /// Its first patch row in the second seriation.
     pub patch_offset: u32,
-    /// How many patch rows it contributes.
     pub patches: u32,
-    /// Its first image in the patch seriation, where its `images + 1` indptr run begins.
     pub image_offset: u32,
-    /// How many images it contributes.
     pub images: u32,
-    /// Its first voxel row in the third seriation.
     pub voxel_offset: u32,
-    /// How many port voxel rows it contributes.
     pub voxels: u32,
-    /// Its first clip in the voxel seriation.
     pub clip_offset: u32,
-    /// How many clips it contributes.
     pub clips: u32,
 }
 
-/// One fire's composition: which windows have rows, where, and in what
-/// order. Not a schedule — this is the data the baked script reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composition {
     lanes: Vec<LaneRow>,
-    /// One [`AxisComposition`] per row space. A text-only fire's patch
-    /// entry is the zero seriation, not an absent table.
     axes: PerAxis<AxisComposition>,
 }
 
-/// One row space's whole composition: its window table, two totals, and
-/// the rung they round up to. On the token axis, lanes are requests; on
-/// the patch axis, lanes are images.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AxisComposition {
-    /// One [`ClassWindow`] per class — this rectangle's seriation.
     pub classes: WindowTable,
-    /// This rectangle's total rows.
     pub rows: u32,
-    /// This rectangle's total lanes.
     pub lanes: u32,
-    /// The rung `rows` rounds up to — which recorded graph this fire's unit launches.
     pub bucket: u32,
 }
 
 impl Composition {
-    /// The lanes, in fire order: grouped by class, submission order inside each class.
     #[must_use]
     pub fn lanes(&self) -> &[LaneRow] {
         &self.lanes
     }
 
-    /// This fire's composition on one row axis.
     #[must_use]
     pub fn axis(&self, axis: RowAxis) -> &AxisComposition {
         &self.axes[axis]
     }
 
-    /// This fire's window table on one axis.
     #[must_use]
     pub fn table(&self, axis: RowAxis) -> &WindowTable {
         &self.axes[axis].classes
     }
 
-    /// How many lanes this fire carries.
     #[must_use]
     pub fn lane_count(&self) -> u32 {
         self.axes[RowAxis::Tokens].lanes
     }
 
-    /// The window table, indexed by class.
     #[must_use]
     pub fn classes(&self) -> &WindowTable {
         self.table(RowAxis::Tokens)
     }
 
-    /// The classes this fire has lanes in, in order.
     #[must_use]
     pub fn present(&self) -> &[u32] {
         &self.axes[RowAxis::Tokens].classes.order
     }
 
-    /// Total token rows.
     #[must_use]
     pub fn rows(&self) -> u32 {
         self.axes[RowAxis::Tokens].rows
     }
 
-    /// The shape bucket these rows round up to. Equal to
-    /// [`rows`](Composition::rows) when the budget lists no lattice.
     #[must_use]
     pub fn bucket(&self) -> u32 {
         self.axes[RowAxis::Tokens].bucket
     }
 
-    /// How many patch rows this fire carries. Zero for a text-only fire.
     #[must_use]
     pub fn patch_rows(&self) -> u32 {
         self.axes[RowAxis::Patches].rows
     }
 
-    /// How many images this fire carries — the patch axis's lane count.
     #[must_use]
     pub fn images(&self) -> u32 {
         self.axes[RowAxis::Patches].lanes
     }
 
-    /// The patch window table, indexed by class. The class order is the
-    /// patch axis's own — a class third in the token rectangle may stand first here.
     #[must_use]
     pub fn patch_classes(&self) -> &WindowTable {
         self.table(RowAxis::Patches)
     }
 
-    /// The patch rung these patch rows round up to. Equal to
-    /// [`patch_rows`](Composition::patch_rows) when the ladder lists no rungs.
     #[must_use]
     pub fn patch_bucket(&self) -> u32 {
         self.axes[RowAxis::Patches].bucket
     }
 
-    /// How many port voxel rows this fire carries. Zero for a fire with no clip.
     #[must_use]
     pub fn voxel_rows(&self) -> u32 {
         self.axes[RowAxis::Voxels].rows
     }
 
-    /// How many clips this fire carries — the voxel axis's lane count.
     #[must_use]
     pub fn clips(&self) -> u32 {
         self.axes[RowAxis::Voxels].lanes
     }
 
-    /// The voxel window table, indexed by class.
     #[must_use]
     pub fn voxel_classes(&self) -> &WindowTable {
         self.table(RowAxis::Voxels)
     }
 
-    /// The voxel rung these voxel rows round up to.
     #[must_use]
     pub fn voxel_bucket(&self) -> u32 {
         self.axes[RowAxis::Voxels].bucket
@@ -449,27 +332,10 @@ impl Composition {
 
 }
 
-/// Compose one fire on the token axis — the door every text-only deployment
-/// uses. [`compose_axes`] is this same seriation with a second row axis.
-///
-/// # Errors
-///
-/// [`Fault::UnknownWord`], [`Fault::EmptyLane`], [`Fault::TooManyLanes`] /
-/// [`Fault::TooManyRows`] past the arena's ceilings, [`Fault::NoBucket`]
-/// above the bucket lattice, or [`Fault::Towerless`] for images (this door admits none).
 pub fn compose(compiled: &CompiledModel, budget: &Budget, lanes: &[Lane]) -> Result<Composition> {
     seriate(compiled, budget, None, None, lanes)
 }
 
-/// Compose one fire over every row axis the deployment admits. Two
-/// seriations, not one widened: the patch pass runs beside the token pass
-/// over the artifact's own patch `ClassOrder`, with images where lanes were.
-///
-/// # Errors
-///
-/// Everything [`compose`] refuses, plus [`Fault::PatchGeometry`] for a
-/// lane whose image count and patch payload disagree, and
-/// [`Fault::TooManyPatches`] / [`Fault::TooManyImages`] / [`Fault::NoPatchBucket`].
 pub fn compose_axes(
     compiled: &CompiledModel,
     budgets: &Budgets,
@@ -499,18 +365,11 @@ fn seriate(
         .into());
     }
 
-    // Pass one: every lane's class. Linear-scanned since a fire's
-    // distinct words are few — cheaper than hashing a `u64`.
     let count = compiled.classes.classes.len();
     let mut memo: Vec<(u64, u32)> = Vec::new();
     let mut of_lane: Vec<u32> = Vec::with_capacity(lanes.len());
-    // `(rows, lanes)` per class, per axis; all-zero on the patch entry for
-    // a text-only fire.
     let mut tally: PerAxis<Vec<(u64, u64)>> = PerAxis::from_fn(|_| vec![(0, 0); count]);
-    // Each rectangle's `(rows, lanes)` total, `u64` until the ceiling checks.
     let mut totals: PerAxis<(u64, u64)> = PerAxis::from_fn(|_| (0, 0));
-    // Whether this artifact has anywhere for a patch row to go — read off
-    // the bake, not the budget.
     let towered = compiled.order_for(RowAxis::Patches).is_some();
     let voxeled = compiled.order_for(RowAxis::Voxels).is_some();
 
@@ -519,8 +378,6 @@ fn seriate(
         if lane.rows == 0 {
             return Err(Fault::EmptyLane { lane: i }.into());
         }
-        // An image is at least one patch row and vice versa; stating one
-        // without the other is inconsistent.
         if (lane.images == 0) != (lane.patches == 0) {
             return Err(Fault::PatchGeometry {
                 lane: i,
@@ -529,14 +386,12 @@ fn seriate(
             }
             .into());
         }
-        // Images against a text with no patch axis are refused, not dropped.
         if lane.images > 0 && !towered {
             return Err(Fault::Towerless { lane: i }.into());
         }
         if lane.images > 0 && ladder.is_none() {
             return Err(Fault::NoPatchLadder { lane: i }.into());
         }
-        // The same three refusals on the voxel axis.
         if (lane.clips == 0) != (lane.voxels == 0) {
             return Err(Fault::ClipGeometry {
                 lane: i,
@@ -551,8 +406,6 @@ fn seriate(
         if lane.clips > 0 && voxel_ladder.is_none() {
             return Err(Fault::NoVoxelLadder { lane: i }.into());
         }
-        // Masked to the bits the sweep ran over, since a model may state a
-        // fact it does not split on.
         let word = lane.word & compiled.classes.mask;
         let class = match memo.iter().find(|(seen, _)| *seen == word) {
             Some((_, class)) => *class,
@@ -565,8 +418,6 @@ fn seriate(
                 class
             }
         };
-        // `class_of`'s index is in range by construction; the tally is
-        // sized from the same list.
         for axis in RowAxis::ALL {
             let (rows, images) = lane.on(axis);
             tally[axis][class as usize].0 += u64::from(rows);
@@ -587,7 +438,6 @@ fn seriate(
     }
     let rows = rows as u32;
 
-    // The patch ceilings, checked even with no ladder (`patches` is then zero).
     let (patches, images) = totals[RowAxis::Patches];
     let (max_patches, max_images) = ladder.map_or((0, 0), |l| (l.max_rows, l.max_lanes));
     if patches > u64::from(max_patches) {
@@ -606,7 +456,6 @@ fn seriate(
     }
     let patches = patches as u32;
 
-    // And the voxel ceilings, the same way.
     let (voxels, clips) = totals[RowAxis::Voxels];
     let (max_voxels, max_clips) = voxel_ladder.map_or((0, 0), |l| (l.max_rows, l.max_lanes));
     if voxels > u64::from(max_voxels) {
@@ -625,24 +474,17 @@ fn seriate(
     }
     let voxels = voxels as u32;
 
-    // Taken before the seriations: the token refusal is owed before the patch one.
     let buckets = PerAxis::new([
         bucket_of(budget, rows)?,
         patch_bucket_of(ladder, patches)?,
         voxel_bucket_of(voxel_ladder, voxels)?,
     ]);
 
-    // Where each submitted lane's rows land on each axis, one side table
-    // (not two lists) to avoid reading a `source` against the wrong record.
     let mut placed: Vec<PerAxis<(u32, u32)>> = vec![PerAxis::from_fn(|_| (0, 0)); lanes.len()];
 
-    // Both rectangles' totals, narrowed — each just admitted by its
-    // ceiling, so the cast is a conversion, not a truncation.
     let checked: PerAxis<(u32, u32)> =
         PerAxis::from_fn(|axis| (totals[axis].0 as u32, totals[axis].1 as u32));
 
-    // The prefix sums and lane placement, once per row axis, over that
-    // axis's own baked order and tallies.
     let axes = PerAxis::from_fn(|axis| {
         seriate_axis(
             compiled.order_for(axis),
@@ -656,9 +498,6 @@ fn seriate(
         )
     });
 
-    // Pass three: the lane records, class by class in token fire order,
-    // submission order inside a class. Every offset is read out of
-    // `placed` rather than re-accumulated.
     let mut seriated: Vec<LaneRow> = Vec::with_capacity(lanes.len());
     for class in axes[RowAxis::Tokens].classes.present_in_order() {
         for (i, lane) in lanes.iter().enumerate() {
@@ -692,10 +531,6 @@ fn seriate(
     })
 }
 
-/// One row axis's seriation — the prefix sums that place its classes and
-/// the walk that places its lanes inside them, over the axis's baked
-/// order. A lane contributing zero requests is not placed. An absent plan
-/// is the zero seriation.
 #[allow(clippy::too_many_arguments)]
 fn seriate_axis(
     plan: Option<&ClassOrder>,
@@ -719,8 +554,6 @@ fn seriate_axis(
         };
     };
 
-    // The classes this fire has rows in, in order: the baked order,
-    // filtered. The widening to `u32` is never a truncation (a class is a `u8`).
     let present = ClassSet::of((0..count).filter(|&class| tally[class].1 > 0));
     let order: Vec<u32> = plan
         .class_order(&present)
@@ -730,7 +563,6 @@ fn seriate_axis(
 
     let (mut row_at, mut lane_at) = (0u32, 0u32);
     for &class in &order {
-        // Narrowed here, not at the tally: part of a total already admitted.
         let (class_rows, class_lanes) = tally[class as usize];
         let (class_rows, class_lanes) = (class_rows as u32, class_lanes as u32);
         classes[class as usize] = ClassWindow {
@@ -739,14 +571,12 @@ fn seriate_axis(
             lane_offset: lane_at,
             lanes: class_lanes,
         };
-        // Inside a class, submission order.
         let (mut lane_row_at, mut lane_lane_at) = (row_at, lane_at);
         for (i, lane) in lanes.iter().enumerate() {
             if of_lane[i] != class {
                 continue;
             }
             let (lane_rows, lane_lanes) = lane.on(axis);
-            // A lane contributing no request here is not placed.
             if lane_lanes == 0 {
                 continue;
             }
@@ -766,9 +596,6 @@ fn seriate_axis(
     }
 }
 
-/// The smallest patch rung that holds these patch rows — [`bucket_of`]'s
-/// question on the second row axis. `0` for no ladder or no patch rows;
-/// past the top rung is [`Fault::NoPatchBucket`]; otherwise [`rung_of`].
 fn patch_bucket_of(ladder: Option<Ladder<'_>>, patches: u32) -> Result<u32> {
     let Some(ladder) = ladder else {
         return Ok(0);
@@ -782,7 +609,6 @@ fn patch_bucket_of(ladder: Option<Ladder<'_>>, patches: u32) -> Result<u32> {
     }
 }
 
-/// [`patch_bucket_of`]'s question on the third row axis.
 fn voxel_bucket_of(ladder: Option<Ladder<'_>>, voxels: u32) -> Result<u32> {
     let Some(ladder) = ladder else {
         return Ok(0);
@@ -796,9 +622,6 @@ fn voxel_bucket_of(ladder: Option<Ladder<'_>>, voxels: u32) -> Result<u32> {
     }
 }
 
-/// The smallest bucket that holds these rows. An empty lattice is not an
-/// error: the bucket for `rows` rows is then `rows` itself. Past the top
-/// rung is [`Fault::NoBucket`].
 fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
     match budget.buckets.last().copied() {
         Some(top) if rows > top => Err(Error::Fire(Fault::NoBucket { rows, top })),
@@ -806,9 +629,6 @@ fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
     }
 }
 
-/// The smallest rung of this lattice that holds `rows`, for a count
-/// already admitted by the ceiling above — [`bucket_of`]'s arithmetic
-/// without its refusal.
 #[must_use]
 pub fn rung_of(buckets: &[u32], rows: u32) -> u32 {
     buckets
@@ -826,32 +646,27 @@ mod tests {
     use model_compiler::{DeviceProfile, compile};
     use model_ir::{Guard, ValueId};
 
-    /// A deployment small enough to state in an assert.
     fn budget() -> Budget {
         Budget::new(8, 64)
     }
 
-    /// A shared producer, an attention pair split on `qo_one`, a merge, a
-    /// shared consumer. Returns the plan's output value.
     fn diagram() -> (Build, ValueId) {
         let mut b = Build::new();
         let x = b.input(8);
-        let plan = b.prepare(Guard::Always); // node 0 — prepare, every class
-        let q = b.op(x, 4, Guard::Always); // node 1 — every class
-        let d = b.decode(q, plan, fact(0)); // node 2 — the decode window
-        let p = b.op(q, 4, Guard::not(fact(0))); // node 3 — the prefill window
+        let plan = b.prepare(Guard::Always);
+        let q = b.op(x, 4, Guard::Always);
+        let d = b.decode(q, plan, fact(0));
+        let p = b.op(q, 4, Guard::not(fact(0)));
         let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
-        let y = b.op(o, 4, Guard::Always); // node 4 — every class again
+        let y = b.op(o, 4, Guard::Always);
         b.out(y);
         (b, y)
     }
 
-    /// The nodes of [`diagram`], named.
     const SHARED: u32 = 1;
     const DECODE: u32 = 2;
     const PREFILL: u32 = 3;
 
-    /// The rows one node runs over — its region's mask, against this fire.
     fn rows_of(compiled: &CompiledModel, fire: &Composition, node: u32) -> u32 {
         let region = compiled
             .template()
@@ -861,9 +676,13 @@ mod tests {
         fire.classes().rows_of(&region.mask)
     }
 
+    fn compose_every_case() {
+        the_thirteen_row_diagram_windows_the_way_the_design_draws_it();
+        a_fire_rounds_up_to_a_bucket_and_one_above_them_all_is_refused();
+    }
+
     #[test]
     fn the_thirteen_row_diagram_windows_the_way_the_design_draws_it() {
-        // fire (R=5): lane0 prefill(7) lane1 prefill(3) lane2..4 decode(1 each)
         let (b, _) = diagram();
         let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
         let lanes = [
@@ -886,7 +705,6 @@ mod tests {
         assert_eq!((p.rows, p.lanes), (10, 2), "two prefill lanes, ten rows");
         assert_eq!((d.rows, d.lanes), (3, 3), "three decode lanes, three rows");
 
-        // The two windows tile the fire, in whichever order the compiler seated them.
         let mut spans = [(p.row_offset, p.rows), (d.row_offset, d.rows)];
         spans.sort_unstable();
         assert!(
@@ -894,14 +712,11 @@ mod tests {
             "the windows do not tile [0, 13): {spans:?}",
         );
 
-        // The diagram's actual claim: one kernel over all 13 rows for
-        // shared ops, one per window for the split pair.
         assert_eq!(rows_of(&compiled, &fire, SHARED), 13);
         assert_eq!(rows_of(&compiled, &fire, DECODE), 3);
         assert_eq!(rows_of(&compiled, &fire, PREFILL), 10);
     }
 
-    #[test]
     fn a_fire_rounds_up_to_a_bucket_and_one_above_them_all_is_refused() {
         let (b, _) = diagram();
         let mut budget = budget();
@@ -913,14 +728,11 @@ mod tests {
         let fire = compose(&compiled, &budget, &[Lane::new(1, 1)]).expect("composes");
         assert_eq!((fire.rows(), fire.bucket()), (1, 1));
 
-        // 17 rows round up to nothing, so there is no graph to launch them in.
         assert_eq!(
             compose(&compiled, &budget, &[Lane::new(0, 17)]),
             Err(Error::Fire(Fault::NoBucket { rows: 17, top: 16 })),
         );
 
-        // No lattice: the bucket is the fire's own size. `budget` is
-        // shadowed above, so the plain one is named through the module.
         let open = super::tests::budget();
         let compiled = compile(&b.trace, &open, &DeviceProfile::default()).expect("bakes");
         let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");

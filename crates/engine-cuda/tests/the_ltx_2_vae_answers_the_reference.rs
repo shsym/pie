@@ -1,55 +1,3 @@
-//! **THE LTX-2.5 VIDEO VAE DECODER, READ OUT OF THE SNAPSHOT'S `vae/`
-//! FOLDER, TURNS A `T x h x w` DiT-SPACE LATENT CLIP INTO THE REFERENCE'S
-//! `(8T - 7) x 32h x 32w` PIXELS — ONE FIRE FOR THE WHOLE CLIP, NO STATE,
-//! NO HEAD ARM.** (design D8/D11, milestone M4)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_ltx_2_vae_answers_the_reference -- --nocapture
-//! ```
-//!
-//! The golden is `scripts/imagegen/ltx2_golden.py --vae`: diffusers 0.40's
-//! fp32 `AutoencoderKLLTX2Video.decode` over a fixed random latent —
-//! `latent.f32` (`[T*h*w, 128]`, the DENOISER's space), `denorm.f32` (the
-//! same times `latents_std` plus `latents_mean`, which is what the
-//! reference hands its decoder) and `pixels.f32` (`[(8T-7)*32h*32w, 3]`,
-//! UNCLAMPED — the reference's `decode` does not clip and neither does this
-//! arm), rows of voxels in `(t, h, w)` order under
-//! `$PIE_IMAGEGEN_GOLDEN/ltx25/ltx2_vae/`. The weights come from the
-//! `Lightricks/LTX-2.5-Diffusers` snapshot in the HuggingFace cache through
-//! `models::ltx_2::Model::import_vae` — the VAE's own 86 planes and the one
-//! stated zero row, none of the 19 B transformer beside them — so this gate
-//! needs no imported artifact.
-//!
-//! **WHAT IS CLAIMED, AND WHAT IS NOT.**
-//!
-//! 1. *The one-fire decode is the reference's decode.* The whole clip goes
-//!    through `vae.decode` at once and lands `8T - 7` frames of `32h x 32w`.
-//!    Gate: `cos >= 0.9999` and `mean |err| <= 0.005` over the whole clip on
-//!    pixels in about `[-1.8, 1.5]` — the tolerance the other VAE gates
-//!    land, asserted rather than approached. MEASURED, 3 latent frames of
-//!    8x12 into 17 frames of 256x384, bf16 banks and activations against
-//!    the fp32 reference: cos 0.999985, mean |err| 0.00193, max |err|
-//!    0.0339, every frame between 0.999980 and 0.999989 — the same
-//!    distance `wan_2`'s decoder (0.999986) and FLUX.2's (0.999994) sit at,
-//!    which is the bf16 floor and not a structural residue.
-//! 2. *Every frame is right, the end frames included.* The same gate is
-//!    asserted PER OUTPUT FRAME. The first and last frames are where the
-//!    non-causal decoder's replicate time padding (`TimePad::Replicate`
-//!    on a symmetric convolution — the clip's own first and last frames
-//!    stand in for the frames outside it) and the temporal upsamplers'
-//!    anchor drop (`pixel_shuffle_trimming`) act, so a frame that alone
-//!    drifts says which of the two is wrong; the middle frames say the
-//!    convolutions and shuffles are right.
-//! 3. *The box is the reference's.* `T` latent frames land exactly
-//!    `8·(T − 1) + 1` frames, not `8T`: the anchor drop is unconditional,
-//!    `decoder_causal: False` notwithstanding.
-//!
-//! Nothing here claims the ENCODER (untraced: `LTX2VideoDownsampler3d`'s
-//! grouped channel mean has no `Spatial` member), the audio VAE, the
-//! vocoder, or a clip larger than the golden's. Skipped by name without a
-//! device, the snapshot or the golden.
-
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -65,8 +13,6 @@ use model_dsl::{
 use models::ltx_2::forward::{Facts, VAE_DECODE, vae_decode};
 use models::ltx_2::model::{Model, VAE_RGB, VAE_Z};
 
-/// The decode arm as a plan of its own: the reading bits still select it,
-/// so the trace keeps the family's own split.
 struct VaeOnly {
     model: Model,
 }
@@ -114,10 +60,6 @@ fn snapshot() -> Option<PathBuf> {
         })
 }
 
-/// `$PIE_IMAGEGEN_GOLDEN/ltx25/ltx2_vae/` — or, under
-/// `PIE_LTX2_VAE_GOLDEN=<name>`, a sibling dump `ltx2_golden.py --vae
-/// --vae-shape T,H,W` wrote (`ltx2_vae_TxHxW`), so a larger clip can be
-/// scored without disturbing the gate's own golden.
 fn golden() -> Option<PathBuf> {
     let root = std::env::var_os("PIE_IMAGEGEN_GOLDEN")
         .map(PathBuf::from)
@@ -171,7 +113,6 @@ fn score(got: &[f32], want: &[f32]) -> Score {
     }
 }
 
-/// The box `shapes.json` states for one plane.
 fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     let at = &shapes[key];
     let get = |name: &str| at[name].as_u64().expect("a box extent") as u32;
@@ -181,7 +122,6 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     )
 }
 
-/// The word one decode lane on the video stream carries.
 fn word() -> u64 {
     Facts::of(
         &Request::new(1, false)
@@ -191,7 +131,6 @@ fn word() -> u64 {
     .word()
 }
 
-/// Load the decode arm out of the snapshot and fire one clip through it.
 fn fire(root: &PathBuf, max_voxels: u32, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3], f64, f64) {
     let model = Model::ltx_2_5(Dtype::Bf16, 1);
     let src = checkpoint::file::diffusers::open(root)
@@ -202,9 +141,6 @@ fn fire(root: &PathBuf, max_voxels: u32, clip: [u32; 3], payload: &[f32]) -> (Ve
     drop(src);
     let arm = VaeOnly { model };
     let trace = trace_hybrid("ltx25-vae-decode", &arm, Platform::Cuda);
-    // The contract states the whole decoder; keep the planes the plan names
-    // and the internal steps they are stated through, nothing else — a load
-    // refuses a contract publishing a plane the plan does not name.
     let mut keep: std::collections::BTreeSet<String> =
         trace.params.iter().map(|p| p.name.clone()).collect();
     loop {
@@ -263,7 +199,6 @@ fn fire(root: &PathBuf, max_voxels: u32, clip: [u32; 3], payload: &[f32]) -> (Ve
         clips: &[clip],
         payload: &bytes,
     }];
-    // Once to warm the JIT, once for the clock.
     let _ = shell.fire_voxels(&lanes, &clips).expect("the first fire");
     let started = Instant::now();
     let mut answered = shell.fire_voxels(&lanes, &clips).expect("the second fire");
@@ -300,7 +235,6 @@ fn the_decoder_answers_the_reference_in_one_fire() {
     let pixels = f32s(&gold.join("pixels.f32"));
     let [frames, hp, wp] = pixel_box;
     let [t_lat, hl, wl] = latent_box;
-    // ---- claim 3: the box -------------------------------------------------
     assert_eq!(
         frames,
         8 * t_lat - 7,
@@ -312,9 +246,6 @@ fn the_decoder_answers_the_reference_in_one_fire() {
     assert_eq!(latent.len(), voxels * latent_c);
     assert_eq!(pixels.len(), out_plane * frames as usize * pixel_c);
 
-    // The ladder is the INPUT clip's ceiling: the compiler walks each
-    // `Spatial` op's grid rule to size the values a decode grows into
-    // (x8192 voxels here).
     let (got, out_box, load_s, fire_s) = fire(&root, voxels as u32 + 8, latent_box, &latent);
     eprintln!(
         "ltx vae: load {load_s:.1} s, fire {fire_s:.3} s, {t_lat}x{hl}x{wl} latent -> {}x{}x{} pixels",
@@ -326,7 +257,6 @@ fn the_decoder_answers_the_reference_in_one_fire() {
     );
     assert_eq!(got.len(), pixels.len());
 
-    // ---- claims 1 and 2 ---------------------------------------------------
     let whole = score(&got, &pixels);
     let (lo, hi) = got
         .iter()

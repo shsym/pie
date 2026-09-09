@@ -2,61 +2,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// **BIDIRECTIONAL DENSE ATTENTION OVER A PATCH WINDOW** — the vision
-/// towers' one real kernel, the Metal mirror of `kernels-cuda`'s
-/// `attn/dense.cuh` (`.wiki/alto/multimodal.md` §2).
-///
-/// It is the simplest attention this plane owns, and every simplification is
-/// a fact about the second row axis rather than a shortcut: patch rows are
-/// not a cache, so there are no pages, no append and no page tables; a patch
-/// attends to every patch of its own image and to no other, so there is no
-/// causal ladder, no sliding window and no mask plane — the block-diagonal
-/// IS the segment list; nothing merges against a second pass, so there is no
-/// log-sum-exp plane to carry out. What is left is q, k, v, one indptr, and
-/// the softmax.
-///
-/// **The segment list is the mask.** `segments` is the patch axis's own
-/// indptr — `int`, `[images + 1]`, image `i` owning rows
-/// `[segments[i], segments[i + 1])` — and a threadgroup finds its image by
-/// binary search rather than by carrying a per-row image id, so the only
-/// geometry the launch reads is the one the fold already assembled. A row at
-/// or past `segments[num_segments]` belongs to NO image: that is a
-/// patch-axis rung's padding, and it lands zeros rather than reading a
-/// neighbour's keys, which is what keeps a bucketed patch window as harmless
-/// as a bucketed token one.
-///
-/// **The reduction is one simdgroup per key chunk, merged in threadgroup
-/// memory.** Simdgroup `w` walks keys `begin + w, begin + w + SIMDS, ...`
-/// keeping its own running (max, sum, accumulator) — the online softmax, so
-/// nothing of size `rows x rows` is ever materialised and the kernel needs no
-/// workspace at all. That is the capture argument: no scratch means no slab
-/// to warm and no allocation on the fire path. The per-simdgroup states are
-/// then folded by one rescaled sum, and a simdgroup that drew no keys folds
-/// in weighing zero.
-///
-/// **`HEAD_DIM_MAX` IS A STAMP, NOT A SHAPE, AND ON THIS PLANE IT IS ALSO
-/// THE THREADGROUP ALLOCATION.** It fixes how many accumulator registers
-/// each lane holds (`HEAD_DIM_MAX / 32`) and how wide the threadgroup planes
-/// below are; the live `head_dim` may be anything at or below it — 64 for
-/// qwen35's tower, 72 or 80 for a SigLIP-shaped one, none of which divide by
-/// 32. The entry picks the tightest stamp that holds the head. The CUDA twin
-/// sizes its shared plane dynamically from the live `head_dim`; a `Fire` here
-/// carries no threadgroup-memory length (`encode.rs` dropped the field with
-/// the rest of the CUDA-plane geometry), so the plane is a static array at
-/// the stamp and `wacc` strides by `HEAD_DIM_MAX` where the twin strides by
-/// `head_dim`. Same values, wider stride, and the widest stamp costs
-/// `(256 + 4 * 256 + 8) * 4` = 5 KiB of a 32 KiB budget.
-///
-/// Grouped heads are read, never expanded: `num_q_heads / num_kv_heads`
-/// query heads share one kv head, so a tower that ships plain MHA states the
-/// two counts equal and pays nothing for the divide.
-///
-/// **`NEG_INF` IS FINITE HERE AND INFINITE THERE, AND NOTHING MOVES.** The
-/// CUDA twin opens its running max at `-inf`; this plane uses the sentinel
-/// its own neighbour `sdpa_paged.metal` opens with (`-3e38`), because
-/// `wm[w] - folded_max` would be `-inf - -inf` for an all-empty fold. Every
-/// live expression agrees to the bit: `exp(-3e38 - score)` and
-/// `exp(-inf - score)` are both zero, and `exp(score - score)` is one.
 template <typename T, int HEAD_DIM_MAX, int SIMDS>
 [[kernel]] void dense_bidirectional(
     const device T* q                 [[buffer(0)]],
@@ -88,8 +33,6 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   threadgroup float wl[SIMDS];
   threadgroup int span[2];
 
-  // Which image owns this row. The list is short (images in the fire), so
-  // one thread walks it and the threadgroup reads the answer.
   if (tid == 0) {
     int begin = -1;
     int end = -1;
@@ -120,7 +63,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   device T* out =
       o + (size_t(row) * size_t(num_q_heads) + size_t(head)) * size_t(head_dim);
   if (end <= begin) {
-    // A rung's padding row: no image claims it, and it reads nobody's keys.
+
     for (int d = tid; d < head_dim; d += THREADS) {
       out[d] = static_cast<T>(0.0f);
     }
@@ -154,8 +97,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
         dot += q_s[d] * float(k_row[d]);
       }
     }
-    // Every lane leaves with the whole score, so the rescale below needs no
-    // broadcast — `simd_sum` is the butterfly the twin spells `__shfl_xor`.
+
     dot = simd_sum(dot);
 
     const float score = dot * sm_scale;

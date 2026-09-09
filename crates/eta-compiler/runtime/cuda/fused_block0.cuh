@@ -328,9 +328,7 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
             d0.len > 1u ? m1_load_u(a0, 1u, d0.dtype) : 0u;
         seed = ptir_rng_keyed_seed(key, counter);
       }
-      // `imm3` is the element base: a row block of a row-parallel region
-      // keys its elements by their position in the whole value, so the
-      // noise is the one block per lane would have drawn.
+
       if (p.kind == 2u) {
         m1_store_f(o0, i, ptir_rng_hash_normal(seed, i + p.imm3));
         continue;
@@ -441,9 +439,7 @@ __device__ __forceinline__ void ptir_parallel_gather(
     const M1ValueDesc index_desc,
     const M1ValueDesc output_desc) {
   if (tag == 0x61u) {
-    // A row block sees the row view (rank 1): one row of `len` columns and
-    // one output element. Reading `dims[0]`/`dims[1]` of that view made
-    // every index invalid and zero-filled `len` elements past the output.
+
     const m1_u32 rows = input_desc.rank <= 1u ? 1u : input_desc.dims[0];
     const m1_u32 columns = input_desc.rank <= 1u ? input_desc.len : input_desc.dims[1];
     for (m1_u32 row = threadIdx.x; row < rows; row += blockDim.x) {
@@ -490,20 +486,6 @@ __device__ __forceinline__ void ptir_parallel_gather(
   }
 }
 
-// cummass_le (top-p / nucleus): keep the DESCENDING prefix whose EXCLUSIVE
-// cumulative mass stays below `p` (interp.rs `Predicate::CummassLe`: sort the
-// row descending, then `k[i] = excl < p; excl += row[i]`). The input is NOT
-// sorted, so this is a block-cooperative selection loop -- one block-wide
-// "next largest still-unpicked element" pick per iteration, carrying the
-// previous pick as a total-order threshold instead of a visited set (the same
-// technique as tier0's `k_pivot_cummassle`). It stops as soon as the running
-// mass clears `p`, so a peaked LM row costs a handful of passes.
-//
-// This replaces the single-threaded M1 reference, which was O(len^3) on
-// thread 0 alone (a selection sort with a linear "already picked" rescan per
-// candidate) and therefore never returned at a 151936-token vocabulary --
-// every hand-written top-p sampler that failed to match
-// `LibraryOp::NucleusSample` wedged the GPU here.
 __device__ __forceinline__ void ptir_parallel_pivot_cummass(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -532,7 +514,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
         m1_pick(threshold_desc.len, row),
         threshold_desc.dtype);
     if (threadIdx.x == 0u) {
-      // Sentinel sorts before every real element, so the first pick is free.
+
       pivot_previous_value = m1_pos_inf();
       pivot_previous_index = 0u;
       pivot_exclusive = 0.0f;
@@ -589,8 +571,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
             index = pivot_share_index[warp];
           }
         }
-        // Descending order ⇒ once the mass condition fails it fails for every
-        // remaining element, so the zero-initialised tail is already correct.
+
         if (index == none || !(pivot_exclusive < cutoff)) {
           pivot_stop = 1u;
         } else {
@@ -606,21 +587,6 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
   }
 }
 
-// rank_le (top-k by rank): keep the elements whose count of strictly-greater
-// values is below `k` (interp.rs `Predicate::RankLe`).
-//
-// This replaces a literal per-element rank pass, which re-scanned the whole row
-// for every element and so cost O(len^2) unconditionally -- ~2.3e10 element
-// visits per row at a 151936-token vocabulary, which is what made
-// `mirostat-v2-sampling` take minutes per request. Instead: a block-cooperative
-// 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len) regardless of `k`.
-//
-// Equivalence: `greater(i)` equals the count of strictly smaller keys, which is
-// monotone in the key, so `greater(i) < k` holds exactly when `key(i) <= K_k`
-// for `K_k` the k-th smallest key counting multiplicity. Ties therefore all
-// survive or all fall together, which is what the reference does (it can keep
-// more than `k` elements when the boundary value repeats). NaN keys sort last
-// so they never displace a real element, and the marking pass excludes them.
 __device__ __forceinline__ void ptir_parallel_pivot_rank(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -658,8 +624,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_rank(
     __syncthreads();
     for (int pass = 0; pass < 4; ++pass) {
       const int shift = 24 - 8 * pass;
-      // Bits fixed by earlier passes; `pass == 0` is special-cased because
-      // shifting a 32-bit value by 32 is undefined, not zero.
+
       const m1_u32 high_mask =
           (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
       for (m1_u32 bucket = threadIdx.x; bucket < 256u; bucket += blockDim.x)
@@ -1130,18 +1095,7 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
-  // Mode 3: the reduction already happened. The engine interleaves the LM head
-  // GEMM with the argmax so the logits never reach HBM, and hands us the
-  // finished token ids instead of a vocab to scan. Like mode 2 this is a table
-  // of row pointers, because a lane's sampled rows are not contiguous -- each
-  // entry addresses one i32 rather than one vocabulary row. The epilogue still
-  // runs and still performs every side effect it declared; only where this one
-  // value comes from changed. `mode` is block-uniform, so the early return is
-  // too.
-  //
-  // Safe only because the engine proves every `logits` reader in the stage is
-  // one of these reductions; a stage that also reads the raw values would find
-  // token ids behind the same intrinsic slot.
+
   if (mode == 3u) {
     const m1_u64* rows = reinterpret_cast<const m1_u64*>(input);
     for (m1_u32 row = threadIdx.x; row < input_desc.rows; row += blockDim.x) {
@@ -1157,10 +1111,7 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
     const m1_u32 last = input_desc.last;
     M1ArgmaxCandidate candidate{
         m1_neg_inf(), 0u, 0u, 0u};
-    // `m1_argmax_combine` takes the max and breaks ties toward the lower
-    // index, so it is commutative and associative: widening each thread's scan
-    // to a 16-byte load changes how many instructions the scan costs, not what
-    // it answers.
+
     const m1_u32 vectors =
         (mode != 0u &&
          ((m1_u64)row_base & 15ull) == 0ull)
@@ -1201,17 +1152,6 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
   }
 }
 
-// `argmax((logits [/ divisor]) + gumbel(state))` straight off the logits
-// intrinsic: what `ptir_fast_argmax_intrinsic` is to a bare argmax, this is
-// to the Gumbel-max draw — the scaled logit, the keyed noise and the compare
-// happen per element in one scan, and nothing is written to scratch. Each
-// element's noise is the draw the `rng_keyed` node would have written for
-// it (`ptir_rng_keyed_seed` of the state cell, `ptir_rng_hash_uniform` at
-// the element's index in the whole value — `noise_base` is the row block's
-// element base, 0 for a whole-value block — then `-log(-log(u))`), the
-// divide and the add are the f32 ops the `div` and `add` arms land, so the
-// scan answers what the four launches answer. `divisor` is null when the
-// chain scales nothing.
 __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
     const m1_u8* input,
     m1_u8* output,

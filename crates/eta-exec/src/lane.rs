@@ -5,9 +5,6 @@ pub use eta_compiler::plan::lane_table::{
     LaneTableHeader as Header,
 };
 
-// The `*_BYTES` constants size the types re-exported above;
-// `eta_compiler::plan::lane_table` owns the ABI the shells bind.
-
 pub const HEADER_BYTES: u64 = size_of::<Header>() as u64;
 
 pub const RECORD_BYTES: u64 = size_of::<Record>() as u64;

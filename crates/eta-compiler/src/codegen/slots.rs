@@ -1,42 +1,18 @@
-//! Which operand goes in which kernel slot.
-//!
-//! `ptir_m1_execute` takes five pointers (three in, two out), and the rule
-//! for filling them from an op is part of the M1 op ABI, not part of any
-//! one backend. Every rule is silent when wrong: a forgotten
-//! `pivot_threshold` predicate payload in `a1` reads whatever the second
-//! operand slot held, and a forgotten second result writes one output and
-//! leaves the other pointing at scratch — both compile and run.
-//!
-//! What is genuinely per-backend is how a value id becomes a pointer
-//! expression, so that is the parameter.
-
 use alloc::string::{String, ToString};
 
 use eta_ir::op::tags;
 
 use crate::codegen::op_view::OpView;
 
-/// The five pointer slots, defaulted to `scratch` the way the C++ does before
-/// the per-tag overrides.
 pub struct Slots {
-    /// Pointer expression for input operand 0, or `"scratch"` when unused.
     pub a0: String,
-    /// Pointer expression for input operand 1. `pivot_threshold` passes its
-    /// predicate payload here instead of a second operand.
     pub a1: String,
-    /// Pointer expression for input operand 2, or `"scratch"` when unused.
     pub a2: String,
-    /// Pointer expression for result 0.
     pub o0: String,
-    /// Pointer expression for result 1 (`base + 1`, since an op's results are
-    /// consecutive value ids).
     pub o1: String,
 }
 
 impl Slots {
-    /// Fill the slots for `op`, whose first result is value `base`. Slots
-    /// the op does not use keep pointing at `scratch`; the runtime ignores
-    /// them, and emitters rely on that to leave a hole to overwrite later.
     pub fn of(op: &OpView, base: u32, mut pointer: impl FnMut(u32) -> String) -> Self {
         let mut slots = Self {
             a0: "scratch".to_string(),
@@ -54,15 +30,12 @@ impl Slots {
         if op.args.len() > 2 {
             slots.a2 = pointer(op.args[2]);
         }
-        // `pivot_threshold` carries its threshold as a predicate payload
-        // rather than an operand, and the runtime expects it in `a1`.
         if op.tag == tags::PIVOT_THRESHOLD {
             slots.a1 = pointer(op.pred_payload);
         }
         if op.results > 0 {
             slots.o0 = pointer(base);
         }
-        // Results are consecutive value ids, so the second one is `base + 1`.
         if op.results > 1 {
             slots.o1 = pointer(base + 1);
         }

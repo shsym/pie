@@ -1,5 +1,3 @@
-//! The `collective` family: `impl DispatchCollective for Run<'_>`.
-
 use kernels_metal::collective;
 use model_exec::{DispatchCollective, KernelError};
 use model_ir::Collective;
@@ -13,8 +11,6 @@ impl DispatchCollective for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-metal`'s error vocabulary, lifted by
-    /// [`kernel`](crate::error::kernel) above.
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_metal::Error> {
         match op {
             Collective::AllReduce { buf, buf_out: _ } => {

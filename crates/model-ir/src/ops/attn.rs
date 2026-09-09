@@ -3,14 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// Ops where tokens interact, or a sequence cache (kv pages, ssm state,
-/// indexer key cache, pooled entries) is touched. `Plan*` variants define
-/// `Struct` values from geometry inputs; every cache-walking variant takes
-/// the plan it was built from. Append ops carry write addressing via
-/// `write_page`/`write_offset`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Attention {
-    /// Defines `Struct(AttnDecodePlan)`. Host work; runs in the prepare phase.
     PlanDecode {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -22,7 +16,6 @@ pub enum Attention {
         window: Option<u32>,
         plan: ValueId,
     },
-    /// Defines `Struct(AttnPrefillPlan)`.
     PlanPrefill {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -53,11 +46,6 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
-    /// Decode with a learned relative-position bias on every score
-    /// (Inkling's `rel_logits_proj`): `bias` is `[rows, heads · extent]`
-    /// f32, one profile over backward distance per (query row, head) —
-    /// [`Linear::RelBias`](crate::ops::Linear::RelBias)'s output — added
-    /// after the scale and zero past `extent`.
     DecodeRel {
         q: ValueId,
         plan: ValueId,
@@ -67,14 +55,10 @@ pub enum Attention {
         head_dim: u32,
         extent: u32,
         sm_scale: f32,
-        /// Log attention scaling past a position floor: a query at one-based
-        /// position `n` has its scores and bias scaled by
-        /// `1 + log_alpha · ln(max(1, n / log_floor))`. `log_alpha` 0 is none.
         log_floor: u32,
         log_alpha: f32,
         o: ValueId,
     },
-    /// Prefill with the same bias; causal, no custom mask.
     PrefillRel {
         q: ValueId,
         plan: ValueId,
@@ -89,8 +73,6 @@ pub enum Attention {
         log_alpha: f32,
         o: ValueId,
     },
-    /// Prefill against a query-provided mask instead of the causal one;
-    /// the op names the `mask` it applies, not the engine.
     Masked {
         q: ValueId,
         plan: ValueId,
@@ -98,31 +80,11 @@ pub enum Attention {
         cache: ValueId,
         window: Option<u32>,
         head_dim: u32,
-        /// The cache row's head split. Stated here for the reason
-        /// [`Prefill`](Attention::Prefill) states it: a row's head width is
-        /// read off its READERS, and a row only this arm reads — a block
-        /// drafter's last layer is full attention and nothing else touches
-        /// its row — would otherwise be taken for one head of the whole
-        /// plane.
         kv_heads: u32,
-        /// Whether the causal upper bound still applies under the mask.
-        ///
-        /// `true` is every existing caller: a stated mask NARROWS what a
-        /// causal row already sees. `false` makes the mask authoritative, so
-        /// a row may attend a key at a LATER position — which a block
-        /// drafter's full-attention layer needs and nothing else does. A
-        /// non-causal read is bounded by the mask alone, and one is always
-        /// stated because this op names it.
         causal: bool,
         sm_scale: f32,
         o: ValueId,
     },
-    /// Bidirectional attention over the patch window, block-diagonal per
-    /// image. `segments` is the patch axis's own indptr
-    /// (`RuntimeInput::PatchSegments`, `i32`, `[Dim::ImagesPlus(1)]`): patch
-    /// row `n` attends both ways over the rows of the image containing it.
-    /// `q`/`k`/`v`/`o` are patch rectangles; row axis is
-    /// [`RowAxis::Patches`](crate::RowAxis::Patches).
     Dense {
         q: ValueId,
         k: ValueId,
@@ -132,28 +94,6 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
-    /// Non-causal attention over segments of PACKED token rows, no cache,
-    /// no plan, no window: query segment `i` attends key/value segment `i`,
-    /// both ways, and nothing else. What every generative family's joint,
-    /// cross- and self-attention is (D2): the segments are groups
-    /// (`GeomKind::GroupIndptr`, the lanes one request submitted, packed
-    /// contiguous by `layout.pack_rows`) or lanes (`GeomKind::LaneIndptr`).
-    ///
-    /// **`q` AND `(k, v)` MAY COME FROM DIFFERENT ARMS.** Cross-attention
-    /// reads its queries off one class's rectangle (the audio lanes) and its
-    /// keys off another's (the video or context lanes); the recorder joins
-    /// the operand guards with `Or` for this op alone and the node runs over
-    /// both classes' windows. `q_indptr` and `kv_indptr` are each a CSR over
-    /// their own selection's packed rows and must have the same segment
-    /// count, segment `i` of one pairing with segment `i` of the other — the
-    /// host orders both by group, so the same request lands at the same
-    /// index on both sides.
-    ///
-    /// `q` is `[rows, heads·head_dim]`, `k`/`v` are `[rows, kv_heads·head_dim]`
-    /// (GQA when `kv_heads` divides `heads`), `o` is `q`'s shape. Widths of
-    /// the two rectangles are unrelated (LTX: 4096-wide video keys under
-    /// 2048-wide audio queries, projected to one `kv_heads·head_dim`).
-    /// `sm_scale` is a trace constant. fp32 accumulation, softmax in fp32.
     Ragged {
         q: ValueId,
         k: ValueId,
@@ -187,7 +127,6 @@ pub enum Attention {
         o: ValueId,
         lse: ValueId,
     },
-    /// Folds attention-sink mass into `o` using its log-sum-exp.
     Sink {
         o: ValueId,
         lse: ValueId,
@@ -217,7 +156,6 @@ pub enum Attention {
         write_page: ValueId,
         write_offset: ValueId,
     },
-    /// Appends one plane shared as both k and v.
     KvAppendShared {
         plane: ValueId,
         cache: ValueId,
@@ -225,10 +163,6 @@ pub enum Attention {
         write_offset: ValueId,
     },
 
-    // Multi-head latent attention: one `MlaPlan` op defines the struct, four
-    // cache-walking variants take it, `MlaKvAppend` carries write addressing.
-    /// Defines `Struct(MlaPlan)`, shared by decode and prefill. Latent
-    /// kernels size their output at `heads × kv_lora_rank`.
     MlaPlan {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -238,7 +172,6 @@ pub enum Attention {
         kv_lora_rank: u32,
         plan: ValueId,
     },
-    /// Splits `kv_a` into the rmsnormed compressed latent and the rope plane.
     MlaLatents {
         kv_a: ValueId,
         weight: ValueId,
@@ -266,7 +199,6 @@ pub enum Attention {
         q_nope: ValueId,
         q_pe: ValueId,
     },
-    /// Absorbs `kv_b`'s up-projection into q, mapping heads into latent space.
     MlaAbsorbQ {
         q_nope: ValueId,
         kv_b: ValueId,
@@ -312,7 +244,6 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
-    /// Decode over the sparse `selection` produced by `IndexTopk`.
     MlaDecodeSelected {
         q: ValueId,
         plan: ValueId,
@@ -336,10 +267,6 @@ pub enum Attention {
         o: ValueId,
     },
 
-    // Recurrent-state mixers: causal conv, gated delta nets, KDA. `state` is
-    // the recurrent cache, updated in place. `dilation`: tap `j` reads
-    // `dilation · j` positions back; state keeps `(conv_width − 1) ·
-    // dilation` columns.
     SsmCausalConv1d {
         x: ValueId,
         weight: ValueId,
@@ -348,10 +275,6 @@ pub enum Attention {
         dilation: u32,
         y: ValueId,
     },
-    /// Inkling's short convolution: the depthwise causal conv with no
-    /// activation and the token's own input added back, `y = x + conv(x)`,
-    /// summed in f32 before the one rounding. Decode form; the state slab
-    /// is the recurrent conv's (`[conv_width, channels]` per slot).
     ShortConv {
         x: ValueId,
         weight: ValueId,
@@ -359,7 +282,6 @@ pub enum Attention {
         conv_width: u32,
         y: ValueId,
     },
-    /// Prefill form: walks the fire's ambient request boundaries.
     ShortConvChunked {
         x: ValueId,
         weight: ValueId,
@@ -367,7 +289,6 @@ pub enum Attention {
         conv_width: u32,
         y: ValueId,
     },
-    /// Prefill form: walks the fire's ambient request boundaries.
     SsmCausalConv1dChunked {
         x: ValueId,
         weight: ValueId,
@@ -376,16 +297,6 @@ pub enum Attention {
         dilation: u32,
         y: ValueId,
     },
-    /// **A two-tap grouped dynamic convolution along the fire's request
-    /// rows** (DFlash2's `attention_conv` / `mlp_conv`). Within each request's
-    /// span, `y[i] = Σ_t (base[side, t, :] + δ[i, side, t, g]) ⊙ x[i − t]`,
-    /// `x` before the span's first row being zero: row `i`'s own coefficients
-    /// mix it with its predecessor in the block. `coeff` is the coefficient
-    /// projection's output, `[rows, 2·taps·groups]` laid `(side, tap, group)`
-    /// — both sides come from one projection of the sublayer's input, and
-    /// `side` says which half this application reads (0 convolves the input
-    /// before the sublayer, 1 its output after). `base` is `[2·taps,
-    /// channels]`, row `side·taps + tap`. `group` channels share one δ.
     BlockDynConv {
         x: ValueId,
         coeff: ValueId,
@@ -395,35 +306,16 @@ pub enum Attention {
         group: u32,
         y: ValueId,
     },
-    /// **DFlash2's candidate selector, walked** — the head's readout. Within
-    /// each request's span the first row is the anchor and every row after it
-    /// a mask slot with `k` candidates (`cand`, `[rows, k]` i32, and their
-    /// logits `unary`, `[rows, k]` f32, both from `layout.topk`). From the
-    /// anchor, slot by slot, the pick is
-    /// `argmax_c unary[c] + ⟨pred[prev] ⊙ hp[row], succ[cand[c]]⟩` with `prev`
-    /// the anchor's id at the first slot and the previous slot's pick after —
-    /// the reference's `walk_greedy` over its `lattice`. `hp` is the slot's
-    /// hidden projected to the codebooks' rank, `pred`/`succ` the two
-    /// `[vocab, rank]` codebooks, `tokens` the fire's ids (the anchor is the
-    /// span's first). `picks` is `[rows, 1]` i32: the walked id at every slot
-    /// row, the first candidate at the anchor row.
     SelectorWalk {
         cand: ValueId,
         unary: ValueId,
-        /// The slot's hidden projected to the codebooks' rank, or `None` for
-        /// a plain bigram lattice (DSpark's markov head: `⟨pred[prev],
-        /// succ[cand]⟩` with no hidden term).
         hp: Option<ValueId>,
         tokens: ValueId,
         pred: ValueId,
         succ: ValueId,
-        /// The first row of each span that is a slot: 1 when the anchor row
-        /// proposes nothing (its pick is its first candidate), 0 when every
-        /// row proposes (the anchor row's predecessor is its own token).
         first: u32,
         picks: ValueId,
     },
-    /// Folds `ba` with dt bias and A-log into per-head decay gates.
     SsmGdnPrep {
         ba: ValueId,
         dt_bias: ValueId,
@@ -479,8 +371,6 @@ pub enum Attention {
         y: ValueId,
     },
 
-    // The sparse-attention indexer: a small key cache (`keys`) scored against
-    // queries to select which pages the main attention will read.
     IndexLayernormRope {
         k: ValueId,
         positions: ValueId,
@@ -500,11 +390,6 @@ pub enum Attention {
         theta: f32,
         q_out: ValueId,
     },
-    /// Scores `q` against the cached keys; `selection` is the top-k key ids.
-    /// `ratio` says which cached rows are keys: `ratio = 1` keys one row per
-    /// token (ids are token positions); `ratio > 1` keys one row per
-    /// compressed block at `(c + 1) * ratio - 1` (ids are compressed-row
-    /// indices, walked by [`Self::PoolLseSelected`]).
     IndexTopk {
         q: ValueId,
         weights: ValueId,
@@ -522,14 +407,6 @@ pub enum Attention {
         write_offset: ValueId,
     },
 
-    // Pooled (compressed) attention: every `ratio` tokens close a boundary
-    // whose pooled entry lands in its own cache. Boundary outputs are
-    // token-shaped, over-allocated with a sentinel in non-boundary rows.
-    /// `row_valid` masks graph-padding rows out of the boundary math.
-    /// `boundary_pos` (cache cell, block's last token) and `boundary_rope`
-    /// (rope angle, block's first token) are different positions for the
-    /// same pooled entry. Non-boundary rows carry `0` in `boundary_rope`,
-    /// `-1` (sentinel) in `boundary_pos`.
     PoolBoundaryDecode {
         positions: ValueId,
         row_valid: ValueId,
@@ -546,11 +423,6 @@ pub enum Attention {
         boundary_req: ValueId,
         boundary_rope: ValueId,
     },
-    /// The compressor's rolling state, written. `kv` is `wkv · x` and
-    /// `score` is `wgate · x`, both `[tokens, coff · head_dim]`. Scatters
-    /// each row into the source cache's paged slot named by
-    /// `write_page`/`write_offset`, since [`Self::PoolGather`] reads state
-    /// back from there rather than from a fire-shaped rectangle.
     PoolStateWrite {
         kv: ValueId,
         score: ValueId,
@@ -560,10 +432,6 @@ pub enum Attention {
         head_dim: u32,
         ratio: u32,
     },
-    /// Pools the closing window out of the kv cache into per-boundary entries.
-    /// `ape` is the compressor's intra-block absolute-position plane
-    /// (`[ratio, coff · head_dim]`, f32), folded into gate logits before the
-    /// softmax; `None` for a parameter-free mean pool.
     PoolGather {
         boundary_pos: ValueId,
         boundary_req: ValueId,
@@ -581,10 +449,6 @@ pub enum Attention {
         write_page: ValueId,
         write_offset: ValueId,
     },
-    /// Attends each token over the pooled entries of its own request:
-    /// `request_of_token` maps tokens to lanes, and `entries` is the pool
-    /// cache space itself — not `PoolGather`'s tensor, which reaches it
-    /// through `PoolKvAppend`.
     PoolLse {
         q: ValueId,
         positions: ValueId,
@@ -597,10 +461,6 @@ pub enum Attention {
         o: ValueId,
         lse: ValueId,
     },
-    /// [`Self::PoolLse`] over a selection instead of the whole visible
-    /// prefix: walks `selection[t · top_k + n]`, the compressed-row ids
-    /// [`Self::IndexTopk`] published (ascending, `-1` padded). Reduces to
-    /// `PoolLse` when a row's visible count is inside the budget.
     PoolLseSelected {
         q: ValueId,
         positions: ValueId,
@@ -616,12 +476,6 @@ pub enum Attention {
         lse: ValueId,
     },
 
-    // The PLE n-gram hasher (qwen4). Touches a sequence cache: the last
-    // `mults.len() - 1` token ids of each lane.
-    /// `ngram_ids[r, g·heads_per_ngram + h]` = the hashed (g+2)-gram id of
-    /// token `r` under head `h`'s prime: ids at `r, r-1, ...` (eos where the
-    /// window crosses a sequence start) are multiplied by `mults`,
-    /// xor-folded, reduced modulo `primes[·]` plus `offsets[·]`.
     PleNgramIds {
         ids: ValueId,
         state: ValueId,
@@ -632,8 +486,6 @@ pub enum Attention {
         heads_per_ngram: u32,
         ngram_ids: ValueId,
     },
-    /// Prefill form: walks the fire's ambient request boundaries, as the
-    /// chunked convolution does.
     PleNgramIdsChunked {
         ids: ValueId,
         state: ValueId,
@@ -646,44 +498,11 @@ pub enum Attention {
     },
 }
 
-/// What a [`Ragged`](Attention::Ragged) attention masks beyond its
-/// segments. The segment pairing is always in force; the mask names what a
-/// kernel must read on top of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RaggedMask {
-    /// Nothing beyond the segments: every query of segment `i` sees every
-    /// key of segment `i`. The indptrs are per-LANE CSRs
-    /// (`GeomKind::LaneIndptr`): a single-stream self-attention, or a
-    /// cross-attention pairing lane `i` of one stream with lane `i` of
-    /// another (Wan's text cross-attention, LTX's a2v/v2a).
     None,
-    /// The segments are attention GROUPS (`GeomKind::GroupIndptr`): every
-    /// lane a request submitted, packed contiguous, attends every other lane
-    /// of the same request — MM-DiT joint attention over `[txt ‖ img]`. The
-    /// same kernel as [`None`](RaggedMask::None); the variant records which
-    /// CSR the text passed.
     GroupBlockDiagonal,
-    /// [`GroupBlockDiagonal`](RaggedMask::GroupBlockDiagonal), except that a
-    /// row whose lane is on [`Stream::Reference`](crate::Stream::Reference)
-    /// attends only the rows of its own lane, while every other row of the
-    /// group still sees the reference rows (FLUX.2's `[txt ‖ target ‖
-    /// ref_1..n]` with refs self-attending). Which rows those are is read
-    /// per packed row from the two `GeomKind::ReferenceTag` tables — the
-    /// query side's and the key side's — carried here: a query with tag
-    /// `t >= 0` sees only keys with tag `t`; a query with tag `-1` sees
-    /// every key of its segment.
     ReferenceSelfOnly { q_tags: ValueId, kv_tags: ValueId },
-    /// The segment pairing, with an additive per-head bias on every logit
-    /// that depends only on the signed distance `kj − qi` inside the
-    /// segment: `s = q·k · sm_scale + table[h][kj − qi + max_len − 1]`,
-    /// the column clamped to the table. `table` is a `[heads, 2·max_len −
-    /// 1]` f32 value — one row per QUERY head — computed once per layer
-    /// from the checkpoint by [`Elementwise::RelativeBucketBias`] (a
-    /// bidirectional encoder's T5-style relative position bias) or any
-    /// other constant the text writes (an ALiBi slope table). `max_len` is
-    /// the longest segment the table answers exactly; a longer distance
-    /// reads the end column. The indptrs are whichever CSR the text passes,
-    /// as under [`None`](RaggedMask::None).
     RelativeBias { table: ValueId, max_len: u32 },
 }
 
@@ -718,7 +537,6 @@ impl Operands for Attention {
             Self::PrefillRel { q, plan, cache, bias, .. } => {
                 sink.extend([*q, *plan, *cache, *bias]);
             }
-            // Bound as `sink_id`: the field name collides with the `sink` param.
             Self::Sink { o, lse, sink: sink_id, .. } => sink.extend([*o, *lse, *sink_id]),
             Self::MergeLse { o1, lse1, o2, lse2, .. } => sink.extend([*o1, *lse1, *o2, *lse2]),
             Self::LogitSoftcap { x, .. } => sink.push(*x),

@@ -1,9 +1,3 @@
-//! Single-DFA fast path engine.
-//!
-//! When the entire grammar compiles down to a single DFA (no RuleRef edges
-//! in the root rule), this engine bypasses the stack parser entirely.
-//! Raw `byte_table[state*256+byte]` lookups at ~2ns/byte.
-
 use std::collections::VecDeque;
 
 use crate::bitmask::{self, set_bit};
@@ -27,8 +21,6 @@ impl SingleDfaEngine {
         }
     }
 
-    /// On success, pushes the previous state to history. On failure, leaves
-    /// state unmodified.
     pub(super) fn advance_bytes(&mut self, compiled: &CompiledGrammar, bytes: &[u8]) -> bool {
         let bt = compiled.rule_dfas[self.rule_idx].fsm.byte_table();
         let mut state = self.state as usize;
@@ -61,7 +53,6 @@ impl SingleDfaEngine {
         self.history.clear();
     }
 
-    /// Find a deterministic prefix by walking DFA edges.
     pub(super) fn find_jump_forward(&self, compiled: &CompiledGrammar) -> String {
         let rule_dfa = &compiled.rule_dfas[self.rule_idx];
         if rule_dfa.ends[self.state as usize] {
@@ -89,7 +80,6 @@ impl SingleDfaEngine {
         String::from_utf8(result).unwrap_or_default()
     }
 
-    /// Fill bitmask for current DFA state using pre-computed masks and trie walk.
     pub(super) fn fill_bitmask(
         &self,
         compiled: &CompiledGrammar,
@@ -105,7 +95,6 @@ impl SingleDfaEngine {
             return;
         }
 
-        // DFA mask fast path
         let dfa_key = (self.rule_idx as u32, self.state as u32);
         let mut need_trie_walk = false;
         if let Some(mask) = compiled.token_masks.get(&dfa_key) {
@@ -132,7 +121,6 @@ impl SingleDfaEngine {
         compiled.cache_bitmask(cache_key, bitmask);
     }
 
-    /// Trie walk for uncertain tokens using raw byte_table lookups.
     fn fill_bitmask_trie_walk(
         &self,
         compiled: &CompiledGrammar,
@@ -161,7 +149,6 @@ impl SingleDfaEngine {
                 continue;
             }
 
-            // Rewind to common prefix
             let common = super::longest_common_prefix(bytes, active_prefix);
             if common < active_prefix.len() {
                 stack.truncate(common + 1);

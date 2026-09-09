@@ -1,12 +1,3 @@
-//! Local backend: same-node device-to-device KV copy, with zero network and
-//! zero serialization. The D2D memcpy is issued through the [`D2dCopier`]
-//! seam (wraps `cudaMemcpyDeviceToDevice`/`hipMemcpy`), kept behind a trait
-//! so the backend is testable without a device.
-//!
-//! Push semantics: [`send`](LocalBackend) drives the copy from the sender's
-//! handle into the co-located destination's region; [`recv`](LocalBackend)
-//! only acknowledges, since the bytes are placed by the paired send.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,26 +8,18 @@ use crate::core::{
 use crate::error::{Result, TransportError};
 use engine::KvHandle;
 
-/// The device-copy primitive the local backend drives. A real implementation
-/// issues a same-node device-to-device copy; tests use a recording fake.
 pub trait D2dCopier: Send + Sync {
-    /// Copy `len` bytes from `src_addr` to `dst_addr` within the same node.
     fn copy(&self, src_addr: u64, dst_addr: u64, len: u64) -> Result<()>;
 }
 
-/// Same-node D2D KV-copy backend.
 pub struct LocalBackend {
     copier: Box<dyn D2dCopier>,
-    /// Co-located handles by owning worker id, so a `send`/`recv` can resolve
-    /// the peer's region on this node.
     peers: Mutex<HashMap<u64, KvHandle>>,
-    /// Completion state per issued transfer.
     transfers: Mutex<HashMap<u64, Completion>>,
     next_id: AtomicU64,
 }
 
 impl LocalBackend {
-    /// Build a local backend over the given device-copy primitive.
     pub fn new(copier: Box<dyn D2dCopier>) -> Self {
         Self {
             copier,
@@ -56,9 +39,6 @@ impl LocalBackend {
         id
     }
 
-    /// Copy `pages` from `src` into `dst` at matching page offsets. Both handles
-    /// are co-located (same node); the copy is a whole-page D2D move.
-    ///
     fn copy_pages(
         &self,
         src: &KvHandle,
@@ -132,12 +112,6 @@ impl Backend for LocalBackend {
         Ok(self.record(Completion::Done))
     }
 
-    /// Receive `pages` into the local `slot` from co-located worker `src`.
-    ///
-    /// No-op ack: the bytes are moved by the paired [`send`](LocalBackend::send),
-    /// so this ignores `slot` and `pages`, only validating `src` is a
-    /// registered peer and acknowledging. Arguments are kept for interface
-    /// uniformity with a future cross-node (`nixl`) backend.
     fn recv_mapped(
         &self,
         slot: &RegisteredHandle,
@@ -161,13 +135,10 @@ impl Backend for LocalBackend {
             .ok_or(TransportError::UnknownTransfer { id: id.0 })
     }
 
-    /// No-op: the local backend has no remote peers — co-located handles are
-    /// known via [`register`](LocalBackend::register), not connect metadata.
     fn connect(&self, _peer: &crate::core::PeerConn) -> Result<()> {
         Ok(())
     }
 
-    /// Empty: same-node D2D needs no advertised connect metadata.
     fn local_metadata(&self) -> Result<Vec<u8>> {
         Ok(Vec::new())
     }

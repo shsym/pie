@@ -1,27 +1,12 @@
-//! Typed physical-id free list over an engine-preallocated static pool.
-//!
-//! One pool per resource kind (`KvBackingPool`, `StateBackingPool`, ...). A
-//! pool only reserves and releases stable ids over static device memory; it
-//! owns no CoW logic, hash maintenance, mapping, residency, or refcounts.
-//! Freed ids are recycled only after the completion epoch of their last
-//! in-flight user retires.
-//!
-//! Some methods here are not yet called by the live single-model fire path,
-//! but are exercised by this module's own tests and reserved for upcoming
-//! increments; kept rather than deleted.
 #![allow(dead_code)]
 
-/// A typed physical id backed by a pool slot. Implemented by
-/// `PhysicalKvPageId` and RS-specific ids.
 pub trait PoolId: Copy {
     fn from_index(index: u32) -> Self;
     fn index(self) -> u32;
 }
 
-/// Free list with completion-epoch-delayed recycling.
 pub struct Pool<I> {
     free: Vec<I>,
-    /// Ids waiting for their epoch to retire before becoming allocatable.
     pending: Vec<(u64, Vec<I>)>,
     base: u32,
     capacity: u32,
@@ -37,7 +22,6 @@ impl<I: PoolId> Pool<I> {
             .checked_add(capacity)
             .expect("pool id range overflows u32");
         Self {
-            // Pop order: ascending ids first (cosmetic, deterministic tests).
             free: (base..end).rev().map(I::from_index).collect(),
             pending: Vec::new(),
             base,
@@ -45,13 +29,10 @@ impl<I: PoolId> Pool<I> {
         }
     }
 
-    /// Allocate one id, or `None` on exhaustion. Exhaustion propagates up to
-    /// the scheduler's contention ladder; the pool itself never blocks.
     pub fn try_alloc(&mut self) -> Option<I> {
         self.free.pop()
     }
 
-    /// Allocate `n` ids all-or-nothing.
     pub fn try_alloc_n(&mut self, n: usize) -> Option<Vec<I>> {
         if self.free.len() < n {
             return None;
@@ -60,16 +41,12 @@ impl<I: PoolId> Pool<I> {
         Some(self.free.split_off(at))
     }
 
-    /// Queue ids for recycling once `epoch` retires.
     pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
         if !ids.is_empty() {
             self.pending.push((epoch, ids));
         }
     }
 
-    /// Return ids that were reserved but never published or submitted to an
-    /// engine operation. No completion epoch is required because no device
-    /// user could have observed them.
     pub fn release_reserved(&mut self, ids: Vec<I>) {
         debug_assert!(ids.iter().all(|id| {
             id.index() >= self.base && id.index() < self.base.saturating_add(self.capacity)
@@ -81,7 +58,6 @@ impl<I: PoolId> Pool<I> {
         self.free.extend(ids);
     }
 
-    /// Retire all epochs `<= epoch`, returning their ids to the free list.
     pub fn retire_through(&mut self, epoch: u64) {
         let mut i = 0;
         while i < self.pending.len() {

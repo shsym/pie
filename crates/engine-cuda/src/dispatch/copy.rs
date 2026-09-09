@@ -1,7 +1,3 @@
-//! `Fallback::Copy`: gathers a region's row-shaped operands into a scratch
-//! slab, dispatches the region's nodes against the compacted rows, then
-//! scatters written rows back to their fire-wide positions.
-
 use kernels_cuda::{Tensor, layout};
 use model_compiler::Region;
 use model_exec::KernelError;
@@ -10,35 +6,21 @@ use model_ir::{Def, Dim, Operands, Operation, Ty, ValueId};
 
 use crate::run::Run;
 
-/// Name the copy slab is keyed by inside a context's scratch arena.
 const SLAB: &str = "fallback.copy";
 
-/// One rectangle a copied region compacts.
-///
-/// Keyed by the fire-wide tensor address (not `ValueId`), so two plan values
-/// aliased onto one arena column share a single compacted slot.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CopySlot {
-    /// The fire-wide rectangle. Its `ptr` is the key.
     pub(crate) wide: Tensor,
-    /// Where the compacted rectangle sits inside the slab.
     pub(crate) offset: u64,
-    /// The compacted rectangle, at the window's row count.
     pub(crate) tight: Tensor,
-    /// Does some node of the region read it? Then it is gathered in.
     pub(crate) read: bool,
-    /// Does some node of the region write it? Then it is scattered back.
     pub(crate) written: bool,
 }
 
-/// A copied region's whole plan: which rectangles move, and where in the slab.
 #[derive(Debug, Clone)]
 pub(crate) struct CopyPlan {
-    /// Region index this plan was built for; `u32::MAX` means none.
-    /// `Run::cut` checks it so a stale plan panics rather than misreads.
     pub(crate) region: u32,
     pub(crate) slots: Vec<CopySlot>,
-    /// The slab bytes this region needs.
     pub(crate) bytes: u64,
 }
 
@@ -53,8 +35,6 @@ impl Default for CopyPlan {
 }
 
 impl CopyPlan {
-    /// The compacted rectangle a fire-wide address was gathered into, if this
-    /// region moves it.
     pub(crate) fn tight(&self, wide: u64) -> Option<Tensor> {
         self.slots
             .iter()
@@ -63,21 +43,15 @@ impl CopyPlan {
     }
 }
 
-/// How many bytes one row of this handle takes.
 fn row_bytes(handle: Tensor) -> u64 {
     u64::from(handle.width) * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0)
 }
 
-/// Rounds up to 16-byte alignment so row copies can use their widest unit.
 fn align(at: u64) -> u64 {
     at.next_multiple_of(16)
 }
 
 impl Run<'_> {
-    /// Which rectangles this region moves, in operand order.
-    ///
-    /// A value is row-shaped iff its declared first dim is `Dim::Tokens` or
-    /// `TokensTimes` (a fixed multiple); everything else is passed whole.
     fn copy_plan(&self, region: &Region) -> CopyPlan {
         let mut plan = CopyPlan {
             region: self.at_region(),
@@ -89,7 +63,6 @@ impl Run<'_> {
             let Some(decl) = self.values().get(id.0 as usize) else {
                 return;
             };
-            // Cache spaces and struct payloads aren't rectangles; skip them.
             if matches!(decl.def, Def::Cache(_)) || matches!(decl.ty, Ty::Struct(_)) {
                 return;
             }
@@ -152,12 +125,9 @@ impl Run<'_> {
         plan
     }
 
-    /// Moves this region's rectangles in one direction (gather in / scatter
-    /// out). The slab is fetched once so plan and launch addresses agree.
     fn move_rows(&mut self, region: &Region, out: bool) -> Result<(), kernels_cuda::Error> {
         let mut plan = self.copy_plan(region);
         if plan.slots.is_empty() {
-            // record even an empty plan so `Run::cut` finds one for this region.
             self.set_copy(plan);
             return Ok(());
         }
@@ -186,7 +156,6 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The row map this region's window was gathered by.
     fn gathered_rows(&self, region: &Region) -> Tensor {
         self.window()
             .gathered
@@ -204,10 +173,6 @@ impl Run<'_> {
 }
 
 impl Serve for Run<'_> {
-    /// Reads the decision `Windows::of` already made: a region copies iff
-    /// its window carries a [`Gathered`] row map.
-    ///
-    /// [`Gathered`]: crate::window::Gathered
     fn copies(&self, _region: &Region) -> bool {
         self.window().gathered.is_some()
     }

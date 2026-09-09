@@ -7,19 +7,6 @@ namespace pie::elemwise {
 
 constexpr int MAX_HC_MULT = 8;
 
-// `mixes[n, o] = dot(normed[n, :], hc_fn[o, :])` — the per-token mix row
-// `hc_gates` below splits, projected out of the weightless-RMS-normed stream
-// row by the layer's own `{attn,ffn}_hc.fn` plane (`[2M + M*M, M*H]`).
-//
-// **A GEMM, AND NOT `linear.matmul`**: both operands are f32 (the sinkhorn
-// downstream is f32 by design and `hc_rmsnorm_f32` widens for that reason)
-// and the dense gemm points are bf16. The rectangle is also the smallest in
-// this tree — `2M + M*M` is twenty-four columns at `hc_mult 4` — so one block
-// per `(row, column)` reducing `M*H` is the shape the arithmetic has.
-//
-// The point is ONE-DIMENSIONAL and the `(row, column)` pair is derived, which
-// is `attn/hc.metal`'s twin exactly: that plane's position attributes must
-// all be scalars, and the two shaders index one arithmetic.
 template <int BLOCK = 256>
 __global__ void hc_project(
     const float* __restrict__ normed,
@@ -31,12 +18,9 @@ __global__ void hc_project(
 {
     const int o = static_cast<int>(blockIdx.x) % mix_hc;
     const int n = static_cast<int>(blockIdx.x) / mix_hc;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `normed` and `mixes` are
-    // both row planes handed at their base.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int tid = threadIdx.x;
@@ -79,13 +63,9 @@ __global__ void hc_gates(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: `mixes`, `residual`,
-    // `post_mix`, `comb_mix` and `layer_input` are all row planes handed at
-    // their base and move together; `scale` and `base` are per-stream tables.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int tid = threadIdx.x;
@@ -196,13 +176,9 @@ __global__ void hc_fold(
 
     const int h = static_cast<int>(idx % H);
     const int n = static_cast<int>(idx / H);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `comb_mix`, `post_mix`,
-    // `x`, `residual` and `out` are all row planes and move together. The
-    // `idx >= N * H` bound above is the LAUNCH's, and stays on the raw index.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const float* comb_n = comb_mix + static_cast<long long>(row) * M * M;
@@ -226,9 +202,6 @@ __global__ void hc_fold(
     }
 }
 
-// **THE TRUNK COLLAPSE** (`elementwise.hc_collapse`, `hc_head`): `M` sigmoid
-// gates off the `[N, M]` mix row `hc_project` lands through `hc_head.fn`, and
-// the streams folded under them — no post, no combiner, no Sinkhorn.
 template <class T, int BLOCK = 256>
 __global__ void hc_head_postprocess(
     const float* __restrict__ mixes,
@@ -242,9 +215,7 @@ __global__ void hc_head_postprocess(
     const u32* __restrict__ win)
 {
     const int block_row = blockIdx.x;
-    // The staged-geometry seat (hc_gates' idiom): a replay whose grid was
-    // carved at a bucket retires its padded rows here, off a word the fire
-    // staged; `win[1]` is where the live rows start.
+
     if (win != nullptr && block_row >= static_cast<int>(win[0])) return;
     const int n = win != nullptr ? block_row + static_cast<int>(win[1]) : block_row;
     const int tid = threadIdx.x;
@@ -283,13 +254,9 @@ __global__ void hc_expand(
     if (idx >= static_cast<long long>(N) * H) return;
     const int n = static_cast<int>(idx / H);
     const int h = static_cast<int>(idx % H);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `input` and `output` are
-    // both row planes handed at their base. The `idx >= N * H` bound above is
-    // the LAUNCH's, and stays on the raw index.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const T val = input[static_cast<long long>(row) * H + h];
@@ -307,12 +274,9 @@ __global__ void hc_rmsnorm_f32(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `input` and `output` are
-    // both row planes handed at their base.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int tid = threadIdx.x;
@@ -404,14 +368,7 @@ __global__ void per_head_rmsnorm(
 }
 
 
-// ---- The GATED-RESIDUAL flavor (qwen4) ----------------------------------
-// Same residual-stream algebra as the sinkhorn family above, a different
-// gate: per-element sigmoid gates a low-rank GEMM chain produced. The GEMMs
-// are ordinary linear nodes; these two say only the arithmetic no other op
-// says.
 
-// y[h] = mean_s( sigmoid(gates[s*H + h]) * normed[s*H + h] ). One block per
-// row; gates and normed are [N, M*H], y is [N, H].
 template <class T, int BLOCK = 256>
 __global__ void hc_mix(
     const T* __restrict__ gates,
@@ -422,12 +379,9 @@ __global__ void hc_mix(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `gates`, `normed` and `y`
-    // are all row planes handed at their base and move together.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int tid = threadIdx.x;
@@ -447,8 +401,6 @@ __global__ void hc_mix(
     }
 }
 
-// hyper[s*H + h] += 2 * sigmoid(gates[s] / M) * o[h], in place. One block
-// per row; o is [N, H], gates is [N, M] of raw logits.
 template <class T, int BLOCK = 256>
 __global__ void hc_inject(
     const T* __restrict__ o,
@@ -459,12 +411,9 @@ __global__ void hc_inject(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `o`, `gates` and `hyper`
-    // are all row planes handed at their base and move together.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int tid = threadIdx.x;
@@ -489,9 +438,6 @@ __global__ void hc_inject(
     }
 }
 
-// The PLE gate (qwen4): one block per (row, stream), flattened the way the
-// grouped norms flatten — block b is row b / M, stream b % M. The dot over H
-// is a block reduction; the gate is sigmoid of its signed square root.
 template <class T, int BLOCK = 256>
 __global__ void ple_gate(
     const T* __restrict__ key,
@@ -506,13 +452,9 @@ __global__ void ple_gate(
     const int tid = threadIdx.x;
     const int n = b / M;
     const int s = b - n * M;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `key`, `query`, `value` and
-    // `y` are all row planes handed at their base. The stream `s` WITHIN the
-    // row is a position in the flattening, not a row, and does not move.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const T* kr = key + (static_cast<long long>(row) * M + s) * H;
@@ -526,8 +468,7 @@ __global__ void ple_gate(
     }
     __shared__ float buf[BLOCK];
     const float dot = block_reduce_sum_fast<BLOCK>(local, buf) * rsqrtf((float)H);
-    // The reference's own damping: sqrt of the clamped magnitude, times
-    // the SIGN — and sign(0) is 0, not the clamp floor.
+
     float damped = sqrtf(fmaxf(fabsf(dot), 1e-6f));
     damped = dot > 0.f ? damped : (dot < 0.f ? -damped : 0.f);
     const float gate = 1.f / (1.f + __expf(-damped));
@@ -537,4 +478,4 @@ __global__ void ple_gate(
     }
 }
 
-} // namespace pie::elemwise
+}

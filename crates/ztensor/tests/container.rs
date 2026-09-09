@@ -1,6 +1,3 @@
-//! The container: round-trip, canonical determinism, blob sharing, and the
-//! files that must be rejected.
-
 use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
@@ -19,11 +16,35 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+fn container_every_case() {
+    roundtrip_dense();
+    an_indexed_source_locates_without_mapping();
+    canonical_is_deterministic();
+    non_canonical_writes_are_reproducible_too();
+    tied_weights_share_one_blob();
+    zero_length_tensor();
+    canonical_requires_sorted_insertion();
+    alignment_is_not_the_canonical_switch();
+    a_non_canonical_writer_still_places_at_64_kib();
+    reject_bad_footer_magic();
+    reject_previous_version();
+    reject_corrupt_manifest();
+    reject_truncated();
+    reject_partial_overlap();
+    identical_refs_are_legal();
+    reject_misaligned_blob();
+    reject_size_mismatch();
+    reject_unknown_leaf();
+    attributes_are_given_one_way_or_the_other();
+    an_object_takes_one_payload();
+    only_an_external_blob_takes_a_digest();
+}
+
 #[test]
 fn roundtrip_dense() {
     let path = tmp("roundtrip.zt");
     let a = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let b: Vec<u8> = (0..10).collect(); // 5 bf16 elements
+    let b: Vec<u8> = (0..10).collect();
     let c: Vec<u8> = vec![7; 7];
 
     let mut w = Writer::create(&path).unwrap();
@@ -44,15 +65,11 @@ fn roundtrip_dense() {
     assert_eq!(&*src.tensor("c.mask").unwrap().bytes().unwrap(), &c[..]);
     assert_eq!(aw.verify().unwrap(), Verified::Digest);
 
-    // Canonical placement: every blob at a 64 KiB boundary.
     for tensor in src.tensors() {
         assert_eq!(tensor.locate().unwrap().offset % ALIGN_CANONICAL, 0);
     }
 }
 
-/// A source is one type whichever way it was opened, and `bytes()` is honest
-/// about which half of the bargain it kept.
-#[test]
 fn an_indexed_source_locates_without_mapping() {
     let path = tmp("indexed.zt");
     let data = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
@@ -63,7 +80,6 @@ fn an_indexed_source_locates_without_mapping() {
     let mapped = Source::open(&path).unwrap();
     let indexed = Source::options().map(false).open(&path).unwrap();
 
-    // The same address either way.
     let here = mapped.tensor("x").unwrap().locate().unwrap();
     let there = indexed.tensor("x").unwrap().locate().unwrap();
     assert_eq!(here.offset, there.offset);
@@ -87,7 +103,6 @@ fn an_indexed_source_locates_without_mapping() {
     ));
 }
 
-#[test]
 fn canonical_is_deterministic() {
     let write = |path: &PathBuf| {
         let mut w = Writer::create(path).unwrap();
@@ -103,15 +118,6 @@ fn canonical_is_deterministic() {
     assert_eq!(fs::read(&p1).unwrap(), fs::read(&p2).unwrap());
 }
 
-/// Writing the same thing twice gives the same bytes outside canonical form
-/// too, which is the path every sharded model takes.
-///
-/// Nothing in the non-canonical writer reads the clock or the environment, so
-/// this holds by construction. It is pinned here because "holds by
-/// construction" is a claim about code as it stands, and this is the path
-/// sharding uses: canonical form is single-file by rule 6, so any model split
-/// across files is written by the code this covers and by nothing else.
-#[test]
 fn non_canonical_writes_are_reproducible_too() {
     let write = |path: &PathBuf| {
         let mut w = Writer::options()
@@ -120,9 +126,6 @@ fn non_canonical_writes_are_reproducible_too() {
             .blocks(8)
             .create(path)
             .unwrap();
-        // Deliberately unsorted, plane-written, attribute-carrying, block
-        // digested: the freedoms canonical form removes are exactly what is
-        // exercised here.
         let later = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
         w.object("z.later", |o| {
             o.shape([2u64, 2])
@@ -152,7 +155,6 @@ fn non_canonical_writes_are_reproducible_too() {
     );
 }
 
-#[test]
 fn tied_weights_share_one_blob() {
     let path = tmp("tied.zt");
     let data = f32_bytes(&[42.0; 256]);
@@ -168,7 +170,6 @@ fn tied_weights_share_one_blob() {
     assert_eq!(src.tensor("embed").unwrap().map().unwrap(), &data[..]);
 }
 
-#[test]
 fn zero_length_tensor() {
     let path = tmp("zero.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -178,7 +179,6 @@ fn zero_length_tensor() {
     assert_eq!(src.tensor("empty").unwrap().map().unwrap().len(), 0);
 }
 
-#[test]
 fn canonical_requires_sorted_insertion() {
     let path = tmp("unsorted.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -187,9 +187,6 @@ fn canonical_requires_sorted_insertion() {
     assert!(matches!(err, Error::InvalidInput(_)));
 }
 
-/// The alignment knob and the canonical-form switch are different questions,
-/// and asking one while meaning the other is refused rather than obeyed.
-#[test]
 fn alignment_is_not_the_canonical_switch() {
     let err = Writer::options()
         .align(4096)
@@ -201,7 +198,6 @@ fn alignment_is_not_the_canonical_switch() {
         "the error should say how to mean it: {message}"
     );
 
-    // Said properly, insertion order is free.
     let path = tmp("unsorted-ok.zt");
     let mut w = Writer::options()
         .canonical(false)
@@ -214,13 +210,6 @@ fn alignment_is_not_the_canonical_switch() {
     assert_eq!(Source::open(&path).unwrap().len(), 2);
 }
 
-/// Leaving canonical form gives up byte-reproducible placement, not placement.
-///
-/// It used to drop to the 4 KiB floor, which mattered because a sharded model
-/// *cannot* be canonical (§6.4 rule 6): every sharded root silently lost
-/// per-tensor page exclusivity on any host with pages above 4 KiB unless its
-/// author knew to ask for the alignment back.
-#[test]
 fn a_non_canonical_writer_still_places_at_64_kib() {
     let path = tmp("noncanon-align.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
@@ -239,7 +228,6 @@ fn a_non_canonical_writer_still_places_at_64_kib() {
         );
     }
 
-    // And asking for the floor still gets the floor.
     let floor = tmp("noncanon-floor.zt");
     let mut w = Writer::options()
         .canonical(false)
@@ -260,10 +248,6 @@ fn a_non_canonical_writer_still_places_at_64_kib() {
     );
 }
 
-// =======================================================================
-// Must-reject cases
-// =======================================================================
-
 fn write_small(path: &PathBuf) {
     let mut w = Writer::create(path).unwrap();
     w.add("t", [2u64], Leaf::U8, &[1, 2]).unwrap();
@@ -277,7 +261,6 @@ fn expect_reject(path: &PathBuf, rule: Rule) {
     }
 }
 
-#[test]
 fn reject_bad_footer_magic() {
     let path = tmp("badfooter.zt");
     write_small(&path);
@@ -287,8 +270,6 @@ fn reject_bad_footer_magic() {
     expect_reject(&path, Rule::FooterMagic);
 }
 
-/// A v2 file is a different format: refused by version, not misread.
-#[test]
 fn reject_previous_version() {
     let path = tmp("v2.zt");
     write_small(&path);
@@ -299,7 +280,6 @@ fn reject_previous_version() {
     expect_reject(&path, Rule::Version);
 }
 
-#[test]
 fn reject_corrupt_manifest() {
     let path = tmp("badmanifest.zt");
     write_small(&path);
@@ -311,7 +291,6 @@ fn reject_corrupt_manifest() {
     expect_reject(&path, Rule::ManifestHash);
 }
 
-#[test]
 fn reject_truncated() {
     let path = tmp("truncated.zt");
     write_small(&path);
@@ -320,16 +299,12 @@ fn reject_truncated() {
     assert!(Source::open(&path).unwrap_err().rule().is_some());
 }
 
-/// Assembles a file by hand: magic, blobs, a caller-supplied manifest value,
-/// and a correct footer. Lets tests express structurally hostile manifests
-/// that the writer would refuse to produce.
 fn assemble(path: &PathBuf, data_len: u64, manifest: &Value) {
     let manifest_bytes = cbor::encode(manifest).unwrap();
     let m_off = (8 + data_len).div_ceil(4096) * 4096;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&MAGIC);
     bytes.resize(m_off as usize, 0);
-    // fill the data region with a marker so blobs have content
     for b in bytes.iter_mut().take(m_off as usize).skip(8) {
         *b = 0xab;
     }
@@ -372,10 +347,8 @@ fn manifest_of(objs: Vec<(&str, Value)>) -> Value {
     )])
 }
 
-#[test]
 fn reject_partial_overlap() {
     let path = tmp("overlap.zt");
-    // blob A: [4096, 12288), blob B: [8192, 8200), which is inside A.
     let m = manifest_of(vec![
         ("a", obj("f32", &[2048], 4096, 8192)),
         ("b", obj("f32", &[2], 8192, 8)),
@@ -384,7 +357,6 @@ fn reject_partial_overlap() {
     expect_reject(&path, Rule::BlobOverlap);
 }
 
-#[test]
 fn identical_refs_are_legal() {
     let path = tmp("aliased.zt");
     let m = manifest_of(vec![
@@ -399,7 +371,6 @@ fn identical_refs_are_legal() {
     );
 }
 
-#[test]
 fn reject_misaligned_blob() {
     let path = tmp("misaligned.zt");
     let m = manifest_of(vec![("a", obj("f32", &[2], 4100, 8))]);
@@ -407,16 +378,13 @@ fn reject_misaligned_blob() {
     expect_reject(&path, Rule::BlobAlignment);
 }
 
-#[test]
 fn reject_size_mismatch() {
     let path = tmp("badsize.zt");
-    // f32 x [3] = 12 bytes, but the blob claims 8.
     let m = manifest_of(vec![("a", obj("f32", &[3], 4096, 8))]);
     assemble(&path, 8192, &m);
     expect_reject(&path, Rule::Size);
 }
 
-#[test]
 fn reject_unknown_leaf() {
     let path = tmp("badleaf.zt");
     let m = manifest_of(vec![("a", obj("f4", &[2], 4096, 1))]);
@@ -424,11 +392,6 @@ fn reject_unknown_leaf() {
     expect_reject(&path, Rule::Type);
 }
 
-/// `attributes()` hands over a whole map and `attr()` adds one entry. Mixing
-/// them is refused rather than resolved: whichever silently won, the other
-/// would lose object metadata with nothing said, which for a named layout is
-/// the block geometry a reader needs to address bytes.
-#[test]
 fn attributes_are_given_one_way_or_the_other() {
     let path = tmp("attrs-mixed.zt");
     let mut w = Writer::create(&path).unwrap();
@@ -456,13 +419,6 @@ fn attributes_are_given_one_way_or_the_other() {
     assert_eq!(attrs.get("bits").and_then(cbor::Value::as_u64), Some(4));
 }
 
-/// Two payloads on one object is a contradiction, not an override.
-///
-/// The builder methods return `Self`, so neither of them can refuse; the
-/// second one records the conflict and the object refuses to build. Before
-/// this, `.bytes(x).length(n)` compiled, dropped `x` silently, and produced a
-/// file whose blob was never written.
-#[test]
 fn an_object_takes_one_payload() {
     let path = tmp("two-payloads.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
@@ -477,7 +433,6 @@ fn an_object_takes_one_payload() {
         "the error has to name both setters, got: {message}"
     );
 
-    // Order is reported as given, and the object did not land.
     let err = w
         .object("t", |o| o.shape([4u64]).term(Leaf::U8).length(4).bytes(&data))
         .unwrap_err();
@@ -488,10 +443,6 @@ fn an_object_takes_one_payload() {
     w.abandon();
 }
 
-/// A digest is for bytes this writer will not see. Supplying one for bytes it
-/// does write could only agree with the computed digest or be wrong, so it is
-/// refused rather than ignored.
-#[test]
 fn only_an_external_blob_takes_a_digest() {
     let path = tmp("digest-on-local.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();

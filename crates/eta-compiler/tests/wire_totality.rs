@@ -1,17 +1,10 @@
-//! Fuzzes the container decoder over real encodings and their byte-flip
-//! mutants: checks no mutant panics or runs away, and that no proper prefix
-//! or extended suffix of a valid encoding ever decodes.
-
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-
 use msl_corpus::{GOLDEN_NAMES, extended_traces, golden_container};
 
-/// A decoder and the real encodings it is swept over.
 struct Sweep {
     name: &'static str,
-    /// `true` = accepted.
     run: fn(&[u8]) -> bool,
     seeds: fn() -> Vec<Vec<u8>>,
 }
@@ -19,7 +12,6 @@ struct Sweep {
 const SWEEPS: &[Sweep] = &[Sweep {
     name: "ETA container",
     run: |bytes| match eta_ir::container::decode(bytes) {
-        // Re-encode so `encode` is exercised on every accepted mutant too.
         Ok(container) => container.encode() == bytes,
         Err(_) => false,
     },
@@ -38,7 +30,6 @@ fn containers() -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Framing: a message must be exactly as long as it says it is.
 #[test]
 fn truncation_and_trailing_bytes_are_never_accepted() {
     for sweep in SWEEPS {
@@ -72,4 +63,3 @@ fn truncation_and_trailing_bytes_are_never_accepted() {
         }
     }
 }
-

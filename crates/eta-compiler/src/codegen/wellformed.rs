@@ -1,6 +1,3 @@
-//! What must hold of a normalized stage before any backend emits from it: a region's node list indexes the op list, its inputs/outputs index the value table, a value's rank fits the wire, and its static extents multiply without overflowing `u32`. An emitter that skips these indexes past the end of a table while building one.
-//! Backend-agnostic; anything backend-specific stays with its backend.
-
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::op_view::OpView;
 
@@ -8,7 +5,6 @@ use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 use eta_ir::op::{OP_TABLE, VARIADIC, tags};
 use eta_ir::types::MAX_RANK;
 
-/// Every value type in the stage is one the runtimes can describe.
 pub fn value_types_valid(stage: &CompiledStage) -> Result<(), EmitError> {
     for value_type in &stage.normalized.value_types {
         value_type_valid(value_type)?;
@@ -16,7 +12,6 @@ pub fn value_types_valid(stage: &CompiledStage) -> Result<(), EmitError> {
     Ok(())
 }
 
-/// Rank fits the wire, and the static extents multiply within `u32`. Symbolic dimensions are skipped rather than assumed to be 1: their extent is a bind-time fact.
 pub fn value_type_valid(value_type: &SymbolicType) -> Result<(), EmitError> {
     if value_type.dims.len() > MAX_RANK {
         return Err(EmitError::NormalizedValueTypeInvalid);
@@ -34,8 +29,6 @@ pub fn value_type_valid(value_type: &SymbolicType) -> Result<(), EmitError> {
     Ok(())
 }
 
-/// Every index the region carries points at something that exists. The node list must also be strictly increasing: both fused emitters walk it once in order and assume a value is defined before it is read.
-/// `form` only chooses which spelling of the error the caller reports.
 pub fn region_ranges_valid(
     stage: &CompiledStage,
     region: &Region,
@@ -76,7 +69,6 @@ pub fn region_ranges_valid(
     Ok(())
 }
 
-/// Every op in the stage defines and reads values that exist, in that order. Walked over the whole op list because `result_base` accumulates across the stage.
 pub fn ops_valid(stage: &CompiledStage, site: ValueLayoutSite) -> Result<(), EmitError> {
     let mut result_base: u32 = 0;
     for op in &OpView::of_all(&stage.normalized.ops) {
@@ -86,7 +78,6 @@ pub fn ops_valid(stage: &CompiledStage, site: ValueLayoutSite) -> Result<(), Emi
     value_layout_valid(result_base, stage, site)
 }
 
-/// The ops define exactly the values the stage declares — no more, no fewer. `op_valid` only bounds each op from above, so a longer value table would pass it and leave an unwritten slot something downstream may read.
 pub fn value_layout_valid(
     defined: u32,
     stage: &CompiledStage,
@@ -98,17 +89,13 @@ pub fn value_layout_valid(
     Ok(())
 }
 
-/// One op's arity, result range, operand dominance, predicate payload and channel slot, given the value id its first result takes.
-/// The pivot payload is easily missed: it's an operand for indexing purposes but not in `args`, so a walk over `args` alone leaves it unchecked.
 pub fn op_valid(op: &OpView, result_base: u32, stage: &CompiledStage) -> Result<(), EmitError> {
     let value_types = &stage.normalized.value_types;
-    // infallible: OP_TABLE has a row per Op variant.
     let spec = OP_TABLE
         .iter()
         .find(|spec| spec.tag == op.tag)
         .expect("every Op tag is in OP_TABLE");
 
-    // pivot_threshold takes its threshold as a predicate payload, so wire arity is one below the table's operand count.
     let expected_arity = if op.tag == tags::PIVOT_THRESHOLD {
         1
     } else {
@@ -123,7 +110,6 @@ pub fn op_valid(op: &OpView, result_base: u32, stage: &CompiledStage) -> Result<
     {
         return Err(EmitError::NormalizedOpResultRangeInvalid);
     }
-    // strictly below result_base: an operand at or past this op's own first result is a use before def.
     if op.args.iter().any(|argument| *argument >= result_base) {
         return Err(EmitError::NormalizedOperandNotPriorValue);
     }

@@ -18,6 +18,8 @@ template <typename T>
 
 instantiate_layer_scalar(bfloat16, bfloat)
 
+instantiate_layer_scalar(float32, float)
+
 template <typename T>
 [[kernel]] void layer_scalar_mul_stated(
     const device T* x                [[buffer(0)]],
@@ -34,10 +36,8 @@ template <typename T>
       const device itype*, const constant float&, device itype*, uint);
 
 instantiate_layer_scalar_stated(bfloat16, bfloat)
+instantiate_layer_scalar_stated(float32, float)
 
-// `silu(s * x)`, in place — qwen4's shared-expert gate, whose scale is a plan
-// constant and not a plane. The scalar is a launch argument and moves with
-// nothing; the grid is exact, so no lane is out of the row.
 template <typename T>
 [[kernel]] void silu_scaled(
     device T* x                      [[buffer(0)]],
@@ -53,3 +53,4 @@ template <typename T>
       device itype*, const constant float&, uint);
 
 instantiate_silu_scaled(bfloat16, bfloat)
+instantiate_silu_scaled(float32, float)

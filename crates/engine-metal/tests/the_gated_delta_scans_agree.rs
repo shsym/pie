@@ -1,28 +1,3 @@
-//! **THE THREE REGISTER SCANS LAND ONE SET OF BITS, AND THEY ARE THE OLD
-//! KERNELS' NUMBERS** — the gate for `ssm_gdn_scan.metal`'s one-token step
-//! and committed twin.
-//!
-//! The serving engine runs a plain decode through the step, a prefill through
-//! the scan and a speculative window through the committed scan. A guest that
-//! verifies a window against a plain decode compares their tokens, so what
-//! this pins first is that the three kernels are ONE arithmetic: over the same
-//! `T` tokens, `T` one-row steps, one committed run with `commit = T` and one
-//! plain scan must leave the same bank and the same outputs **byte for byte**,
-//! and a committed run with `commit = j < T` must leave the bank `j` steps
-//! leave. Then, against the threadgroup kernels they replace
-//! (`ssm_gated_delta.metal`'s `gated_delta` and `gated_delta_committed`), the
-//! new kernels must agree to the reassociation floor — the shuffle tree sums
-//! the same terms in another order, so the answers part in the last bits and
-//! nowhere else.
-//!
-//! qwen3.6-27B's shape (16 key heads, 48 value heads, 128 wide), pseudo-random
-//! operands, a dense pseudo-random starting bank so the recurrence has memory
-//! to carry.
-//!
-//! ```text
-//! cargo test -p engine-metal --release --test the_gated_delta_scans_agree -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
@@ -37,19 +12,14 @@ const K_HEADS: u32 = 16;
 const V_HEADS: u32 = 48;
 const K_DIM: u32 = 128;
 const V_DIM: u32 = 128;
-/// The fused row: `[q | k | v]`.
 const QKV_WIDTH: u32 = 2 * K_HEADS * K_DIM + V_HEADS * V_DIM;
 const Y_WIDTH: u32 = V_HEADS * V_DIM;
-/// One bank: `[v_heads][v_dim][k_dim]` f32.
 const BANK_FLOATS: u64 = V_HEADS as u64 * V_DIM as u64 * K_DIM as u64;
-/// Tokens in the run — a full verify window.
 const T: u32 = 16;
-/// The truncated commit.
 const J: u32 = 5;
 
 const OLD_FILE: &str = "attn/ssm_gated_delta.metal";
 
-/// Banks, one per arm.
 const SLOTS: u32 = 8;
 const SLOT_OLD_COMMITTED: u32 = 0;
 const SLOT_NEW_COMMITTED: u32 = 1;
@@ -66,7 +36,6 @@ fn noise(at: u64) -> u32 {
     (x >> 32) as u32
 }
 
-/// A pseudo-random float in `[-1, 1)`.
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
@@ -92,7 +61,6 @@ fn ints(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|i| i.to_le_bytes()).collect()
 }
 
-/// Relative rms of the difference, and the worst absolute difference.
 fn compare(want: &[f32], got: &[f32]) -> (f64, f64) {
     assert_eq!(want.len(), got.len());
     let mut diff = 0.0f64;
@@ -117,7 +85,6 @@ fn the_scans_agree() {
     let pipelines = Pipelines::new();
     eprintln!("device: {}", device.name());
 
-    // ── operands ─────────────────────────────────────────────────────────
     let mut qkv_b = Buffer::zeroed(&device, u64::from(T) * u64::from(QKV_WIDTH) * 2).expect("qkv");
     {
         let mut bytes = Vec::with_capacity((T * QKV_WIDTH * 2) as usize);
@@ -126,7 +93,6 @@ fn the_scans_agree() {
         }
         qkv_b.write(0, &bytes).expect("write qkv");
     }
-    // `[g_log | beta]` a row: a decay in (e^-0.4, e^-0.02), a beta in (0.3, 0.9).
     let mut gates_b = Buffer::zeroed(&device, u64::from(T) * u64::from(2 * V_HEADS) * 4).expect("gates");
     {
         let mut g = Vec::with_capacity((T * 2 * V_HEADS) as usize);
@@ -140,7 +106,6 @@ fn the_scans_agree() {
         }
         gates_b.write(0, &as_bytes(&g)).expect("write gates");
     }
-    // Every slot starts from the same dense bank.
     let mut state_b = Buffer::zeroed(&device, u64::from(SLOTS) * BANK_FLOATS * 4).expect("state");
     {
         let bank: Vec<f32> = (0..BANK_FLOATS).map(|at| 0.1 * unit(at ^ 0xC3C3)).collect();
@@ -153,7 +118,6 @@ fn the_scans_agree() {
     let y_b: Vec<Buffer> = (0..SLOTS)
         .map(|_| Buffer::zeroed(&device, u64::from(T) * u64::from(Y_WIDTH) * 4).expect("y"))
         .collect();
-    // Tables: one lane, the run is the whole CSR, no replay.
     let mut indptr_b = Buffer::zeroed(&device, 8).expect("indptr");
     indptr_b.write(0, &ints(&[0, T as i32])).expect("write indptr");
     let mut replay_b = Buffer::zeroed(&device, 4).expect("replay");
@@ -162,7 +126,6 @@ fn the_scans_agree() {
     commit_t_b.write(0, &ints(&[T as i32])).expect("write commit");
     let mut commit_j_b = Buffer::zeroed(&device, 4).expect("commit j");
     commit_j_b.write(0, &ints(&[J as i32])).expect("write commit j");
-    // One slot table per arm, i32 for the committed tables and u32 for the pools.
     let slot_tables: Vec<Buffer> = (0..SLOTS)
         .map(|s| {
             let mut b = Buffer::zeroed(&device, 4).expect("slot");
@@ -182,7 +145,6 @@ fn the_scans_agree() {
     let h_commit_j = bind(&commit_j_b);
     let h_slot: Vec<u32> = slot_tables.iter().map(bind).collect();
     let h_y: Vec<u32> = y_b.iter().map(bind).collect();
-    // Row `t` of qkv, gates and y as its own one-row tensor.
     let row = |b: &Buffer, t: u32, width: u32, elem: u64| {
         let stride = u64::from(width) * elem;
         handles.bind(b, u64::from(t) * stride, stride).expect("a row handle")
@@ -217,7 +179,6 @@ fn the_scans_agree() {
         frame.commit().expect("the commit");
     };
 
-    // ── A: the old committed kernel, the whole run, commit = T ───────────
     run(&|sink| {
         sink.fire(
             Fire::at(OLD_FILE, "gated_delta_committed_bfloat16")
@@ -243,7 +204,6 @@ fn the_scans_agree() {
         .expect("the old committed kernel");
     });
 
-    // ── B: the new committed scan, commit = T; B': commit = J ────────────
     for (slot, commit) in [(SLOT_NEW_COMMITTED, h_commit_t), (SLOT_NEW_COMMITTED_J, h_commit_j)] {
         run(&|sink| {
             ssm::gated_delta_committed(
@@ -264,7 +224,6 @@ fn the_scans_agree() {
         });
     }
 
-    // ── C: the new step, one token a fire; C': the first J only ──────────
     for (slot, steps) in [(SLOT_NEW_STEPS, T), (SLOT_NEW_STEPS_J, J)] {
         for t in 0..steps {
             let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
@@ -277,7 +236,6 @@ fn the_scans_agree() {
         }
     }
 
-    // ── D: the plain scan over the CSR ───────────────────────────────────
     run(&|sink| {
         ssm::gated_delta_chunked(
             sink,
@@ -294,7 +252,6 @@ fn the_scans_agree() {
         .expect("the scan");
     });
 
-    // ── E: the old step kernel, one token a fire ─────────────────────────
     for t in 0..T {
         let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
         let g = Tensor::new(row(&gates_b, t, 2 * V_HEADS, 4), 1, 2 * V_HEADS, Dtype::F32);
@@ -320,7 +277,6 @@ fn the_scans_agree() {
         });
     }
 
-    // ── read back ────────────────────────────────────────────────────────
     let bank = |s: u32| {
         let raw = handles
             .read(handles.bind(&state_b, u64::from(s) * BANK_FLOATS * 4, BANK_FLOATS * 4).expect("a bank handle"), BANK_FLOATS * 4)
@@ -330,25 +286,18 @@ fn the_scans_agree() {
     let out = |s: u32| floats(&handles.read(h_y[s as usize], u64::from(T) * u64::from(Y_WIDTH) * 4).expect("read y"));
     let rows = |v: &[f32], n: u32| v[..(n * Y_WIDTH) as usize].to_vec();
 
-    // 1. One arithmetic: steps, committed and scan land the same bytes.
     let steps_bank = bank(SLOT_NEW_STEPS);
     let steps_y = out(SLOT_NEW_STEPS);
     assert_eq!(bank(SLOT_NEW_COMMITTED), steps_bank, "committed(T) left other bank bits than T steps");
     assert_eq!(out(SLOT_NEW_COMMITTED), steps_y, "committed(T) answered other bits than T steps");
     assert_eq!(bank(SLOT_NEW_SCAN), steps_bank, "the scan left other bank bits than T steps");
     assert_eq!(out(SLOT_NEW_SCAN), steps_y, "the scan answered other bits than T steps");
-    // 2. The commit is live: `commit = J` leaves the bank J steps leave, and
-    //    still answers every row of the run.
     assert_eq!(bank(SLOT_NEW_COMMITTED_J), bank(SLOT_NEW_STEPS_J), "committed(J) left other bank bits than J steps");
     assert_ne!(bank(SLOT_NEW_COMMITTED_J), steps_bank, "J and T steps leave the same bank, so the commit claim can't tell them apart");
     assert_eq!(out(SLOT_NEW_COMMITTED_J), steps_y, "committed(J) answered the rows past J other bits than the steps");
     assert_eq!(rows(&out(SLOT_NEW_STEPS_J), J), rows(&steps_y, J));
     eprintln!("one arithmetic: {T} steps == committed({T}) == scan; committed({J}) bank == {J} steps  (byte for byte)");
 
-    // 3. Against the threadgroup kernels: the reassociation floor.
-    //    5.2e-9 rms over 512 tokens is what the scan header measured against
-    //    the chunked kernel; 1e-5 is three orders above that and four below
-    //    a wrong answer.
     let floor = 1e-5f64;
     for (name, old_slot, new_slot) in [
         ("committed", SLOT_OLD_COMMITTED, SLOT_NEW_COMMITTED),
@@ -362,8 +311,6 @@ fn the_scans_agree() {
         assert!(bank_rms <= floor, "{name}: the new kernel's bank parts from the old by {bank_rms:.2e} rms");
         assert!(y_rms <= floor, "{name}: the new kernel's output parts from the old by {y_rms:.2e} rms");
     }
-    // The old two agree with each other the same way, which says the floor is
-    // the reassociation's and not a bug shared by the two new kernels.
     let (rms, _) = compare(&bank(SLOT_OLD_COMMITTED), &bank(SLOT_OLD_STEPS));
     eprintln!("old committed vs old steps: bank rel rms {rms:.2e}");
 }

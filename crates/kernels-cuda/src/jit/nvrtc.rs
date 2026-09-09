@@ -1,8 +1,3 @@
-//! The compile step: one NVRTC program per (unit, arch), name expressions
-//! for the wanted instantiations, SASS out — plus the device-link pass a
-//! relocatable unit needs and the diagnostics for the two ways a cubin can
-//! be quietly wrong (Tile IR without SASS, tile-frontend header skew).
-
 use std::ffi::{CStr, CString, c_char};
 
 use cudarc::nvrtc::sys as nvrtc;

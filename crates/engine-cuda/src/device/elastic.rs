@@ -1,23 +1,13 @@
-//! A budgeted pool of physical pages backing virtual arenas whose backing
-//! grows and shrinks under a fixed address.
-
 use crate::error::{Fault, Result};
 
-/// The accounting unit the budget is counted in.
 pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// The largest quantum an arena grows and trims by.
 pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Bounds an arena's growth quantum so it stays proportional to the arena's
-/// size and never coarser than the map unit.
 const HANDLES_PER_ARENA: u64 = 256;
 
-/// Reserved out of free memory so a later driver allocation (cuBLAS
-/// workspace, NCCL buffer, module load) still has room.
 const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The floor this card holds back, shared by the pool, accounting, and tests.
 #[must_use]
 pub const fn safety_floor_bytes(total: u64) -> u64 {
     let tenth = total / 10;
@@ -28,17 +18,8 @@ pub const fn safety_floor_bytes(total: u64) -> u64 {
     }
 }
 
-/// What the elastic pool may hold.
-///
-/// ```text
-/// budget = total x utilization - (total - free) - floor
-/// ```
-///
-/// A fraction under what is already on the card answers zero rather than
-/// wrapping.
 #[must_use]
 pub fn budget_bytes(free: u64, total: u64, utilization: f64) -> u64 {
-    // Clamp again: a NaN must not become a budget.
     let fraction = if utilization.is_finite() {
         utilization.clamp(0.0, 1.0)
     } else {
@@ -58,7 +39,6 @@ pub fn budget_bytes(free: u64, total: u64, utilization: f64) -> u64 {
         .saturating_sub(safety_floor_bytes(total))
 }
 
-/// How many logical pages `bytes` occupies.
 #[must_use]
 pub const fn pages_for_bytes(bytes: u64) -> u64 {
     bytes.div_ceil(LOGICAL_PAGE_BYTES)
@@ -71,40 +51,21 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
-/// A budgeted supply of physical pages. `held` is promised-not-yet-mapped
-/// pages, `committed` is mapped pages; the budget charges their sum.
 #[derive(Debug)]
 pub struct PhysicalPool {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     device: i32,
-    /// `cuMemGetAllocationGranularity(CU_MEM_ALLOC_GRANULARITY_MINIMUM)`.
     granularity: u64,
-    /// One handle's bytes, rounded up to the granularity.
     handle_bytes: u64,
-    /// Soft budget, in logical pages (recalibrated when a commit needs
-    /// growth).
     budget_pages: u64,
-    /// The hard ceiling, in logical pages. Never lowered.
     hard_pages: u64,
-    /// Promised, not yet mapped.
     held_pages: u64,
-    /// Mapped.
     committed_pages: u64,
-    /// High water mark of `committed_pages`.
     high_water_pages: u64,
-    /// Operator's memory fraction (`gpu_mem_utilization`); `1.0` is the
-    /// whole card.
     utilization: f64,
 }
 
 impl PhysicalPool {
-    /// Opens the pool for `device` at the operator's memory fraction
-    /// `utilization`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] with no runtime selected, [`Fault::Device`] for
-    /// the granularity query or the memory query.
     pub fn open(device: i32, utilization: f64) -> Result<PhysicalPool> {
         #[cfg(feature = "cuda")]
         {
@@ -137,8 +98,6 @@ impl PhysicalPool {
         }
     }
 
-    /// A pool with a stated budget and no device — for tests and runtimeless
-    /// builds.
     #[must_use]
     pub fn stated(budget_bytes: u64) -> PhysicalPool {
         let pages = budget_bytes / LOGICAL_PAGE_BYTES;
@@ -151,54 +110,35 @@ impl PhysicalPool {
             held_pages: 0,
             committed_pages: 0,
             high_water_pages: 0,
-            // No device behind a stated pool.
             utilization: 1.0,
         }
     }
 
-    /// The operator's fraction of the card this pool was opened at.
     #[must_use]
     pub const fn utilization(&self) -> f64 {
         self.utilization
     }
 
-    /// Bytes one logical page holds.
     #[must_use]
     pub const fn page_bytes(&self) -> u64 {
         LOGICAL_PAGE_BYTES
     }
 
-    /// The soft budget, in logical pages.
     #[must_use]
     pub const fn budget_pages(&self) -> u64 {
         self.budget_pages
     }
 
-    /// The hard ceiling, in logical pages.
     #[must_use]
     pub const fn hard_pages(&self) -> u64 {
         self.hard_pages
     }
 
-    /// Bytes one mapping takes: what a commit of any size is rounded up to,
-    /// per arena.
     #[must_use]
     pub const fn map_unit_bytes(&self) -> u64 {
         self.handle_bytes
     }
 
-    /// Bytes this process may still take under the operator's ceiling beyond
-    /// `reserve` — what the supply has yet to map on its way to the
-    /// watermarks the deployment declared or has already reached:
-    /// `(ceiling - used - floor) - reserve`, zero when the reserve alone
-    /// needs everything left. The arming pass reads it before each body it
-    /// captures: graph execs are allocated by the driver outside this pool,
-    /// so every byte they take is a byte the pool's next `recalibrate` no
-    /// longer finds.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] with no runtime, [`Fault::Device`] for the query.
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "cuda")]
         {
@@ -208,8 +148,6 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            // The operator's ceiling, not the card's: what this process may
-            // still take is what `recalibrate` would hand the pool next.
             Ok(budget_bytes(free as u64, total as u64, self.utilization).saturating_sub(reserve))
         }
         #[cfg(not(feature = "cuda"))]
@@ -219,27 +157,21 @@ impl PhysicalPool {
         }
     }
 
-    /// Logical pages under a mapping right now.
     #[must_use]
     pub const fn committed_pages(&self) -> u64 {
         self.committed_pages
     }
 
-    /// The most that has ever been.
     #[must_use]
     pub const fn high_water_pages(&self) -> u64 {
         self.high_water_pages
     }
 
-    /// One handle's bytes — the quantum an arena grows and trims by.
     #[must_use]
     pub const fn handle_bytes(&self) -> u64 {
         self.handle_bytes
     }
 
-    /// Promise `pages`, or say no. Charged against committed + held, so a
-    /// promise made and not yet mapped still counts. `false` means nothing
-    /// was touched.
     pub fn try_reserve(&mut self, pages: u64) -> bool {
         let charged = self.committed_pages + self.held_pages;
         if pages > self.budget_pages.saturating_sub(charged.min(self.budget_pages)) {
@@ -249,12 +181,10 @@ impl PhysicalPool {
         true
     }
 
-    /// Give a promise back unused.
     pub fn unreserve(&mut self, pages: u64) {
         self.held_pages -= self.held_pages.min(pages);
     }
 
-    /// A promise became a mapping.
     pub fn mark_committed(&mut self, pages: u64) {
         let promised = self.held_pages.min(pages);
         self.held_pages -= promised;
@@ -262,18 +192,10 @@ impl PhysicalPool {
         self.high_water_pages = self.high_water_pages.max(self.committed_pages);
     }
 
-    /// A mapping went away.
     pub fn mark_uncommitted(&mut self, pages: u64) {
         self.committed_pages -= self.committed_pages.min(pages);
     }
 
-    /// Re-reads what the card has left, and moves the soft budget. The hard
-    /// ceiling only ever rises.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`] for the query; a runtimeless build leaves the budget
-    /// where `stated` put it and answers `Ok`.
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -292,11 +214,6 @@ impl PhysicalPool {
         Ok(())
     }
 
-    /// One physical allocation of `bytes`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     fn acquire_handle(&self, bytes: u64) -> Result<u64> {
         #[cfg(feature = "cuda")]
         {
@@ -317,8 +234,6 @@ impl PhysicalPool {
         }
     }
 
-    /// Release one physical allocation. Infallible: used on rollback/trim
-    /// paths.
     fn release_handle(&self, handle: u64) {
         #[cfg(feature = "cuda")]
         if handle != 0 {
@@ -337,50 +252,26 @@ impl PhysicalPool {
     }
 }
 
-/// A fixed virtual range whose backing is mapped one unit at a time, wherever
-/// a frame addresses; `base` never changes after `reserve`.
-///
-/// Each kv-row plane gets its own arena. A plane is laid out slot-major
-/// (`Paging::base(slot)`), so backing only the units a frame's pages touch
-/// — rather than every unit below the highest addressed one — is what lets
-/// a 300-token sequence in slot seven cost its own pages and not slots
-/// zero to six's ceiling (§26–29 of the diffusion study).
 #[derive(Debug)]
 pub struct Arena {
     label: &'static str,
-    /// `CUdeviceptr`. Fixed from `reserve` to `Drop`.
     base: u64,
-    /// The ceiling this arena may be asked to commit to.
     max_bytes: u64,
-    /// The address range actually reserved: `max_bytes` rounded up to the map
-    /// unit.
     virtual_bytes: u64,
-    /// This arena's handle size: the pool's, or the arena's own size if
-    /// smaller.
     map_unit: u64,
-    /// Per unit, the handle backing `base + i * map_unit`, if mapped.
     units: Vec<Option<u64>>,
-    /// How many of `units` are mapped.
     mapped: u64,
-    /// Unmapped handles cached for reuse, avoiding a `cuMemCreate` round trip
-    /// on the next grow.
     cached: Vec<u64>,
-    /// The most `committed_bytes` has ever been.
     high_water: u64,
 }
 
-/// What a commit asks an arena to have backed.
 #[derive(Debug, Clone)]
 pub enum Want {
-    /// Everything below `bytes` (a recurrent slab's slots, a pooled row).
     Prefix(u64),
-    /// The byte ranges `(offset, len)` a frame addresses; the units they
-    /// touch are backed, nothing between them.
     Ranges(Vec<(u64, u64)>),
 }
 
 impl Want {
-    /// The highest byte the want reaches, for the ceiling check.
     fn reach(&self) -> u64 {
         match self {
             Want::Prefix(bytes) => *bytes,
@@ -394,12 +285,6 @@ impl Want {
 }
 
 impl Arena {
-    /// Reserve `max_bytes` of address space. Nothing is mapped yet; `base`
-    /// is valid immediately.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], [`Fault::Device`] for the reservation.
     pub fn reserve(pool: &PhysicalPool, max_bytes: u64, label: &'static str) -> Result<Arena> {
         let ceiling = align_up(max_bytes, pool.granularity).max(pool.granularity);
         let map_unit = align_up(
@@ -458,25 +343,21 @@ impl Arena {
         }
     }
 
-    /// The base address, fixed for the arena's life.
     #[must_use]
     pub const fn base(&self) -> u64 {
         self.base
     }
 
-    /// The ceiling this arena's address space was reserved at.
     #[must_use]
     pub const fn max_bytes(&self) -> u64 {
         self.max_bytes
     }
 
-    /// Bytes backed right now (units mapped, wherever they lie).
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.mapped * self.map_unit
     }
 
-    /// The units a want names, ascending and deduplicated.
     fn units_of(&self, want: &Want) -> Vec<usize> {
         if self.map_unit == 0 {
             return Vec::new();
@@ -500,17 +381,11 @@ impl Arena {
         units
     }
 
-    /// The most that has ever been.
     #[must_use]
     pub const fn high_water_bytes(&self) -> u64 {
         self.high_water
     }
 
-    /// The units a want asks for, checked against the arena's ceiling.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a want past the arena's ceiling.
     pub fn target_units(&self, want: &Want) -> Result<Vec<usize>> {
         let reach = want.reach();
         if reach > self.max_bytes {
@@ -522,33 +397,19 @@ impl Arena {
         }
         Ok(self.units_of(want))
     }
-    /// Whether unit `u` is not backed (or does not exist).
     fn unbacked(&self, u: usize) -> bool {
         self.units.get(u).is_none_or(Option::is_none)
     }
-    /// Bytes the arena comes to once `units` are backed: what the pool is
-    /// priced on for the ceiling.
     fn target_bytes_of(&self, units: &[usize]) -> u64 {
         let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
         self.committed_bytes() + fresh * self.map_unit
     }
-    /// Pages needed from the pool to back `units`; cached handles cost
-    /// nothing to re-map.
     fn growth_pages(&self, units: &[usize]) -> u64 {
         let fresh = units.iter().filter(|&&u| self.unbacked(u)).count() as u64;
         let fresh = fresh.saturating_sub(self.cached.len() as u64);
         pages_for_bytes(fresh * self.map_unit)
     }
 
-    /// Map physical pages under every unit of `units` not yet backed.
-    ///
-    /// Caller has already reserved the pages; this only maps, and rolls back
-    /// to the start on partial failure.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], [`Fault::Device`] for the map or the access
-    /// descriptor.
     fn grow(&mut self, pool: &PhysicalPool, units: &[usize]) -> Result<()> {
         let cached_before = self.cached.len();
         let mut fresh: Vec<usize> = Vec::new();
@@ -588,7 +449,6 @@ impl Arena {
         self.high_water = self.high_water.max(self.committed_bytes());
         Ok(())
     }
-    /// One handle, mapped and made readable at `at`.
     fn map(&self, pool: &PhysicalPool, at: u64, handle: u64) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -619,8 +479,6 @@ impl Arena {
         }
     }
 
-    /// Undo a partial grow: unmap the units it mapped, caching handles up
-    /// to `cached_goal` and releasing the rest.
     fn rollback(&mut self, pool: &PhysicalPool, fresh: &[usize], cached_goal: usize) {
         for &unit in fresh.iter().rev() {
             let Some(handle) = self.units.get_mut(unit).and_then(Option::take) else {
@@ -635,11 +493,6 @@ impl Arena {
             }
         }
     }
-    /// Unmap every backed unit outside `want` and tell the pool. Best
-    /// effort: releases whole map units only.
-    ///
-    /// Keeps one handle cached (not released) when 2+ units stay, since a
-    /// trim is usually followed by a grow. Returns pages actually handed back.
     pub fn release_outside(&mut self, pool: &mut PhysicalPool, want: &Want) -> u64 {
         let keep = self.units_of(want);
         let cache_goal = usize::from(keep.len() >= 2);
@@ -670,7 +523,6 @@ impl Arena {
         pool.mark_uncommitted(pages);
         pages
     }
-    /// [`Arena::release_outside`] down to a prefix: the tail above `bytes`.
     pub fn release_tail(&mut self, pool: &mut PhysicalPool, bytes: u64) -> u64 {
         self.release_outside(pool, &Want::Prefix(bytes))
     }
@@ -690,13 +542,6 @@ impl Arena {
         }
     }
 
-    /// An address `offset` bytes in, checked against committed (not just
-    /// reserved) bytes — a fault past the committed edge inside a captured
-    /// graph is unattributable.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] naming this arena.
     pub fn span(&self, offset: u64, len: u64) -> Result<u64> {
         let end = offset.saturating_add(len);
         let backed = self.map_unit != 0
@@ -747,46 +592,25 @@ impl Drop for Arena {
     }
 }
 
-/// What one arena is asked to be, for the atomic commit.
 #[derive(Debug)]
 pub struct Target<'a> {
     pub arena: &'a mut Arena,
-    /// What must be backed afterwards.
     pub want: Want,
 }
 
-/// The answer to one atomic multi-arena commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commit {
-    /// Every arena is at or past its target. Stream work may proceed.
     Committed,
-    /// Not right now; nothing was touched. `required`/`budget` are logical
-    /// pages.
     Exhausted {
-        /// Logical pages the targets come to, in total.
         required: u64,
-        /// Logical pages the soft budget allows.
         budget: u64,
     },
-    /// Never, on this device, for this load. Past the hard ceiling.
     Impossible {
-        /// Logical pages the targets come to, in total.
         required: u64,
-        /// Logical pages the hard ceiling allows.
         ceiling: u64,
     },
 }
 
-/// Admission gate: brings every arena to its target, or none of them.
-///
-/// Priced against the hard ceiling then the soft budget before anything
-/// maps, so a refusal touches nothing; `required` is each arena's total, not
-/// its growth.
-///
-/// # Errors
-///
-/// [`Fault::Ceiling`] for a target past an arena's own ceiling,
-/// [`Fault::Device`] for a map that failed after admission.
 pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) -> Result<Commit> {
     let mut required = 0u64;
     let mut growth = 0u64;
@@ -798,11 +622,8 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
         wanted.push(units);
     }
     if growth == 0 {
-        // Already fully mapped: nothing to check or reserve.
         return Ok(Commit::Committed);
     }
-    // Recalibrate before both refusals, so freed memory isn't reported
-    // Impossible.
     pool.recalibrate()?;
     if required > pool.hard_pages() {
         return Ok(Commit::Impossible {
@@ -816,8 +637,6 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
             budget: pool.budget_pages(),
         });
     }
-    // Snapshot for rollback on partial failure: the units each arena did
-    // not have before, and its cache depth.
     let was: Vec<(Vec<usize>, usize)> = targets
         .iter()
         .zip(&wanted)
@@ -830,8 +649,6 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     let mut done = 0usize;
     for (target, units) in targets.iter_mut().zip(&wanted) {
         if let Err(fault) = target.arena.grow(pool, units) {
-            // The failed arena already rolled itself back; unwind the ones
-            // before it, tail first.
             for (undone, (fresh, cached)) in targets[..done].iter_mut().zip(&was[..done]).rev() {
                 undone.arena.rollback(pool, fresh, *cached);
             }
@@ -844,7 +661,6 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     Ok(Commit::Committed)
 }
 
-/// Maps a CUDA driver status to a `Fault`.
 #[cfg(feature = "cuda")]
 fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     if code == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
@@ -902,7 +718,11 @@ fn allocation_granularity(device: i32) -> Result<u64> {
 mod tests {
     use super::{LOGICAL_PAGE_BYTES, PhysicalPool, pages_for_bytes};
 
-    // A promise not yet mapped still charges the budget.
+    fn elastic_every_case() {
+        a_promise_charges_the_budget_before_it_is_a_mapping();
+        a_partial_page_is_a_whole_page();
+    }
+
     #[test]
     fn a_promise_charges_the_budget_before_it_is_a_mapping() {
         let mut pool = PhysicalPool::stated(10 * LOGICAL_PAGE_BYTES);
@@ -917,8 +737,6 @@ mod tests {
         assert!(!pool.try_reserve(1));
     }
 
-    // Bytes round up to whole pages.
-    #[test]
     fn a_partial_page_is_a_whole_page() {
         assert_eq!(pages_for_bytes(0), 0);
         assert_eq!(pages_for_bytes(1), 1);

@@ -8,8 +8,6 @@ pub struct Facts {
     pub qo_one: bool,
     pub masked: bool,
     pub has_adapter: bool,
-    /// Lanes that want their attention's per-query LSE kept — see
-    /// [`Facts::captures_scores`].
     pub captures_scores: bool,
 }
 
@@ -22,15 +20,10 @@ impl Facts {
         Predicate::fact(1)
     }
 
-    /// Rows routed to a registered adapter. A fire with no adapter rows
-    /// costs nothing: the walk skips the empty class.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(2)
     }
 
-    /// Lanes that want their attention's per-query LSE kept (the H2O / TOVA /
-    /// SnapKV observation the `attn_score` intrinsic reads). Ordered before
-    /// `qo_one` in the split, after `masked` — the order gemma_4 fixes.
     pub fn captures_scores() -> Predicate {
         Predicate::fact(3)
     }
@@ -71,9 +64,6 @@ impl ForwardHybrid for Model {
         let m = self;
         let d = m.head_dim;
 
-        // The two readings differ only in window and rotation, but a window
-        // is a plan's fact, so each reading carves its own schedules:
-        // `[sliding, full]`, indexed by `Reading as usize`.
         let windows = [Some(m.window), None];
         let classes = [
             Facts::masked(),
@@ -98,8 +88,6 @@ impl ForwardHybrid for Model {
         let mask = inputs.mask();
         let positions = inputs.positions();
 
-        // `MuseGlimmerTextNormedEmbedding`: the lookup, then a scale-free
-        // RMSNorm over the whole row.
         let ids = inputs.tokens();
         let mut y = ops::elemwise::rmsnorm_no_scale(
             &ops::layout::embed(&ids, &m.embed, m.vocab),
@@ -119,8 +107,6 @@ impl ForwardHybrid for Model {
                 m.q_heads * d,
                 m.kv_heads * d,
             );
-            // Scale-free per-head norms on q and k; `qk_scale_factor` is in
-            // `sm_scale`. The full reading rotates nothing (NoPE).
             let q = ops::elemwise::rmsnorm_no_scale(&q, d, m.norm_eps);
             let k = ops::elemwise::rmsnorm_no_scale(&k, d, m.norm_eps);
             let (q, k) = match w.reading {
@@ -136,10 +122,6 @@ impl ForwardHybrid for Model {
             );
             seam::at(seam::ATTN_Q, &[&q]);
 
-            // Four arms of one merge: masked, score-capturing, decode,
-            // prefill — the class order above. Only the full reading exports
-            // a score plane: a sliding layer's row is a softmax over its
-            // window, which the capture kernel refuses for that reason.
             let [mq, sq, dq, p] = q.split(classes.clone());
             let so = match w.reading {
                 Reading::Sliding => ops::attn::prefill(
@@ -183,8 +165,6 @@ impl ForwardHybrid for Model {
             ]);
             seam::at(seam::ATTN_OUT, &[&a]);
 
-            // `attn_output * sigmoid(gate_proj(hidden_states))`, then `o_proj`.
-            // The gate is columns-cut like q, so each rank gates its own heads.
             let gate = ops::linear::matmul(&normed, &w.gate);
             let o = ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&a, &gate), &w.o_proj);
             let o = if m.tp > 1 {
@@ -192,8 +172,6 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // The adapter's `B·(A·x)`, over the adapter window, after the
-            // reduce and before `post_attn_norm`.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = normed.split(&Facts::has_adapter());
@@ -218,13 +196,8 @@ impl ForwardHybrid for Model {
             );
         }
 
-        // `softcap · tanh(logits · output_multiplier / softcap)`: the
-        // multiplier is a scalar over the normed row (exact, one launch),
-        // the softcap is the head's own epilogue.
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps) * m.output_multiplier;
         let logits = ops::linear::lm_head(&x, &m.lm_head);
-        // This rank landed its COLUMNS of the logits; the plan wants all of
-        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
         let logits = if m.lm_head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
         } else {

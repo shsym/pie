@@ -42,9 +42,6 @@ impl GroupKey {
 }
 
 pub fn used_channel_slots(ops: &[LaunchOp]) -> Result<usize, TooManyChannels> {
-    // Was `filter(channel != u32::MAX).map(channel as usize + 1)`, the
-    // `PIE_NO_CHANNEL` sentinel read by hand. `filter_map` over the `Option`
-    // is the same walk with the sentinel spelled by the type.
     let needed = ops
         .iter()
         .filter_map(|op| op.channel)

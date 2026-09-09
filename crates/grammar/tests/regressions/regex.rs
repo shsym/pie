@@ -2,6 +2,11 @@ use crate::common::grammar_accepts;
 use ::grammar::grammar::Grammar;
 use ::grammar::regex::regex_to_grammar;
 
+fn regex_every_case() {
+    unicode_literals_quantifiers_and_classes();
+    exact_zero_repetition_matches_empty_string();
+}
+
 #[test]
 fn unicode_literals_quantifiers_and_classes() {
     let grammar = regex_to_grammar("é").unwrap();
@@ -21,7 +26,6 @@ fn unicode_literals_quantifiers_and_classes() {
     assert!(!grammar_accepts(character_class, "e"));
 }
 
-#[test]
 fn exact_zero_repetition_matches_empty_string() {
     let grammar = Grammar::from_ebnf(r#"root ::= "a"{0}"#, "root").unwrap();
     assert!(grammar_accepts(grammar, ""));

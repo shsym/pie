@@ -1,21 +1,3 @@
-//! Reading tensors.
-//!
-//! A [`Source`] is a catalog over one or more [`Store`]s. One `.zt` file, a
-//! `.zt` root plus its shards, a foreign checkpoint and a set of unrelated
-//! files all come back as this same type. Only the way the catalog was built
-//! differs.
-//!
-//! There are three ways to get at a tensor's bytes:
-//!
-//! - [`bytes`](Tensor::bytes) gives the best the source can do, as a
-//!   `Cow<[u8]>` that says whether it borrowed or copied.
-//! - [`map`](Tensor::map) gives a borrow or an error, never a hidden copy.
-//! - [`locate`](Tensor::locate) gives the address, so the caller can do its
-//!   own I/O with io_uring, cuFile or a staged host-to-device copy.
-//!
-//! A tensor is one blob. Where its type has several planes, [`Tensor::planes`]
-//! says where each lies inside those bytes.
-
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -29,41 +11,18 @@ use crate::provide::catalog::{Catalog, Entry, Location, Payload};
 use crate::provide::store::{Store, StoreId};
 use crate::vocab::Vocabulary;
 
-// =======================================================================
-// capabilities
-// =======================================================================
-
-/// What can be done with one tensor's bytes.
-///
-/// Each field is named after the operation it gates, and is computed from
-/// that operation's own precondition, so the report cannot disagree with the
-/// behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
-    /// [`Tensor::map`] will succeed: the bytes are raw and the file is mapped.
     pub map: bool,
-    /// [`Tensor::locate`] will succeed: the decoded bytes are exactly one
-    /// range of one file.
     pub locate: bool,
-    /// [`Tensor::evict`] will succeed: no other blob shares an OS page with
-    /// this one.
     pub evict: bool,
-    /// [`Tensor::verify`] will check a digest rather than report that there
-    /// is none to check.
     pub verify: bool,
-    /// Largest power of two dividing the blob's file offset.
     pub alignment: u64,
 }
 
-/// The outcome of a successful [`Tensor::verify`].
-///
-/// A digest *mismatch* is not here: that is a rejected file, and it comes back
-/// as `Err(Reject { rule: Rule::Digest, .. })`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verified {
-    /// A digest was checked and matched.
     Digest,
-    /// There is no digest; content rules (if any) passed.
     NoDigest,
 }
 
@@ -73,18 +32,10 @@ impl Verified {
     }
 }
 
-/// Where a [`Source`]'s description came from, and therefore who is making the
-/// claim that its tensors are where it says they are.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Provenance<'a> {
-    /// A `.zt` root: the file states its own structure, hash-checked on open,
-    /// and every object may carry a digest.
     Root(&'a Manifest),
-    /// A `.zt` data shard (spec §7.2): a container holding bytes and no
-    /// manifest.
     DataShard,
-    /// A foreign format, or several sources merged. The description was built
-    /// by whoever opened the files.
     Projection,
 }
 
@@ -97,13 +48,6 @@ impl<'a> Provenance<'a> {
     }
 }
 
-// =======================================================================
-// shard resolution
-// =======================================================================
-
-/// Resolves a shard name + identity to a file path. A name is a label the
-/// producer chose, not a location: turning it into bytes is entirely the
-/// transport's concern (spec §7.1, Appendix B).
 pub trait ShardResolver {
     fn resolve(&self, name: &str, shard: &Shard) -> Result<PathBuf>;
 }
@@ -114,8 +58,6 @@ impl<F: Fn(&str, &Shard) -> Result<PathBuf>> ShardResolver for F {
     }
 }
 
-/// The positional convention (Appendix B), and the default: root
-/// `<dir>/<stem>.zt` maps a shard named `n` to `<dir>/<stem>-<n>.zt`.
 pub fn positional(root: impl AsRef<Path>) -> impl ShardResolver + 'static {
     let root = root.as_ref();
     let dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -126,8 +68,6 @@ pub fn positional(root: impl AsRef<Path>) -> impl ShardResolver + 'static {
     move |name: &str, _: &Shard| Ok(dir.join(format!("{stem}-{name}.zt")))
 }
 
-/// The content-addressed convention (Appendix B): a shard with digest
-/// `algo:hex` lives at `<store>/blobs/<algo>/<hex>`.
 pub fn cas(store: impl AsRef<Path>) -> impl ShardResolver + 'static {
     let store = store.as_ref().to_path_buf();
     move |_: &str, shard: &Shard| {
@@ -138,16 +78,12 @@ pub fn cas(store: impl AsRef<Path>) -> impl ShardResolver + 'static {
     }
 }
 
-/// Finds shards by identity: scans a directory once and matches each file by
-/// size and whole-file digest, ignoring what anything is called.
 pub struct DirectoryResolver {
     by_size: BTreeMap<u64, Vec<PathBuf>>,
     digests: std::sync::Mutex<HashMap<(u64, DigestAlgorithm), BTreeMap<Vec<u8>, PathBuf>>>,
 }
 
 impl DirectoryResolver {
-    /// Indexes every `.zt` file directly inside `dir` by size. Reads no
-    /// tensor bytes; hashing happens in `resolve`, once per bucket.
     pub fn scan(dir: impl AsRef<Path>) -> Result<Self> {
         let mut by_size: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
         for entry in std::fs::read_dir(dir.as_ref())? {
@@ -191,11 +127,6 @@ impl ShardResolver for DirectoryResolver {
     }
 }
 
-// =======================================================================
-// opening
-// =======================================================================
-
-/// How to open a source.
 pub struct Options {
     vocab: Option<Arc<Vocabulary>>,
     resolver: Option<Box<dyn ShardResolver>>,
@@ -213,21 +144,16 @@ impl Default for Options {
 }
 
 impl Options {
-    /// The profiles the reader should know. Defaults to
-    /// [`Vocabulary::standard`].
     pub fn vocabulary(mut self, vocab: &Vocabulary) -> Self {
         self.vocab = Some(Arc::new(vocab.clone()));
         self
     }
 
-    /// How to find shard files. Defaults to [`positional`].
     pub fn resolver(mut self, resolver: impl ShardResolver + 'static) -> Self {
         self.resolver = Some(Box::new(resolver));
         self
     }
 
-    /// Map the files (the default). With `false`, files are opened but not
-    /// mapped: metadata and addresses are available, borrowed reads are not.
     pub fn map(mut self, map: bool) -> Self {
         self.map = map;
         self
@@ -245,7 +171,6 @@ impl Options {
         }
     }
 
-    /// Opens a `.zt` file, following its shard table if it has one.
     pub fn open(self, path: impl AsRef<Path>) -> Result<Source> {
         let path = path.as_ref();
         let vocab = self.vocabulary_arc();
@@ -305,7 +230,6 @@ impl Options {
         })
     }
 
-    /// Opens several `.zt` files as one name space.
     pub fn open_all(self, paths: &[impl AsRef<Path>]) -> Result<Source> {
         let vocab = self.vocabulary_arc();
         let mut sources = Vec::with_capacity(paths.len());
@@ -320,8 +244,6 @@ impl Options {
         Source::merge(sources)
     }
 
-    /// Builds a source from a projection's own stores and catalog, under this
-    /// vocabulary.
     pub fn from_parts(self, stores: Vec<Store>, catalog: Catalog) -> Result<Source> {
         for (name, entry) in catalog.iter() {
             if entry.store().0 as usize >= stores.len() {
@@ -342,7 +264,6 @@ impl Options {
     }
 }
 
-/// Turns a manifest's blob references into addresses.
 fn resolve_manifest(manifest: &Manifest, store_of: &BTreeMap<&str, StoreId>) -> Result<Catalog> {
     let mut catalog = Catalog::new();
     catalog.set_attributes(manifest.attributes.clone());
@@ -386,10 +307,6 @@ fn resolve_manifest(manifest: &Manifest, store_of: &BTreeMap<&str, StoreId>) -> 
     Ok(catalog)
 }
 
-// =======================================================================
-// Source
-// =======================================================================
-
 pub struct Source {
     stores: Vec<Store>,
     catalog: Catalog,
@@ -409,41 +326,22 @@ impl std::fmt::Debug for Source {
 }
 
 impl Source {
-    /// Opens a `.zt` file, including a sharded model. Shards are found with
-    /// the positional convention.
     pub fn open(path: impl AsRef<Path>) -> Result<Source> {
         Options::default().open(path)
     }
 
-    /// Opens several `.zt` files as one name space.
     pub fn open_all(paths: &[impl AsRef<Path>]) -> Result<Source> {
         Options::default().open_all(paths)
     }
 
-    /// Every way of opening that is not one of the two above.
     pub fn options() -> Options {
         Options::default()
     }
 
-    /// Builds a source directly from a projection's stores and catalog.
     pub fn from_parts(stores: Vec<Store>, catalog: Catalog) -> Result<Source> {
         Options::default().from_parts(stores, catalog)
     }
 
-    /// This source with `prefix` in front of every tensor name.
-    ///
-    /// The one operation a multi-component checkpoint needs and
-    /// [`merge`](Source::merge) cannot express: a diffusers pipeline is N
-    /// safetensors sets that each spell their tensors `norm.weight`, and
-    /// merging them raw is a wall of collisions. Prefixing each set first
-    /// (`dit.`, `te.`, `vae.`) makes one name space out of them, exactly as
-    /// `pie model import --aux` does for a drafter head — but by renaming a
-    /// catalog rather than by rewriting the bytes into a staging file.
-    ///
-    /// The manifest is dropped: a manifest is one FILE's own claim about the
-    /// names it holds, and those names are no longer the names this source
-    /// answers to. Addresses, stores and payloads are untouched, so a
-    /// prefixed source still maps and locates its bytes where they lie.
     pub fn under(self, prefix: &str) -> Result<Source> {
         if prefix.is_empty() {
             return Ok(self);
@@ -464,7 +362,6 @@ impl Source {
         })
     }
 
-    /// Reads several sources as one name space. Names must not collide.
     pub fn merge(sources: Vec<Source>) -> Result<Source> {
         let vocab = sources
             .first()
@@ -520,7 +417,6 @@ impl Source {
         self.catalog.is_empty()
     }
 
-    /// Tensor names, sorted, across every file of this source.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.catalog.names()
     }
@@ -533,13 +429,11 @@ impl Source {
         })
     }
 
-    /// One tensor by name, or [`Error::NotFound`].
     pub fn tensor(&self, name: &str) -> Result<Tensor<'_>> {
         self.get(name)
             .ok_or_else(|| Error::NotFound(format!("tensor {name:?}")))
     }
 
-    /// One tensor by name, for a caller to whom absence is not an error.
     pub fn get(&self, name: &str) -> Option<Tensor<'_>> {
         let (name, entry) = self.catalog.get_key_value(name)?;
         Some(Tensor {
@@ -549,12 +443,10 @@ impl Source {
         })
     }
 
-    /// File-level attributes.
     pub fn attributes(&self) -> Option<&Value> {
         self.catalog.attributes()
     }
 
-    /// Who is claiming that this source's tensors are where it says they are.
     pub fn provenance(&self) -> Provenance<'_> {
         match (&self.manifest, self.data_shard) {
             (Some(manifest), _) => Provenance::Root(manifest),
@@ -563,22 +455,14 @@ impl Source {
         }
     }
 
-    /// Every file this source reads from: `stores()[k]` is `StoreId(k)`.
     pub fn stores(&self) -> &[Store] {
         &self.stores
     }
 
-    /// The file an address names.
-    ///
-    /// # Panics
-    ///
-    /// If `id` did not come from this `Source`.
     pub fn store(&self, id: StoreId) -> &Store {
         &self.stores[id.0 as usize]
     }
 
-    /// Deep shard verification: the whole-file digest of every shard against
-    /// the root's shard table. Only a `.zt` root has one.
     pub fn verify_shards(&self) -> Result<()> {
         let Some(manifest) = &self.manifest else {
             return Ok(());
@@ -606,11 +490,6 @@ impl Source {
     }
 }
 
-// =======================================================================
-// handles
-// =======================================================================
-
-/// One named tensor of a [`Source`]. Holding one has read nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct Tensor<'a> {
     src: &'a Source,
@@ -627,12 +506,10 @@ impl<'a> Tensor<'a> {
         &self.entry.shape
     }
 
-    /// The type. `None` only under a layout that defines the values itself.
     pub fn term(&self) -> Option<&'a Term> {
         self.entry.term.as_ref()
     }
 
-    /// The named layout, or `None` for the canonical layout.
     pub fn layout(&self) -> Option<&'a str> {
         self.entry.layout.as_deref()
     }
@@ -645,7 +522,6 @@ impl<'a> Tensor<'a> {
         self.entry.num_elements()
     }
 
-    /// The planes inside this tensor's bytes, under the canonical layout.
     pub fn planes(&self) -> Result<Vec<Plane>> {
         self.entry.planes()
     }
@@ -658,7 +534,6 @@ impl<'a> Tensor<'a> {
         self.entry.blocks.as_ref()
     }
 
-    /// Decoded byte size.
     pub fn nbytes(&self) -> u64 {
         self.entry.payload.decoded_len()
     }
@@ -667,7 +542,6 @@ impl<'a> Tensor<'a> {
         &self.entry.payload
     }
 
-    /// The file these bytes live in.
     pub fn store(&self) -> &'a Store {
         self.src.store(self.entry.payload.store())
     }
@@ -696,7 +570,6 @@ impl<'a> Tensor<'a> {
             .then_some(at)
     }
 
-    /// What can be done with these bytes.
     pub fn caps(&self) -> Caps {
         Caps {
             map: self.mappable().is_some(),
@@ -707,7 +580,6 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    /// The address of the decoded bytes: exactly this range of this file.
     pub fn locate(&self) -> Result<Location> {
         self.addressable().ok_or_else(|| {
             Error::Unsupported(format!(
@@ -718,7 +590,6 @@ impl<'a> Tensor<'a> {
         })
     }
 
-    /// Borrowed bytes. Errors rather than copying.
     pub fn map(&self) -> Result<&'a [u8]> {
         let Some(at) = self.mappable() else {
             let detail = if self.addressable().is_some() {
@@ -738,7 +609,6 @@ impl<'a> Tensor<'a> {
             .expect("mappable stores are mapped"))
     }
 
-    /// Decoded bytes, the best way this source can produce them.
     pub fn bytes(&self) -> Result<Cow<'a, [u8]>> {
         match &self.entry.payload {
             Payload::At(at) => {
@@ -779,11 +649,6 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    /// Checks this tensor's digest (if it has one) and, under the canonical
-    /// layout, the content rules of its leaves.
-    ///
-    /// A mismatch comes back as `Err(Reject { rule: Digest, .. })`.
-    /// `Ok(NoDigest)` means there was no digest to check.
     pub fn verify(&self) -> Result<Verified> {
         let canonical = self.entry.layout.is_none();
         if self.entry.digest.is_none() && !canonical {
@@ -808,8 +673,6 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    /// Checks block `which` of the decoded bytes against its block digest.
-    /// What a streaming consumer calls per window instead of [`verify`](Self::verify).
     pub fn verify_block(&self, which: u64, bytes: &[u8]) -> Result<()> {
         let (Some(blocks), Some(digest)) = (&self.entry.blocks, &self.entry.digest) else {
             return Err(Error::Unsupported(format!(
@@ -839,7 +702,6 @@ impl<'a> Tensor<'a> {
         Ok(())
     }
 
-    /// Hints the OS to prefetch these pages.
     pub fn prefetch(&self) -> Result<()> {
         let Some(at) = self.mappable() else {
             return Ok(());
@@ -847,7 +709,6 @@ impl<'a> Tensor<'a> {
         self.src.store(at.store).prefetch(at.offset, at.len)
     }
 
-    /// Drops these pages from the page cache. Requires page exclusivity.
     pub fn evict(&self) -> Result<()> {
         let at = self.evictable().ok_or_else(|| {
             Error::Unsupported(format!(
@@ -874,8 +735,6 @@ impl<'a> Tensor<'a> {
     }
 }
 
-/// The identity of a `.zt` container: its size and whole-file digest. This is
-/// exactly what [`Writer::add_shard`](crate::Writer::add_shard) records.
 pub fn shard_identity(path: impl AsRef<Path>, algo: DigestAlgorithm) -> Result<Shard> {
     let store = Store::index(path.as_ref(), "zt")?;
     validate::store(&store, &Vocabulary::shared())?;
@@ -885,7 +744,6 @@ pub fn shard_identity(path: impl AsRef<Path>, algo: DigestAlgorithm) -> Result<S
     })
 }
 
-/// The whole-file digest, a megabyte at a time.
 fn hash_store(store: &Store, algo: DigestAlgorithm) -> Result<Digest> {
     let mut hasher = Hasher::new(algo);
     let mut at = 0u64;
@@ -897,16 +755,12 @@ fn hash_store(store: &Store, algo: DigestAlgorithm) -> Result<Digest> {
     Ok(hasher.finish())
 }
 
-/// Reads and validates one container's manifest, resolving nothing. `None`
-/// is a data shard (§7.2).
 pub fn manifest_of(path: impl AsRef<Path>) -> Result<Option<Manifest>> {
     let store = Store::index(path.as_ref(), "zt")?;
     let parsed = validate::store(&store, &Vocabulary::shared())?;
     Ok(parsed.manifest.map(|(manifest, _)| manifest))
 }
 
-/// Checks a file against canonical form (spec §6.4) and returns every rule it
-/// breaks, in rule order. An empty list means the file is canonical.
 pub fn canonical_violations(path: impl AsRef<Path>) -> Result<Vec<String>> {
     let store = Store::index(path.as_ref(), "zt")?;
     let Some((manifest, placement)) = validate::store(&store, &Vocabulary::shared())?.manifest

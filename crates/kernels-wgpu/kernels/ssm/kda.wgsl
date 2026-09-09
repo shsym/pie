@@ -1,9 +1,7 @@
-//#include "common/bf16.inc.wgsl"
-//#include "common/reduce.inc.wgsl"
+
 
 const PIE_DMAX = 256u;
 
-//#if defined(PIE_COMMITTED)
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> replay: array<i32>;
@@ -32,7 +30,7 @@ fn st_get(i: u32) -> f32 {
 fn st_set(i: u32, v: f32) {
     work[i] = v;
 }
-//#elif defined(PIE_CHUNKED)
+
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> f: array<u32>;
@@ -50,7 +48,7 @@ struct Params {
     gate_floor: f32,
 }
 @group(0) @binding(9) var<uniform> params: Params;
-//#else
+
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> f: array<u32>;
 @group(0) @binding(2) var<storage, read> b: array<u32>;
@@ -67,15 +65,14 @@ struct Params {
     gate_floor: f32,
 }
 @group(0) @binding(8) var<uniform> params: Params;
-//#endif
-//#if !defined(PIE_COMMITTED)
+
 fn st_get(i: u32) -> f32 {
     return rstate[i];
 }
 fn st_set(i: u32, v: f32) {
     rstate[i] = v;
 }
-//#endif
+
 
 var<workgroup> sq: array<f32, PIE_DMAX>;
 var<workgroup> sk: array<f32, PIE_DMAX>;
@@ -155,7 +152,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     let d = u32(params.head_dim);
     let cells = d * d;
     let heads = u32(params.heads);
-//#if defined(PIE_COMMITTED)
+
     let r = group.z;
     let lane0 = u32(params.lane0);
     var begin = indptr[r];
@@ -186,7 +183,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             workgroupBarrier();
         }
     }
-//#elif defined(PIE_CHUNKED)
+
     let r = group.z;
     let begin = indptr[r];
     let end = indptr[r + 1u];
@@ -197,13 +194,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     for (var t = begin; t < end; t = t + 1) {
         token(tid, u32(t), h, state_base);
     }
-//#else
+
     let n = group.z;
     let state_base = (slots[n] * heads + h) * cells;
     token(tid, n, h, state_base);
-//#endif
+
 }
 
-// pie:instantiate kda_step_bf16 PIE_GROUP_X=128
-// pie:instantiate kda_chunked_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1
-// pie:instantiate kda_committed_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1

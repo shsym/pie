@@ -1,14 +1,3 @@
-//! Bind-time validation: the single gate every inferlet-supplied trace passes
-//! before it reaches a backend. Decides SPSC channel endpoints, the
-//! per-channel first-op direction table (readiness predicate), sink
-//! stage-precedence, shape closure, model-gated intrinsic availability and
-//! replayability, and in-place channel classification — nothing downstream
-//! re-decides these.
-//!
-//! [`bind`] consumes a decoded [`TraceContainer`] plus a [`ModelProfile`] and
-//! returns a [`BoundTrace`], the validated, typed artifact the reference
-//! interpreter and the CUDA tiers execute.
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -21,198 +10,109 @@ use super::registry::{
 };
 use crate::types::{Dtype, Shape, ValueType};
 
-/// Which bit a channel's first in-pass op needs (the fire-time structural
-/// predicate): `take`/`read` need **full**; a leading `put` needs **empty**
-/// (back-pressure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Direction {
-    /// The channel must hold a value: the first op consumes one.
     NeedsFull,
-    /// The channel must have room: the first op produces one.
     NeedsEmpty,
 }
 
-/// One row of the readiness table: channel × the phase owning its first
-/// in-pass op × the required bit. Emitted per pass; the wait-word
-/// machinery consumes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadinessEntry {
-    /// The channel this row is about, in declaration order.
     pub chan: u32,
-    /// The phase owning the channel's first in-pass op.
     pub phase: Phase,
-    /// Which bit that op needs before it can run.
     pub dir: Direction,
 }
 
-/// Lowering class, computed at registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelClass {
-    /// Host-visible (or non-linear device use): full epoch ring.
     FullRing,
-    /// Linear `take`→`put` with no fallible stage after it: in-place, no
-    /// undo (predicated on the accumulated flag at stage entry).
     InPlace,
-    /// Linear `take`→`put` ahead of a fallible stage: in-place with undo at
-    /// mutation granularity.
     InPlaceUndo,
 }
 
-/// A validated + typed trace, bound to a model profile.
 #[derive(Clone, Debug)]
 pub struct BoundTrace {
-    /// The program this binding validated.
     pub container: TraceContainer,
-    /// The model the program was checked against; availability and type
-    /// rules are only meaningful relative to it.
     pub profile: ModelProfile,
-    /// C3 identity: FNV-1a over the canonical container bytes.
     pub hash: u64,
-    /// Program-side channel element types (`ACT` materialized).
     pub channel_types: Vec<ValueType>,
-    /// Per stage (container order): the body's SSA type table.
     pub stage_types: Vec<Vec<ValueType>>,
-    /// The first-op direction table (one entry per touched channel).
     pub readiness: Vec<ReadinessEntry>,
-    /// Lowering class per channel (declaration order).
     pub classes: Vec<ChannelClass>,
 }
 
-/// A bind failure.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ValidateError {
-    /// SSA/shape/dtype error inside a stage body.
     Body {
-        /// The stage the offending op sits in.
         stage: Stage,
-        /// What the body check rejected.
         err: BodyError,
     },
-    /// At most one program per stage; stages sorted by tag.
     DuplicateStage(Stage),
-    /// Stage programs are not in tag order.
     StagesUnsorted,
-    /// The name table is not sorted, or repeats an entry.
     NamesUnsortedOrDuplicate,
-    /// Ports sorted by tag, unique.
     DuplicatePort(Port),
-    /// Port bindings are not in tag order.
     PortsUnsorted,
-    /// A port binds a channel index outside the declaration table.
     PortChannelOutOfRange {
-        /// The offending port.
         port: Port,
-        /// The offending channel, in declaration order.
         chan: u32,
     },
-    /// Const payload length must equal `numel × elem_size`.
     PortConstPayload {
-        /// The offending port.
         port: Port,
     },
-    /// Every attention trace must define the post-write readable extent.
     EmbedTokensWithoutKvLen,
-    /// Every attention trace must bind its complete geometry explicitly.
     EmbedTokensWithoutGeometry {
-        /// The offending port.
         port: Port,
     },
-    /// Channel capacity must be ≥ 1 (trace-known constructor arg).
     ZeroCapacity {
-        /// The offending channel, in declaration order.
         chan: u32,
     },
-    /// SPSC: the host writes this channel — no stage may put.
     SecondProducer {
-        /// The offending channel, in declaration order.
         chan: u32,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// SPSC: the host reads this channel — no stage may take/read, and
-    /// no port may bind it.
     SecondConsumer {
-        /// The offending channel, in declaration order.
         chan: u32,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// A sink at a stage that does not precede its consumption point
-    /// (pass-wide ⇒ prologue-only; attention ⇒ prologue or attn-proj).
     SinkMisplaced {
-        /// Index of the name in the container's name table.
         name_index: u16,
-        /// The name, resolved for the diagnostic.
         name: String,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// A `SinkCall` names something the profile knows as a value kernel, or
-    /// a `KernelCall` names a sink.
     SinkKernelKindMismatch {
-        /// Index of the name in the container's name table.
         name_index: u16,
-        /// The name, resolved for the diagnostic.
         name: String,
     },
-    /// Bind-time availability: the backend lacks this
-    /// second-party name.
     KernelUnavailable {
-        /// Index of the name in the container's name table.
         name_index: u16,
-        /// The name, resolved for the diagnostic.
         name: String,
     },
-    /// The named kernel returns a time-/load-varying value.
     NotReplayable {
-        /// Index of the name in the container's name table.
         name_index: u16,
-        /// The name, resolved for the diagnostic.
         name: String,
     },
-    /// Stage-scoped intrinsic used outside its stages.
     IntrinsicWrongStage {
-        /// The offending intrinsic.
         intr: IntrinsicId,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// Model-gated intrinsic the profile lacks. "Model-gated" names where the
-    /// gate is READ, not where it is decided: the profile's bit is a copy of
-    /// the serving engine's `EtaCaps`, so the checkpoint has no say in it.
     IntrinsicUnavailable {
-        /// The offending intrinsic.
         intr: IntrinsicId,
     },
-    /// Declared intrinsic type violates the registry rule (e.g. `logits`
-    /// must be `[n_out, vocab]` F32 for the bound model).
     IntrinsicTypeRule {
-        /// The offending intrinsic.
         intr: IntrinsicId,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
-    /// v1.1: extern table not sorted by channel / duplicate channel.
     ExternsUnsortedOrDup,
-    /// v1.1: an extern channel must be device-role (`host_role = None`) and
-    /// unseeded (the producing instance fills it).
     ExternDeclConflict {
-        /// The offending channel, in declaration order.
         chan: u32,
     },
-    /// v1.1: extern name index outside the name table.
     ExternNameOutOfRange {
-        /// The offending channel, in declaration order.
         chan: u32,
     },
-    /// v1.1 SPSC across the pair: a stage op (or port) on the wrong side of
-    /// the extern direction (put on an Import; take/read/port on an Export).
     ExternDirViolation {
-        /// The offending channel, in declaration order.
         chan: u32,
-        /// The stage the offending op sits in.
         stage: Stage,
     },
 }
@@ -336,17 +236,11 @@ impl fmt::Display for ValidateError {
 #[cfg(feature = "std")]
 impl std::error::Error for ValidateError {}
 
-/// Program-side view of a channel's element type.
 pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
     ValueType::new(decl.shape, decl.dtype.program_dtype())
 }
 
-/// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
-    // One pass per rule group, in dependency order: `check_spsc_endpoints`
-    // reads a channel decl by an op-carried index that `check_bodies` proved
-    // in range. Channel lookups go through `channel_decl` rather than a bare
-    // index so a reordering costs a wrong error message, not a panic.
     check_structure(&container)?;
     check_externs(&container)?;
     let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
@@ -370,11 +264,6 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     })
 }
 
-/// The channel decl an op names, or the error [`check_bodies`] would have
-/// raised for it.
-///
-/// Every caller runs after [`check_bodies`], so the `None` arm is
-/// unreachable in practice; kept total anyway rather than indexing blind.
 fn channel_decl(
     container: &TraceContainer,
     chan: u32,
@@ -393,11 +282,6 @@ fn channel_decl(
         })
 }
 
-/// Container-level shape: sorted/unique tables, non-zero capacities, port
-/// sources in range, and the geometry ports `embed_tokens` implies.
-///
-/// Establishes that every `PortSource::Channel` index is in range, which
-/// [`check_spsc_endpoints`] relies on.
 fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
     if container.names.windows(2).any(|names| names[0] >= names[1]) {
         return Err(ValidateError::NamesUnsortedOrDuplicate);
@@ -436,9 +320,6 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
                 }
             }
             PortSource::Const { dtype, shape, data } => {
-                // u64 arithmetic: `usize` is 32 bits on the wasm guest, so a
-                // shape whose numel exceeds u32 must not wrap to a size a
-                // short payload then matches.
                 let elem_size = super::container::const_elem_size(*dtype) as u64;
                 let expect = shape.numel().checked_mul(elem_size);
                 if expect != Some(data.len() as u64) {
@@ -447,17 +328,6 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
             }
         }
     }
-    // **A TRACE THAT ATTENDS BINDS ITS WHOLE GEOMETRY.** The rule is on the
-    // GEOMETRY, not on the tokens: a container that binds any one of the
-    // page-table ports binds all of them plus `kv_len`, so nothing infers a
-    // readable extent or a write slot it was not told.
-    //
-    // Embedding tokens no longer implies attending. A CACHELESS ENCODER —
-    // bidirectional, holding nothing between fires, its rows attending each
-    // other inside the arm over the lane's own indptr (Wan 2.2's umT5) —
-    // binds `embed_tokens` and NO geometry, and a page table for it would be
-    // a table of nothing. Such a container is a float lane that happens to
-    // carry ids (`runtime::pipeline::fire::float`).
     const GEOMETRY: [Port; 5] = [
         Port::Positions,
         Port::Pages,
@@ -480,8 +350,6 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
     Ok(())
 }
 
-/// v1.1 extern channels: sorted and unique, and each one declared in a way that
-/// leaves the endpoint free for its peer.
 fn check_externs(container: &TraceContainer) -> Result<(), ValidateError> {
     for w in container.externs.windows(2) {
         if w[0].chan >= w[1].chan {
@@ -502,10 +370,6 @@ fn check_externs(container: &TraceContainer) -> Result<(), ValidateError> {
     Ok(())
 }
 
-/// Per-stage bodies: SSA numbering, shapes and dtypes.
-///
-/// Establishes that every channel and name index an op carries is in range —
-/// the precondition the passes below are written against.
 fn check_bodies(
     container: &TraceContainer,
     channel_types: &[ValueType],
@@ -525,7 +389,6 @@ fn check_bodies(
     Ok(stage_types)
 }
 
-/// Intrinsics: stage scope, model gating, and the registry's type rules.
 fn check_intrinsics(
     container: &TraceContainer,
     profile: &ModelProfile,
@@ -554,10 +417,6 @@ fn check_intrinsics(
     Ok(())
 }
 
-/// Second-party names: availability, replayability, and the sink/kernel
-/// kind and placement rules.
-///
-/// Runs after [`check_bodies`], which is what puts every `name` index in range.
 fn check_second_party_names(
     container: &TraceContainer,
     profile: &ModelProfile,
@@ -589,10 +448,6 @@ fn check_second_party_names(
                 }
                 Op::SinkCall { name, .. } => {
                     let n = resolve_name(container, *name);
-                    // First-party sinks have spec-owned scopes; second-party
-                    // sinks come from the profile. `attn_page_mask`/`lora`
-                    // must be checked here since a backend that can't honor
-                    // them would otherwise bind cleanly and silently no-op.
                     if n == "attn_page_mask" && !profile.has_attn_page_mask {
                         return Err(ValidateError::KernelUnavailable {
                             name_index: *name,
@@ -613,7 +468,6 @@ fn check_second_party_names(
                     let scope = match scope {
                         Some(s) => s,
                         None => {
-                            // Unknown name: available? (bind-time rule)
                             let info = profile.kernel(n).ok_or_else(|| {
                                 ValidateError::KernelUnavailable {
                                     name_index: *name,
@@ -631,7 +485,6 @@ fn check_second_party_names(
                             }
                         }
                     };
-                    // The call must precede the consumption point.
                     let ok = match scope {
                         SinkScope::PassWide => sp.stage == Stage::Prologue,
                         SinkScope::Attention => {
@@ -653,11 +506,6 @@ fn check_second_party_names(
     Ok(())
 }
 
-/// SPSC endpoints, extended across the extern pair: at most one
-/// producer and one consumer per channel, counting the host role and the
-/// descriptor ports as endpoints.
-///
-/// Runs after [`check_structure`] and [`check_bodies`]; see [`channel_decl`].
 fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError> {
     let extern_dir = |chan: u32| -> Option<ExternDir> {
         container
@@ -671,11 +519,8 @@ fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError>
             let Some((use_, chan)) = op.channel_use() else {
                 continue;
             };
-            // Which endpoint a local op occupies, and therefore which peer it
-            // would be a second copy of.
             let (local_role, peer_dir) = match use_ {
                 ChannelUse::Put => (HostRole::Writer, ExternDir::Import),
-                // A non-consuming read still occupies the consumer endpoint.
                 ChannelUse::Take | ChannelUse::Read => (HostRole::Reader, ExternDir::Export),
             };
             let decl = channel_decl(
@@ -705,8 +550,6 @@ fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError>
             }
         }
     }
-    // Ports consume too: an Export channel bound to a port would make this
-    // pass a second consumer of its own export.
     for p in &container.ports {
         if let PortSource::Channel(c) = p.source
             && extern_dir(c) == Some(ExternDir::Export)
@@ -717,14 +560,10 @@ fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError>
             });
         }
     }
-    // Ports are pass-side consumers too.
     for p in &container.ports {
         if let PortSource::Channel(c) = p.source
             && channel_decl(container, c, Stage::Prologue, 0)?.host_role == HostRole::Reader
         {
-            // Attribute to the descriptor; report with the epilogue tag
-            // absent a stage — use Prologue? Keep a dedicated message via
-            // SecondConsumer with the earliest stage marker.
             return Err(ValidateError::SecondConsumer {
                 chan: c,
                 stage: Stage::Prologue,
@@ -738,8 +577,6 @@ fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
     c.names.get(idx as usize).map(|s| s.as_str()).unwrap_or("")
 }
 
-/// Registry type rules for the stage-scoped intrinsics, against the bound
-/// model. `query` is deliberately loose (backend-shaped): rank ≥ 1, F32.
 fn intrinsic_type_ok(
     intr: IntrinsicId,
     shape: Shape,
@@ -754,21 +591,12 @@ fn intrinsic_type_ok(
                 && shape.dims()[0] >= 1
         }
         IntrinsicId::Hidden => dtype == Dtype::F32 && shape.rank() == 2 && shape.dims()[0] >= 1,
-        // Unlike `hidden`, whose width the profile does not carry, a
-        // velocity row's channel count is a model fact — so a declaration
-        // that disagrees is refused here rather than carried into the plan's
-        // extents.
-        // A peer's rows come off the same plane at the same width, so they
-        // are typed identically; only the row offset the host binds differs.
         IntrinsicId::Velocity | IntrinsicId::PeerVelocity => {
             dtype == Dtype::F32
                 && shape.rank() == 2
                 && shape.dims()[0] >= 1
                 && shape.dims()[1] == profile.velocity_width
         }
-        // A pixels row's width is the model's when its VAE plants one width
-        // (an RGB decoder); a model planting several (decode RGB, encode a
-        // 16-channel mean) states `0` and the row count alone is checked.
         IntrinsicId::Pixels => {
             dtype == Dtype::F32
                 && shape.rank() == 2
@@ -778,12 +606,7 @@ fn intrinsic_type_ok(
         IntrinsicId::ValueHead => dtype == Dtype::F32 && shape.rank() == 1,
         IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),
-        // `[k]` I32 draft tokens (k = row count, trace-known).
         IntrinsicId::MtpDrafts => dtype == Dtype::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,
-        // `[planes, ATTN_SCORE_KV_MAX]`: row count is a program-declared
-        // ceiling (checked like `hidden`'s), but width is not negotiable —
-        // it is the fixed pitch of a slab the load carved, so it is a
-        // published constant rather than a per-program number.
         IntrinsicId::AttnScore => {
             dtype == Dtype::F32
                 && shape.rank() == 2
@@ -793,9 +616,6 @@ fn intrinsic_type_ok(
     }
 }
 
-/// Walk the pass's phases in execution order (prologue → descriptor →
-/// attn-proj → attn → epilogue) and record, per channel, the FIRST op's
-/// required bit. Take/read ⇒ full; put ⇒ empty.
 pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     let mut seen: Vec<bool> = alloc::vec![false; c.channels.len()];
     let mut out = Vec::new();
@@ -841,21 +661,10 @@ pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     out
 }
 
-/// In-place classification, computed at registration: host-visible ⇒ full
-/// ring; device-private linear `take`→`put` (the taken value flows into
-/// exactly one put on the same channel) ⇒ in-place, with row-granularity
-/// undo only if a fallible stage follows the mutating one; anything else ⇒
-/// full ring.
-///
-/// A stage is fallible here when it owns the first op of a host-coupled or
-/// extern channel — the only readiness fire time cannot settle.
 pub(crate) fn classify_channels(
     c: &TraceContainer,
     readiness: &[ReadinessEntry],
 ) -> Vec<ChannelClass> {
-    // Fallible phases: first-use of a host-coupled OR extern channel (an
-    // extern edge crosses pipelines — fire time cannot settle it, like a
-    // late host edge).
     let is_extern = |chan: u32| c.externs.iter().any(|e| e.chan == chan);
     let mut fallible = [false; 5];
     for e in readiness {
@@ -869,14 +678,11 @@ pub(crate) fn classify_channels(
     'chan: for (ci, decl) in c.channels.iter().enumerate() {
         let ci = u32::try_from(ci).unwrap_or(u32::MAX);
         if decl.host_role != HostRole::None || is_extern(ci) {
-            // Host-visible and extern channels always keep the full ring
-            // (the other endpoint peeks/commits on its own clock).
             classes.push(ChannelClass::FullRing);
             continue;
         }
-        // Gather (stage, op-index) of takes and puts of this channel.
-        let mut take: Option<(usize, usize, u32)> = None; // (stage idx, op idx, value id)
-        let mut put: Option<(usize, usize, u32)> = None; // (stage idx, op idx, put value)
+        let mut take: Option<(usize, usize, u32)> = None;
+        let mut put: Option<(usize, usize, u32)> = None;
         let mut extra = false;
         for (si, sp) in c.stages.iter().enumerate() {
             let mut next_id = 0u32;
@@ -891,7 +697,6 @@ pub(crate) fn classify_channels(
                             }
                             take = Some((si, oi, next_id));
                         }
-                        // A peek is a second reader, so never linear.
                         ChannelUse::Read => extra = true,
                         ChannelUse::Put => {
                             if put.is_some() {
@@ -906,7 +711,6 @@ pub(crate) fn classify_channels(
                 next_id += op.result_count();
             }
         }
-        // Descriptor peeks count as extra consumers (not linear).
         for p in &c.ports {
             if matches!(p.source, PortSource::Channel(ch) if ch == ci) {
                 extra = true;
@@ -916,14 +720,11 @@ pub(crate) fn classify_channels(
             classes.push(ChannelClass::FullRing);
             continue;
         };
-        // Same stage, take before put, and the put's value must depend on
-        // the taken value. Other non-put readers of the taken value are fine.
         if tsi != psi || toi >= poi {
             classes.push(ChannelClass::FullRing);
             continue;
         }
         let ops = &c.stages[tsi].ops;
-        // Reachability: does `pval` depend on `tid`?
         let mut reach =
             alloc::vec![false; ops.iter().map(|o| o.result_count()).sum::<u32>() as usize];
         if (tid as usize) < reach.len() {
@@ -947,8 +748,6 @@ pub(crate) fn classify_channels(
             classes.push(ChannelClass::FullRing);
             continue 'chan;
         }
-        // Fallible-stage analysis: any fallible phase strictly after the
-        // mutating stage's phase?
         let mstage = c.stages[tsi].stage;
         let mpi = Phase::ORDER
             .iter()

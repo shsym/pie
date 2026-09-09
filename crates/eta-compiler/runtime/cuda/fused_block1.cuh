@@ -17,8 +17,7 @@
     const m1_u32* intrinsic_offsets,
     m1_u32 rows_per_lane,
     m1_u32 temporary_stride) {
-  // `rows_per_lane` blocks serve one lane: a row-parallel region launches
-  // one per row, anything else one. `lane_row` is this block's row.
+
   const m1_u32 lane_blocks = rows_per_lane == 0u ? 1u : rows_per_lane;
   const m1_u32 dispatch_lane = blockIdx.x / lane_blocks;
   const m1_u32 lane_row = blockIdx.x % lane_blocks;

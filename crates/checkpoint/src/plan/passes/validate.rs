@@ -1,7 +1,3 @@
-//! The passes that only refuse: each is a `Pass` returning `Ok(0)`, stating
-//! an invariant the rewriters must preserve rather than leaving it implicit
-//! in the code that could break it.
-
 use std::collections::HashMap;
 
 use crate::error::{Error, OrOverflow, Result};
@@ -12,15 +8,6 @@ use crate::types::{
     BackendKind, BufferId, Encoding, QuantScheme, RepackLayout, TensorId, Visibility,
 };
 
-/// Every `Fill` runs before every write to the buffer it zeroes.
-///
-/// A fill is the one instruction whose absence of order is silent: run it
-/// late and the plan still validates, but hands back a tensor whose padded
-/// region has eaten real data.
-///
-/// `ExtentWrite`/`TileMap` carry a [`BufferId`] and match by lookup;
-/// `BulkExtentWrite` addresses the arena directly and is matched by overlap
-/// against each filled buffer's arena window instead.
 pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     let mut filled: HashMap<BufferId, usize> = HashMap::new();
     for (at, id) in program.schedule.iter().enumerate() {
@@ -47,14 +34,11 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
             fill_at: *fill_at,
         });
     }
-    // `filled` is a map, so its iteration order is not stable; sorting keeps the
-    // reported violation the same one on every run.
     windows.sort_by_key(|window| (window.start, window.buffer.0));
 
     for (at, id) in program.schedule.iter().enumerate() {
         let instr = instr_by_id(&program.instrs, *id)?;
 
-        // Writes that name their destination.
         let named: &[BufferId] = match instr {
             StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
                 std::slice::from_ref(&dest.buffer)
@@ -70,7 +54,6 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
             }
         }
 
-        // Writes that name an arena offset.
         if let StorageInstr::BulkExtentWrite {
             source,
             dest_offset,
@@ -83,7 +66,6 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A zeroed persistent buffer, as the arena window it owns.
 struct FilledWindow {
     start: u64,
     end: u64,
@@ -91,7 +73,6 @@ struct FilledWindow {
     fill_at: usize,
 }
 
-/// Refuse an arena-relative write that lands in a buffer zeroed after it.
 fn check_arena_write(
     windows: &[FilledWindow],
     dest_offset: u64,
@@ -143,9 +124,6 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             | QuantScheme::MlxAffineU4
                     )
                 ))
-                // Decode is implemented for schemes whose scales live inside
-                // the payload; a separate-scale scheme dequants via `Scale`
-                // instead, and `Decode` of one has no meaning.
                 || (*kind == TileMapKind::Decode
                     && transform
                         .from
@@ -158,9 +136,6 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
                         )
                     }))
-                // The tiled affine pair needs no device capability bit: it
-                // is a pure gather the host executor runs, not a device
-                // transform.
                 || (*kind == TileMapKind::Repack
                     && transform.repack.is_some_and(|repack| {
                         matches!(
@@ -170,8 +145,6 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                         )
                     })));
         if !supported {
-            // Unlike the other refusals here, this one is not a missing
-            // kernel: a serving plan may not convert at all (serve-as-stored).
             if *kind == TileMapKind::Encode {
                 return Err(Error::Unsupported(format!(
                     "this load would quantize on the way in ({:?}->{:?}), and a serving \
@@ -181,8 +154,6 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     transform.from, transform.to
                 )));
             }
-            // And for a unary: it is a function of the stored values, so
-            // the artifact holds its answer and a serving load reads that.
             if *kind == TileMapKind::Unary {
                 return Err(Error::Unsupported(format!(
                     "this load would apply {:?} on the way in, and a serving plan does \
@@ -193,8 +164,6 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     transform.unary
                 )));
             }
-            // Same reasoning for a repack: paid once per weight, not once
-            // per boot, so a serving load must not take one.
             if *kind == TileMapKind::Repack {
                 return Err(Error::Unsupported(format!(
                     "this load would relayout a weight plane on the way in ({:?}), and a \
@@ -214,21 +183,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A tensor the engine binds is stored in something the engine can read: no
-/// device may be handed a self-contained block it cannot read directly (see
-/// [`binds_block`] for which blocks a backend's kernels do read as stored).
-///
-/// `validate_target_support` is not the guard for this: it only refuses a
-/// `Decode` a backend has no bit for, so a plan that passes a blocked tensor
-/// straight through emits no `TileMap` and nothing to refuse there.
-///
-/// Only `Visibility::Public` tensors are checked. An `Internal` tensor is an
-/// intermediate the plan itself consumes, and a blocked one is exactly what
-/// a `Decode` reads from — refusing it would refuse the repair.
 pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> {
-    // A host target legitimately publishes blocked tensors: `pie model
-    // import`'s passthrough is this, and the whole point of an offline
-    // conversion is to write bytes no device has read yet.
     if program.target.backend == BackendKind::Unknown {
         return Ok(0);
     }
@@ -251,20 +206,8 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
     Ok(0)
 }
 
-/// The block schemes a backend's kernels read as stored, and the whole of
-/// the exception [`validate_bound_encodings`] carries.
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        // The five ggml K-quants: `kernels_cuda::linear::kquant`,
-        // `kernels_vulkan::linear::kquant` and `kernels_wgpu::linear::kquant`
-        // all read the super-block row as one byte plane, decoding inside
-        // the dot. Not the 32-element blocks (q4_0/q4_1/q5_0/q5_1/q8_0,
-        // gguf mxfp4), whose CUDA point reads a leaf-per-plane operand
-        // instead, and not the IQ lattices, which no backend signs.
-        //
-        // Reading them as stored is what keeps a GGUF the size it was: the
-        // alternative is decoding to the activation dtype at import, which
-        // inflates a K-quant checkpoint four- to eightfold.
         BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu => matches!(
             scheme,
             QuantScheme::GgufQ2K
@@ -273,16 +216,10 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
         ),
-        // Metal has no stored-block point and decodes to the activation
-        // dtype before the dot. `Unknown` never reaches here (the host arm
-        // above returns first).
         BackendKind::Metal | BackendKind::Unknown => false,
     }
 }
 
-/// A per-group [`TileMapKind::Scale`] keeps the operand holding its factors.
-/// Losing it would not fail to compile — it would silently scale by
-/// whatever the executor found first — so the final plan says it out loud.
 pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
     for instr in &program.instrs {
         let StorageInstr::TileMap {
@@ -298,8 +235,6 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
         if *kind != TileMapKind::Scale || transform.scale_blocks.is_empty() {
             continue;
         }
-        // One operand carries the payload unless it arrives as a source
-        // extent, and one carries the factors. Both, or neither is found.
         let wanted = 1 + usize::from(source.is_none());
         if inputs.len() != wanted {
             return Err(Error::Contract(format!(
@@ -312,13 +247,6 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A named kernel's operands are all in the arena. Without this check, a plan
-/// could name a device kernel over a checkpoint-backed operand and silently
-/// fall back to a correct but ~100x slower host execution instead of failing
-/// to compile.
-///
-/// A view is resolved to its base: a window on a resident buffer IS in the
-/// arena, which is the same walk `executor::host::resolve` does.
 pub(super) fn validate_kernel_operands(program: &mut LoadPlan) -> Result<usize> {
     for instr in &program.instrs {
         let StorageInstr::TileMap {
@@ -358,7 +286,6 @@ pub(super) fn validate_kernel_operands(program: &mut LoadPlan) -> Result<usize> 
     Ok(0)
 }
 
-/// Whether a buffer resolves to a span of the arena, through views.
 fn in_arena(program: &LoadPlan, id: BufferId) -> Result<bool> {
     let mut id = id;
     for _ in 0..MAX_VIEW_HOPS {
@@ -378,19 +305,8 @@ fn in_arena(program: &LoadPlan, id: BufferId) -> Result<bool> {
     Ok(false)
 }
 
-/// How deep a chain of views may go before the walk gives up; the same guard
-/// `passes::arena` and `passes::tile` use, for the same reason.
 const MAX_VIEW_HOPS: usize = 16;
 
-/// Operand-unit invariants the optimizer/ABI must preserve and the executor
-/// relies on, checked explicitly on the final plan so a future rewrite fails
-/// fast instead of silently regressing:
-///   1. every persistent operand buffer base is aligned to the device target
-///      and its tensor contract.
-///   2. persistent operand buffers occupy disjoint arena ranges.
-///   3. every `CreateView` reads a single backing buffer that exists, and the
-///      view window lies within it.
-///   4. a declared tensor is claimed by at most one buffer.
 pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize> {
     let mut claimed: HashMap<TensorId, BufferId> = HashMap::new();
     for buffer in &program.buffers {
@@ -460,8 +376,11 @@ mod tests {
     use super::binds_block;
     use crate::types::{BackendKind, QuantScheme};
 
-    /// The five K-quants carry their scales inside the payload, so a backend
-    /// either has a stored-block point or the plan must decode them. Three do.
+    fn validate_every_case() {
+        the_k_quants_bind_on_every_backend_with_a_stored_block_point();
+        the_small_blocks_and_the_lattices_bind_nowhere();
+    }
+
     #[test]
     fn the_k_quants_bind_on_every_backend_with_a_stored_block_point() {
         let k_quants = [
@@ -485,9 +404,6 @@ mod tests {
         }
     }
 
-    /// The 32-element blocks and the IQ lattices are NOT the K family: no
-    /// backend here reads them as stored, so a plan must decode them.
-    #[test]
     fn the_small_blocks_and_the_lattices_bind_nowhere() {
         for scheme in [
             QuantScheme::GgufQ4_0,

@@ -149,9 +149,7 @@ impl Run<'_> {
                 self.uncut(*y),
             ),
 
-            // The per-row top-k a candidate selector reads has no vulkan kernel yet.
             Layout::TopK { .. } => Err(kernels_vulkan::Error::Unsupported { op: "layout.topk" }),
-            // M0: the row packing (D2) is CUDA-first; refused by name here.
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
@@ -166,8 +164,6 @@ impl Run<'_> {
                 }
                 Ok(())
             }
-            // The readout gather is the CUDA head's; this shell runs the
-            // trunk head over every row, as it always has.
             Layout::GatherRows { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             Layout::Select {
                 table,

@@ -1,20 +1,3 @@
-//! The plan mutations the `validate_singleton_plan` corpus is built from. They
-//! were transcribed from `kMutations` / `mutate()` in an in-driver C++ oracle
-//! that has since been deleted, and are now the definition rather than a copy
-//! of one.
-//!
-//! `validate_singleton_plan` rejects things a well-formed compiler plan never
-//! produces, so almost all of its error paths are only reachable by damaging a
-//! valid plan. Both dumps apply exactly these mutations, in this order.
-//!
-//! Nothing damages a symbolic extent role, a dtype or an op tag: those are
-//! closed enums in the Rust plan types, so the matching C++ branches are
-//! unreachable here and are deliberately left uncovered.
-//!
-//! `singleton_plan_rejection.rs` is what reads this. The oracle comparison in
-//! `metal_msl_golden.rs` deliberately does not (its reasons are there), which
-//! left this file compiled by nothing at all for long enough to bit-rot past a
-//! `NodeIndex` newtype -- 245 lines describing a test that was not running.
 #![allow(dead_code)]
 
 use eta_compiler::plan::{
@@ -51,7 +34,6 @@ pub const MUTATIONS: &[&str] = &[
     "clear_names",
 ];
 
-/// Apply one mutation in place. `false` when it does not apply to this plan.
 pub fn mutate(stage: &mut CompiledStage, mutation: &str) -> bool {
     match mutation {
         "none" => true,

@@ -43,7 +43,7 @@ for name in names:
         if base == "decoder.attn.wo_a":
             deq = deq.reshape(-1, deq.shape[-1])
         mx.eval(deq)
-        out[name] = np.array(deq.astype(mx.float32)).astype(np.float32).view(np.uint32) >> 16  # bf16 bits
+        out[name] = np.array(deq.astype(mx.float32)).astype(np.float32).view(np.uint32) >> 16
         out[name] = out[name].astype(np.uint16)
         print(f"{name}: mxfp8 -> bf16 {tuple(deq.shape)}")
     elif spec and spec["mode"] == "mxfp4":
@@ -59,7 +59,6 @@ for name in names:
         print(f"{name}: copied {tuple(t.shape)} {t.dtype}")
 
 os.makedirs(args.out, exist_ok=True)
-# safetensors.numpy has no bf16: write uint16 payloads and patch the header dtype to BF16.
 tmp = os.path.join(args.out, "model.safetensors")
 bf16 = {n for n, a in out.items() if a.dtype == np.uint16}
 save_file(out, tmp)

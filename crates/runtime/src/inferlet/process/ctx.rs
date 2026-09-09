@@ -1,5 +1,3 @@
-//! Per-process runtime state attached to every wasmtime `Store`: WASI context, filesystem/Python preopens, and dynamic-linking resource maps.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,63 +18,35 @@ use crate::inferlet::sandbox::InstancePolicy;
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::rs::RsWorkingSetId;
 
-/// Where a process's stdout/stderr are routed.
 pub enum OutputMode {
-    /// Discard outputs (wasmtime's default sink). Used for snapshot init,
-    /// where guest output is noise.
     Discard,
-    /// Route to the per-process actor channel, drained by an attached client.
     Stream,
-    /// Route to pie-worker's `tracing` log, tagged with `program`, when no
-    /// client session is attached.
     Log { program: String },
 }
 
 pub struct ProcessCtx {
-    // Wasm states
     id: ProcessId,
     username: String,
 
-    // WASI states
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
-    /// wasi:http@0.3 host hooks. Enforces the instance's network policy at
-    /// the one host-side choke point (`is_supported_scheme`).
     http_hooks: PieHttpHooks,
 
-    /// Whether outbound network is permitted (gates `pie:core/http.fetch`).
     network_allowed: bool,
 
-    /// Per-instance scratch directory, deleted on Drop. `None` when the
-    /// sandbox denies the filesystem.
     scratch_dir: Option<PathBuf>,
 
-    // Dynamic linking support for proxy resources
-    /// Maps host rep → guest ResourceAny for dynamic linking
     dynamic_resource_map: HashMap<u32, ResourceAny>,
-    /// Maps guest ResourceAny → host rep (for identity preservation)
     guest_resource_map: Vec<(ResourceAny, u32)>,
-    /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
-    /// Held while this process is in the prewarm cohort (spawn through bind
-    /// admission); bounds how many processes instantiate without engine
-    /// progress. Released once the bind permit is won.
     prewarm_permit: Option<OwnedSemaphorePermit>,
-    /// The bind-ahead permit, acquired at the first operation creating
-    /// per-instance engine state. Transferred to deferred teardown alongside
-    /// the execution permit.
     bind_permit: Option<OwnedSemaphorePermit>,
     bind_admitted: bool,
-    /// The real concurrency permit, acquired lazily at fire submit. Process
-    /// drop transfers it to deferred teardown so the next cohort cannot
-    /// overlap stale scheduler membership or pooled resources.
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
-    /// This process's lock-free planner residency flag, taken once on the
-    /// first residency-gate call.
     residency_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -86,8 +56,6 @@ impl Drop for ProcessCtx {
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
         self.bind_admitted = false;
-        // Free the seat here, not in spawned teardown: Terminate leave is
-        // posted first on this producer, so every engine sees leave-then-release.
         let terminate_fences = execution_permit.as_ref().map(|_| {
             let fences = crate::scheduler::worker::post_process_terminate_fenced(self.id);
             crate::scheduler::worker::notify_execution_slot_released(self.id);
@@ -125,9 +93,6 @@ impl WasiHttpView for ProcessCtx {
     }
 }
 
-/// wasi:http@0.3 hooks carrying the instance's network policy. When the
-/// network is disabled every scheme is reported unsupported, so
-/// `wasi:http/handler#handle` fails each request rather than refusing to instantiate.
 pub struct PieHttpHooks {
     network_allowed: bool,
 }
@@ -159,8 +124,6 @@ impl ProcessCtx {
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtx::builder();
 
-        // `socket_addr_check` filters per-connect/per-bind; skipping
-        // `inherit_network` denies all socket operations entirely.
         if policy.network.allow {
             builder.inherit_network();
             if !policy.network.is_unrestricted() {
@@ -197,8 +160,6 @@ impl ProcessCtx {
             None
         };
 
-        // Set up Python runtime environment if py-runtime directory is available.
-        // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
         if let Some(dir) = py_runtime_dir {
             let runtime_dir = dir.join("runtime");
             let site_packages_dir = dir.join("site-packages");
@@ -244,7 +205,6 @@ impl ProcessCtx {
             },
             network_allowed: policy.network.allow,
             scratch_dir,
-            // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
@@ -267,9 +227,6 @@ impl ProcessCtx {
         self.id
     }
 
-    /// The residency-gate fast path: one relaxed load, no lookup, no lock.
-    /// Until the planner hands out a flag, the process holds no pooled
-    /// pages and is resident by definition.
     pub(crate) fn is_resident_fast(&mut self) -> bool {
         if self.residency_flag.is_none() {
             let Some(planner) = crate::planner::planner() else {
@@ -287,7 +244,6 @@ impl ProcessCtx {
         self.prewarm_permit = permit;
     }
 
-    /// Free the prewarm conveyor slot. Called once bind admission is won. Idempotent.
     pub(crate) fn release_prewarm_permit(&mut self) {
         self.prewarm_permit = None;
     }
@@ -303,8 +259,6 @@ impl ProcessCtx {
     pub(crate) fn admit_bind(&mut self, permit: Option<OwnedSemaphorePermit>) {
         self.bind_permit = permit;
         self.bind_admitted = true;
-        // Safety net: normally released before the bind-admission park
-        // (`release_prewarm_permit`).
         self.prewarm_permit = None;
     }
 
@@ -323,12 +277,10 @@ impl ProcessCtx {
         self.username.clone()
     }
 
-    /// Whether outbound network is permitted for this inferlet.
     pub fn network_allowed(&self) -> bool {
         self.network_allowed
     }
 
-    /// Just the live pipeline queues — for the per-prologue hot paths.
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
         self.residency.lock().unwrap().pipelines()
     }
@@ -397,23 +349,16 @@ impl ProcessCtx {
             });
     }
 
-    // ========================================================================
-    // Dynamic Linking Support Methods
-    // ========================================================================
-
-    /// Allocates a new host rep for dynamic resource mapping.
     pub fn alloc_dynamic_rep(&mut self) -> u32 {
         let rep = self.next_dynamic_rep;
         self.next_dynamic_rep = self.next_dynamic_rep.checked_add(1).unwrap();
         rep
     }
 
-    /// Gets the guest ResourceAny for a given host rep.
     pub fn get_dynamic_resource(&self, rep: u32) -> Option<ResourceAny> {
         self.dynamic_resource_map.get(&rep).copied()
     }
 
-    /// Gets the host rep for a given guest ResourceAny (for identity preservation).
     pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
         self.guest_resource_map
             .iter()
@@ -421,16 +366,13 @@ impl ProcessCtx {
             .map(|(_, rep)| *rep)
     }
 
-    /// Inserts a mapping between host rep and guest ResourceAny.
     pub fn insert_dynamic_resource_mapping(&mut self, rep: u32, resource: ResourceAny) {
         self.dynamic_resource_map.insert(rep, resource);
-        // Only insert the reverse mapping if not already present
         if self.rep_for_guest_resource(resource).is_none() {
             self.guest_resource_map.push((resource, rep));
         }
     }
 
-    /// Removes the mapping for a host rep and returns the guest ResourceAny.
     pub fn remove_dynamic_resource_mapping(&mut self, rep: u32) -> Option<ResourceAny> {
         if let Some(resource) = self.dynamic_resource_map.remove(&rep) {
             self.guest_resource_map.retain(|(r, _)| *r != resource);

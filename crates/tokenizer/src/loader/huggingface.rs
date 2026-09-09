@@ -1,8 +1,3 @@
-//! Strict loader for modern Hugging Face `tokenizer.json` BPE pipelines.
-//! Supports byte-level, string-replacement+byte-fallback, legacy
-//! sentencepiece, and Metaspace sentencepiece profiles; other component
-//! combinations are rejected rather than partially interpreted.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -72,18 +67,12 @@ struct CompiledProfile {
     normalizes_text: bool,
 }
 
-/// Load a tokenizer from an HF `tokenizer.json` file.
 pub fn from_file(path: &Path) -> Result<Tokenizer> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     from_slice(&data)
 }
 
-/// Load a tokenizer from raw HF `tokenizer.json` bytes.
 pub fn from_slice(json: &[u8]) -> Result<Tokenizer> {
-    // The model type decides the SHAPE of `model.vocab`, so it is read
-    // before anything is deserialized into a typed record: BPE's vocab is
-    // `{piece: id}` and Unigram's is `[[piece, score], …]`, and `HfModel`
-    // can only hold the first.
     let probe: serde_json::Value =
         serde_json::from_slice(json).context("parsing tokenizer JSON")?;
     if probe.get("model").and_then(|m| m.get("type")).and_then(serde_json::Value::as_str)
@@ -95,14 +84,6 @@ pub fn from_slice(json: &[u8]) -> Result<Tokenizer> {
     from_hf(hf)
 }
 
-/// **SENTENCEPIECE UNIGRAM** (umT5, and every T5 relative), read off the same
-/// `tokenizer.json` a BPE model uses and nothing else — no `spiece.model`
-/// protobuf, which is the other door and one this does not need.
-///
-/// Refuses by name, rather than approximating, anything this does not serve:
-/// byte fallback, a normalizer that is not the space-run collapse, a
-/// pre-tokenizer that is not Metaspace, or a post-processor that appends
-/// anything but one special token.
 fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
     use std::collections::HashMap;
 
@@ -137,8 +118,6 @@ fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
             .with_context(|| format!("vocab entry {index}'s score is not a number"))?;
         let id = u32::try_from(index).context("Unigram vocabulary is too large")?;
         pieces.push((piece.to_string(), score as f32));
-        // First writer wins, matching the score table: a duplicate piece
-        // later in the list is unreachable in both.
         vocab.entry(piece.to_string()).or_insert(id);
     }
 
@@ -146,9 +125,6 @@ fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
     let eos_id = unigram_template_tail(root, &vocab)?;
     let scores = crate::unigram::UnigramScores::new(&pieces, unk_id)?;
 
-    // The symbol table is the SAME one BPE uses — id to bytes and back — so
-    // decode, the grammar vocabulary and the special-token walk all keep
-    // working with no Unigram of their own. There are no merges.
     let bpe = BpeTable::from_vocab_and_merges(&vocab, &[], false)?;
     let added_tokens = added_tokens_of(root)?;
     Tokenizer::new(
@@ -163,7 +139,6 @@ fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
     )
 }
 
-/// The Metaspace marker, and the refusal for every other pre-tokenizer.
 fn unigram_metaspace(root: &serde_json::Value) -> Result<String> {
     let pre = root
         .get("pre_tokenizer")
@@ -185,8 +160,6 @@ fn unigram_metaspace(root: &serde_json::Value) -> Result<String> {
         .to_string())
 }
 
-/// The `TemplateProcessing` tail: the ONE special token every encode ends
-/// with, resolved to its id. `None` for a tokenizer that appends nothing.
 fn unigram_template_tail(
     root: &serde_json::Value,
     vocab: &std::collections::HashMap<String, u32>,
@@ -203,8 +176,6 @@ fn unigram_template_tail(
         .get("single")
         .and_then(serde_json::Value::as_array)
         .context("a TemplateProcessing states a `single` template")?;
-    // `[Sequence A, SpecialToken X]` and nothing else: a template that
-    // prefixes, or appends more than one, is refused rather than half-read.
     ensure!(
         single.len() == 2 && single[0].get("Sequence").is_some(),
         "only a `[sequence, special]` template is served; this states {} piece(s)",
@@ -222,7 +193,6 @@ fn unigram_template_tail(
     Ok(Some(id))
 }
 
-/// The `added_tokens` list, in the shape [`Tokenizer::new`] takes.
 fn added_tokens_of(root: &serde_json::Value) -> Result<Vec<AddedToken>> {
     let Some(list) = root.get("added_tokens").and_then(serde_json::Value::as_array) else {
         return Ok(Vec::new());
@@ -286,7 +256,6 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
             "duplicate added-token content {:?}",
             token.content
         );
-        // `single_word` is not expressible by an Aho-Corasick match, so it is refused rather than ignored.
         ensure!(
             !token.single_word,
             "unsupported added-token single_word flag for {:?}",
@@ -335,8 +304,6 @@ fn validate_model_basics(model: &HfModel) -> Result<()> {
     Ok(())
 }
 
-/// Validate the shared `Replace` + `ByteFallback` + `Fuse` head of a
-/// byte-fallback decoder sequence.
 fn validate_fallback_decoder_head(
     decoders: &[&serde_json::Value],
     normalizer_from: &str,
@@ -367,9 +334,6 @@ fn validate_fallback_decoder_head(
     Ok(())
 }
 
-/// Validate the `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder shared
-/// by the legacy sentencepiece and Metaspace profiles: the head reverses the
-/// space→marker mapping and `Strip` removes the dummy prefix again.
 fn validate_sentencepiece_decoder(
     hf: &HfTokenizerJson,
     normalizer_from: &str,
@@ -434,7 +398,6 @@ fn compile_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     }
 }
 
-/// Legacy Llama-2-style sentencepiece BPE (Phi-3 and relatives): a `Prepend` + `Replace` normalizer injecting the dummy prefix, undone by a `Strip` decoder.
 fn compile_sentencepiece_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     ensure!(
         hf.model.byte_fallback,
@@ -502,7 +465,6 @@ fn compile_sentencepiece_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile
     })
 }
 
-/// Mistral-style Metaspace BPE: a `Metaspace` pre-tokenizer with `prepend_scheme: "first"` and `split: false`. Other parameterizations have different segmentation semantics and are rejected instead of approximated.
 fn compile_metaspace_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     ensure!(
         hf.model.byte_fallback,
@@ -626,7 +588,6 @@ fn compile_byte_level_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
             "unsupported pre-tokenizer: {}",
             node_type(node)
         );
-        // `Isolated`+`invert: false` keeps the gaps between matches; `Removed`+`invert: true` drops them.
         let behavior = node.get("behavior").and_then(serde_json::Value::as_str);
         let invert = node.get("invert").and_then(serde_json::Value::as_bool) == Some(true);
         let keep_gaps = match (behavior, invert) {
@@ -766,7 +727,6 @@ fn compile_byte_fallback_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile
             normalizer_from: normalizer_from.to_string(),
             normalizer_to: normalizer_to.to_string(),
             unk_token_id: Some(unk_token_id),
-            // Gemma injects no dummy prefix and its decoder does not strip.
             dummy_prefix: DummyPrefix::None,
             strip_decoder_marker: false,
         },

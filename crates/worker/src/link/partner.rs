@@ -1,5 +1,3 @@
-//! Decode-worker lifecycle for controller-assigned executor partners.
-
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -11,8 +9,6 @@ use crate::executor::ModelIdentity;
 
 use crate::executor;
 
-// fields read by the dial handshake once it exists; kept so a future
-// implementation doesn't need to rediscover which numbers it needs.
 #[allow(
     dead_code,
     reason = "read by the dial handshake once remote executors are supported"
@@ -45,7 +41,6 @@ struct PartnerLink {
 }
 
 pub(crate) struct PartnerLinkManager {
-    /// This worker's own id; the handshake's client nonce.
     #[allow(
         dead_code,
         reason = "read by the dial handshake once remote executors are supported"
@@ -139,8 +134,6 @@ impl PartnerLinkManager {
         {
             return false;
         }
-        // liveness probe needs a cheap "still serving the model" check; a
-        // wrong answer is worse than none.
         let healthy = false;
         if healthy
             && link
@@ -154,16 +147,6 @@ impl PartnerLinkManager {
         false
     }
 
-    /// Dial a controller-assigned executor partner. Not yet implemented.
-    ///
-    /// Once implemented, the grant's page range must be validated against
-    /// the peer's pool before any page id is minted against it
-    /// (`grant.end_page() <= capabilities.total_pages`), since those ids feed
-    /// a `KvCopy` this worker builds.
-    ///
-    /// # Errors
-    ///
-    /// Always, until implemented.
     async fn dial(&self, peer: NeighborPeer) -> Result<PartnerLink> {
         let role = match peer.role {
             Role::Prefill => runtime::offload::PartnerRole::Prefill,

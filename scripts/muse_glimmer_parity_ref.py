@@ -40,7 +40,6 @@ PROMPTS = [
     ("chat", "<|start|>user<|message|>What is 17 times 23?<|eot|><|start|>assistant"),
 ]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
@@ -100,7 +99,6 @@ def main():
         )
         print(f"  {name}: {len(ids)} tokens, gen={produced[:12]}  ({time.time() - started:.1f}s)")
         print(f"      {tokenizer.decode(produced)!r}")
-
 
 if __name__ == "__main__":
     main()

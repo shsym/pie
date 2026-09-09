@@ -1,47 +1,3 @@
-//! **THE MINIMAX H3 ROWS TRACE, CLASSIFY AND BAKE: THREE READINGS UNDER
-//! ONE PLAN, FOUR STREAMS IN ONE JOINT ATTENTION, AND A MODALITY GATHER
-//! MADE OF ONE WEIGHT CUT AND ONE COLUMN SLICE.**
-//!
-//! ```text
-//! cargo test -p models --test the_minimax_h3_rows_bake
-//! ```
-//!
-//! `minimax-h3-fl2va` is the first catalog row whose denoise reading
-//! carries FOUR streams in one attention group, whose modulation is
-//! per-(lane, modality) rather than per-lane, and whose head answers two
-//! velocities of different widths (design D1, D2, D6, D7).
-//! `minimax-h3-mini` is the parity fixture `scripts/imagegen/h3_golden.py
-//! --mini` writes. What is asserted:
-//!
-//! ```text
-//! (a) every row traces on every platform; the flagship declares one kv
-//!     row per encoder layer it runs (50) and the miniature none
-//! (b) the seams are `hidden` (the encoder, the refiner, the audio head)
-//!     and `velocity` (the video head), never `out`
-//! (c) the ports the trace reads are the ports the facts declare, at the
-//!     facts' widths and kind-relative indices, and every declared index
-//!     is the port's positional one (so `ReadingFact::port` and
-//!     `ports_indexed` cannot disagree)
-//! (d) the (reading, stream) lanes the facts list classify into distinct
-//!     classes where every merge resolves — including the two lane-shaped
-//!     merges the modality gather is made of
-//! (e) one ragged read per block over the GROUP CSR, one per refiner
-//!     block over the LANE CSR, and one per encoder layer through the
-//!     paged prefill
-//! (f) every trunk rope turns three axes of `2·rope_freqs` channels each,
-//!     neox, at θ 10 000, over `6·rope_freqs` of the head; the refiner
-//!     turns nothing
-//! (g) the modality gather: three adaLN row blocks per block, one per
-//!     modality, each `[6·dim, t_dim]`, and a `[Lanes, 4]` timestep port
-//!     sliced to one column per stream
-//! (h) every row bakes on every platform; no row wants a voxel ladder
-//! (i) the generative facts: readings dense from 0, the latent space
-//!     `(24, 1×2×2, /16, /4)`, and TWO stream shifts — video 12, audio 3
-//! (j) the modulation is a per-lane f32 vector over a bf16 trunk — two
-//!     scale-shift pairs per block and one at the head — and every gated
-//!     fold answers its residual's own rectangle
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
@@ -93,7 +49,21 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
     })
 }
 
-/// (a)
+fn the_minimax_h3_rows_bake_every_case() {
+    every_row_traces_on_every_platform_with_the_encoder_it_declares();
+    the_seams_are_the_two_float_readouts_and_never_logits();
+    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve();
+    one_joint_read_per_block_and_one_lane_read_per_refiner();
+    the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing();
+    the_modality_gather_is_three_weight_blocks_and_one_column_slice();
+    every_row_bakes_on_every_platform();
+    the_sharded_worlds_trace_and_bake();
+    the_generative_facts_state_the_readings_the_latent_and_two_shifts();
+    the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual();
+    the_gather_merges_four_lane_shaped_arms_back_onto_the_reading();
+}
+
 #[test]
 fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
     for platform in PLATFORMS {
@@ -117,8 +87,6 @@ fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
     }
 }
 
-/// (b)
-#[test]
 fn the_seams_are_the_two_float_readouts_and_never_logits() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -133,8 +101,6 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
             Some(&1),
             "`{sku}`: one velocity planting (the video head); found {found:?}"
         );
-        // The refiner's readout, the audio head's, and — on the flagship —
-        // the encoder's.
         assert_eq!(
             found.get(seam::HIDDEN.name),
             Some(&if is_flagship(sku) { 3 } else { 2 }),
@@ -143,7 +109,6 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
     }
 }
 
-/// The `(kind, index, width)` triples a plan's runtime inputs read.
 fn kind_code(kind: PortKind) -> u8 {
     match kind {
         PortKind::Latents => 0,
@@ -186,8 +151,6 @@ fn ports_read(plan: &Trace) -> BTreeSet<(u8, u8, u32)> {
     found
 }
 
-/// (c)
-#[test]
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     for sku in ROWS {
         let facts = row(sku).generative.as_ref().expect("generative facts");
@@ -205,9 +168,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             declared,
             "`{sku}`: the trace's runtime inputs and the readings' ports"
         );
-        // A stated index must also be the positional one, because the
-        // host resolves `input(name)` positionally (`ReadingFact::port`)
-        // and the plan reads the stated one.
         for reading in &facts.readings {
             for (positional, port) in reading.ports_indexed() {
                 let (by_name, _) = reading.port(port.name).expect("a declared port by name");
@@ -218,7 +178,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
                 );
             }
         }
-        // The names the plan spells.
         let denoise = facts
             .readings
             .iter()
@@ -240,7 +199,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     }
 }
 
-/// Every lane a request may submit: `(reading name, reading index, stream)`.
 fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
     let facts = row(sku).generative.as_ref().expect("generative facts");
     facts
@@ -259,8 +217,6 @@ fn lanes(sku: &str) -> Vec<(&'static str, u8, Stream)> {
         .collect()
 }
 
-/// (d)
-#[test]
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -289,7 +245,6 @@ fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
     }
 }
 
-/// Every attention node of a plan, with the mask it reads under.
 fn ragged(plan: &Trace) -> Vec<RaggedMask> {
     plan.nodes
         .iter()
@@ -300,8 +255,6 @@ fn ragged(plan: &Trace) -> Vec<RaggedMask> {
         .collect()
 }
 
-/// (e)
-#[test]
 fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
     for sku in ROWS {
         let d = dims(sku);
@@ -340,8 +293,6 @@ fn one_joint_read_per_block_and_one_lane_read_per_refiner() {
     }
 }
 
-/// (f)
-#[test]
 fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
     for sku in ROWS {
         let d = dims(sku);
@@ -370,7 +321,6 @@ fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
             assert_eq!(*rotary_dim, d.rotary_dim(), "`{sku}`: the rotated span");
             assert_eq!(*head_dim, d.head_dim, "`{sku}`: the head width");
         }
-        // Two per trunk block (q and k) and none in the refiner.
         assert_eq!(
             turns,
             2 * d.blocks as usize,
@@ -379,8 +329,6 @@ fn the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing() {
     }
 }
 
-/// (g)
-#[test]
 fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
     for sku in ROWS {
         let d = dims(sku);
@@ -405,8 +353,6 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
                 );
             }
         }
-        // Every stream of the denoise reading names a distinct
-        // (timestep slot, modality) pair for the three it uses.
         let pairs: BTreeSet<(u32, usize)> = [
             Stream::Text,
             Stream::Video,
@@ -421,7 +367,6 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
             4,
             "`{sku}`: the four lanes gather four different modulation vectors"
         );
-        // The timestep port is the step's whole unique-timestep list.
         let facts = row(sku).generative.as_ref().expect("facts");
         let denoise = facts
             .readings
@@ -446,8 +391,6 @@ fn budget() -> model_compiler::Budget {
     }
 }
 
-/// (h)
-#[test]
 fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
         for sku in ROWS {
@@ -468,13 +411,6 @@ fn every_row_bakes_on_every_platform() {
     }
 }
 
-/// The sharded worlds: the flagship at tp 2 and tp 4 traces and bakes,
-/// and every plane it cuts divides. What is NOT sharded is the adaLN bank
-/// — the modulation is applied over the trunk's whole width, which every
-/// rank holds, so a column-parallel adaLN would want an all-gather this IR
-/// has no op for; the recorded consequence is that a `-tp4` rank carries
-/// 9.4 GiB of trunk beside the whole 24.3 GiB bank (study §H.1).
-#[test]
 fn the_sharded_worlds_trace_and_bake() {
     for tp in [2u32, 4] {
         let sku = format!("minimax-h3-fl2va-bf16-kv-bf16-tp{tp}");
@@ -489,7 +425,6 @@ fn the_sharded_worlds_trace_and_bake() {
         );
         model_compiler::compile(&plan, &budget(), &model_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{sku}` does not bake: {why}"));
-        // The adaLN bank is whole on every rank.
         let m = model::Model::fl2va(Dtype::Bf16, tp);
         for bank in &m.dit.blocks[0].adaln {
             assert_eq!(
@@ -501,8 +436,6 @@ fn the_sharded_worlds_trace_and_bake() {
     }
 }
 
-/// (i)
-#[test]
 fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
     for sku in ROWS {
         let facts = row(sku).generative.as_ref().expect("facts");
@@ -570,8 +503,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
             schedule.pinned_sigmas.windows(2).all(|w| w[0] > w[1]),
             "`{sku}`: the sigma grid descends"
         );
-        // The two velocity heads: the reading states the video one, and
-        // the audio head's 32 rows ride the `hidden` seam.
         let denoise = facts
             .readings
             .iter()
@@ -582,8 +513,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
     }
 }
 
-/// (j)
-#[test]
 fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
     for sku in ROWS {
         let d = dims(sku);
@@ -607,9 +536,6 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
                 }
                 Operation::Elementwise(Elementwise::GatedResidualAdd { r, r_out, .. }) => {
                     folds += 1;
-                    // `r_out` is the fold's own value; the compiler
-                    // resolves it onto `r`'s slot, which it can only do
-                    // when the two carry the same rectangle.
                     assert_eq!(
                         plan.values[r.0 as usize].ty, plan.values[r_out.0 as usize].ty,
                         "`{sku}`: a gated fold answers its residual's own rectangle"
@@ -618,7 +544,6 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
                 _ => {}
             }
         }
-        // Two per block (attention and MLP) plus the head's one.
         assert_eq!(
             modulates,
             2 * d.blocks as usize + 1,
@@ -632,10 +557,6 @@ fn the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual() {
     }
 }
 
-/// The merges the modality gather is made of are LANE-shaped, which no
-/// other family in the catalog builds; if that ever stops resolving, this
-/// is the claim that says so.
-#[test]
 fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
     for sku in ROWS {
         let d = dims(sku);
@@ -650,13 +571,11 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
                 _ => false,
             })
             .count();
-        // One per block, and one for the final layer's pair.
         assert_eq!(
             lane_merges,
             d.blocks as usize + 1,
             "`{sku}`: the four sides' modulation vectors come back as one rectangle"
         );
-        // And the token-shaped one that joins the four streams' rows.
         let token_merges = plan
             .values
             .iter()

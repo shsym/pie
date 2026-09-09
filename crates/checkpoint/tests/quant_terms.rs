@@ -1,26 +1,7 @@
-//! `QuantSpec::term`, checked against what this crate already knows.
-//!
-//! A mapping table is prose until something computes with it. Every term
-//! [`QuantSpec::term`] emits is a claim about bytes, and this crate holds the
-//! independent statement of those bytes — `QuantScheme::block_layout`'s
-//! `(elements, bytes)` pairs, measured off real GGUF files rather than read
-//! off a struct — so the two can be multiplied against each other. That is
-//! what the first test does, and it is the reason a wrong element or a
-//! misremembered sub-block width cannot survive here: `q4_k` and `q5_k` differ
-//! by one bit of code width and 32 bytes of block, and no other pair of
-//! numbers satisfies both.
-//!
-//! The rest pin the three properties the bridge exists to have: that two
-//! pipelines shipping identical bytes land on ONE row, that a scheme and the
-//! dtype naming it land on the SAME row, and that a served row's term is
-//! recognized by `Dtype::of_fmt` while an unserved one is refused.
-
 use checkpoint::types::{DType, QuantScheme, QuantSpec};
 use dtype::Dtype;
 use dtype::{Elem, Fmt, spells};
 
-/// A spec whose numbers are the scheme's own defaults, which is what a zero
-/// field means everywhere else in this crate.
 fn spec(scheme: QuantScheme) -> QuantSpec {
     QuantSpec {
         scheme,
@@ -31,7 +12,6 @@ fn spec(scheme: QuantScheme) -> QuantSpec {
     }
 }
 
-/// The same, at a stated width and group.
 fn sized(scheme: QuantScheme, bits: u8, group: u32) -> QuantSpec {
     QuantSpec {
         bits_per_element: bits,
@@ -40,13 +20,6 @@ fn sized(scheme: QuantScheme, bits: u8, group: u32) -> QuantSpec {
     }
 }
 
-/// Every scheme that has a term, with the spelling it takes under a
-/// default-shaped spec.
-///
-/// The parametric rows are here at their DEFAULTS, which is why AWQ reads
-/// `g32` and not the `g128` its checkpoints ship: `default_group_size` answers
-/// 32 for it, and this table is what that default spells. The group is the
-/// spec's everywhere it is a spec field at all.
 const ROWS: &[(QuantScheme, &str)] = &[
     (QuantScheme::Fp8E4M3, "gr_e4m3_f32_n"),
     (QuantScheme::Fp8E5M2, "gr_e5m2_f32_n"),
@@ -69,12 +42,6 @@ const ROWS: &[(QuantScheme, &str)] = &[
     (QuantScheme::GgufMxfp4, "g32_e2m1_e8m0_n"),
 ];
 
-/// Every scheme that has none, and the family it belongs to.
-///
-/// Three reasons, and none of them is "not implemented yet" in the sense that
-/// invites a guess later: a raw tensor's row is the dtype's to give, a
-/// codebook needs a table registry that does not exist, and a lattice has no
-/// node in the algebra at all.
 const NO_ROW: &[QuantScheme] = &[
     QuantScheme::None,
     QuantScheme::Int8Asymmetric,
@@ -87,10 +54,22 @@ const NO_ROW: &[QuantScheme] = &[
     QuantScheme::GgufIq3S,
 ];
 
-/// The term, or a failure naming the scheme that had none.
 fn row(scheme: QuantScheme) -> Fmt<'static> {
     spec(scheme).term()
         .unwrap_or_else(|| panic!("{scheme:?} is listed as having a term and answered None"))
+}
+
+fn quant_terms_every_case() {
+    every_scheme_spells_the_row_the_table_says();
+    the_schemes_with_no_term_say_so_rather_than_guessing();
+    a_gguf_block_weighs_what_its_term_says_it_does();
+    awq_and_gptq_converge_on_one_row();
+    the_mlx_row_has_one_truth_and_two_doors();
+    of_fmt_sorts_the_bridge_rows_into_served_and_import_only();
+    an_mlx_width_the_decoder_does_not_know_gets_no_row();
+    a_scalar_dtype_is_its_own_element();
+    a_gguf_row_does_not_move_when_the_spec_says_otherwise();
+    the_structural_answers_come_off_the_term_not_the_name();
 }
 
 #[test]
@@ -108,7 +87,6 @@ fn every_scheme_spells_the_row_the_table_says() {
     }
 }
 
-#[test]
 fn the_schemes_with_no_term_say_so_rather_than_guessing() {
     for scheme in NO_ROW {
         assert_eq!(
@@ -119,19 +97,6 @@ fn the_schemes_with_no_term_say_so_rather_than_guessing() {
     }
 }
 
-/// **THE CROSS-CHECK.** A GGUF block's byte count is stated twice over: once
-/// by `QuantScheme::block_layout`, which this crate measured, and once by the
-/// term, which says bits per weight and knows nothing about ggml. The two
-/// have to agree exactly, and for all eleven blocks they do — the scales, the
-/// mins, the sub-block bytes and the super-block f16s all fall out of the term.
-///
-/// No skips and no tolerance. Every one of these containers is packed with
-/// nothing wasted: `q3_k`'s twelve bytes carry sixteen six-bit scales,
-/// `q4_k`'s twelve carry eight scales AND eight mins, and `q6_k`'s 210 are
-/// 128 + 64 + 16 + 2 with no padding anywhere. A block that ever does carry
-/// padding would fail here, and the right answer then is to say so in the
-/// scheme's own docs rather than to loosen this.
-#[test]
 fn a_gguf_block_weighs_what_its_term_says_it_does() {
     let mut checked = 0;
     for (scheme, _) in ROWS {
@@ -154,12 +119,6 @@ fn a_gguf_block_weighs_what_its_term_says_it_does() {
     assert_eq!(checked, 11, "the GGUF rows the bridge maps");
 }
 
-/// **AWQ AND GPTQ ARE ONE ROW.** They ship the identical numbers and differ in
-/// the order nibbles sit inside a word, which `file/zt.rs` recovers the scheme
-/// from and which no arithmetic ever sees. A dispatch table keyed on the
-/// term serves both with one kernel, and that convergence is the whole
-/// argument for naming rows rather than pipelines.
-#[test]
 fn awq_and_gptq_converge_on_one_row() {
     let awq = sized(QuantScheme::AwqInt4, 4, 128).term();
     let gptq = sized(QuantScheme::GptqInt4, 4, 128).term();
@@ -171,12 +130,6 @@ fn awq_and_gptq_converge_on_one_row() {
     );
 }
 
-/// One truth, two doors: a plane that reaches the loader as
-/// `QuantScheme::MlxAffineU4` at four bits and 64, and a model text that says
-/// `Dtype::U4g64`, are the same format and must produce the same value. The
-/// dtype is the declaration's shorthand for the scheme; if the two doors ever
-/// disagreed the shorthand would be a second format.
-#[test]
 fn the_mlx_row_has_one_truth_and_two_doors() {
     let scheme = QuantScheme::MlxAffineU4;
     assert_eq!(
@@ -194,12 +147,6 @@ fn the_mlx_row_has_one_truth_and_two_doors() {
         Some(Dtype::U4g32.repr()),
         "a row too narrow for 64 is the same scheme, the other spec field over"
     );
-    // THE THIRD WIDTH IS A DOOR TOO. The DQ stacks quantize their expert
-    // banks to two bits at three groups, and each of the three is a `Dtype`
-    // the engine lands. A width missing here is not a narrower answer: it is
-    // `term()` answering `None`, which is `affine_point()` answering `None`,
-    // which is `engine-metal` refusing the bank for carrying scale factors
-    // with nothing to be factors of.
     for (group, d) in [(32, Dtype::U2g32), (64, Dtype::U2g64), (128, Dtype::U2g128)] {
         assert_eq!(
             sized(scheme, 2, group).term().as_ref(),
@@ -210,12 +157,6 @@ fn the_mlx_row_has_one_truth_and_two_doors() {
     }
 }
 
-/// **SERVED IS `of_fmt` SAYING SO.** The bridge's terms fall in two piles:
-/// those the engine lands (a `Dtype` variant exists — the k-quants, mxfp4,
-/// the per-row e4m3, MLX's three) and those it merely reads (GPTQ's row,
-/// `q4_1`, the per-row e5m2 — repack or refuse). The pile is not a new
-/// table: it is `Dtype::of_fmt`, asked of every row the bridge emits.
-#[test]
 fn of_fmt_sorts_the_bridge_rows_into_served_and_import_only() {
     let served: &[(QuantScheme, Dtype)] = &[
         (QuantScheme::Fp8E4M3, Dtype::E4m3row),
@@ -256,9 +197,6 @@ fn of_fmt_sorts_the_bridge_rows_into_served_and_import_only() {
     }
 }
 
-/// The two widths MLX quantizes at are the two `codec/mlx.rs` decodes; a
-/// third is a plane this crate cannot read, so it gets no row.
-#[test]
 fn an_mlx_width_the_decoder_does_not_know_gets_no_row() {
     let scheme = QuantScheme::MlxAffineU4;
     assert_eq!(sized(scheme, 6, 64).term(), None);
@@ -269,10 +207,6 @@ fn an_mlx_width_the_decoder_does_not_know_gets_no_row() {
     );
 }
 
-/// A dtype needs no bridge: its term is its own `repr`, and the scalar rows
-/// are `Elem` of their own element and nothing more — no group, no gain, no
-/// offset — which is what makes a raw tensor's term the element itself.
-#[test]
 fn a_scalar_dtype_is_its_own_element() {
     assert_eq!(DType::F32.repr(), &Fmt::Elem(Elem::F32));
     assert_eq!(DType::Bf16.repr(), &Fmt::Elem(Elem::Bf16));
@@ -289,10 +223,6 @@ fn a_scalar_dtype_is_its_own_element() {
     );
 }
 
-/// A blocked scheme ignores the spec's numbers, because its block already
-/// answered them. `default_group_size`'s own docs call those fields inert
-/// here; this is that word spent.
-#[test]
 fn a_gguf_row_does_not_move_when_the_spec_says_otherwise() {
     for (scheme, spelling) in ROWS {
         if scheme.block_layout().is_none() {
@@ -308,14 +238,6 @@ fn a_gguf_row_does_not_move_when_the_spec_says_otherwise() {
     }
 }
 
-/// The two structural answers the plan hands an engine, read off the term.
-///
-/// `is_mxfp4` is the two-plane form only: `GgufMxfp4` shares the algebra but
-/// interleaves its scale byte, and a binder asking about two-plane bytes must
-/// not be told yes. `affine_point` is the term's `(group, bits)` for the
-/// leaf-per-plane integer-code families and `None` for everything a block
-/// decoder or a dedicated kernel owns — whatever numbers the spec carries.
-#[test]
 fn the_structural_answers_come_off_the_term_not_the_name() {
     assert!(spec(QuantScheme::Mxfp4E2M1E8M0).is_mxfp4());
     assert!(
@@ -341,9 +263,7 @@ fn the_structural_answers_come_off_the_term_not_the_name() {
         Some((128, 4)),
         "excess-binary codes read at an affine point too"
     );
-    // A default-shaped MLX spec reads at the scheme's default point.
     assert_eq!(spec(QuantScheme::MlxAffineU4).affine_point(), Some((64, 4)));
-    // Everything a block decoder or a dedicated kernel owns: no point.
     assert_eq!(spec(QuantScheme::Mxfp4E2M1E8M0).affine_point(), None);
     assert_eq!(
         spec(QuantScheme::GgufQ4_0).affine_point(),

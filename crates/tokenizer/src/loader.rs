@@ -1,9 +1,3 @@
-//! External tokenizer format loaders.
-//!
-//! This module owns file-format detection and delegates format-specific
-//! parsing to [`huggingface`] or [`tiktoken`]. Encoding and decoding remain in
-//! the crate root.
-
 use std::path::Path;
 
 use anyhow::Result;
@@ -14,7 +8,6 @@ pub mod gguf;
 pub mod huggingface;
 pub mod tiktoken;
 
-/// Load a supported tokenizer artifact.
 pub fn from_file(path: &Path) -> Result<Tokenizer> {
     if is_tiktoken_path(path) {
         tiktoken::from_file(path)

@@ -1,12 +1,3 @@
-//! The checkpoint, resident: one device allocation, one row per
-//! `Trace::params`, plus the adapter banks in the same allocation and table.
-//! Banks live here, not in `store/`: they share `Def::Weight`'s one
-//! resolution path and are written between fires by `register_adapter`,
-//! not by launches in the fire path. `trace.params[i].name` must equal the
-//! contract's published name, or resolution fails at first fire with
-//! [`WeightTable`]'s `None`.
-
-/// The device load arena and its four transforms, gated on a chosen runtime.
 #[cfg(feature = "cuda")]
 pub mod arena;
 
@@ -30,57 +21,29 @@ use crate::error::{Fault, Result};
 use crate::experts::Attachments;
 use crate::run::{WeightRow, WeightTable};
 
-/// What a matrix operand wants under cuBLAS, and what `cudaMalloc` itself
-/// guarantees — the same alignment the loader's `StorageTarget` states.
 pub(crate) const ALIGN: u64 = 256;
 
-/// One plane of a registered adapter. `bytes` must be exactly one
-/// full-capacity slot of `bank`, zero-padded by the caller if the adapter
-/// was trained at a lower rank; a short plane errors as `Fault::Adapter`.
 #[derive(Debug, Clone, Copy)]
 pub struct AdapterPlane<'a> {
-    /// The bank param this plane fills, as `Trace::params` names it.
     pub bank: &'a str,
-    /// One slot's worth of bytes.
     pub bytes: &'a [u8],
 }
 
-/// Every weight this model needs, on the device — the checkpoint's and the
-/// banks'.
 #[derive(Debug)]
 pub struct Weights {
     store: Buffer,
     table: WeightTable,
-    /// Keyed by bank name, built at load off `ParamSource::Registered`.
     banks: BTreeMap<String, Bank>,
-    /// The routed-expert tier, or `None` when the device budget covers the
-    /// whole table.
     experts: Option<crate::experts::Tier>,
-    /// `true` means the host-side transform pipeline never ran for this load.
     from_cache: bool,
-    /// `Some` means some spilled dense planes are read out of device slots
-    /// that rotate during the fire; weight-table addresses never move.
     rotor: Option<crate::rotate::Rotor>,
-    /// The 8-bit dense projections decoded to bf16 once at load, for a
-    /// model whose every fire is wide (see [`decoded_dense_bytes`]). The
-    /// table's rows point into these; the packed planes stay in the store
-    /// unread.
     decoded: Vec<Buffer>,
 }
 
-/// Whether a param is an 8-bit dense projection a load may decode once:
-/// MLX affine codes at eight bits over a two-dimensional weight. Routed
-/// banks are three-dimensional and the select reads their codes directly.
 fn decodes_at_load(param: &model_ir::Param) -> bool {
     param.dtype == Dtype::U8g64 && param.shape.len() == 2
 }
 
-/// The bf16 bytes [`Weights::resident`] adds when `decode_dense` is on:
-/// every [`decodes_at_load`] param at two bytes an element. A denoiser
-/// fires every projection at a canvas of rows, where the fused 8-bit
-/// GEMV loses to cuBLAS over a decoded tile and the per-fire decode was
-/// 150 launches and 3.8 ms of a 44 ms step; decoding once at load trades
-/// that for the bf16 row's memory. Zero for a model that decodes.
 #[must_use]
 pub fn decoded_dense_bytes(trace: &Trace) -> u64 {
     trace
@@ -94,41 +57,26 @@ pub fn decoded_dense_bytes(trace: &Trace) -> u64 {
         .sum()
 }
 
-/// One declared adapter bank: where its slots are and how big they are.
 #[derive(Debug, Clone, Copy)]
 struct Bank {
     offset: u64,
     adapters: u32,
     slot: u64,
-    /// One slot's rectangle, past the leading adapters axis — `[rank, in]`
-    /// for an `A`, `[out, rank]` for a `B`. Needed by the shared-blob
-    /// resolver only.
     rows: u64,
     cols: u64,
     elem: u64,
 }
 
-/// One bank, as [`crate::blob`]'s shared-adapter resolver reads it: a
-/// flattened [`Bank`], since the resolver lives in another module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankSeat {
-    /// The param's own name, which is what a registration names.
     pub name: String,
-    /// How many adapters it seats.
     pub adapters: u32,
-    /// One adapter's bytes.
     pub slot: u64,
-    /// The leading axis of one slot.
     pub rows: u64,
-    /// The trailing axes of one slot, multiplied out.
     pub cols: u64,
-    /// One element in bytes.
     pub elem: u64,
 }
 
-/// The banks a plan declares, read off `ParamSource::Registered`. A bank's
-/// capacity is its param's leading axis; one adapter's slot is everything
-/// after it. `A` and `B` are independent banks — the op pairs them, not this.
 fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
     trace.params
         .iter()
@@ -142,7 +90,6 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
             } else {
                 place.bytes / u64::from(adapters)
             };
-            // Slot rectangle: the param's shape with the adapters axis cut off.
             let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
             (
                 param.name.clone(),
@@ -159,22 +106,11 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
         .collect()
 }
 
-/// How many device bytes this plan's weight table demands resident, before a
-/// byte is allocated. A pure function of the trace, so an unadmittable
-/// [`Residency`](engine::load::Residency) budget is refused early.
-/// # Errors
-/// [`Fault::Param`] for a param whose dtype has no element size.
 pub fn device_demand(trace: &Trace) -> Result<u64> {
     let places = places(trace, &crate::experts::Plan::default())?;
     Ok(places.last().map_or(0, |place| place.offset + place.reserved))
 }
 
-/// Every param's plane bytes, unaligned and unreduced. Shared by [`places`]
-/// and [`experts::Plan::of`](crate::experts::Plan::of) so both agree on a
-/// bank's size. Packed dtypes (mxfp4, MLX affine) are sized from their
-/// already-packed shape, not through `elem_bytes`.
-/// # Errors
-/// [`Fault::Param`] for a param declared in a storage element with no byte size.
 pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
     trace
         .params
@@ -182,19 +118,14 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
         .map(|param| {
             let (rows, width) = rectangle(&param.shape);
             Ok(match param.dtype {
-                // The shape already folds a 32-code block into sixteen bytes.
                 Dtype::Mxfp4 => rows.saturating_mul(width),
-                // Nibble element: two codes to a byte, odd row rounds up.
                 Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => {
                     rows.saturating_mul(width).div_ceil(2)
                 }
-                // Two-bit codes, four to a byte; group size is in the companion planes.
                 Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
                     rows.saturating_mul(width).div_ceil(4)
                 }
-                // One whole byte a code, so nothing rounds.
                 Dtype::U8g64 => rows.saturating_mul(width),
-                // Braided plane: shape is already `[n, Dtype::row_bytes(k)]`.
                 Dtype::U2g16k
                 | Dtype::I3g16k
                 | Dtype::U4g32k
@@ -214,26 +145,12 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
         .collect()
 }
 
-/// Everything a load can be planned against before a byte of it is read.
-/// Both fields come off the same `LoadPlan` compile.
 #[derive(Debug, Clone)]
 pub struct Prospect {
-    /// The split-plane pairings: which other params move when a packed bank
-    /// moves. What [`experts::Plan::of`](crate::experts::Plan::of) budgets
-    /// groups with.
     pub planes: Attachments,
-    /// The priority ranking this trace declares, before any budget cuts it.
-    /// What [`experts::Plan::cut`](crate::experts::Plan::cut) turns into a
-    /// residency.
     pub ranking: crate::experts::Ranking,
 }
 
-/// A routed bank's other device planes and the T2 source's name, so a
-/// residency decision can be made before [`Weights::resident`] reserves the
-/// store. Reads no tensor bytes.
-/// # Errors
-/// [`Fault::Load`] for a checkpoint the contract does not fit,
-/// [`Fault::Param`] for an attachment this plan cannot resolve.
 pub fn prospect(
     trace: &Trace,
     contract: &ModelContract,
@@ -260,10 +177,6 @@ pub fn prospect(
     })
 }
 
-/// The split-plane pairings, as a residency decision wants them: which other
-/// params move when a packed bank moves, keyed by the bank's own row.
-/// # Errors
-/// [`pairings`]', verbatim.
 fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
     let mut planes = Attachments::new();
     for (name, pairing) in pairings(landing, index)? {
@@ -277,13 +190,6 @@ fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Atta
     Ok(planes)
 }
 
-/// Restores every device image from the checkpoint itself: T1 into the
-/// pinned allocation, T0 as staged transfers, both hash-verified as they
-/// arrive.
-/// # Errors
-/// [`Rotten::Bytes`] for a file that does not answer for a plane or whose
-/// blocks do not hash, [`Rotten::Machine`] for a device or disk that did
-/// not. The file is left where it is either way.
 fn restore_from_checkpoint(
     serving: &crate::checkpoint_serving::Serving,
     trace: &Trace,
@@ -292,8 +198,6 @@ fn restore_from_checkpoint(
     store: &mut Buffer,
     tier: Option<&mut crate::experts::Tier>,
 ) -> std::result::Result<(), Rotten> {
-    // A deferred seat's T1 is a verify, not a copy: kernels fault its pages
-    // in themselves. `tier` is `None` for a resident plan (no T1 arm).
     let layout = tier.as_ref().map(|tier| tier.plan().host_layout()).unwrap_or_default();
     let seated = tier.as_ref().is_some_and(|tier| tier.deferred_image().is_some());
     let refill = match seated || layout.is_empty() {
@@ -305,19 +209,15 @@ fn restore_from_checkpoint(
         .map(|(param, _, _, _)| u32::try_from(*param).unwrap_or(u32::MAX))
         .collect();
 
-    // T0: one transfer per image the store holds, at the store's own offsets.
     let base = store.at(0).map_err(|why| Rotten::Machine(format!("{why}")))?;
     let mut transfers = Vec::with_capacity(places.len());
     let mut device_params = Vec::with_capacity(places.len());
     for (param, place) in places.iter().enumerate() {
-        // A registered plane is zeroed at load and filled by `register_adapter`.
         if place.reserved == 0
             || trace.params.get(param).map(|p| p.source) != Some(ParamSource::Checkpoint)
         {
             continue;
         }
-        // A streamed bank's slab is not pumped: `Tier::land` fills its
-        // resident slots from the pinned copy, so pumping would overwrite it.
         if plan.resident(param).is_some() {
             continue;
         }
@@ -335,7 +235,6 @@ fn restore_from_checkpoint(
                  device store"
             )));
         };
-        // The one bounds check on this path: this arm never reaches `Buffer::write`.
         store
             .at(place.offset.saturating_add(len))
             .map_err(|why| Rotten::Machine(format!("an image does not fit the store: {why}")))?;
@@ -347,14 +246,11 @@ fn restore_from_checkpoint(
         device_params.push(id);
     }
 
-    /// The pinned allocation's base, as something a scope thread may carry.
     struct Into(*mut u8);
     // SAFETY: the allocation is the tier's, handed to nobody else, and the
     // thread it moves into is its sole writer for as long as the scope is open.
     unsafe impl Send for Into {}
 
-    // T2's spilled planes are hashed too: a mapped plane has no first-touch
-    // hook, so without this a flipped bit in it would boot clean.
     let mapped: Vec<u32> = plan
         .mapped_layout()
         .iter()
@@ -363,16 +259,13 @@ fn restore_from_checkpoint(
     let mut hashed = device_params;
     hashed.extend(mapped);
     let (pumped, pinned) = (transfers.len(), pinned_params.len());
-    // Null when there is no tier; never dereferenced there since `refill` is `None` too.
     let into = Into(tier.as_ref().map_or(std::ptr::null_mut(), |tier| tier.host().host()));
     let (read, moved, verified) = std::thread::scope(|scope| {
         // SAFETY: `into` is the tier's own uninitialized allocation, which
         // `host_layout` tiles exactly, and no other reader names it yet.
         let reading =
             scope.spawn(move || match &refill {
-                // A deferred seat: images stay where they lie, only the claim is checked.
                 None => serving.verify_planes(&pinned_params),
-                // Move the whole value: edition 2021 would capture `into.0`, not `Send`.
                 Some(refill) => {
                     let into = into;
                     unsafe { crate::checkpoint_serving::read_into(refill, into.0) }
@@ -386,7 +279,6 @@ fn restore_from_checkpoint(
                     Ok(lanes) => lanes,
                     Err(why) => return (reading.join(), Err(why), Ok(Ok(()))),
                 };
-                // Device digests run beside their own lanes' mapping.
                 std::thread::scope(|inner| {
                     let hashing = inner.spawn(|| serving.verify_planes(&hashed));
                     let moved = lanes.pump(&transfers);
@@ -397,7 +289,6 @@ fn restore_from_checkpoint(
         (reading.join(), moved, verified)
     });
 
-    // Check the host arm first: its destination skipped a memset.
     match read {
         Ok(Ok(())) => {}
         Ok(Err(why)) => return Err(Rotten::Bytes(why)),
@@ -420,11 +311,6 @@ fn restore_from_checkpoint(
     Ok(())
 }
 
-/// The artifact to serve T1 from during a warm boot, or `None` to page-lock
-/// the image up front. Deferring verifies T1 planes where they lie instead of
-/// copying them, at the cost of page faults until the background fill lands.
-/// Requires the deployment's word (`[model] deferred_tier`, `deferred` here),
-/// a warm artifact, `host_image() > 0`, and `pageable_access`.
 fn defer_tiers(
     serving: Option<&crate::checkpoint_serving::Serving>,
     plan: &crate::experts::Plan,
@@ -434,8 +320,6 @@ fn defer_tiers(
     if !deferred || plan.host_image() == 0 || !crate::experts::pageable_access() {
         return None;
     }
-    // A spill and a deferred seat ask the artifact for different sets; the
-    // seat's needs can be missing even when a spill's are met. Fall back.
     if let Err(why) = serving.covers(&plan.host_layout()) {
         eprintln!(
             "engine-cuda: the tier is not deferred — {why}, so this boot builds its \
@@ -446,23 +330,15 @@ fn defer_tiers(
     Some(serving.clone())
 }
 
-/// Why a warm streamed boot did not get its images. The two variants exist
-/// so the operator is told whether to re-import (bad bytes) or check the
-/// machine (a device or disk that stopped answering); neither deletes the file.
 enum Rotten {
     Bytes(String),
     Machine(String),
 }
 
-/// Arms the background fill behind a deferred seat: spawns the thread and
-/// hands it its end of the channel. A fill that cannot be armed just leaves
-/// the seat serving out of the mapping for its whole life.
 fn arm_refill(tier: &mut crate::experts::Tier) {
-    // The tier's own mapping, already verified by the caller.
     let Some(image) = tier.deferred_image() else {
         return;
     };
-    // Built before the spawn so nothing crossing it aliases the tier or artifact.
     let refill = match image.refill(&tier.plan().host_layout()) {
         Ok(refill) => refill,
         Err(why) => {
@@ -474,7 +350,6 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
         }
     };
     let bytes = usize::try_from(tier.plan().host_image()).unwrap_or(usize::MAX);
-    // `cudaSetDevice` is per-thread, so the ordinal is read here and carried.
     let ordinal = match crate::device::ctx::current() {
         Ok(ordinal) => ordinal,
         Err(why) => {
@@ -487,9 +362,6 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
         }
     };
     let (send, filled) = std::sync::mpsc::channel();
-    // Logged even though every other line here is a refusal: until the fill
-    // lands, every T1 read is an NVMe page fault over HMM, and a log that
-    // never says the road was taken cannot show it.
     let objects = refill.landings.len();
     let path = refill.path.clone();
     match std::thread::Builder::new()
@@ -511,9 +383,6 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
     }
 }
 
-/// The fill, on its own thread: bind, map, read, verify, page-lock, send.
-/// Page-lock runs last since `cudaHostAlloc` holds the memory-manager lock
-/// while it runs. A failure sends nothing; the seat keeps serving what it had.
 fn refill_from(
     refill: &crate::checkpoint_serving::Landings,
     bytes: usize,
@@ -525,7 +394,6 @@ fn refill_from(
         eprintln!("engine-cuda: the deferred tier's fill cannot bind device {ordinal} ({why})");
         return;
     }
-    // Uninitialized and not yet page-locked; page-lock happens at the end.
     let host = match crate::device::Pinning::uninit(bytes) {
         Ok(host) => host,
         Err(why) => {
@@ -539,7 +407,6 @@ fn refill_from(
     // SAFETY: `host` maps exactly `bytes`, which `host_layout` tiles, and
     // was made on this thread with no other reader until it is sent.
     match unsafe { crate::checkpoint_serving::read_into(refill, host.host()) } {
-        // The lock is taken only over already-verified bytes.
         Ok(()) => match host.lock() {
             Ok(host) => {
                 let _ = out.send(host);
@@ -549,7 +416,6 @@ fn refill_from(
                  ({why}); the seat serves out of {path:?} for the life of this load"
             ),
         },
-        // A performance failure, not correctness: the seat still serves the verified mapping.
         Err(why) => eprintln!(
             "engine-cuda: the deferred tier's fill could not read {path:?} back ({why}); \
              the seat serves out of the mapping and the file is left alone. {}",
@@ -558,18 +424,12 @@ fn refill_from(
     }
 }
 
-/// The transform arena's backing: RAM when the machine has room, a
-/// file-backed map when it does not. See [`Scratch::fitting`].
 enum Scratch {
     Ram(Vec<u8>),
     Disk(SpillArena),
 }
 
 impl Scratch {
-    /// `arena` bytes of scratch, spilled to disk when RAM will not hold it
-    /// with a safety share left for the rest of the load. `mapped` is the
-    /// mapped-tier bytes the kernel will page in behind the executor, charged
-    /// as headroom since no allocation accounts for them.
     fn fitting(arena: usize, mapped: u64) -> Result<Scratch> {
         let need = arena as u64 + mapped + (2 << 30);
         if need <= available_memory() {
@@ -591,8 +451,6 @@ impl Scratch {
     }
 }
 
-/// The tighter of the kernel's `MemAvailable` and this cgroup's remaining
-/// allowance. Never zero: unreadable accounting gets the RAM-arena fallback.
 fn available_memory() -> u64 {
     let meminfo = std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -623,9 +481,6 @@ fn available_memory() -> u64 {
     }
 }
 
-/// A writable file-backed map, sized once and unlinked on drop. `MAP_SHARED`
-/// over a temp file makes dirty pages the kernel's problem to reclaim under
-/// memory pressure, where an anonymous map of the same size would OOM.
 struct SpillArena {
     at: *mut u8,
     len: usize,
@@ -649,7 +504,6 @@ impl SpillArena {
                 "the arena spill file {} does not open: {why}",
                 path.display()
             ))))?;
-        // Unlinked immediately: a crashed load leaves no file behind.
         let _ = std::fs::remove_file(&path);
         file.set_len(len as u64).map_err(|why| {
             Fault::Load(checkpoint::error::Error::Checkpoint(format!(
@@ -694,25 +548,16 @@ impl Drop for SpillArena {
     }
 }
 
-/// One quantized weight's other planes, as rows of [`places`]: the scales
-/// always, and — for an affine scheme, whose codes centre on a stored zero
-/// point — the biases beside them.
 #[derive(Debug, Clone, Copy)]
 struct Pairing {
     scales: usize,
     biases: Option<usize>,
 }
 
-/// The split-plane pairings this load plan states, by the code plane's own
-/// name. Read here, never reconstructed by matching a `.scales` suffix.
-/// # Errors
-/// [`Fault::Param`] for an attachment naming a plane this trace does not
-/// declare, or a scale form this shell has no point for.
 fn pairings<'a>(
     landing: &'a LoadPlan,
     index: &BTreeMap<&str, usize>,
 ) -> Result<BTreeMap<&'a str, Pairing>> {
-    // Keyed by the id's own number: `TensorId` is `Hash`+`Eq`, not `Ord`.
     let named: BTreeMap<u32, &str> = landing
         .tensors
         .iter()
@@ -723,7 +568,6 @@ fn pairings<'a>(
         let Some(name) = named.get(&attachment.tensor.0) else {
             continue;
         };
-        // Only a plane the trace declares becomes a weight row.
         if !index.contains_key(name) {
             continue;
         }
@@ -739,7 +583,6 @@ fn pairings<'a>(
         };
         let biases = match attachment.scale_form {
             ScaleForm::RawE8M0 => None,
-            // Affine bank: `code * scale + zero`; zero point is required, not optional.
             ScaleForm::Bf16AffineFactors => Some(row(
                 attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
                     name: (*name).to_string(),
@@ -774,14 +617,6 @@ fn pairings<'a>(
 }
 
 impl Weights {
-    /// Land `contract` against the checkpoint at `path`. A matching device
-    /// table under `cache_dir` is read straight to the device, skipping the
-    /// executor; a corrupt artifact is never retried, only reported.
-    /// # Errors
-    /// [`Fault::Load`] for a checkpoint the contract does not fit,
-    /// [`Fault::Param`] for a plan and a contract that do not name the same
-    /// tensors, [`Fault::Device`] for the residency itself,
-    /// [`Fault::Residency`] for a streamed `Serve` with no artifact it can cut.
     pub fn resident(
         trace: &Trace,
         contract: &ModelContract,
@@ -790,8 +625,6 @@ impl Weights {
         stream: *mut core::ffi::c_void,
         target: StorageTarget,
         decode_dense: bool,
-        // `Residency::deferred_tier`: whether a warm boot may serve T1 out of
-        // the artifact while the page-locked image is built behind it.
         deferred_tier: bool,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
@@ -800,11 +633,8 @@ impl Weights {
             (zt::parse(path)?, path.parent().unwrap_or(Path::new(".")))
         };
 
-        // `target` names this rank's band; a rank of one takes all of
-        // `Shard::Cut`'s segments.
         let landing = compile(&metadata, contract, target.clone())?;
 
-        // Name -> row map, shared by the landing sink and the table build.
         let index: BTreeMap<&str, usize> = trace
             .params
             .iter()
@@ -815,14 +645,8 @@ impl Weights {
         let places = places(trace, &plan)?;
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
         let mut store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
-        // A streamed bank's plane lands whole in the pinned tier, not the store.
         let serving = crate::checkpoint_serving::Serving::open(path, trace);
-        // T2 source: this deployment's own artifact, else a resident load's.
         let deferred = defer_tiers(serving.as_ref(), &plan, deferred_tier);
-        // Whether the checkpoint could fill the image, asked before it exists.
-        // The artifact's images are whole tensors landed for one rank; a
-        // rank of a wider group wants its band of each, which only the
-        // compiled plan below cuts. So a group lands the cold way.
         let restorable = target.tp_size == 1
             && serving
                 .as_ref()
@@ -831,7 +655,6 @@ impl Weights {
             true => serving.clone().map(crate::experts::Spill::Serving),
             false => None,
         };
-        // `None` from `defer_tiers` makes the page-locked image up front.
         let mut experts = match plan.streams() {
             true => {
                 let fill = match (deferred, restorable) {
@@ -844,7 +667,6 @@ impl Weights {
             false => None,
         };
 
-        // The checkpoint answers first, ahead of the caches below.
         let from_cache = if restorable {
             match serving.as_ref() {
                 None => false,
@@ -859,7 +681,6 @@ impl Weights {
                     ) {
                         Ok(()) => true,
                         Err(rotten) => {
-                            // The restore did not write either; zero both before landing cold.
                             store.zero_span(0, store.bytes())?;
                             if let Some(tier) = experts.as_mut() {
                                 tier.zero_host();
@@ -881,12 +702,10 @@ impl Weights {
                 }
             }
         } else {
-            // Lands cold; a spilled load is refused earlier, in `api.rs`.
             false
         };
 
         let landed = if from_cache {
-            // A matched restore wrote exactly the bytes `places` describes.
             vec![true; places.len()]
         } else {
             let mut sink = Landing {
@@ -897,7 +716,6 @@ impl Weights {
                 index: &index,
                 landed: vec![false; places.len()],
             };
-            // A streamed load has no arena; `landing` is what a key hashes, not this.
             let landed = if plan.streams() {
                 let streaming = compile_streaming(&metadata, contract, target)?;
                 Execution::new(&streaming, snapshot)
@@ -906,7 +724,6 @@ impl Weights {
                     .run()?;
                 sink.landed
             } else {
-                // Host memory; an arena too large for RAM spills to a file-backed map.
                 let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
                 let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
                 let mut backing: &mut [u8] = scratch.as_mut();
@@ -919,34 +736,26 @@ impl Weights {
                 landed
             };
 
-            // The device-table artifact is written elsewhere, under `Intent::Prepare` only.
             landed
         };
 
-        // Outside `from_cache` deliberately: a deferred seat is taken on both roads.
         if let Some(tier) = experts.as_mut().filter(|tier| tier.deferring()) {
             crate::experts::count_deferred();
             arm_refill(tier);
         }
 
-        // Empty for every SKU whose weights are all dense.
         let pairings = pairings(&landing, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         let mut decoded: Vec<Buffer> = Vec::new();
         for (at, place) in places.iter().enumerate() {
-            // A registered plane is reserved and zeroed; `register_adapter` fills it.
             if !landed[at] && trace.params[at].source == ParamSource::Checkpoint {
                 return Err(Fault::Param {
                     name: trace.params[at].name.clone(),
                     why: "is a plan param the load contract never published",
                 });
             }
-            // A split-plane bank is two handles under one `Def::Weight`,
-            // both bound as `U8`: `rows x width` is the byte rectangle.
             let row = match pairings.get(trace.params[at].name.as_str()) {
-                // A resident 8-bit dense projection of a model that fires
-                // wide: decoded to bf16 here, once, and seated as a dense row.
                 Some(pairing)
                     if decode_dense
                         && decodes_at_load(&trace.params[at])
@@ -981,9 +790,7 @@ impl Weights {
                     decoded.push(plane);
                     WeightRow::Dense(tile)
                 }
-                // A streamed group carries its seat: the fixed-address cell the select reads.
                 Some(pairing) => WeightRow::Planes {
-                    // `U4g64tiled` marks the tiled relabelling.
                     repacked: place.dtype == Dtype::U4g64tiled,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
@@ -1020,7 +827,6 @@ impl Weights {
             };
             table.push(Some(row));
         }
-        // Resident slots filled from the pinned copy; the rest at pinned bytes over UVA.
         if let Some(tier) = experts.as_mut() {
             let slabs: Vec<u64> = tier
                 .plan()
@@ -1028,7 +834,6 @@ impl Weights {
                 .iter()
                 .map(|bank| store.at(places[bank.param].offset))
                 .collect::<Result<_>>()?;
-            // Where the store put every plane, so the ladder can displace a T0 group.
             let store_at: Vec<(usize, u64)> = tier
                 .plan()
                 .seated()
@@ -1049,12 +854,6 @@ impl Weights {
         })
     }
 
-    /// Arms the rotating dense pump: copies a spilled dense plane into a
-    /// slot whose address never moves, instead of reading it where it lies.
-    /// Returns whether a pump was armed; declining one is still correct.
-    /// # Errors
-    /// [`Fault::Device`] for a slot, event or stream the runtime refused,
-    /// [`Fault::Residency`] for a tier that disagrees with the plan.
     pub fn rotate(
         &mut self,
         trace: &Trace,
@@ -1063,7 +862,6 @@ impl Weights {
         let Some(tier) = self.experts.as_ref() else {
             return Ok(false);
         };
-        // A spilled dense plane's shape: one plane, not routed, `experts: 0`.
         let candidates: Vec<(usize, u64)> = tier
             .plan()
             .groups()
@@ -1087,10 +885,8 @@ impl Weights {
             crate::rotate::ARENA_CAP,
         ) {
             Ok(rotation) => rotation,
-            // A decline is not a fault: every plane is read where it lies.
             Err(_why) => return Ok(false),
         };
-        // Page-locked source; the tier owns these bytes for the load's life.
         let mut source: Vec<*const u8> = Vec::with_capacity(rotation.tenants().len());
         for tenant in rotation.tenants() {
             let at = tier.serving_host_of(tenant.param).ok_or_else(|| {
@@ -1102,7 +898,6 @@ impl Weights {
             source.push(at);
         }
         let rotor = crate::rotate::Rotor::open(rotation, source)?;
-        // The rows now name the slots.
         for tenant in rotor.rotation().tenants() {
             let Some(seat) = rotor.seat(tenant.param) else {
                 continue;
@@ -1120,21 +915,16 @@ impl Weights {
         Ok(true)
     }
 
-    /// The rotating dense pump this load armed, or `None`.
     #[must_use]
     pub fn rotor(&self) -> Option<&crate::rotate::Rotor> {
         self.rotor.as_ref()
     }
 
-    /// Does this load rotate dense planes during a fire? A rotating load
-    /// takes the eager walk, whatever mode the shell is in.
     #[must_use]
     pub fn rotating(&self) -> bool {
         self.rotor.is_some()
     }
 
-    /// Whether routed experts are served off the host (T1/T2): such a fire
-    /// stages its routed experts on the eager path, which a body cannot bake.
     #[must_use]
     pub fn hosts_experts(&self) -> bool {
         self.experts
@@ -1142,38 +932,25 @@ impl Weights {
             .is_some_and(|tier| tier.plan().host_image() > 0)
     }
 
-    /// The routed-expert tier this load opened, or `None` for a load whose
-    /// banks are resident.
     #[must_use]
     pub fn experts(&self) -> Option<&crate::experts::Tier> {
         self.experts.as_ref()
     }
 
-    /// The same, mutably — what the promotion between two fires is driven
-    /// through.
     pub fn experts_mut(&mut self) -> Option<&mut crate::experts::Tier> {
         self.experts.as_mut()
     }
 
-    /// Is the whole weight table on the device? What
-    /// [`LoadFacts::weights_resident`](engine::load::LoadFacts) reports.
     #[must_use]
     pub fn all_resident(&self) -> bool {
         self.experts.is_none()
     }
 
-    /// Did this table come off the warm-boot artifact? `true` means the
-    /// host-side transform pipeline did not run for this load.
     #[must_use]
     pub fn from_cache(&self) -> bool {
         self.from_cache
     }
 
-    /// The digest of what is actually resident on the device — the bytes,
-    /// not the size or source. What a gate compares between a cold load and
-    /// a warm one.
-    /// # Errors
-    /// A device failure reading the store back.
     pub fn digest(&self) -> Result<u64> {
         const CHUNK: usize = 8 << 20;
         let total = self.store.bytes() as u64;
@@ -1192,15 +969,7 @@ impl Weights {
         Ok(hash)
     }
 
-    /// Write one adapter's planes into the banks: a `cudaMemcpy` per plane
-    /// onto an address reserved at load. Re-registering zeroes the slot
-    /// first, so a skipped plane can't leave a mix of two adapters' bytes.
-    /// # Errors
-    /// [`Fault::Adapter`] for a bank this plan does not declare, an id past
-    /// the bank's capacity, or a plane whose bytes are not one slot's;
-    /// [`Fault::Device`] for the copy.
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        // Checked whole first: a halfway refusal would leave a bank half-written.
         for plane in planes {
             let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
                 bank: plane.bank.to_string(),
@@ -1241,8 +1010,6 @@ impl Weights {
         Ok(())
     }
 
-    /// The banks this load declared: name, capacity, and bytes per slot.
-    /// What a caller sizes its planes against, and what a gate asserts on.
     #[must_use]
     pub fn banks(&self) -> Vec<(&str, u32, u64)> {
         self.banks
@@ -1251,9 +1018,6 @@ impl Weights {
             .collect()
     }
 
-    /// [`Weights::banks`]'s longer twin: name, capacity, slot bytes, the
-    /// slot's rectangle and its element size — what [`crate::blob`] needs to
-    /// check the out-major statute against.
     #[must_use]
     pub fn seats(&self) -> Vec<BankSeat> {
         self.banks
@@ -1269,10 +1033,6 @@ impl Weights {
             .collect()
     }
 
-    /// How many adapters this load can hold resident at once: the smallest
-    /// capacity any declared bank states (zero if none), since an adapter
-    /// occupies one slot of every bank it fills. Concurrent residency, not a
-    /// catalog count.
     #[must_use]
     pub fn adapter_seats(&self) -> u32 {
         self.banks
@@ -1282,23 +1042,17 @@ impl Weights {
             .unwrap_or(0)
     }
 
-    /// The table a fire resolves `Def::Weight(i)` through.
     #[must_use]
     pub fn table(&self) -> &WeightTable {
         &self.table
     }
 
-    /// Every byte the store holds, and the decoded dense planes beside it.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes() as u64 + self.decoded.iter().map(|b| b.bytes() as u64).sum::<u64>()
     }
 }
 
-/// Where a param's bytes actually are: the device store, or the pinned tier
-/// for a plane of a packed group the store does not hold. A handle built off
-/// `store.at(offset)` for such a plane would silently name the next param's
-/// bytes.
 fn address(
     tier: Option<&crate::experts::Tier>,
     store: &Buffer,
@@ -1311,8 +1065,6 @@ fn address(
     }
 }
 
-/// One plane of a split-plane bank, as the mxfp4 select reads it: raw bytes,
-/// `U8` dtype, byte rectangle.
 fn packed(
     tier: Option<&crate::experts::Tier>,
     store: &Buffer,
@@ -1320,12 +1072,9 @@ fn packed(
     param: usize,
 ) -> Result<Tensor> {
     let place = places[param];
-    // Byte rectangle, not element count, matching the `U8`-bound handle.
     let width = match place.dtype {
         Dtype::Mxfp4 => place.width,
-        // Two codes to a byte; `plane_bytes` rounds the total up.
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
-        // Four codes to a byte.
         Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
         other => model_compiler::arena::elem_bytes(other)
@@ -1344,24 +1093,16 @@ fn packed(
     ))
 }
 
-/// Where one param's plane sits in the store.
 #[derive(Debug, Clone, Copy)]
 struct Place {
     offset: u64,
-    /// The plane's own bytes — the whole tensor the checkpoint publishes.
     bytes: u64,
-    /// What the device store gives it, rounded up to the next handle
-    /// alignment. Less than `bytes` for a streamed routed bank, whose slab
-    /// seats only `resident` of its experts.
     reserved: u64,
     rows: u32,
     width: u32,
     dtype: Dtype,
 }
 
-/// The store's layout, decided before a byte is read: stated ahead rather
-/// than accumulated, so an arriving plane is checked against the size its
-/// own declaration predicted.
 fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
     let bytes = plane_bytes(trace)?;
     let mut out = Vec::with_capacity(trace.params.len());
@@ -1369,7 +1110,6 @@ fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
         let plane = bytes[index];
-        // A streamed bank reserves resident slots only; a packed group reserves nothing here.
         let held = if plan.streamed_whole(index) {
             0
         } else {
@@ -1391,9 +1131,6 @@ fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
     Ok(out)
 }
 
-/// A declared shape, read as `rows x width` — the IR's own rule. Honest
-/// rather than load-bearing: `linear.matmul` takes its dimensions from the
-/// activation and the result, never from the weight.
 fn rectangle(shape: &[u64]) -> (u64, u64) {
     match shape.split_first() {
         Some((rows, rest)) => (*rows, rest.iter().product()),
@@ -1401,10 +1138,8 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
     }
 }
 
-/// The sink that puts each finalized tensor where the layout said it goes.
 struct Landing<'a> {
     store: &'a mut Buffer,
-    /// The pinned tier a streamed bank's plane lands in instead of the store.
     experts: Option<&'a crate::experts::Tier>,
     plan: &'a crate::experts::Plan,
     places: &'a [Place],
@@ -1429,14 +1164,11 @@ impl TensorSink for Landing<'_> {
                 place.bytes
             )));
         }
-        // A mapped group's bytes are already on disk; count landed and drop.
         if self.plan.mapped(at) {
             self.landed[at] = true;
             return Ok(());
         }
         let streamed = self.plan.resident(at).is_some() || self.plan.pinned(at);
-        // A deferred seat has no pinned allocation to land into: it serves
-        // T1 out of the artifact where it lies until `arm_refill` fills it.
         if streamed && self.experts.as_ref().is_some_and(|tier| tier.deferred_image().is_some()) {
             self.landed[at] = true;
             return Ok(());
@@ -1490,8 +1222,6 @@ mod tests {
             end = place.offset + place.reserved;
         }
 
-        // The embedding is the SKU's largest plane and its first: 248320
-        // rows of 1024 bf16, and the head is tied to it, so it is landed once.
         assert_eq!(places[0].offset, 0);
         assert_eq!(places[0].rows, 248_320);
         assert_eq!(places[0].width, 1024);

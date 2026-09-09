@@ -5,8 +5,6 @@ use serde::Serialize;
 
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
 
-/// The plan's own name for an instruction. Exhaustive match: a new variant
-/// must be named here or the build fails.
 fn instr_name(instr: &StorageInstr) -> &'static str {
     match instr {
         StorageInstr::Allocate { .. } => "Allocate",
@@ -20,7 +18,6 @@ fn instr_name(instr: &StorageInstr) -> &'static str {
     }
 }
 
-/// The plan's own name for a tile transform. See [`instr_name`].
 fn tile_map_name(kind: TileMapKind) -> &'static str {
     match kind {
         TileMapKind::Cast => "Cast",
@@ -35,7 +32,6 @@ fn tile_map_name(kind: TileMapKind) -> &'static str {
     }
 }
 
-/// One line describing a compiled plan, for the engine's boot log.
 pub fn describe(plan: &LoadPlan) -> String {
     let rewrites: usize = plan.passes.iter().map(|pass| pass.rewrites).sum();
     let mut out = String::new();
@@ -68,13 +64,10 @@ struct PlanStats<'a> {
     buffer_count: usize,
     instruction_count: usize,
     schedule_count: usize,
-    /// Sorted, so two dumps of the same plan compare as text.
     instruction_kinds: BTreeMap<&'static str, usize>,
     tile_map_kinds: BTreeMap<&'static str, usize>,
 }
 
-/// A compiled plan's shape as JSON: counts plus instruction and transform
-/// histograms — not the whole plan.
 pub fn plan_stats_json(plan: &LoadPlan) -> String {
     let mut instruction_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut tile_map_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -95,6 +88,5 @@ pub fn plan_stats_json(plan: &LoadPlan) -> String {
         instruction_kinds,
         tile_map_kinds,
     };
-    // A histogram of fixed-name counters cannot fail to serialize.
     serde_json::to_string_pretty(&stats).unwrap_or_default()
 }

@@ -3,17 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// The deliberate backend escape hatch: fusions in cuda's vocabulary, refused by
-/// every other platform; `CustomMetal`/`CustomVulkan` join only when those
-/// platforms grow fusions. Pure data like every family — only the dispatch impl is gated.
-/// Emitting one is a model-source decision, under the standing rule that each
-/// has a canonical unfused equivalent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CustomCuda {
-    /// Splits packed qkv, head-norms q and k, ropes them, norms v, and appends
-    /// k/v to the cache in one pass; `q` is the only tensor left over.
-    /// `positions` feeds the rope math; `write_page`/`write_offset` address
-    /// the cache rows the append lands in.
     QkvFusedQknormRopeVnormWrite {
         packed: ValueId,
         positions: ValueId,
@@ -27,8 +18,6 @@ pub enum CustomCuda {
         kv_heads: u32,
         head_dim: u32,
         theta: f32,
-        /// The rotated width of each head: `head_dim` for a full rope, less
-        /// for a partial one (the rest of the head is normed, not rotated).
         rotary_dim: u32,
         q: ValueId,
     },

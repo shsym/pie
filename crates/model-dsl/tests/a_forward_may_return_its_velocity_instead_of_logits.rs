@@ -1,25 +1,3 @@
-//! **A FORWARD THAT PLANTS `velocity` (OR `hidden`) ON THE VALUE IT RETURNS
-//! GETS NO `out` SEAM; ONE THAT PLANTS NEITHER STILL DOES.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_forward_may_return_its_velocity_instead_of_logits
-//! ```
-//!
-//! `trace_hybrid` has always planted `out` on the returned value — the
-//! logits every sampler reads. A denoiser has no logits: its readout is the
-//! velocity (D3), and an encoder stage's is its hidden states. So the door
-//! plants `out` only when the returned value is not already under a float
-//! readout, and a text that carries both an encoder arm and a denoiser arm
-//! may plant `hidden` beside the `out` it returns:
-//!
-//! ```text
-//! (a) velocity on the returned value: a `velocity` seam, no `out`
-//! (b) hidden on the returned value: a `hidden` seam, no `out`
-//! (c) nothing planted: `out`, as before
-//! (d) hidden planted on another value, logits returned: both seams, one
-//!     `hidden` per layer it was planted in
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops, seam,
     trace_hybrid,
@@ -66,8 +44,6 @@ impl ForwardHybrid for Readout {
             Plants::Velocity => seam::at(seam::VELOCITY, &[&h]),
             Plants::Hidden => seam::at(seam::HIDDEN, &[&h]),
             Plants::Nothing => {}
-            // The encoder's taps are planted per layer; what comes back is
-            // a head over the last one, a different value.
             Plants::HiddenBesideLogits => {
                 let head = Weight::sym("head", [32, 16], Dtype::Bf16);
                 h = ops::linear::lm_head(&h, &head);
@@ -89,6 +65,13 @@ fn count(seams: &[(String, usize, Option<u32>)], name: &str) -> usize {
     seams.iter().filter(|(seam, _, _)| seam == name).count()
 }
 
+fn a_forward_may_return_its_velocity_instead_of_logits_every_case() {
+    velocity_on_the_returned_value_stands_in_for_out();
+    hidden_on_the_returned_value_stands_in_for_out();
+    nothing_planted_still_gets_out();
+    hidden_beside_logits_keeps_both_and_names_its_layer();
+}
+
 #[test]
 fn velocity_on_the_returned_value_stands_in_for_out() {
     let seams = seams(Plants::Velocity);
@@ -96,14 +79,12 @@ fn velocity_on_the_returned_value_stands_in_for_out() {
     assert_eq!(count(&seams, seam::VELOCITY.name), 1, "{seams:?}");
 }
 
-#[test]
 fn hidden_on_the_returned_value_stands_in_for_out() {
     let seams = seams(Plants::Hidden);
     assert_eq!(count(&seams, seam::OUT.name), 0, "{seams:?}");
     assert_eq!(count(&seams, seam::HIDDEN.name), 1, "{seams:?}");
 }
 
-#[test]
 fn nothing_planted_still_gets_out() {
     let seams = seams(Plants::Nothing);
     assert_eq!(count(&seams, seam::OUT.name), 1, "{seams:?}");
@@ -111,7 +92,6 @@ fn nothing_planted_still_gets_out() {
     assert_eq!(count(&seams, seam::HIDDEN.name), 0);
 }
 
-#[test]
 fn hidden_beside_logits_keeps_both_and_names_its_layer() {
     let seams = seams(Plants::HiddenBesideLogits);
     assert_eq!(count(&seams, seam::OUT.name), 1, "{seams:?}");

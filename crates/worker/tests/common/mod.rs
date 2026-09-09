@@ -1,8 +1,3 @@
-//! Shared real-hardware (`cuda_native`) test harness: boots the worker's prod
-//! embedded path in-proc and drives inferlets directly (`program::add` →
-//! `process::spawn`), bypassing the gateway/client edge. Every cuda test is
-//! `#[ignore]`d and boots once per process.
-
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -12,31 +7,21 @@ use std::time::Duration;
 use ::runtime::inferlet::program::{Manifest, ProgramName};
 use worker::WorkerHandle;
 
-/// Default local HF snapshot (Qwen3-0.6B dense). Override with
-/// `PIE_CUDA_TEST_SNAPSHOT`.
 pub const DEFAULT_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca";
 
-/// Local HF snapshot for the Qwen3.5-0.8B GDN model (RS-fold validation).
-/// Override with `PIE_CUDA_TEST_GDN_SNAPSHOT`.
 pub const DEFAULT_GDN_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
-/// The dense model snapshot path (env-overridable).
 pub fn snapshot() -> String {
     std::env::var("PIE_CUDA_TEST_SNAPSHOT").unwrap_or_else(|_| DEFAULT_SNAPSHOT.to_string())
 }
 
-/// The GDN/hybrid-RS model snapshot path (env-overridable).
 pub fn gdn_snapshot() -> String {
     std::env::var("PIE_CUDA_TEST_GDN_SNAPSHOT").unwrap_or_else(|_| DEFAULT_GDN_SNAPSHOT.to_string())
 }
 
-/// Single-model worker config for `snapshot_path`: `cuda_native`, no cluster.
 pub fn cuda_toml_for(snapshot_path: &str) -> String {
     let scratch = std::env::temp_dir().join("pie-cuda-test-scratch");
     let _ = std::fs::create_dir_all(&scratch);
-    // Expert residency is `[model] device_weight_budget` / `host_weight_budget`;
-    // KV pages are sized from remaining VRAM, so changing the expert slab
-    // changes the attention plan's reduction order too.
     let kv = std::env::var("PIE_CUDA_TEST_KV_PAGES")
         .map(|v| format!("max_total_pages = {v}\n"))
         .unwrap_or_default();
@@ -63,21 +48,16 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     )
 }
 
-/// Worker config for the default dense model.
 pub fn cuda_toml() -> String {
     cuda_toml_for(&snapshot())
 }
 
-/// Route `tracing` to stderr, once per process, at whatever `RUST_LOG` says
-/// (`error` if it says nothing). Needed because device compile/load/launch
-/// failures are reported only through `tracing::error!`, not the returned error.
 fn wire_tracing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
-        // try_init: a second subscriber already wired is not a failure here.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -85,8 +65,6 @@ fn wire_tracing() {
     });
 }
 
-/// Boot the embedded cuda engine in-proc with an explicit model snapshot.
-/// Caller holds the handle and `shutdown()`s it.
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
     wire_tracing();
     let cfg =
@@ -94,14 +72,10 @@ pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
     worker::run(cfg).await.expect("boot embedded cuda engine")
 }
 
-/// Boot the embedded cuda engine with the default dense model (Qwen3-0.6B).
 pub async fn boot_cuda() -> WorkerHandle {
     boot_cuda_model(&snapshot()).await
 }
 
-/// Build a curated inferlet fixture → wasm + manifest + program id. Fixtures
-/// live at the repository's `tests/inferlets`, two levels above this crate's
-/// manifest.
 pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/inferlets")
@@ -121,7 +95,6 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
-    // Workspace members' artifacts land one level up; non-members build in place.
     let wasm_path = if wasm_path.exists() {
         wasm_path
     } else {
@@ -136,7 +109,6 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     (wasm, manifest, program_name)
 }
 
-/// Build + add + install an inferlet once; returns its program id for repeated spawns.
 pub async fn install_inferlet(name: &str) -> ProgramName {
     let (wasm, manifest, program_name) = load_curated_inferlet(name);
     ::runtime::inferlet::program::add(wasm, manifest, true)
@@ -148,8 +120,6 @@ pub async fn install_inferlet(name: &str) -> ProgramName {
     program_name
 }
 
-/// Spawn one inferlet run and capture its result (`Ok(text)` / `Err(msg)`).
-/// Panics only on timeout.
 pub async fn spawn_text(
     program: &ProgramName,
     prompt: &str,
@@ -159,7 +129,6 @@ pub async fn spawn_text(
     spawn_input(program, &input).await
 }
 
-/// Spawn an already-installed inferlet with a raw JSON input string.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     ::runtime::inferlet::process::spawn(
@@ -171,24 +140,17 @@ pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<Stri
         Some(tx),
     )
     .expect("spawn process");
-    // A timeout is an `Err`, not a panic: "did not answer" is a result about
-    // the inferlet; callers that want it fatal use `.expect()`.
     match tokio::time::timeout(Duration::from_secs(180), rx).await {
         Err(_) => Err("no answer within 180s".to_string()),
         Ok(result) => result.expect("process result channel dropped"),
     }
 }
 
-/// Build + add + install + spawn an arbitrary curated inferlet fixture with a
-/// raw JSON input. One-shot: installs then spawns.
 pub async fn spawn_inferlet(name: &str, input_json: &str) -> Result<String, String> {
     let program = install_inferlet(name).await;
     spawn_input(&program, input_json).await
 }
 
-/// Refuse a completion that is not made of words: a non-empty check alone
-/// passes garbage output from a broken reduction. Requires at least
-/// `min_words` runs of 3+ letters and >=2/5 of non-space chars alphanumeric.
 pub fn assert_coherent(text: &str, min_words: usize) {
     let words = text
         .split(|c: char| !c.is_alphabetic())

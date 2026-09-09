@@ -5,7 +5,6 @@ use model_dsl::Platform;
 use super::model::Model;
 
 impl Model {
-    /// The trunk, from the checkpoint's `model.decoder.*` spelling.
     pub fn import(
         &self,
         src: &ztensor::Source,

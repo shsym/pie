@@ -11,7 +11,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // Try the native layout first; fall back to Hugging Face if any plane is missing.
         self.import_from_huggingface(src, platform)
     }
 

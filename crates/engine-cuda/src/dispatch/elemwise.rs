@@ -1,5 +1,3 @@
-//! `Elementwise`: the norm anchor, rope, gate, and hc arms.
-
 use kernels_cuda::{Tensor, elemwise};
 use model_exec::{DispatchElementwise, KernelError};
 use model_ir::{Elementwise, ModulateForm, MropeForm, NormKind, Operands, RopeForm};
@@ -8,10 +6,6 @@ use crate::run::Run;
 
 impl DispatchElementwise for Run<'_> {
     fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
-        // A launch whose answer is LANE-shaped (a lane vector's chain:
-        // the timestep embedding, its activation, its sum) grids over the
-        // fire's lane carve and reads no seat — the seat's words are token
-        // rows, which would retire and shift it wrongly.
         let mut outputs = Vec::new();
         op.outputs(&mut outputs);
         let lanes = outputs.first().is_some_and(|out| self.lane_shaped(*out));
@@ -24,9 +18,6 @@ impl DispatchElementwise for Run<'_> {
     }
 }
 
-/// The kernel's norm for a fused modulation's, when the kernel has one: the
-/// centred layer norm, or a whole-row rms norm. A grouped rms norm (`head_dim`
-/// below the row) is not one row reduction, and takes the unfused pair.
 fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind> {
     match norm {
         NormKind::Layernorm { eps } => Some(elemwise::modulate::NormKind::LayerNormNoAffine { eps }),
@@ -38,7 +29,6 @@ fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind
 }
 
 impl Run<'_> {
-    /// The scale-free norm a fused modulation folds, launched on its own.
     fn scale_free_norm(
         &self,
         norm: NormKind,
@@ -55,7 +45,6 @@ impl Run<'_> {
         }
     }
 
-    /// `modulate`'s three forms, one entry each.
     fn modulate(
         &self,
         form: ModulateForm,
@@ -75,11 +64,8 @@ impl Run<'_> {
         }
     }
 
-    /// Dispatch arms, in `kernels-cuda`'s error vocabulary rather than the
-    /// contract's, so each arm is a plain tail call with a plain `?`.
     fn elementwise(&self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
-            // norm (anchor)
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
                 self.ctx(),
                 self.tensor(*x),
@@ -134,15 +120,12 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // The one part of nn.LayerNorm that does not fold into the
-            // preceding GEMM at import.
             Elementwise::LayernormNoScale { x, eps, y } => elemwise::layernorm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // add_bias(b, rmsnorm(layernorm_no_scale(x), w)) collapsed into one launch.
             Elementwise::Layernorm {
                 x,
                 weight,
@@ -157,11 +140,9 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // In place on x; the IR aliases x_out onto it.
             Elementwise::Clamp { x, lo, hi, x_out: _ } => {
                 elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x))
             }
-            // Bounds are two [1] planes resolved like any other weight.
             Elementwise::ClampLearned {
                 x,
                 lo,
@@ -353,7 +334,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // rope
             Elementwise::RopeFull {
                 q,
                 k,
@@ -390,8 +370,6 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            // Interleaved vs blocked just selects the function; both share
-            // the same refusals.
             Elementwise::RopeMrope {
                 q,
                 k,
@@ -406,12 +384,7 @@ impl Run<'_> {
             } => (match form {
                 MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
                 MropeForm::Blocked => elemwise::rope_mrope::blocked,
-                // Gemma's per-block `rotate_half` (`kernels-metal`'s
-                // `rope_mrope_split`) has no CUDA twin yet; refused by name
-                // rather than served with the blocked pairing, which is a
-                // different rotation.
                 MropeForm::Split => {
-                    // The split (per-block rotate_half) M-RoPE form has no CUDA kernel yet.
                     return Err(kernels_cuda::Error::Unsupported {
                         op: "elementwise.rope_mrope",
                     });
@@ -516,7 +489,6 @@ impl Run<'_> {
                 *original_max_position,
                 *interleaved,
             ),
-            // gate
             Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), fan, &mut self.tensor(*x))
@@ -534,7 +506,6 @@ impl Run<'_> {
                 *scale,
                 &mut self.tensor(*x),
             ),
-            // hc
             Elementwise::RmsnormGroupedPlusOne {
                 x,
                 weight,
@@ -577,9 +548,6 @@ impl Run<'_> {
                 *streams,
                 &mut self.tensor(*hyper),
             ),
-            // The conditioning algebra (design D6). `m` and `g` are lane
-            // vectors (whole, absolute lanes through the lane map) or
-            // per-token rectangles (cut like `x`).
             Elementwise::Modulate {
                 x,
                 m,
@@ -593,7 +561,6 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 &mut self.tensor(*y),
             ),
-            // In place on `r`; the IR aliases `r_out` onto it.
             Elementwise::GatedResidualAdd {
                 r,
                 g,
@@ -608,10 +575,6 @@ impl Run<'_> {
                 lane_of_row.map(|lanes| self.tensor(lanes)),
                 &mut self.tensor(*r),
             ),
-            // The fused pair: one launch when the kernel has the norm and the
-            // form (a whole-row norm into the scale-shift), the traced pair
-            // otherwise. The normed row is written on its own only when a
-            // node other than this one reads it.
             Elementwise::NormModulate {
                 x,
                 norm,
@@ -718,9 +681,6 @@ impl Run<'_> {
                 *scale,
                 &mut self.tensor(*y),
             ),
-            // A constant of the plan: the bucket embedding is a weight and
-            // the table is `[Const, Const]`, both handed whole, so the
-            // launch reads no seat and no window.
             Elementwise::RelativeBucketBias {
                 embedding,
                 max_len,
@@ -737,7 +697,6 @@ impl Run<'_> {
                 *bidirectional,
                 &mut self.tensor(*y),
             ),
-            // In place; the IR aliases `x_out` onto `x`.
             Elementwise::Silu { x, x_out: _ } => {
                 elemwise::activation::silu(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
@@ -767,7 +726,6 @@ impl Run<'_> {
                 self.tensor(*y),
                 &mut self.tensor(*z),
             ),
-            // In place on `x`, the positions cut like it (design D7).
             Elementwise::RopeAxes {
                 x,
                 positions,

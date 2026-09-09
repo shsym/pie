@@ -1,15 +1,3 @@
-//! **`spatial::conv3d` LANDS WHAT `torch.nn.functional.conv3d` LANDS**, on
-//! both device kernels, for k=3 at stride 1 and 2 with pad 1, symmetric and
-//! causal time, symmetric time replicating the clip's end frames (a
-//! one-frame clip included), causal time with a frame cache and with
-//! replicated first frames, `C_in != C_out`, one and two lanes of different boxes, `kt = 1`
-//! (conv2d) with a three-channel input, with and without a bias — the
-//! weight arriving in the checkpoint's own order through
-//! `conv_weight_taps_major`, and the rows a bucketed fire pads past the last
-//! lane landing zeros.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_conv3d_answers_the_cpu_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -72,8 +60,6 @@ fn check(case: &Case, path: ConvPath) {
     let w_at = gpu.zeros(w_raw.len() * 2);
     let bias_at = gpu.up(&bias_vals);
     let cache_at = gpu.up(&cache_raw);
-    // Five rows past the last lane, the way a bucketed fire pads: they must
-    // land zeros, not the neighbour's taps.
     let slack = 5usize;
     let o_at = gpu.up(&vec![0x7fc0u16; (rows_out + slack) * c_out]);
     let ctx = gpu.ctx();
@@ -166,8 +152,6 @@ fn cases() -> Vec<Case> {
             bias: false,
         },
         Case {
-            // LTX-2.5's non-causal decoder: the clip's first frame stands
-            // in front of it and its last frame behind it.
             name: "symmetric replicating the first and last frames",
             boxes: vec![Box3::new(3, 5, 5), Box3::new(1, 4, 6)],
             c_in: 16,
@@ -249,6 +233,12 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+fn the_conv3d_answers_the_cpu_reference_every_case() {
+    the_direct_kernel_answers_the_reference();
+    the_tensor_core_kernel_answers_the_reference();
+    the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise();
+}
+
 #[test]
 fn the_direct_kernel_answers_the_reference() {
     for case in cases() {
@@ -256,14 +246,12 @@ fn the_direct_kernel_answers_the_reference() {
     }
 }
 
-#[test]
 fn the_tensor_core_kernel_answers_the_reference() {
     for case in cases().iter().filter(|c| c.c_in % 8 == 0) {
         check(case, ConvPath::TensorCore);
     }
 }
 
-#[test]
 fn the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise() {
     let case = cases()
         .into_iter()

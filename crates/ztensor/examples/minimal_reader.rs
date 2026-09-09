@@ -1,11 +1,3 @@
-//! The spec §8 reading algorithm, spelled out step by step.
-//!
-//! This example deliberately avoids the `Source` type: it demonstrates that a
-//! functional `.zt` reader needs nothing beyond a CBOR decoder, XXH3 and the
-//! type grammar of spec §4.
-//!
-//! Usage: `cargo run --example minimal_reader -- model.zt`
-
 use std::env;
 use std::fs;
 
@@ -17,10 +9,8 @@ fn main() {
     let path = env::args().nth(1).expect("usage: minimal_reader <file.zt>");
     let buf = fs::read(&path).expect("read file");
 
-    // 1. Minimum size.
     assert!(buf.len() >= 48, "not a .zt file: too small");
 
-    // 2. Magic at both ends, version 3 in the footer (the last 40 bytes).
     let magic = [0x89, b'Z', b'T', b'2', 0x0d, 0x0a, 0x1a, 0x0a];
     assert_eq!(&buf[..8], &magic, "bad header magic");
     let footer = &buf[buf.len() - 40..];
@@ -28,7 +18,6 @@ fn main() {
     let version = u32::from_le_bytes(footer[24..28].try_into().unwrap());
     assert_eq!(version, 3, "unsupported version");
 
-    // 3. Data shard?
     let m_off = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
     let m_len = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
     let m_hash = u64::from_le_bytes(footer[16..24].try_into().unwrap());
@@ -37,14 +26,11 @@ fn main() {
         return;
     }
 
-    // 4. Manifest bytes + hash.
     let manifest_bytes = &buf[m_off..m_off + m_len];
     assert_eq!(xxh3_64(manifest_bytes), m_hash, "manifest hash mismatch");
 
-    // 5. Deterministic CBOR decode.
     let root = cbor::decode(manifest_bytes).expect("manifest CBOR");
 
-    // 6. Walk the objects: a shape, a type or a layout, one blob.
     let objects = map_get(&root, "objects").expect("manifest missing 'objects'");
     for (key, obj) in objects.as_map().unwrap() {
         let name = key.as_text().unwrap();
@@ -62,8 +48,6 @@ fn main() {
             ty.unwrap_or("(no type)"),
         );
 
-        // 7. Under the canonical layout the type alone places every plane
-        //    (spec §5.1); a named layout's document says where its bytes lie.
         match layout {
             Some(layout) => println!("  layout {layout}"),
             None => {

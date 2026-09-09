@@ -1,40 +1,3 @@
-//! **THE BLOCK DRAFTER'S PLANES BIND, AND THE TRUNK DOES NOT NOTICE THEM.**
-//!
-//! `qwen36-27b-dflash` is `mlx-community/Qwen3.6-27B-4bit` with
-//! `z-lab/Qwen3.6-27B-DFlash` landed over it by `pie model import <target>
-//! --aux <drafter>`. Unlike the chained heads, this drafter is five decoder
-//! layers of its OWN geometry (32 q heads / 8 kv / head dim 128 against the
-//! trunk's 24 / 4 / 256) fed by a fusion of five tapped trunk hidden states,
-//! and it runs over rows the trunk is guarded away from.
-//!
-//! This asks the two things an engine can ask before an inferlet drives a
-//! draft pass at it:
-//!
-//! 1. the artifact loads — every one of the drafter's 58 planes binds, its
-//!    five kv rows are carved, and the load advertises a draft head;
-//! 2. **the trunk's tokens are the tokens the SAME WEIGHTS give with no
-//!    drafter over them.** The context arm fuses five taps and writes ten
-//!    projections into the drafter's kv rows on every trunk fire; a trunk
-//!    that moved under it would mean the fusion had reached the residual
-//!    stream, which is exactly the bug the two-stream reading of this
-//!    architecture invites. The comparison is against the plain
-//!    `qwen36-27b-mtp` artifact built from the same checkpoint — a
-//!    within-artifact A/B is not available, because the context arm is
-//!    guarded by the trunk's own arm and runs on every trunk fire (it has
-//!    to: a fire that skipped it would leave a hole in the sequence the
-//!    drafter attends over).
-//!
-//! 3. **the draft pass itself computes.** A lane that states
-//!    `drafting_a_block` carries `[anchor, MASK x 15]`, the trunk is guarded
-//!    away from its rows, and the readout it gets back is the DRAFTER's —
-//!    the two arms merge before the target's one `lm_head`, so a block row's
-//!    logits row is the drafter's proposal for that position.
-//!
-//! ```text
-//! PIE_DFLASH_ARTIFACT=~/.pie/models/<hash>/<hash>.qwen36-27b-dflash-u4g64-kv-bf16.metal.zt \
-//!   cargo test -p engine-metal --release --test the_block_drafter_loads_and_leaves_the_trunk_alone -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
@@ -46,12 +9,10 @@ use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
-/// The same checkpoint with no drafter over it — the trunk's control.
 const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
 const PROMPT: &[u32] = &[9707, 11, 847, 829, 374, 264, 1602, 2613, 3364];
 const STEPS: usize = 4;
 
-/// The artifact, named or found in the store by the SKU its name carries.
 fn artifact() -> Option<PathBuf> {
     if let Ok(named) = std::env::var("PIE_DFLASH_ARTIFACT") {
         let path = PathBuf::from(shellexpand(&named));
@@ -69,7 +30,6 @@ fn artifact() -> Option<PathBuf> {
     None
 }
 
-/// The plain artifact beside the drafted one, if the store holds it.
 fn plain_artifact() -> Option<PathBuf> {
     let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
     for entry in std::fs::read_dir(store).ok()?.flatten() {
@@ -115,8 +75,6 @@ fn finite(logits: &[f32], what: &str) {
     assert!(spread > 1e-3, "{what} logits span {spread}, which nothing wrote");
 }
 
-/// Prefill and decode `STEPS` greedy tokens in `slot`, every fire asking for
-/// the drafter's context arm or not.
 fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
     shell.open(slot).expect("the slot opens");
     let mut rows = Vec::with_capacity(STEPS + 1);
@@ -142,6 +100,11 @@ fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
     rows
 }
 
+fn the_block_drafter_loads_and_leaves_the_trunk_alone_every_case() {
+    the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit();
+    a_draft_block_fires_and_the_drafter_answers_it();
+}
+
 #[test]
 fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     if !engine_metal::device::present() {
@@ -161,6 +124,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
 
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: &artifact,
@@ -192,7 +156,6 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     }
     let tokens: Vec<u32> = drafted.iter().map(|r| argmax(r)).collect();
 
-    // ── the same weights with no drafter over them ───────────────────────
     let Some(plain_artifact) = plain_artifact() else {
         eprintln!(
             "the drafted run decoded {tokens:?}; no plain artifact beside it, so the \
@@ -208,6 +171,7 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
             .expect("the plain artifact holds every plane");
     drop(plain_source);
     let mut plain_shell = Shell::load(Boot {
+        voxels: None,
         trace: plain_trace,
         contract: &plain_contract,
         checkpoint: &plain_artifact,
@@ -257,13 +221,6 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     );
 }
 
-/// The mask a draft block reads under: everything visible.
-///
-/// `Mask`'s runs alternate masked-out first, so `[0, n]` is "nothing hidden,
-/// then `n` positions visible". That is what the reference states for the
-/// drafter's one full-attention layer, where `is_causal` is false and
-/// `create_causal_mask` is skipped outright: the block sees the whole cached
-/// context AND all of itself, with no causality at all.
 fn all_visible(extent: u64) -> Masking {
     Masking::Extent(Mask::new(
         vec![0, u32::try_from(extent).expect("an extent that fits")],
@@ -271,7 +228,6 @@ fn all_visible(extent: u64) -> Masking {
     ))
 }
 
-#[test]
 fn a_draft_block_fires_and_the_drafter_answers_it() {
     if !engine_metal::device::present() {
         eprintln!("skipping: this machine publishes no Metal device");
@@ -288,6 +244,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: &artifact,
@@ -303,8 +260,6 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     })
     .expect("the block drafter's shell loads");
 
-    // Prefill with the context arm on, so the drafter's five kv rows carry
-    // this prompt before the block asks to attend over them.
     shell.open(0).expect("the slot opens");
     let seeded = shell
         .fire(&[Lane {
@@ -315,7 +270,6 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         .expect("the prefill fires");
     let anchor = argmax(&seeded[0]);
 
-    // The block: the anchor, then the model's mask token in every other row.
     let block = models::qwen_3::model::QWEN36_27B_DFLASH.block as usize;
     let mut tokens = vec![models::qwen_3::model::QWEN36_27B_DFLASH.mask_token; block];
     tokens[0] = anchor;

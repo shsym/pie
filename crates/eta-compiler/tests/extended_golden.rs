@@ -1,17 +1,3 @@
-//! Pins the emitters over [`extended_stages`] — the traces that exist to reach
-//! what `corpus_stages()` never does.
-//!
-//! `golden-{msl,cuda}/` are dumps of a C++ oracle that has since been deleted,
-//! so their expected column can never be re-derived; adding cases there would
-//! silently turn oracle-authored lines into self-authored ones. These cases are
-//! therefore pinned separately, against this compiler's own output, and
-//! `golden-extended/` says exactly that in its header.
-//!
-//! What that buys: not correctness — nothing here was ever checked against a
-//! second implementation — but *change detection*. A rewrite that alters what
-//! these 55 ops, 8 intrinsics, 4 schedules and 4 stages compile to has to say
-//! so out loud instead of moving under a corpus that never looked.
-
 #[path = "common/device_text.rs"]
 mod device_text;
 #[path = "common/msl_corpus.rs"]
@@ -57,8 +43,6 @@ fn compare(name: &str, body: &str) {
     }
 }
 
-/// The stage wire bytes, so a plan-encoding change is visible even where the
-/// emitters happen to agree.
 #[test]
 fn extended_corpus_plans_are_pinned() {
     let mut body = String::new();
@@ -78,4 +62,3 @@ fn extended_corpus_plans_are_pinned() {
     }
     compare("extended_plans", &body);
 }
-

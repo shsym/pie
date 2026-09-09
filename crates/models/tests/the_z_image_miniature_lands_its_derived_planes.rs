@@ -1,28 +1,3 @@
-//! **THE MINIATURE'S IMPORT EXECUTES OVER THE REFERENCE FIXTURE, AND THE
-//! PLANES THE FAMILY DERIVES — THE PAD TABLES AND THE TIME-REVERSAL
-//! CONSTANT — HOLD THE VALUES THE TEXT COMPUTES WITH.**
-//!
-//! ```text
-//! cargo test -p models --test the_z_image_miniature_lands_its_derived_planes
-//! ```
-//!
-//! `scripts/imagegen/zimage_golden.py --mini` writes `zimage_mini.safetensors`
-//! (the fp32 `state_dict` of a 256-wide `ZImageTransformer2DModel`, seed 0)
-//! to `$PIE_IMAGEGEN_GOLDEN/z-image/` (default
-//! `/root/.cache/pie-imagegen/golden/z-image`). The load plan the miniature
-//! row compiles over it is EXECUTED on the host here, and what lands is
-//! checked where the contract does more than copy:
-//!
-//! ```text
-//! (a) `dit.x_pad_mod` / `dit.cap_pad_mod`: `[−1 × dim | pad_token]` down
-//!     the column, the token's fp32 values rounded to bf16
-//! (b) `dit.t_flip` is the one f32 `1000`
-//! (c) a packed `qkv` bank is `to_q` over `to_k` over `to_v`, rounded
-//! (d) every bank landed bf16, half the bytes it was stored in
-//! ```
-//!
-//! Skipped by name when the fixture is absent.
-
 use std::path::{Path, PathBuf};
 
 use checkpoint::executor::Execution;
@@ -42,7 +17,6 @@ fn fixture() -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// The fixture as a flat snapshot directory: one `model.safetensors`.
 fn stage(fixture: &Path) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("z_image_mini_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -66,7 +40,6 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// fp32 to its nearest bf16 (round to nearest even), as the cast lands it.
 fn round_bf16(x: f32) -> f32 {
     let bits = x.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -105,7 +78,6 @@ fn the_miniature_lands_its_derived_planes() {
             .unwrap_or_else(|| panic!("`{name}` was not published"))
     };
 
-    // (a)
     for (bank, token) in [
         ("dit.x_pad_mod", "x_pad_token"),
         ("dit.cap_pad_mod", "cap_pad_token"),
@@ -125,10 +97,8 @@ fn the_miniature_lands_its_derived_planes() {
         );
     }
 
-    // (b)
     assert_eq!(f32s(landed("dit.t_flip")), vec![1000.0]);
 
-    // (c)
     let qkv = bf16(landed("dit.layer.0.qkv"));
     let mut want = Vec::new();
     for proj in ["to_q", "to_k", "to_v"] {
@@ -144,7 +114,6 @@ fn the_miniature_lands_its_derived_planes() {
         "the packed bank is the three projections in order"
     );
 
-    // (d)
     for name in ["dit.layer.1.out", "dit.noise.0.gate_up", "dit.x_embed"] {
         let elements = match name {
             "dit.layer.1.out" => dim * dim,

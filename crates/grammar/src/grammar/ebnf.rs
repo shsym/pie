@@ -1,19 +1,7 @@
-//! EBNF parser: parses EBNF grammar strings into `Grammar`.
-//!
-//! Supports:
-//! - String literals with UTF-8 and escape sequences
-//! - Character classes with Unicode ranges, negation
-//! - Rule references
-//! - Sequences, choices (|), grouping with parentheses
-//! - Quantifiers: *, +, ?, {n}, {n,m}, {n,}
-//! - Comments: # to end of line
-
 use anyhow::{Result, bail};
 
 use super::builder::GrammarBuilder;
 use super::{Expr, ExprId, Grammar, RuleId};
-
-// ─── UTF-8 / Escape helpers ──────────────────────────────────────────
 
 fn hex_char_to_u32(c: u8) -> Option<u32> {
     match c {
@@ -24,7 +12,6 @@ fn hex_char_to_u32(c: u8) -> Option<u32> {
     }
 }
 
-/// Parse an escape sequence starting at `\`. Returns (codepoint, bytes_consumed).
 fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)> {
     if data.len() < 2 || data[0] != b'\\' {
         bail!("expected escape sequence");
@@ -49,7 +36,6 @@ fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)
         b'0' => Ok((0x00, 2)),
         b'e' => Ok((0x1B, 2)),
         b'x' => {
-            // \xHH... (variable length hex)
             let mut cp = 0u32;
             let mut len = 0;
             while 2 + len < data.len() {
@@ -66,7 +52,6 @@ fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)
             Ok((cp, 2 + len))
         }
         b'u' => {
-            // \uXXXX (exactly 4 hex digits)
             if data.len() < 6 {
                 bail!("invalid \\u escape: need 4 hex digits");
             }
@@ -79,7 +64,6 @@ fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)
             Ok((cp, 6))
         }
         b'U' => {
-            // \UXXXXXXXX (exactly 8 hex digits)
             if data.len() < 10 {
                 bail!("invalid \\U escape: need 8 hex digits");
             }
@@ -95,7 +79,6 @@ fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)
     }
 }
 
-/// Parse next UTF-8 char or escape sequence. Returns (codepoint, bytes_consumed).
 fn parse_next_utf8_or_escaped(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)> {
     if data.is_empty() {
         bail!("unexpected end of input");
@@ -111,8 +94,6 @@ fn parse_next_utf8_or_escaped(data: &[u8], extra_escapes: &[(u8, u32)]) -> Resul
     }
 }
 
-// ─── Token types ─────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq)]
 enum TokenType {
     RuleName,
@@ -121,7 +102,7 @@ enum TokenType {
     LBracket,
     RBracket,
     Caret,
-    CharInCharClass(u32), // codepoint
+    CharInCharClass(u32),
     Dash,
     Assign,
     LParen,
@@ -141,13 +122,10 @@ enum TokenType {
 #[derive(Debug, Clone)]
 struct Token {
     ty: TokenType,
-    /// The string value (for StringLiteral: decoded UTF-8, for Identifier/RuleName: the name)
     value: String,
     line: usize,
     col: usize,
 }
-
-// ─── Lexer ───────────────────────────────────────────────────────────
 
 struct Lexer<'a> {
     input: &'a [u8],
@@ -314,7 +292,6 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
 
-        // Extra escape chars inside character classes
         let char_class_escapes: &[(u8, u32)] = &[
             (b'^', b'^' as u32),
             (b'$', b'$' as u32),
@@ -592,7 +569,6 @@ fn convert_identifiers_to_rule_names(tokens: &mut [Token]) -> Result<()> {
                     tokens[i - 1].col
                 );
             }
-            // Check rule name is at start of line
             if i >= 2 && tokens[i - 2].line == tokens[i - 1].line {
                 bail!(
                     "EBNF parser error at line {}, column {}: rule name should be at the beginning of the line",
@@ -605,8 +581,6 @@ fn convert_identifiers_to_rule_names(tokens: &mut [Token]) -> Result<()> {
     }
     Ok(())
 }
-
-// ─── Parser ──────────────────────────────────────────────────────────
 
 struct Parser {
     tokens: Vec<Token>,
@@ -658,8 +632,6 @@ impl Parser {
         format!("{}_{}", self.cur_rule_name, self.aux_rule_counter)
     }
 
-    // ── Init: collect all rule names (two-pass) ──
-
     fn init_rule_names(&mut self, root_rule_name: &str) -> Result<()> {
         for tok in &self.tokens {
             if tok.ty == TokenType::RuleName {
@@ -683,8 +655,6 @@ impl Parser {
         Ok(())
     }
 
-    // ── Parsing ──
-
     fn parse_char_class(&mut self) -> Result<ExprId> {
         self.expect(&TokenType::LBracket, "expected [")?;
 
@@ -704,7 +674,6 @@ impl Parser {
             };
             self.consume();
 
-            // Check for range expression: char-char
             if self.peek().ty == TokenType::Dash {
                 let next_is_char = matches!(
                     self.tokens.get(self.pos + 1).map(|t| &t.ty),
@@ -823,8 +792,6 @@ impl Parser {
         }
     }
 
-    /// Extract a RuleId from an expression: if it's already a RuleRef, return that RuleId;
-    /// otherwise wrap the expression in a new auxiliary rule.
     fn wrap_in_rule(&mut self, expr_id: ExprId) -> RuleId {
         if let BorrowedExpr::RuleRef(rid) = self.builder_get_expr(expr_id) {
             return rid;
@@ -836,24 +803,20 @@ impl Parser {
     }
 
     fn handle_star(&mut self, expr_id: ExprId) -> ExprId {
-        // Check if it's a character class → CharacterClassStar optimization
         if let BorrowedExpr::CharacterClass { negated, ranges } = self.builder_get_expr(expr_id) {
             return self.builder.add_character_class_star(negated, ranges);
         }
 
-        // a* → Repeat(rule_for(a), 0, None)
         let rule_id = self.wrap_in_rule(expr_id);
         self.builder.add_repeat(rule_id, 0, None)
     }
 
     fn handle_plus(&mut self, expr_id: ExprId) -> ExprId {
-        // a+ → Repeat(rule_for(a), 1, None)
         let rule_id = self.wrap_in_rule(expr_id);
         self.builder.add_repeat(rule_id, 1, None)
     }
 
     fn handle_question(&mut self, expr_id: ExprId) -> ExprId {
-        // a? → Repeat(rule_for(a), 0, Some(1))
         let rule_id = self.wrap_in_rule(expr_id);
         self.builder.add_repeat(rule_id, 0, Some(1))
     }
@@ -948,13 +911,11 @@ impl Parser {
         self.builder.build(root_rule_name)
     }
 
-    /// Helper to read an expr from the builder (needed for star optimization check).
     fn builder_get_expr(&self, id: ExprId) -> BorrowedExpr {
         self.builder.peek_expr(id)
     }
 }
 
-/// A borrowed view of an expression, for optimization checks in the parser.
 pub(crate) enum BorrowedExpr {
     CharacterClass {
         negated: bool,
@@ -965,7 +926,6 @@ pub(crate) enum BorrowedExpr {
 }
 
 impl GrammarBuilder {
-    /// Peek at an expression type (used by parser for CharacterClass star optimization).
     pub(crate) fn peek_expr(&self, id: ExprId) -> BorrowedExpr {
         match &self.exprs[id.0 as usize] {
             Expr::CharacterClass { negated, ranges } => BorrowedExpr::CharacterClass {
@@ -978,18 +938,7 @@ impl GrammarBuilder {
     }
 }
 
-// ─── Public API ──────────────────────────────────────────────────────
-
 impl Grammar {
-    /// Parse an EBNF grammar string.
-    ///
-    /// # Example
-    /// ```
-    /// use ::grammar::grammar::Grammar;
-    ///
-    /// let grammar = Grammar::from_ebnf(r#"root ::= "hello" | "world""#, "root").unwrap();
-    /// assert_eq!(grammar.num_rules(), 1);
-    /// ```
     pub fn from_ebnf(source: &str, root_rule_name: &str) -> Result<Grammar> {
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize()?;
@@ -1004,6 +953,12 @@ mod tests {
 
     fn parse_and_display(input: &str) -> String {
         Grammar::from_ebnf(input, "root").unwrap().to_string()
+    }
+
+    fn ebnf_every_case() {
+        test_unicode_string();
+        test_complex_character_class();
+        test_escape_sequences_in_string();
     }
 
     #[test]
@@ -1021,13 +976,11 @@ mod tests {
         }
     }
 
-    #[test]
     fn test_complex_character_class() {
         let g = parse_and_display(r"root ::= [a-zA-Z0-9_\-]");
         assert_eq!(g, "root ::= (([a-zA-Z0-9_\\-]))");
     }
 
-    #[test]
     fn test_escape_sequences_in_string() {
         let g = Grammar::from_ebnf(r#"root ::= "\n\t\\\"""#, "root").unwrap();
         match g.get_expr(g.root().body) {

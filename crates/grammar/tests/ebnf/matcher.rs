@@ -1,15 +1,7 @@
-//! EBNF matcher acceptance behavior, ported from xgrammar.
-//!
-//! Tests EBNF grammar acceptance/rejection via the GrammarMatcher.
-
 use crate::common::{
     ebnf_accepts as is_grammar_accept_string, grammar_accepts as is_grammar_accept_string_g,
 };
 use ::grammar::grammar::Grammar;
-
-// ---------------------------------------------------------------------------
-// JSON acceptance (from test_json_pressure / test_json_grammar)
-// ---------------------------------------------------------------------------
 
 const JSON_GRAMMAR: &str = r#"
 root ::= value
@@ -26,6 +18,12 @@ fraction ::= "." [0-9]+
 exponent ::= [eE] [+-]? [0-9]+
 ws ::= [ \t\n\r]*
 "#;
+
+fn matcher_every_case() {
+    test_json_complex();
+    test_nullable_grammar();
+    test_predict_complete_complex();
+}
 
 #[test]
 fn test_json_complex() {
@@ -53,11 +51,6 @@ fn test_json_complex() {
     assert!(is_grammar_accept_string(JSON_GRAMMAR, complex_json));
 }
 
-// ---------------------------------------------------------------------------
-// Nullable grammar (from test_nullable_grammar)
-// ---------------------------------------------------------------------------
-
-#[test]
 fn test_nullable_grammar() {
     let grammar = r#"
     root ::= rule1 | (rule1 rule1 rule1 rule3)+
@@ -65,17 +58,10 @@ fn test_nullable_grammar() {
     rule2 ::= [0-9]*
     rule3 ::= [a-z]
 "#;
-    // Empty string accepted (rule2 is [0-9]* which matches empty)
     assert!(is_grammar_accept_string(grammar, ""));
-    // Mixed string accepted
     assert!(is_grammar_accept_string(grammar, "abc12312398014a"));
 }
 
-// ---------------------------------------------------------------------------
-// Predict/Complete (from test_predict_complete)
-// ---------------------------------------------------------------------------
-
-#[test]
 fn test_predict_complete_complex() {
     let grammar = r#"root ::= rule1 [0-9]?
     rule1 ::= rule2 [0-9]? | rule4 [0-9]?
@@ -90,7 +76,6 @@ fn test_predict_complete_complex() {
     "#;
     let g = Grammar::from_ebnf(grammar, "root").unwrap();
 
-    // Empty string through strings of increasing length
     let mut input = String::new();
     for _ in 0..=10 {
         assert!(
@@ -102,60 +87,3 @@ fn test_predict_complete_complex() {
     }
     assert!(is_grammar_accept_string_g(&g, &input));
 }
-
-// ---------------------------------------------------------------------------
-// Advance (from test_advance)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// UTF-8 tests (from test_character_class_star_utf8, test_positive_utf8_*)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// UTF-8 with quantifiers (from test_positive_utf8_character_class_with_quantifier)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// NFA test (from test_nfa)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Non-neighbor character class (from test_not_neighbour_character_class)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Repetition tests
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Complex rule interactions
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Simple rule interaction (from test_simple)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Complex repetition (from test_repetition)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// JSON acceptance: more complex inputs (from test_json_accept)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// JSON rejection (from test_json_refuse)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// JSON pressure test (from test_json_pressure)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// UTF-8 comma character class (from test_utf8)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Custom root rule (from test_custom_root_rule)
-// ---------------------------------------------------------------------------
-

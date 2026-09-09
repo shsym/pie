@@ -7,7 +7,6 @@ pub mod tokenizer;
 use model::Model;
 use model_dsl::Dtype;
 
-/// Identification order: the first row whose import fits the checkpoint wins.
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
         (

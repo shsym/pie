@@ -1,17 +1,3 @@
-//! Remote executor partners: the registry and the admission accounting, and a
-//! named hole where the transport goes — remote is a property of a transport,
-//! not an encoding of a contract, so nothing here moves bytes.
-//!
-//! What's kept is everything above the wire: the registry (which peers
-//! exist, in which role, behind which `EngineId`), admission accounting
-//! (`max_outstanding`, claim/release guard, drain notification,
-//! power-of-two-choices selection), and the settings/counters an operator
-//! reads. A registered peer's engine
-//! (`crate::engine::backend::remote::RemoteEngine`) answers
-//! [`Error::Unsupported`](engine::Error::Unsupported) to every verb, so the
-//! runtime can see the peer, refuse to use it, and say why — rather than
-//! silently dropping the request.
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -19,29 +5,19 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use anyhow::{Result, anyhow};
 
-/// Which side of a disaggregated deployment a peer serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartnerRole {
-    /// It runs prefills and hands back KV.
     Prefill,
-    /// It runs a multimodal encoder and hands back embedding rows.
     Encode,
 }
 
-/// How a peer's bytes are meant to reach this node. A runtime type, not a
-/// contract one: which wire a deployment runs on is the runtime's to
-/// configure, not the contract's to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransferKind {
-    /// The peer's pages travel inside the reply.
     #[default]
     Inline,
-    /// The peer writes into this node's pool over RDMA.
     Nixl,
 }
 
-/// One registered peer: the identity a scheduler routes on and the
-/// accounting an admission decision reads.
 pub struct Partner {
     worker_id: u64,
     destination_worker_id: u64,
@@ -56,62 +32,47 @@ pub struct Partner {
 }
 
 impl Partner {
-    /// Which worker this is.
     pub fn worker_id(&self) -> u64 {
         self.worker_id
     }
 
-    /// Which worker its answers are destined for.
     pub fn destination_worker_id(&self) -> u64 {
         self.destination_worker_id
     }
 
-    /// Which registry slot its engine holds.
-    ///
-    /// # Panics
-    ///
-    /// For an encode partner, which has no engine of its own.
     pub fn engine_id(&self) -> usize {
         self.engine_id
             .expect("only prefill partners have remote engine slots")
     }
 
-    /// Which side it serves.
     pub fn role(&self) -> PartnerRole {
         self.role
     }
 
-    /// Which wire it was configured for.
     pub fn transfer_kind(&self) -> TransferKind {
         self.transfer
     }
 
-    /// How many claims are outstanding against it.
     pub fn outstanding(&self) -> u32 {
         self.outstanding.load(Ordering::Relaxed)
     }
 
-    /// Stop selecting it.
     pub fn mark_suspect(&self) {
         self.available.store(false, Ordering::Release);
     }
 
-    /// Select it again.
     pub fn mark_available(&self) {
         self.available.store(true, Ordering::Release);
     }
 
-    /// Where its large payloads would be fetched from.
     pub fn set_blob_host(&self, host: IpAddr) {
         *self.blob_host.write().unwrap() = Some(host);
     }
 
-    /// Where its large payloads would be fetched from, if it stated one.
     pub fn blob_host(&self) -> Option<IpAddr> {
         *self.blob_host.read().unwrap()
     }
 
-    /// Park until nothing is outstanding against it.
     pub async fn wait_drained(&self) {
         loop {
             if self.outstanding() == 0 {
@@ -127,26 +88,11 @@ impl Partner {
         }
     }
 
-    /// Pull this peer's KV pages into the home pool.
-    ///
-    /// # Errors
-    ///
-    /// Always, until the envelope exists: it must carry either page bytes
-    /// or an RDMA registration
-    /// ([`KvHandle`](engine::KvHandle)), and say which one it used, since
-    /// the caller's next act differs between them.
     pub async fn pull_kv(&self, src_page_ids: Vec<u32>, dst_page_ids: Vec<u32>) -> Result<()> {
         let _ = (src_page_ids, dst_page_ids);
         Err(self.no_transport("pull_kv"))
     }
 
-    /// Run this peer's encoder over a media payload.
-    ///
-    /// # Errors
-    ///
-    /// Always, until the envelope exists.
-    /// [`MediaEncode`](engine::MediaEncode) already carries its own bytes;
-    /// what the envelope must add is a size policy for large payloads.
     pub async fn encode(&self, plan: engine::MediaEncode) -> Result<engine::MediaEncode> {
         let _ = plan;
         Err(self.no_transport("encode"))
@@ -192,13 +138,11 @@ impl Partner {
     }
 }
 
-/// One outstanding claim against a partner, released on drop.
 pub struct PartnerGuard {
     partner: Arc<Partner>,
 }
 
 impl PartnerGuard {
-    /// The peer this claim is against.
     pub fn partner(&self) -> &Arc<Partner> {
         &self.partner
     }
@@ -219,7 +163,6 @@ type PartnerKey = (PartnerRole, u64);
 static PARTNERS: LazyLock<RwLock<HashMap<PartnerKey, Arc<Partner>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Register a peer, replacing (and suspecting) any earlier one in the same role.
 pub fn register_partner(
     worker_id: u64,
     destination_worker_id: u64,
@@ -250,23 +193,16 @@ pub fn register_partner(
     partner
 }
 
-/// Forget a peer.
 pub fn remove_partner(worker_id: u64, role: PartnerRole) {
     if let Some(partner) = PARTNERS.write().unwrap().remove(&(role, worker_id)) {
         partner.mark_suspect();
     }
 }
 
-/// Close every surrogate instance an engine holds. Nothing holds a surrogate,
-/// so this has nothing to close; it stays as a door the link layer calls on
-/// teardown.
 pub fn close_engine_surrogates(engine_id: usize) {
     let _ = engine_id;
 }
 
-/// Note that a home instance is gone. As with
-/// [`close_engine_surrogates`], there is nothing to do while no surrogate
-/// exists.
 pub(crate) fn close_home_instance(home_instance_id: u64) {
     let _ = home_instance_id;
 }
@@ -294,8 +230,6 @@ pub fn unregister_remote_store(model_idx: usize, engine_idx: usize) -> anyhow::R
     crate::store::registry::unregister_engine(model_idx, engine_idx)
 }
 
-/// Claim the least-loaded of two random available peers in `role`
-/// (power-of-two-choices).
 pub fn select_partner(role: PartnerRole) -> Option<PartnerGuard> {
     let candidates = PARTNERS
         .read()
@@ -362,7 +296,6 @@ static ENCODE_INJECTION_ENABLED: AtomicBool = AtomicBool::new(false);
 static HOME_KV_HANDLE: LazyLock<RwLock<Option<engine::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Turn prefill offload on, and say how long a suffix has to be to qualify.
 pub fn configure(enabled: bool, prefill_min_suffix_tokens: usize) {
     let mut settings = SETTINGS.write().unwrap();
     settings.enabled = enabled;
@@ -370,7 +303,6 @@ pub fn configure(enabled: bool, prefill_min_suffix_tokens: usize) {
     OFFLOAD_ENABLED.store(enabled, Ordering::Release);
 }
 
-/// Turn encode offload on, and say how wide an embedding row is.
 pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
     let mut settings = SETTINGS.write().unwrap();
     settings.encode_injection = enabled;
@@ -378,44 +310,27 @@ pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
     ENCODE_INJECTION_ENABLED.store(enabled, Ordering::Release);
 }
 
-/// Publish this node's own KV pool address, so a peer can be told where to
-/// write. Still meaningful with no transport: [`KvHandle`](engine::KvHandle)
-/// is a fact about this node's pool.
 pub fn set_home_kv_handle(handle: engine::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
 
-/// This node's own KV pool address, if an engine exported one.
 pub fn home_kv_handle() -> Option<engine::KvHandle> {
     HOME_KV_HANDLE.read().unwrap().clone()
 }
 
-/// What an operator reads to see where offload decisions went.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OffloadCounterSnapshot {
-    /// No peer was available in the role.
     pub no_partner: u64,
-    /// The suffix was shorter than the threshold.
     pub below_threshold: u64,
-    /// The fire was not a plain contiguous append.
     pub noncanonical: u64,
-    /// The fire touched recurrent state.
     pub recurrent_state: u64,
-    /// The fire carried a guest-supplied mask.
     pub user_mask: u64,
-    /// The fire touched a channel.
     pub channels: u64,
-    /// The fire carried media.
     pub media: u64,
-    /// The fire's shape was past a ceiling.
     pub shape: u64,
-    /// The peer refused, or could not be reached.
     pub remote_failure: u64,
-    /// The transfer failed after the peer answered.
     pub transfer_failure: u64,
-    /// A prefix was adopted from a peer.
     pub adopted: u64,
-    /// The NIXL path is quarantined after a failure.
     pub nixl_quarantined: bool,
 }
 
@@ -437,7 +352,6 @@ struct OffloadCounters {
 static COUNTERS: LazyLock<OffloadCounters> = LazyLock::new(OffloadCounters::default);
 static NIXL_QUARANTINED: AtomicBool = AtomicBool::new(false);
 
-/// Read every counter at once.
 pub fn counters() -> OffloadCounterSnapshot {
     let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
     OffloadCounterSnapshot {
@@ -456,17 +370,7 @@ pub fn counters() -> OffloadCounterSnapshot {
     }
 }
 
-/// Offer this fire's media to an encode partner, and inject the rows it
-/// answers with. Answers whether anything was injected — `false` every
-/// time, for now: two things are still missing and independent, the
-/// envelope ([`Partner::encode`]) and the fire's own seat for precomputed
-/// embedding rows (what a fire needs after an encode is rows in the arena,
-/// a seam the shell resolves rather than a payload the submission carries).
-/// The configured-check is kept so a caller gets the partner's refusal
-/// rather than silence from here.
 pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool {
-    // The request is the seam the injected rows land on; nothing reads it
-    // until there are rows to land.
     let _ = request;
     if !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire) {
         return false;
@@ -485,13 +389,9 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
     false
 }
 
-/// Forget every peer. The shutdown path's door, and the only way a test can
-/// start from a known registry — `pub` rather than `#[cfg(test)]` since the
-/// crate's public facade re-exports it.
 pub fn clear_partners() {
     let partners: Vec<Arc<Partner>> = PARTNERS.write().unwrap().drain().map(|(_, p)| p).collect();
     for partner in partners {
         partner.mark_suspect();
     }
 }
-

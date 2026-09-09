@@ -1,5 +1,3 @@
-//! ChatML template: `<|im_start|>{role}\n{message}<|im_end|>\n`, shared by Qwen and GLM.
-
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -9,18 +7,11 @@ use crate::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar, special, specials,
 };
 
-/// What one ChatML-speaking model does differently from another.
 pub struct ChatML {
-    /// The model emits `<think>…</think>`.
     pub thinking: bool,
-    /// Replayed assistant turns keep their `<think>` blocks. Meaningless when
-    /// `thinking` is false.
     pub preserve_thinking: bool,
-    /// The model was trained on the `<tool_call>` grammar below.
     pub tools: bool,
-    /// Text appended to the assistant header when cueing generation.
     pub generation_suffix: &'static str,
-    /// Every token that ends a turn.
     pub stop_tokens: &'static [&'static str],
 }
 
@@ -104,7 +95,6 @@ impl ChatMLInstruct {
         }
     }
 
-    /// Replayed message, with reasoning stripped unless `preserve_thinking`.
     fn replay_body<'a>(config: &ChatML, msg: &'a str) -> &'a str {
         if config.thinking && !config.preserve_thinking {
             Self::without_thinking(msg)
@@ -136,7 +126,6 @@ impl ChatMLInstruct {
     }
 }
 
-/// Tool names as grammar alternatives, or `None` if none are found.
 pub fn tool_names(tools: &[String]) -> Option<String> {
     let mut names: Vec<String> = Vec::new();
     for tool in tools {
@@ -157,7 +146,6 @@ pub fn tool_names(tools: &[String]) -> Option<String> {
     Some(names.join(" | "))
 }
 
-/// The JSON value production every tool grammar in this crate ends with.
 pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" json-members? "}"
 json-members ::= json-pair ("," json-pair)*
 json-pair ::= json-string ":" json-value
@@ -257,9 +245,6 @@ tool-name ::= {alternatives}
     }
 }
 
-/// Reads `<tool_call>{json}</tool_call>` spans from generated text. Multiple
-/// calls in one batch yield multiple events; unparseable JSON is dropped
-/// without stopping the scan.
 struct ChatMLToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
@@ -322,7 +307,12 @@ mod tests {
         }
     }
 
-    /// Qwen3.5/3.6 and GLM: a replayed turn is its answer alone.
+    fn chatml_every_case() {
+        a_stripping_model_replays_the_answer_without_its_reasoning();
+        a_preserving_model_replays_the_turn_whole();
+        a_non_thinking_model_replays_verbatim();
+    }
+
     #[test]
     fn a_stripping_model_replays_the_answer_without_its_reasoning() {
         assert_eq!(
@@ -331,16 +321,10 @@ mod tests {
         );
     }
 
-    /// Qwen3.8's interleaved-thinking default: the turn is replayed whole,
-    /// `<think>` block and all.
-    #[test]
     fn a_preserving_model_replays_the_turn_whole() {
         assert_eq!(ChatMLInstruct::replay_body(&config(true, true), TURN), TURN);
     }
 
-    /// No `<think>` support: message is replayed verbatim, even if it
-    /// contains the marker.
-    #[test]
     fn a_non_thinking_model_replays_verbatim() {
         assert_eq!(ChatMLInstruct::replay_body(&config(false, false), TURN), TURN);
     }

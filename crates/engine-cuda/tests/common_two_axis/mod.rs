@@ -1,14 +1,3 @@
-//! A hand-written plan that states BOTH row axes (design D8): one DiT block
-//! on the token axis under reading 0, and one convolution on the voxel axis
-//! under reading 1. Its reason for existing is that no other miniature has
-//! both — the mini-DiT states tokens alone and the conv decoder voxels alone
-//! — and the two questions that need both are the ones this module's tests
-//! ask: does a voxel port fed from a CHANNEL land its committed cell, and
-//! does a plan stating voxel rows still arm its token bodies.
-//!
-//! Traced with `model_dsl`, loaded through the real `Engine` API, weights
-//! drawn at random into a `.zt` the load reads.
-
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -38,34 +27,21 @@ use model_dsl::{
     RaggedMask, Request, RopeForm, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
-/// The token block's residual width.
 pub const WIDTH: u32 = 32;
-/// One head at the ragged arm's smallest stamped width.
 pub const HEAD_DIM: u32 = 64;
-/// The timestep embedding's width.
 pub const FREQ: u32 = 16;
-/// `q · k` scale.
 pub const SM_SCALE: f32 = 0.125;
-/// The rope's per-axis base.
 pub const THETA: f32 = 10_000.0;
-/// The voxel port's channels.
 pub const C_IN: u32 = 8;
-/// The convolution's output channels.
 pub const C_OUT: u32 = 4;
-/// `kt·kh·kw` of the 3×3×3 convolution.
 pub const TAPS: u32 = 27;
-/// The name the trace and the artifact stamp share.
 pub const NAME: &str = "two-axis-mini";
-/// Which reading code selects the VAE arm.
 pub const VAE_READING: u8 = 1;
-/// Which fact bit that code sets.
 const VAE_BIT: u8 = 0;
 
-/// One bit: is this lane's reading the VAE's?
 pub struct Facts(bool);
 
 impl Facts {
-    /// The literal both arms are split on.
     #[must_use]
     pub fn is_vae() -> Predicate {
         Predicate::fact(VAE_BIT)
@@ -81,7 +57,6 @@ impl Classify for Facts {
     }
 }
 
-/// The catalog-shaped classifier the engine is opened with.
 pub fn classify(request: &Request) -> u64 {
     Facts::of(request).word()
 }
@@ -90,13 +65,11 @@ pub fn classify_for(_: &str) -> Option<model_ir::ClassifyFn> {
     Some(classify)
 }
 
-/// The word a lane of `reading` carries.
 #[must_use]
 pub fn word(reading: u8) -> u64 {
     classify(&Request::new(1, false).in_reading(reading))
 }
 
-/// The plan: a DiT block under reading 0, a convolution under reading 1.
 pub struct TwoAxis;
 
 impl ForwardHybrid for TwoAxis {
@@ -110,7 +83,6 @@ impl ForwardHybrid for TwoAxis {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
 
-        // ── the token axis: one DiT block ────────────────────────────────
         let x = dit.latents(0, WIDTH, Dtype::Bf16);
         let t = dit.lane_vector(0, 1);
         let pos = dit.axis_positions(0, 2);
@@ -160,7 +132,6 @@ impl ForwardHybrid for TwoAxis {
         let out = ops::elemwise::residual_add(&x, &y);
         seam::at(seam::VELOCITY, &[&out]);
 
-        // ── the voxel axis: one convolution ─────────────────────────────
         let grid = vae.grid();
         let xv = vae.voxels(0, C_IN, Dtype::Bf16);
         let conv = Weight::sym(
@@ -181,8 +152,6 @@ pub fn trace() -> Trace {
     trace_hybrid(NAME, &TwoAxis, Platform::Cuda)
 }
 
-// ── numbers ───────────────────────────────────────────────────────────────
-
 #[must_use]
 pub fn to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
@@ -195,7 +164,6 @@ pub fn from_bf16(v: u16) -> f32 {
     f32::from_bits(u32::from(v) << 16)
 }
 
-/// One f32 rounded the way the loader rounds.
 #[must_use]
 pub fn bf(x: f32) -> f32 {
     from_bf16(to_bf16(x))
@@ -214,7 +182,6 @@ impl Lcg {
     }
 }
 
-/// The weights, by plan name: `[out, in]` row-major, bf16-rounded.
 pub struct Weights {
     pub planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
 }
@@ -244,10 +211,6 @@ impl Weights {
             .1
     }
 
-    /// Write the artifact the engine loads: every plane a bf16 leaf under
-    /// the stamp the load checks. Convolution planes are written in the
-    /// checkpoint's NATURAL `[C_out, C_in·taps]` order — the load relabels
-    /// them tap-major itself.
     pub fn write(&self, dir: &Path) -> PathBuf {
         let path = dir.join(format!("cuda-{NAME}.zt"));
         let bytes: Vec<(String, Vec<u64>, Vec<u8>)> = self
@@ -287,16 +250,10 @@ pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String>
         .map_err(|why| why.to_string())
 }
 
-/// The host's f32 reading of the voxel arm: one `same3` convolution over a
-/// clip, zero-padded, in the order the plan's rows run (`(t, h, w)`, `w`
-/// fastest). Every rectangle the device stores is bf16, so the input is
-/// rounded once on the way in and the answer once on the way out.
 #[must_use]
 pub fn conv_reference(weights: &Weights, clip: [u32; 3], x: &[f32]) -> Vec<f32> {
     let [t, h, w] = clip.map(|n| n as usize);
     let (c_in, c_out) = (C_IN as usize, C_OUT as usize);
-    // The plane is stored `[C_out, C_in·taps]` with `taps` fastest — the
-    // checkpoint's natural order, which is what `Weights` wrote.
     let plane = weights.get("conv");
     let mut y = vec![0f32; t * h * w * c_out];
     for ti in 0..t {
@@ -330,18 +287,10 @@ pub fn conv_reference(weights: &Weights, clip: [u32; 3], x: &[f32]) -> Vec<f32> 
     y
 }
 
-/// The 3×3×3 window's offsets, in the tap order a checkpoint stores.
 fn taps() -> impl Iterator<Item = (i32, i32, i32)> {
     (-1..=1).flat_map(|dt| (-1..=1).flat_map(move |dh| (-1..=1).map(move |dw| (dt, dh, dw))))
 }
 
-// ── the rig ───────────────────────────────────────────────────────────────
-
-/// The epilogue a VAE lane attaches: channel 0 is the port cell the guest
-/// writes its clip into (read, never taken — the port feed reads the
-/// committed cell itself), channel 1 is where the decoded pixels go. This is
-/// the guest-visible road of design D8: the plan's `pixels` seam through
-/// `IntrinsicId::Pixels`, `[rows, C_OUT]` f32.
 #[must_use]
 pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
     let cell = Shape::new(&[clip[1], clip[2], C_IN]).expect("the clip's box");
@@ -381,8 +330,6 @@ pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
     }
 }
 
-/// The epilogue a token lane attaches: the latent it carries, the timestep,
-/// the positions, and the velocity plane read back. Mirrors the mini-DiT's.
 #[must_use]
 pub fn velocity_epilogue(rows: u32) -> TraceContainer {
     let writer = |shape: Shape| ChannelDecl {
@@ -431,8 +378,6 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// Load the miniature at these budgets, under the serving knobs (graphs
-    /// on, bodies armed, golden checked).
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>, max_voxels: u32) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
@@ -478,8 +423,6 @@ impl Rig {
         &self.loaded.caps.profile
     }
 
-    /// Compile and register an epilogue container against this load's
-    /// profile; `salt` keeps two programs' hashes apart.
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
         let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
@@ -557,8 +500,6 @@ impl Rig {
     }
 }
 
-/// One VAE lane: ONE dummy token row (a lane's rows are its token count and
-/// this reading embeds none), and the channel its voxel port is fed from.
 #[must_use]
 pub fn vae_lane(slot: u32, channel: u64) -> Lane {
     Lane {
@@ -578,7 +519,6 @@ pub fn vae_lane(slot: u32, channel: u64) -> Lane {
     }
 }
 
-/// One token lane of the DiT arm, fed from its three channels.
 #[must_use]
 pub fn dit_lane(slot: u32, rows: u32, latent: u64, timestep: u64, positions: u64) -> Lane {
     Lane {

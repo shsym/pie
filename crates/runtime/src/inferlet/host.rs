@@ -1,10 +1,3 @@
-//! `pie:inferlet` WIT host boundary: bindgen! + `add_to_linker`, one thin
-//! host-glue file per interface.
-//!
-//! `session.rs` calls `crate::server::send_file` and
-//! `crate::server::inbox::receive`: the one accepted upward layering
-//! exception in this crate.
-
 pub mod chat;
 pub mod forward;
 pub mod frames;
@@ -26,10 +19,6 @@ use crate::inferlet::ProcessCtx;
 use wasmtime::component::HasSelf;
 use wasmtime_wasi::WasiView;
 
-/// Implements `pipeline::fire`'s narrow resource-table/process-identity seam
-/// for the process context, so the fire engine's orchestration functions
-/// (generic over `C: FireContext`) can run with `self: &mut ProcessCtx`
-/// without `pipeline/` ever naming `ProcessCtx`/`inferlet` itself.
 impl crate::pipeline::fire::FireContext for ProcessCtx {
     fn resources(&mut self) -> &mut wasmtime::component::ResourceTable {
         self.ctx().table
@@ -47,48 +36,27 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
 wasmtime::component::bindgen!({
     path: "../inferlet/wit",
     world: "inferlet",
-    // keeps generated host traits on `anyhow::Result` so existing host/*.rs
-    // impls continue to compile unchanged.
     anyhow: true,
     with: {
-        // world imports resolve to the wasmtime p3 host bindings rather than
-        // generating fresh host code; package-level keys cover every
-        // reachable sub-interface.
         "wasi:http": wasmtime_wasi_http::p3::bindings::http,
         "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
         "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
-        // pie:inferlet/working-set (kv); rs-working-set below
         "pie:inferlet/working-set.kv-working-set": crate::store::kv::working_set::KvWorkingSet,
-        // pie:inferlet/grammar
         "pie:inferlet/grammar.grammar": grammar::Grammar,
         "pie:inferlet/grammar.matcher": grammar::Matcher,
-        // pie:inferlet/channel — hoisted out of forward so all three
-        // forward-pass interfaces can name the same channel type.
         "pie:inferlet/channel.channel": forward::Channel,
-        // pie:inferlet/forward — forward-pass submission (the registry surface
-        // folded into forward-pass.new).
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
-        // all three forward interfaces map `forward-pass` to the same Rust
-        // type; WIT still scopes resource names per interface, so a hybrid
-        // pass can't reach an attention-only call.
         "pie:inferlet/forward-recurrent.forward-pass": forward::ForwardPass,
         "pie:inferlet/forward-hybrid.forward-pass": forward::ForwardPass,
         "pie:inferlet/forward-diffusion.forward-pass": forward::ForwardPass,
-        // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
-        // so working-set mutators can take borrow<pipeline> without a cycle).
         "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
-        // pie:inferlet/working-set (rs)
         "pie:inferlet/working-set.rs-working-set": crate::store::rs::working_set::RsWorkingSet,
-        // pie:inferlet/media
         "pie:inferlet/media.image": media::Image,
         "pie:inferlet/media.video": media::Video,
         "pie:inferlet/media.audio": media::Audio,
-        // pie:inferlet/frames — pixel / sample output
         "pie:inferlet/frames.frames": frames::Frames,
         "pie:inferlet/frames.pcm": frames::Pcm,
-        // pie:inferlet/speech (ex audio-out)
         "pie:inferlet/speech.speech": speech::Speech,
-        // pie:inferlet chat / tools / reasoning (ex pie:instruct)
         "pie:inferlet/chat.decoder": chat::Decoder,
         "pie:inferlet/tools.decoder": tools::Decoder,
         "pie:inferlet/reasoning.decoder": reasoning::Decoder,
@@ -100,8 +68,6 @@ wasmtime::component::bindgen!({
 pub fn add_to_linker(
     linker: &mut wasmtime::component::Linker<ProcessCtx>,
 ) -> Result<(), wasmtime::Error> {
-    // must be concrete: async-func imports are generated on `HostWithStore`
-    // traits implemented for `HasSelf<ProcessCtx>`.
     type D = HasSelf<ProcessCtx>;
     pie::inferlet::types::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::pipeline::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

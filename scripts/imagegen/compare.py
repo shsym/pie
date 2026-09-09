@@ -21,11 +21,9 @@ import sys
 
 import numpy as np
 
-
 def load(path: str) -> dict:
     z = np.load(path, allow_pickle=False)
     return {k: np.asarray(z[k], dtype=np.float64) for k in z.files}
-
 
 def stats(a: np.ndarray, b: np.ndarray, floor: float) -> dict:
     d = a - b
@@ -40,7 +38,6 @@ def stats(a: np.ndarray, b: np.ndarray, floor: float) -> dict:
     return dict(max_abs=max_abs, rel=rel, max_rel_el=max_rel_el, cos=cos,
                 shape=a.shape, n=a.size,
                 amax=float(np.abs(a).max()) if a.size else 0.0)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -121,7 +118,6 @@ def main() -> int:
     if rc == 0:
         print("PASS")
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

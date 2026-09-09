@@ -1,22 +1,3 @@
-//! The float-lane fire path (imagegen design D1/D3): a pass whose reading
-//! declares no KV space — a DiT's denoise step, a VAE tile, a CACHELESS
-//! ENCODER — fires ONE lane whose rows are its latents port's (or its ids')
-//! and whose only state is its channels. Nothing here is a sequence: no geometry ports,
-//! no KV grant, no page projection, no recurrent state. What remains of
-//! the ordinary path is kept exactly: the pipeline FIFO and its failure
-//! poisoning, channel wiring, the seat book (a lane is still one of the
-//! shell's row groups), the fire lease on the pass's scratch working set,
-//! ticket reservation, the scheduler submit with a frame stamp, and the
-//! host shadow's advance.
-//!
-//! The lane the engine sees: `tokens` is `rows` zeros (a `Lane`'s row
-//! count is its token count, and most readings on this path embed none) or,
-//! for a cacheless encoder, the ids themselves,
-//! `kv` is the default (no pages: the shell owns nothing for it), `mask`
-//! is `None`, `readout` is every row (the epilogue reads a velocity or a
-//! hidden row per latent row), and `reading`/`stream`/`group`/`ports` are
-//! the pass's [`LaneFacts`](crate::pipeline::instance::LaneFacts).
-
 use wasmtime::component::Resource;
 
 use super::context::FireContext;
@@ -31,8 +12,6 @@ use crate::store::kv::working_set::{FireLeaseError, KvWorkingSet};
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// The body behind one non-no-op slot of `forward.submit` for a pass
-/// bound as a float lane (`BoundForwardPass::float`).
 pub(crate) async fn fire_float_lane<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -50,7 +29,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             pipeline.scope.clone(),
         )
     };
-    // Non-blocking settlement drain, as on the ordinary path.
     drain_settled(ctx, Some(&pipe_fires)).await?;
     if let Some(error) = pipeline_failed(&pipeline_failure) {
         return Ok(Err(error));
@@ -90,11 +68,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         (
             float.rows,
             float.clips.clone(),
-            // A CACHELESS ENCODER's ids: the `embed_tokens` port's value,
-            // resolved the way every other host-known descriptor is (the
-            // container's const payload, or the seed of the channel it
-            // binds). `None` for every other float lane, whose token
-            // rectangle is a formality.
             float.embed.then(|| {
                 let container = &pass.instance.program.bound.container;
                 let values = pass.instance.channel_values();
@@ -119,7 +92,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         )
     };
 
-    // The scratch working set: seats and the fire lease, nothing else.
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
     let stores = crate::store::registry::get(ws.model, ws.engine);
@@ -130,8 +102,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             "pipeline: float lane's working set is already scoped to pipeline {owner:032x}"
         )));
     }
-    // The lease is the suspend seal, as on the ordinary path: a fenced
-    // working set means an eviction is in flight; settle and wait it out.
     let ws_guard = loop {
         match ws.fire_lease() {
             Ok(lease) => break lease,
@@ -144,9 +114,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         }
     };
 
-    // A CACHELESS ENCODER's rows ARE its ids, so its token rectangle is the
-    // ids themselves; every other float lane seats a rectangle of zeros
-    // whose only job is to give the lane `rows` rows.
     let tokens: Vec<u32> = match embed_ids {
         Some(Some(bytes)) => bytes
             .chunks_exact(4)
@@ -169,21 +136,14 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         )));
     }
 
-    // One lane, `rows` rows, every row read out. The word is stamped once
-    // the lane facts are on it.
     let mut req = crate::engine::FireRequest {
         boundary_program: true,
         lanes: vec![::engine::Lane {
             tokens,
             readout: ::engine::Readout::Rows((0..rows).collect()),
-            // A float lane binds no kv space: the shell seats no tokens
-            // for it and carries no count between fires.
             kv_less: true,
             ..::engine::Lane::default()
         }],
-        // The VAE clips (design D8): the boxes this lane's `Voxels` ports
-        // declared, with NO payload — the port itself is channel-fed, so
-        // what travels is the geometry a channel cell cannot carry.
         voxels: if clips.is_empty() {
             Vec::new()
         } else {

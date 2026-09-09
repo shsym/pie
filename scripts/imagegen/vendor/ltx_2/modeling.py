@@ -46,12 +46,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ---------------------------------------------------------------------------
-# embeddings
-# ---------------------------------------------------------------------------
-
-
 def timestep_embedding(
     t: torch.Tensor, dim: int, max_period: int = 10000, dtype=torch.float32
 ) -> torch.Tensor:
@@ -67,7 +61,6 @@ def timestep_embedding(
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
-
 
 def apply_split_rotary_emb(
     x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
@@ -94,7 +87,6 @@ def apply_split_rotary_emb(
     out = out.reshape(*out.shape[:-2], last)
     out = out.transpose(1, 2).reshape(b, t, -1)
     return out.to(dtype=x_dtype)
-
 
 class LTX2AudioVideoRotaryPosEmbed(nn.Module):
     """The split-form rope, video and audio, transcribed for one batch."""
@@ -201,7 +193,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             torch.swapaxes(sin_freq, 1, 2).to(out_dtype),
         )
 
-
 class LTX2RotaryPosEmbed1d(nn.Module):
     """The connectors' 1-D rope: row `i` at `i / base_seq_len`."""
 
@@ -239,12 +230,6 @@ class LTX2RotaryPosEmbed1d(nn.Module):
         if dtype is not None:
             cos, sin = cos.to(dtype), sin.to(dtype)
         return cos, sin
-
-
-# ---------------------------------------------------------------------------
-# attention and feed-forward
-# ---------------------------------------------------------------------------
-
 
 class LTX2Attention(nn.Module):
     """`to_q|to_k|to_v`, RMSNorm ACROSS heads with a gain, optional split
@@ -295,7 +280,6 @@ class LTX2Attention(nn.Module):
         out = out.view(b, t, self.heads * self.dim_head)
         return self.to_out[0](out)
 
-
 class GELUProj(nn.Module):
     """diffusers' `GELU` module: a `proj` linear and a tanh gelu."""
 
@@ -305,7 +289,6 @@ class GELUProj(nn.Module):
 
     def forward(self, x):
         return F.gelu(self.proj(x), approximate="tanh")
-
 
 class LTX2FeedForward(nn.Module):
     """`net.0.proj` up, GELU (tanh), `net.2` down — diffusers' layout."""
@@ -320,12 +303,6 @@ class LTX2FeedForward(nn.Module):
     def forward(self, x):
         return self.net[2](self.net[0](x))
 
-
-# ---------------------------------------------------------------------------
-# timestep modulation
-# ---------------------------------------------------------------------------
-
-
 class LTX2TimestepEmbedder(nn.Module):
     def __init__(self, embedding_dim: int, in_channels: int = 256) -> None:
         super().__init__()
@@ -334,7 +311,6 @@ class LTX2TimestepEmbedder(nn.Module):
 
     def forward(self, t_emb):
         return self.linear_2(F.silu(self.linear_1(t_emb)))
-
 
 class CombinedTimestepSizeEmbeddings(nn.Module):
     def __init__(self, embedding_dim: int) -> None:
@@ -348,7 +324,6 @@ class CombinedTimestepSizeEmbeddings(nn.Module):
             emb = emb.to(dtype=hidden_dtype)
         return self.timestep_embedder(emb)
 
-
 class LTX2AdaLayerNormSingle(nn.Module):
     def __init__(self, embedding_dim: int, embedding_coefficient: int = 6) -> None:
         super().__init__()
@@ -361,23 +336,14 @@ class LTX2AdaLayerNormSingle(nn.Module):
         embedded = self.emb(timestep, hidden_dtype=hidden_dtype)
         return self.linear(F.silu(embedded)), embedded
 
-
 def rms_no_weight(x, eps):
     return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
-
 
 def modulate(x, scale, shift):
     return x * (1 + scale) + shift
 
-
 def residual_gate_add(residual, update, gate):
     return residual + update * gate
-
-
-# ---------------------------------------------------------------------------
-# the transformer
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class LTX2Config:
@@ -414,7 +380,6 @@ class LTX2Config:
     @property
     def audio_hidden_size(self):
         return self.audio_num_attention_heads * self.audio_attention_head_dim
-
 
 class LTX2TransformerBlock(nn.Module):
     def __init__(self, cfg: LTX2Config) -> None:
@@ -500,7 +465,6 @@ class LTX2TransformerBlock(nn.Module):
         b = hidden_states.size(0)
         eps = self.norm_eps
 
-        # 1. self-attentions
         vshift, vscale, vgate = self._ada(self.scale_shift_table, b, temb, slice(0, 3))
         h = modulate(rms_no_weight(hidden_states, eps), vscale, vshift)
         hidden_states = residual_gate_add(
@@ -515,7 +479,6 @@ class LTX2TransformerBlock(nn.Module):
             audio_hidden_states, self.audio_attn1(h, pe=audio_rotary_emb), agate
         )
 
-        # 2. prompt cross-attentions, with the context modulated too
         vshift_q, vscale_q, vgate_q = self._ada(
             self.scale_shift_table, b, temb, slice(6, 9)
         )
@@ -538,7 +501,6 @@ class LTX2TransformerBlock(nn.Module):
             audio_hidden_states, self.audio_attn2(h, c), agate_q
         )
 
-        # 3. the cross-modal pair, both norms taken before either fold
         nv = rms_no_weight(hidden_states, eps)
         na = rms_no_weight(audio_hidden_states, eps)
 
@@ -585,7 +547,6 @@ class LTX2TransformerBlock(nn.Module):
             a_gate,
         )
 
-        # 4. feed-forwards
         vshift_m, vscale_m, vgate_m = self._ada(
             self.scale_shift_table, b, temb, slice(3, 6)
         )
@@ -600,7 +561,6 @@ class LTX2TransformerBlock(nn.Module):
             audio_hidden_states, self.audio_ff(h), agate_m
         )
         return hidden_states, audio_hidden_states
-
 
 class LTX2VideoTransformer3DModel(nn.Module):
     def __init__(self, cfg: LTX2Config) -> None:
@@ -785,12 +745,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
         audio_hidden_states = self.audio_proj_out(audio_hidden_states)
         return hidden_states, audio_hidden_states
 
-
-# ---------------------------------------------------------------------------
-# the connectors
-# ---------------------------------------------------------------------------
-
-
 class LTX2TransformerBlock1d(nn.Module):
     def __init__(self, dim: int, heads: int, head_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -802,7 +756,6 @@ class LTX2TransformerBlock1d(nn.Module):
         x = x + self.attn1(rms_no_weight(x, self.eps), pe=rotary_emb)
         x = x + self.ff(rms_no_weight(x, self.eps))
         return x
-
 
 class LTX2ConnectorTransformer1d(nn.Module):
     def __init__(
@@ -840,7 +793,6 @@ class LTX2ConnectorTransformer1d(nn.Module):
             hidden_states = block(hidden_states, rotary_emb=rotary)
         return rms_no_weight(hidden_states, self.eps)
 
-
 @dataclass
 class LTX2ConnectorConfig:
     caption_channels: int = 3840
@@ -855,7 +807,6 @@ class LTX2ConnectorConfig:
     rope_base_seq_len: int = 4096
     rope_theta: float = 10000.0
     eps: float = 1e-6
-
 
 class LTX2TextConnectors(nn.Module):
     def __init__(self, cfg: LTX2ConnectorConfig) -> None:
@@ -900,7 +851,6 @@ class LTX2TextConnectors(nn.Module):
         v = self.video_text_proj_in(v)
         a = self.audio_text_proj_in(a)
         return self.video_connector(v), self.audio_connector(a)
-
 
 def pack_text_embeds_v2(text_hidden_states: torch.Tensor, eps: float = 1e-6):
     """`[B, L, hidden, layers] -> [B, L, hidden*layers]`, per-token per-layer

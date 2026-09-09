@@ -1,21 +1,5 @@
-//! Inferlet program management, instantiation, and process execution.
-//!
-//! - [`process`]: spawn/list/attach/terminate a running guest instance.
-//! - [`program`]: install/add a guest program (WASM component + manifest).
-//! - `host`: the `pie:inferlet` WIT boundary (bindgen! + `Host*` impls) —
-//!   internal wiring only, never named by external callers.
-//! - `linker`/`python`/`sandbox`: component linking, Python guest support,
-//!   filesystem/network policy — internal.
-
 pub(crate) mod host;
-/// The output half: the `frames`/`pcm` host objects and the format enums
-/// their encode dispatch reads. Re-exported for the same reason `media_codec`
-/// is — the dispatch is the runtime's own arithmetic and its gates live
-/// outside this module — while the guest boundary (`host`) stays private.
 pub use host::frames::{FrameStore, Frames, Pcm};
-/// The media codec and span digest: the host's half of the media pipe
-/// (`models::media`'s catalog does arithmetic, the host decodes and hashes).
-/// The guest boundary (`host`) itself stays private.
 pub use host::media::{decode as media_codec, span_digest};
 pub use host::pie::inferlet::frames::{AudioFormat, ImageFormat};
 pub(crate) mod linker;

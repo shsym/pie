@@ -6,15 +6,10 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// The one attention reading this whole family (trunk and draft head)
-    /// shares. Per-rank: `q_heads`/`kv_heads` are already divided by `tp`;
-    /// `head_dim` is not.
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
 
-    /// Adapter banks, one pair of numbers per layer — the correction is a
-    /// per-lane axis, not a per-layer one.
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -24,95 +19,38 @@ pub struct Model {
     pub final_norm: Weight,
     pub final_norm_eps: f32,
 
-    /// `None` for a text-only checkpoint (4-bit conversions ship no tower
-    /// either) — a single-unit plan rather than the two-unit plan a tower
-    /// adds. Also decides the trunk's rotation: `Some` gives every layer the
-    /// three-section mrope; `None` keeps the plain scalar rotation.
     pub tower: Option<Tower>,
 
-    /// `None` if the artifact carries no draft head. [`Recipe`] distinguishes
-    /// the checkpoint's own `mtp.*` head from an EAGLE overlay imported from
-    /// a second checkpoint; both share this same declaration.
     pub mtp: Option<Mtp>,
 
-    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`] or
-    /// [`Recipe::DFlash2`] — declared in [`crate::drafter::dflash`], since it
-    /// brings its own architecture and nothing of this trunk's.
-    /// Exclusive with [`mtp`](Model::mtp): a plan carries one draft head or
-    /// none, and the two shapes share no declaration.
     pub dflash: Option<DFlash>,
 }
 
-/// Passes of the draft head a fire chains — the `mtp_drafts` seam's width and
-/// the most a guest may ask for as `k`. The checkpoint ships one prediction
-/// layer trained for one step; a second pass is that layer fed its own argmax
-/// and residual (as the qwen4 head chains its two).
-///
-/// Measured at 2 on Qwen3.8-27B-4bit (M4 Pro, 2026-09-04, decode-only, with
-/// a three-row fire at 1.17x a one-row fire): the second step lands ~0.60 of
-/// its drafts on math and ~0.23 on prose against a break-even near 0.30, so
-/// k=2 is +18% on math (24.9 -> 29.2 tok/s) and -4% on prose (18.9 -> 18.2);
-/// and every pass costs the fire ~4 ms on the device (mostly the 389 MB
-/// `lm_head` readout), which a k=1 round pays for a draft it never reads —
-/// about -5%. A static depth is the wrong knob for a workload-shaped gain;
-/// one, until the window is chosen per request off realized acceptance.
 pub const DRAFT_DEPTH: u32 = 1;
 
-/// One MTP (multi-token-prediction / NEXTN) head: fuses a hidden state with
-/// the next token's embedding, runs one transformer block over the fused
-/// stream, and reads out through the base model's own `lm_head`.
-///
-/// ```text
-/// h = fc · [ rms(embed(tok)) · Wₑ | rms(hidden) · W_h ]
-/// h += attn(rms(h))
-/// h += mlp(rms(h))
-/// draft = lm_head(rms(h))
-/// ```
-///
-/// The stored `mtp.fc.weight` is one `[hidden, 2·hidden]` bank, split into
-/// `fc_embed`/`fc_hidden` and summed via `residual_add` (the IR has no
-/// concat op). An EAGLE head ([`Recipe::Eagle`]) reuses this struct with
-/// `pre_fc` and `norm` both `None`.
 pub struct Mtp {
-    /// Which recipe this head was trained under — the one thing that is not
-    /// derivable from the planes, because it is what says which planes exist.
     pub recipe: Recipe,
-    /// The two pre-fusion norms, or `None` for a recipe that fuses the raw
-    /// streams.
     pub pre_fc: Option<PreFc>,
-    /// The embedding half of the stored `[hidden, 2·hidden]` fusion bank.
     pub fc_embed: Weight,
-    /// The hidden half of it.
     pub fc_hidden: Weight,
     pub mixer_norm: Weight,
     pub mixer_norm_eps: f32,
-    /// The head's own block: full attention with the family's q-gate and its
-    /// own kv row (`mtp.layers.0.self_attn`), same shape as a trunk layer.
     pub attn: Attn,
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
-    /// Dense SwiGLU at the trunk's own intermediate width.
     pub mlp: Mlp,
-    /// The final norm before the readout, or `None` for a recipe that reads
-    /// out of the block directly.
     pub norm: Option<Weight>,
     pub norm_eps: f32,
 }
 
-/// The two pre-fusion norms, when the recipe has them. One shared epsilon,
-/// since `rms_norm_eps` is a single config value for this family.
 pub struct PreFc {
-    /// Scales the embedding of the row's token before the fusion.
     pub embedding: Weight,
-    /// Scales the trunk's hidden state before the fusion.
     pub hidden: Weight,
     pub eps: f32,
 }
 
 const SLIDING: Option<u32> = Some(2_048);
 
-/// `z-lab/Qwen3.6-27B-DFlash`: block sixteen, four sliding layers then one
-/// full, bidirectional over the block, argmax readout.
 pub const QWEN36_27B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 16, 31, 46, 61],
     windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
@@ -129,10 +67,6 @@ pub const QWEN36_27B_DFLASH: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
-/// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
-/// inside the block, a dynamic convolution around every sublayer, a
-/// candidate selector for the readout. Heads, widths, window, theta and the
-/// mask token are v1's.
 pub const QWEN38_27B_DFLASH2: dflash::Head = dflash::Head {
     taps: &[5, 19, 33, 47, 61],
     windows: &[SLIDING; 5],
@@ -152,11 +86,6 @@ pub const QWEN38_27B_DFLASH2: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
-/// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five plain
-/// layers) with every layer full attention and the block bidirectional, a
-/// block of fifteen whose EVERY row proposes (row `i` predicts position
-/// `i + 1`, the anchor's row included), its own mask id, and a markov bigram
-/// head for the readout. Its confidence head is not read yet.
 pub const QWEN38_27B_DSPARK: dflash::Head = dflash::Head {
     taps: &[1, 16, 31, 46, 61],
     windows: &[None; 5],
@@ -176,9 +105,6 @@ pub const QWEN38_27B_DSPARK: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
-/// `z-lab/Qwen3.6-35B-A3B-DFlash`: the v1 shape against the 40-layer
-/// mixture — eight taps, six layers (five sliding at 4096, then one full),
-/// hidden 2048, MLP 6144, its own mask id.
 pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 6, 11, 16, 22, 27, 32, 37],
     windows: &[
@@ -202,9 +128,6 @@ pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
-/// `z-lab/Qwen3.5-9B-DFlash`: the v1 shape against the 32-layer 9B —
-/// eight taps, six layers (five sliding at 4096, then one full), the
-/// trunk's hidden 4096 and MLP 12288, the Qwen3.5 mask id.
 pub const QWEN35_9B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 5, 9, 13, 17, 21, 25, 29],
     windows: &[
@@ -228,38 +151,16 @@ pub const QWEN35_9B_DFLASH: dflash::Head = dflash::Head {
     attn_bias: false,
 };
 
-/// Which draft-head recipe an artifact carries. Read by `Model::new` (which
-/// pieces to declare) and `import` (which tensors to bind); irrelevant once
-/// the trace is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recipe {
-    /// The checkpoint's own head: 15 `mtp.*` tensors in the base artifact,
-    /// with pre-fusion norms and a final norm.
     Mtp,
-    /// A separately-obtained head baked into the artifact by
-    /// `pie model import --aux` under an `aux.` prefix (can't collide with
-    /// base checkpoint names). No pre-fusion norms, no final norm.
     Eagle,
-    /// A DFlash block drafter, also `--aux`-imported under `aux.`: five
-    /// decoder layers of its OWN geometry fed by a fusion of five tapped
-    /// trunk hidden states, run bidirectionally over a masked block so one
-    /// pass proposes [`DFlash::block`] tokens. Declared as [`DFlash`], not
-    /// [`Mtp`] — it shares neither the fusion shape nor the attention shape.
     DFlash,
-    /// DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`): the same fusion and the same
-    /// five blocks, at a block of eight, every layer sliding and causal
-    /// inside the block, with a two-tap dynamic convolution around each
-    /// sublayer ([`DynConv`]). The candidate selector the head also ships is
-    /// not declared yet — the readout is the per-slot argmax, as v1's.
     DFlash2,
-    /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
-    /// layers full, a block of fifteen whose every row proposes, a markov
-    /// bigram readout. See [`QWEN38_27B_DSPARK`].
     DSpark,
 }
 
 impl Recipe {
-    /// The plane prefix this recipe's head is named under.
     #[must_use]
     pub fn prefix(self) -> &'static str {
         match self {
@@ -268,70 +169,33 @@ impl Recipe {
         }
     }
 
-    /// Whether this recipe is a block drafter ([`DFlash`]) rather than a
-    /// chained head ([`Mtp`]).
     #[must_use]
     pub fn drafts_a_block(self) -> bool {
         matches!(self, Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark)
     }
 }
 
-/// The vision tower: a windowed region of the same fire whose rows are
-/// patches and whose lanes are images.
-///
-/// ```text
-/// y  = patch_embed(x) + pos_embed[interp(grid)]
-/// per block:
-///   y += proj(dense_attn(rope(qkv(LN(y)))))
-///   y += fc2(gelu(fc1(LN(y))))
-/// out = mfc2(gelu(mfc1(merge(LN(y)))))
-/// ```
-///
-/// Norms are real `nn.LayerNorm`, not RMSNorm. MLP is ungated. Rotation is
-/// two-axis, block-laid ([`MropeForm::Blocked`]), no time axis. Replicated
-/// whole under `tp` rather than sharded — too small to be worth a collective.
-///
-/// [`MropeForm::Blocked`]: model_dsl::MropeForm::Blocked
 pub struct Tower {
-    /// The tower's own residual width — NOT the trunk's.
     pub hidden: u32,
     pub heads: u32,
-    /// `hidden / heads`, stated rather than derived (same reason as
-    /// `Model::head_dim`).
     pub head_dim: u32,
-    /// `spatial_merge_size`: the merger folds `merge²` consecutive patch rows
-    /// into one (`layout.merge_rows`).
     pub merge: u32,
-    /// `C · T · P²`: width of one pre-unfolded patch row, the carve size
-    /// `Input::patches` uses.
     pub patch_width: u32,
-    /// Rows of [`pos_embed`](Tower::pos_embed) gathered per patch: 4 for
-    /// bilinear resample of a non-native grid. Could be 1 only for a
-    /// deployment that never resizes.
     pub taps: u32,
-    /// `num_position_embeddings`: learned table row count, the square of the
-    /// grid side the host resamples from.
     pub positions: u32,
     pub theta: f32,
     pub norm_eps: f32,
     pub sm_scale: f32,
-    /// `[hidden, patch_width]`: patch embedding as a matmul (patches arrive
-    /// as vectors, not images).
     pub patch_embed: Weight,
     pub patch_embed_bias: Weight,
-    /// `[positions, hidden]`, gathered per patch row.
     pub pos_embed: Weight,
     pub blocks: Vec<TowerBlock>,
     pub merger: Merger,
 }
 
-/// One vision block: a prenorm bidirectional attention and a prenorm ungated
-/// MLP, both with biases, which is what makes every projection here a
-/// `matmul` plus an `add_bias` rather than a bare `matmul`.
 pub struct TowerBlock {
     pub norm1: Weight,
     pub norm1_bias: Weight,
-    /// `[3·hidden, hidden]` — q, k and v fused, as the checkpoint stores them.
     pub qkv: Weight,
     pub qkv_bias: Weight,
     pub proj: Weight,
@@ -344,15 +208,11 @@ pub struct TowerBlock {
     pub fc2_bias: Weight,
 }
 
-/// The patch merger: the one place the patch rectangle's row count changes.
-/// Norm runs before the merge shuffle, on `[hidden]`, not `[merge²·hidden]`.
 pub struct Merger {
     pub norm: Weight,
     pub norm_bias: Weight,
-    /// `[merge²·hidden, merge²·hidden]`.
     pub fc1: Weight,
     pub fc1_bias: Weight,
-    /// `[out_hidden, merge²·hidden]`; `out_hidden` is the trunk's width.
     pub fc2: Weight,
     pub fc2_bias: Weight,
 }
@@ -371,13 +231,6 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// This layer's adapter bank, `[slots, rank, hidden]` and
-    /// `[slots, hidden, rank]` — the down and up planes of one correction
-    /// site.
-    ///
-    /// Sits on the mixer sublayer's replicated input/output, after the
-    /// `all_reduce` — not on `o_proj`'s own (rank-cut) output, which would
-    /// have every rank add the full `ΔW·x` and sum it `tp` times.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -460,32 +313,22 @@ enum MlpDims {
     Routed(MoeDims),
 }
 
-/// A tower's own numbers, read off `config.json`'s `vision_config`. Separate
-/// from [`Dims`] since nothing here divides by `tp` (the tower is
-/// replicated). `out_hidden` is the trunk's `hidden`, asserted against it
-/// rather than restated.
 #[derive(Clone, Copy)]
 struct TowerDims {
     depth: u32,
     hidden: u32,
     heads: u32,
     inter: u32,
-    /// `in_channels · temporal_patch_size · patch_size²`.
     patch_width: u32,
     merge: u32,
     positions: u32,
     out_hidden: u32,
-    /// Rotary embedding class default; not set by either SKU's `vision_config`.
     theta: f32,
     norm_eps: f32,
-    /// How many table rows a patch's position gathers ([`Tower::taps`]).
     taps: u32,
 }
 
 impl TowerDims {
-    /// The two shipped towers share `patch_width`, `merge`, `positions` and
-    /// `theta`/`norm_eps`; they differ in depth, hidden, heads, inter and
-    /// `out_hidden`.
     const fn qwen35() -> TowerDims {
         TowerDims {
             depth: 12,
@@ -537,14 +380,8 @@ struct Dims {
     vocab: u32,
     tied: bool,
     norm_eps: f32,
-    /// The vision tower this SKU's checkpoint publishes, or `None`.
     tower: Option<TowerDims>,
-    /// Which draft-head recipe this SKU's artifact carries, or `None`. No
-    /// layer count: every shipped draft head (either recipe) is exactly one
-    /// decoder layer.
     draft: Option<Recipe>,
-    /// The published block drafter a block-drafting recipe reads — its own
-    /// numbers, one descriptor a checkpoint (`drafter::dflash`).
     dflash_head: Option<&'static dflash::Head>,
 }
 
@@ -553,16 +390,12 @@ impl Model {
         Model::new(w, kv, tp, Model::a3b_dims())
     }
 
-    /// The A3B with its published MTP head (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`,
-    /// the head alone, overlaid by `--aux`): one dense block over the mixture.
     pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::Mtp);
         Model::new(w, kv, tp, d)
     }
 
-    /// The A3B with z-lab's block drafter (`Qwen3.6-35B-A3B-DFlash`)
-    /// overlaid: the same four hooks the 27B spells, a second mixture.
     pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::DFlash);
@@ -570,8 +403,6 @@ impl Model {
         Model::new(w, kv, tp, d)
     }
 
-    /// The shipped A3B geometry, factored out so the miniature below can move
-    /// the two numbers it moves and nothing else.
     fn a3b_dims() -> Dims {
         Dims {
             hidden: 2048,
@@ -602,25 +433,14 @@ impl Model {
         }
     }
 
-    /// Width-invariance fixture (`mini-l5-e16-k8`), carved from the shipped
-    /// A3B checkpoint. Only depth (5) and expert count (16) change from
-    /// `a3b_dims`; everything else stays production width so accumulation
-    /// order over K stays comparable. `top_k` stays 8 to keep a contested
-    /// tail among the 16 experts.
     pub fn a3b_mini(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::a3b_mini_dims(16))
     }
 
-    /// Same fixture with a crowded tail (`mini-l5-e64-k8`): 64 routed
-    /// experts instead of 16, top-k still 8, so the router has more rejected
-    /// experts to break ties among. Only the expert count differs from
-    /// `a3b_mini`.
     pub fn a3b_mini64(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::a3b_mini_dims(64))
     }
 
-    /// The miniature's geometry; only `experts` varies between the two
-    /// public rows above.
     fn a3b_mini_dims(experts: u32) -> Dims {
         let mut d = Model::a3b_dims();
         d.layers = 5;
@@ -631,12 +451,6 @@ impl Model {
         d
     }
 
-    /// Test-only routed MoE, `a3b`'s shape scaled down to fit two copies on
-    /// one device. Not a catalog row — no checkpoint ships it. Used to check
-    /// that a load holding half the experts produces the same logits as
-    /// full residency. `attn_every: 1` isolates the MLP's expert banks from
-    /// the (orthogonal) GDN mixer; `tied: true` drops the `lm_head` plane
-    /// since the dense floor isn't under test.
     pub fn a3b_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -672,19 +486,6 @@ impl Model {
         )
     }
 
-    /// **`a3b_micro`'S SIBLING WITH A BANK TOO BIG TO CACHE.** Not a catalog
-    /// row either — no checkpoint ships it.
-    ///
-    /// `a3b_micro`'s whole expert bank is a few megabytes, which sits inside
-    /// a serving card's last-level cache, so a per-route re-read of it never
-    /// reaches memory. That is the case that flatters the per-route GEMV
-    /// most, and measuring the grouped routed matmul against it understates
-    /// what grouping is worth by the width of the cache.
-    ///
-    /// This one's gate/up bank is `32 * 2 * 512 * 2048` bf16 — 134 MiB, past
-    /// the 48 MiB an L40S carries — so a re-read is a fetch. One layer,
-    /// because the bank is the whole point and four of them would be four
-    /// times the fixture on disk for no more signal.
     pub fn a3b_uncached_bank(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -724,17 +525,10 @@ impl Model {
         Model::new(w, kv, tp, Model::d0_8b_dims(None, None))
     }
 
-    /// Same 24-layer trunk as `d0_8b`, with an EAGLE head from a second
-    /// checkpoint overlaid via `pie model import <base> --aux <head>`. A
-    /// separate row rather than an optional field, since whether the head
-    /// exists is a fact about which artifact was imported.
     pub fn d0_8b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d0_8b_dims(None, Some(Recipe::Eagle)))
     }
 
-    /// Same 24-layer trunk as `d0_8b`, reading the 12-block tower its own
-    /// checkpoint ships. A separate row rather than an optional tower field,
-    /// since a tower makes this a two-unit plan.
     pub fn d0_8b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -744,10 +538,6 @@ impl Model {
         )
     }
 
-    /// Trunk, tower and EAGLE head together. Needed because vision rows are
-    /// ordered ahead of the plain eagle row, so a checkpoint that has both
-    /// the tower and the overlaid head would otherwise match the vision row
-    /// and never bind its draft head.
     pub fn d0_8b_vision_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -812,9 +602,6 @@ impl Model {
         )
     }
 
-    /// Qwen3.5-2B (`mlx-community/Qwen3.5-2B-4bit`): the 0.8B's layout at
-    /// hidden 2048 — 8 query heads over 2 kv, 16 × 128 for both GDN sides,
-    /// MLP 6144, tied embeddings.
     pub fn d2b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -845,14 +632,10 @@ impl Model {
         )
     }
 
-    /// Qwen3.5-9B (`mlx-community/Qwen3.5-9B-4bit`): 32 layers at hidden
-    /// 4096, 16 query heads over 4 kv, GDN 16 key × 32 value heads of 128,
-    /// MLP 12288, its own `lm_head`.
     pub fn d9b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d9b_dims())
     }
 
-    /// The 9B with z-lab's block drafter overlaid (`Qwen3.5-9B-DFlash`).
     pub fn d9b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::d9b_dims();
         d.draft = Some(Recipe::DFlash);
@@ -887,46 +670,26 @@ impl Model {
         }
     }
 
-    /// Qwen3.6-27B: a SKU of this family, not a separate one —
-    /// `config.json` names itself `qwen3_5`. `attn_every = 4` (3 linear : 1
-    /// full attention), `q_proj` is gated (`attn_output_gate`), `rotary_dim
-    /// = 64` (`partial_rotary_factor: 0.25` of `head_dim: 256`). Adds the
-    /// `mtp.*` draft head. Text-only reading: the checkpoint also ships a
-    /// 27-block tower and interleaved mrope, neither declared here.
     pub fn d27b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::Mtp)))
     }
 
-    /// The 27B with a DFlash block drafter overlaid by `--aux`
-    /// (`z-lab/Qwen3.6-27B-DFlash`, the drafter alone: `fc.*`, `layers.0..4.*`,
-    /// `hidden_norm`, `norm` at its root). The trunk is `d27b_undrafted`'s —
-    /// the drafter brings its own layers rather than sharing one.
     pub fn d27b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash)))
     }
 
-    /// The 27B with the DFlash2 drafter overlaid by `--aux`
-    /// (`z-lab/Qwen3.8-27B-DFlash2`): the same trunk, [`Recipe::DFlash2`]'s
-    /// head. The Qwen3.8-27B trunk reads with `d27b`'s dims.
     pub fn d27b_dflash2(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
     }
 
-    /// The 27B with the DSpark drafter overlaid by `--aux`
-    /// (`DimInfer/Qwen3.8-27B-Dspark-v1`).
     pub fn d27b_dspark(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DSpark)))
     }
 
-    /// Same 64 layers without the draft head. Used for 4-bit conversions:
-    /// `mlx_lm` implements no MTP arm for this family, so those artifacts
-    /// carry none of the `mtp.*` planes.
     pub fn d27b_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, None))
     }
 
-    /// Both the 27-block tower and the `mtp.*` head — two independent
-    /// fields, so this row is `d27b`'s dims plus a tower.
     pub fn d27b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -936,8 +699,6 @@ impl Model {
         )
     }
 
-    /// Tower without the draft head — the pairing the 4-bit artifact
-    /// actually ships (tower present, no `mtp.*` planes).
     pub fn d27b_vision_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(Some(TowerDims::qwen36()), None))
     }
@@ -963,8 +724,6 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
-            // The 27B heads: which one is the recipe's, since three are
-            // published for this trunk.
             dflash_head: draft.and_then(|r| match r {
                 Recipe::DFlash => Some(&QWEN36_27B_DFLASH),
                 Recipe::DFlash2 => Some(&QWEN38_27B_DFLASH2),
@@ -979,23 +738,11 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
-        // Non-matmul values (norms, depthwise conv, deltanet per-head
-        // biases, adapter planes) use `dense`, not `w`. See `crate::dense`.
         let dense = crate::dense(w);
-        // Router gates (`mlp.gate`, `mlp.shared_expert_gate`) are stored at
-        // 8 bits even when the rest of a 4-bit stack is 4-bit; a bf16 stack
-        // keeps its gates at bf16.
         let gate = match w {
             Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
-        // `U4g64tiled` reorders `U4g64` codes into m16n8k16 fragment order
-        // for `linear::tiled`. Applies only to 2D dense projections read by
-        // `ops::linear::matmul`: `embed`/tied head (gather), routed expert
-        // banks (3D, grouped select) and the MTP `fc` slices stay row-major
-        // since none have a tiled reader. `model_dsl::place` resolves the
-        // actual per-platform layout: CUDA gets tiled, Metal gets canonical
-        // `U4g64` (Metal's quant kernels have no fragment-order reader).
         let proj = match w {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
@@ -1037,8 +784,6 @@ impl Model {
                             .packed([k_w, k_w, v_w, v_w]),
                         in_ba: Weight::sym(n("in_ba"), [2 * v_heads as u64, hidden], proj)
                             .packed([v_heads as u64, v_heads as u64]),
-                        // conv and dt_bias stay unquantized: neither has 64
-                        // values to group.
                         conv: Weight::sym(n("conv"), [qkv, d.conv_kernel as u64], dense)
                             .packed([k_w, k_w, v_w]),
                         dt_bias: Weight::sym(n("dt_bias"), [v_heads as u64], dense).columns(),
@@ -1099,20 +844,12 @@ impl Model {
                     mlp_norm: norm("mlp_norm", hidden),
                     mlp_norm_eps: d.norm_eps,
                     mlp,
-                    // Replicated under tp: both ends (normed residual in,
-                    // reduced mixer result out) are replicated, so nothing
-                    // here is summed twice.
                     lora_a,
                     lora_b,
                 }
             })
             .collect();
 
-        // Draft head's mlp is always dense at the trunk's width, even when
-        // the trunk routes — one block, no experts to route to.
-        //
-        // Tower, when published: every plane replicated, names under
-        // `visual.` (checkpoint's own namespace, `model.` stripped).
         let tower = d.tower.map(|t| {
             assert_eq!(
                 t.out_hidden, d.hidden,
@@ -1132,9 +869,6 @@ impl Model {
             let merged = u64::from(t.merge) * u64::from(t.merge) * th;
             let head_dim = t.hidden / t.heads;
             let n = |s: String| format!("visual.{s}");
-            // Every tower plane is `dense(w)`, merger included: 4-bit
-            // checkpoints still ship the tower unquantized, so a
-            // `-vision-u4g64` row is a bf16 tower over a U4 trunk.
             let plane = |s: String, dims: [u64; 2]| Weight::sym(n(s), dims, dense);
             let vec1 = |s: String, len: u64| Weight::sym(n(s), [len], dense);
             Tower {
@@ -1181,9 +915,6 @@ impl Model {
             }
         });
 
-        // kv row stays `kv.mtp` under either recipe — a fact about this
-        // plan's page-id space, not about which checkpoint the bytes came
-        // from.
         let mtp = d.draft.filter(|r| !r.drafts_a_block()).map(|recipe| {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
@@ -1198,8 +929,6 @@ impl Model {
                     hidden: Weight::sym(n("pre_fc_norm_hidden"), [hidden], dense),
                     eps: d.norm_eps,
                 }),
-                // Replicated, both halves: token embedding and the trunk's
-                // reduced residual stream are both replicated values.
                 fc_embed: Weight::sym(n("fc_embed"), [hidden, hidden], w),
                 fc_hidden: Weight::sym(n("fc_hidden"), [hidden, hidden], w),
                 mixer_norm: Weight::sym(n("mixer_norm"), [hidden], dense),
@@ -1214,8 +943,6 @@ impl Model {
             }
         });
 
-        // The block drafter's geometry is its OWN (`drafter::dflash`), so it
-        // reads nothing off `Dims` but the trunk's widths and element types.
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
             let head = d
                 .dflash_head
@@ -1244,15 +971,6 @@ impl Model {
             adapters: ADAPTERS,
             kv,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
-            // An UNTIED head is `vocab x hidden` of its own and every rank
-            // streamed all of it. Band it on the vocab axis: each rank lands
-            // its slice and `forward` all-gathers the logits shard. Exact —
-            // partitioning a GEMM's output changes no reduction.
-            //
-            // A TIED head IS the embedding table, whose lookup would then need
-            // banding (and an all-reduce) too, so it is left whole here; see
-            // `gemma_4` for that shape. `PIE_NO_VOCAB_SHARD` restores the
-            // replicated head for bisecting.
             head: if d.tied {
                 Head::Tied
             } else {
@@ -1275,15 +993,8 @@ impl Model {
     }
 }
 
-/// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
-/// pretrained artifact states it) — a deployment setting baked in at trace
-/// time; changing it means re-tracing.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-/// One gated full-attention site's banks, named under `prefix`. Shared by
-/// trunk and draft head — `mtp.layers.0.self_attn.*` matches a trunk
-/// layer's shapes tensor for tensor. `q_heads`/`kv_heads` passed in here are
-/// already per-rank (cut by `tp`).
 fn gated_attn(w: Dtype, d: &Dims, q_heads: u32, kv_heads: u32, prefix: &str, kv: String) -> Attn {
     let n = |s: &str| format!("{prefix}.{s}");
     let dense = crate::dense(w);
@@ -1305,8 +1016,6 @@ fn gated_attn(w: Dtype, d: &Dims, q_heads: u32, kv_heads: u32, prefix: &str, kv:
     }
 }
 
-/// One dense SwiGLU sublayer's banks, named under `prefix`. The draft head's
-/// mlp is the trunk's at the same intermediate width.
 fn dense_mlp(w: Dtype, hidden: u64, inter: u32, prefix: &str) -> Mlp {
     let n = |s: &str| format!("{prefix}.{s}");
     Mlp::Dense {

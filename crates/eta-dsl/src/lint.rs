@@ -1,9 +1,3 @@
-//! SDK span lints: SPSC double-endpoint, readiness-direction conflict, and
-//! sink stage-precedence — caught during assembly with source spans. The
-//! IR's [`bind`](eta_ir::validate::bind) is the authoritative SPSC gate;
-//! these run first for friendly, span-rich author errors and mirror its
-//! model.
-
 use alloc::vec::Vec;
 
 use eta_ir::registry::{SinkScope, Stage};
@@ -11,7 +5,6 @@ use eta_ir::registry::{SinkScope, Stage};
 use crate::context::{ChannelRef, SinkCall};
 use crate::error::{Endpoint, Span, TraceError};
 
-/// Run the span lints over the interned channels + recorded sinks.
 pub(crate) fn lint(
     channels: &[ChannelRef],
     sinks: &[(Stage, SinkCall)],
@@ -30,8 +23,6 @@ pub(crate) fn lint(
         let stage_puts = !st.prog_puts.is_empty();
         let stage_consumes = !st.prog_takes.is_empty() || !st.desc_takes.is_empty();
 
-        // Double-endpoint: the host claims both endpoints (writes and
-        // consumes the same channel) — no pass endpoint remains.
         if let (Some(w), Some(c)) = (host_writes, host_consumes) {
             errs.push(TraceError::DoubleEndpoint {
                 channel: name.clone(),
@@ -41,8 +32,6 @@ pub(crate) fn lint(
             });
         }
 
-        // Readiness-direction: a consumed channel must be produced or
-        // seeded, else its `take`/`read` can never become full.
         let produced = stage_puts || host_writes.is_some() || st.seeded || st.seed.is_some();
         let consumed = stage_consumes
             || !st.prog_reads.is_empty()
@@ -66,7 +55,6 @@ pub(crate) fn lint(
         }
     }
 
-    // Sink stage-precedence.
     for (stage, s) in sinks {
         let ok = match s.scope {
             SinkScope::PassWide => *stage == Stage::Prologue,

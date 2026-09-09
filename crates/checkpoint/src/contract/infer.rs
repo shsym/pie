@@ -1,7 +1,3 @@
-//! The type checker: what an [`Expr`] denotes at one point in a
-//! tensor-parallel split, total over every variant including
-//! [`Expr::Shard`].
-
 use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec, TILED_BAND, TILED_STEP};
 
@@ -10,19 +6,13 @@ use super::{
     BiasBy, Expr, Partition, ScaleFactor, TensorType, UnaryOp, local_range, resolve_extents,
 };
 
-/// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
     fn tensor_type(&self, name: &str) -> Option<TensorType>;
 }
 
-/// What resolving a contract's expressions turned up: the checkpoint tensors
-/// they consulted, and the types the earlier entries published. Handed to
-/// the compiler so it doesn't repeat the same name resolution.
 #[derive(Clone, Debug, Default)]
 pub struct Checked {
-    /// Checkpoint tensors referenced by some [`Expr::Src`], by name.
     pub sources: std::collections::HashMap<String, TensorType>,
-    /// Declared contracts, by name.
     pub outputs: std::collections::HashMap<String, TensorType>,
 }
 
@@ -35,7 +25,6 @@ impl Checked {
         self.outputs.get(name)
     }
 
-    /// The type behind a lowering leaf, whichever namespace it names.
     pub fn type_of(&self, leaf: &compile::Leaf) -> Option<&TensorType> {
         match leaf {
             compile::Leaf::Checkpoint(name) => self.source(name),
@@ -48,17 +37,11 @@ struct Scope<'a> {
     checkpoint: &'a dyn CheckpointTypes,
     resolved: Checked,
     partition: Partition,
-    /// Which instance of a [`GroupContract`](crate::contract::GroupContract) is
-    /// being resolved, or `None` outside a group (which makes an index node
-    /// outside a group a contract error rather than a silent instance 0).
     instance: Option<u32>,
-    /// What the caller is resolving; names the tensor in the divisibility
-    /// error message when a `tp_size` does not fit the model.
     what: String,
 }
 
 impl Scope<'_> {
-    /// This instance's index, or the error an index node outside a group earns.
     fn instance(&self, node: &str) -> Result<i64, Error> {
         self.instance.map(i64::from).ok_or_else(|| {
             Error::Contract(format!(
@@ -70,8 +53,6 @@ impl Scope<'_> {
     }
 }
 
-/// Substitute `index` for the single `{}` in `template`. Exactly one
-/// placeholder, decimal, no other brace use.
 pub fn substitute_index(template: &str, index: u32) -> Result<String, Error> {
     let braces = template.matches('{').count();
     if braces != 1 || template.matches('}').count() != 1 || !template.contains("{}") {
@@ -83,8 +64,6 @@ pub fn substitute_index(template: &str, index: u32) -> Result<String, Error> {
     Ok(template.replace("{}", &index.to_string()))
 }
 
-/// Type-check a standalone expression against the unsplit tensor. Returns the
-/// inferred type alongside the resolution the compiler needs.
 pub fn infer_type(
     expr: &Expr,
     checkpoint: &dyn CheckpointTypes,
@@ -94,10 +73,6 @@ pub fn infer_type(
     Ok((ty, resolver.into_checked()))
 }
 
-/// A scope built up one entry at a time: the compiler checks an expression,
-/// lowers it, publishes what that produced, then moves to the next entry with
-/// the new name in scope. Built for one [`Partition`], which is what makes
-/// typing total for [`Expr::Shard`].
 pub struct Resolver<'a> {
     scope: Scope<'a>,
 }
@@ -115,29 +90,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The same resolver, bound to one instance of a
-    /// [`GroupContract`](crate::contract::GroupContract). [`Expr::SrcIndexed`]
-    /// and [`Expr::Select`] resolve against `instance` the way [`Expr::Shard`]
-    /// resolves against the partition.
     pub fn for_instance(mut self, instance: u32) -> Self {
         self.scope.instance = Some(instance);
         self
     }
 
-    /// Infer `expr`'s type, resolving [`Expr::Out`] against what has been
-    /// published so far. `what` names the thing being resolved, for the
-    /// divisibility error a [`Expr::Shard`] can raise.
     pub fn infer(&mut self, expr: &Expr, what: &str) -> Result<TensorType, Error> {
         self.scope.what.clear();
         self.scope.what.push_str(what);
         infer(expr, &mut self.scope)
     }
 
-    /// Infer `expr`'s type as the *contract* states it, with every
-    /// [`Expr::Shard`] in it read at [`Partition::WHOLE`] — the
-    /// rank-independent answer a declaration is a claim about. Uses this
-    /// resolver (not a fresh one) so `Expr::Out` still resolves against
-    /// published entries, whose types are already this rank's.
     pub fn infer_whole(&mut self, expr: &Expr, what: &str) -> Result<TensorType, Error> {
         let partition = std::mem::replace(&mut self.scope.partition, Partition::WHOLE);
         let ty = self.infer(expr, what);
@@ -145,16 +108,12 @@ impl<'a> Resolver<'a> {
         ty
     }
 
-    /// Rewrite `expr` for this resolver's rank, replacing every
-    /// [`Expr::Shard`] with the slice that rank reads. Lowering's
-    /// precondition, not typing's: a byte offset cannot be symbolic.
     pub fn specialize(&mut self, expr: Expr, what: &str) -> Result<Expr, Error> {
         self.scope.what.clear();
         self.scope.what.push_str(what);
         specialize(expr, &mut self.scope)
     }
 
-    /// Bring `name` into scope for later expressions.
     pub fn publish(&mut self, name: &str, ty: TensorType) {
         self.scope.resolved.outputs.insert(name.to_string(), ty);
     }
@@ -168,7 +127,6 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Infers the type of `expr`, resolving names through `scope`.
 fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
     match expr {
         Expr::Src(name) => {
@@ -202,8 +160,6 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             len,
         } => {
             let ty = infer(src, scope)?;
-            // Typed at instance 0: a Select's type doesn't depend on the
-            // index. `specialize` checks the concrete instance.
             let _ = stride;
             infer_slice(&ty, *axis, 0, *len)
         }
@@ -260,7 +216,6 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             match by {
                 BiasBy::Uniform(bits) => infer_bias(ty, *bits),
                 BiasBy::PerBlock { by } => {
-                    // Addends must be a declared tensor (see Scale below).
                     if !matches!(by.as_ref(), Expr::Out(_)) {
                         return Err(Error::Contract(
                             "Bias addends must be a declared tensor; declare \
@@ -278,8 +233,6 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             match factor {
                 ScaleFactor::Uniform(bits) => infer_scale(ty, *bits),
                 ScaleFactor::PerBlock { by } => {
-                    // The kernel reads factors from memory, so they must be a
-                    // declared tensor, not an inline expression.
                     if !matches!(by.as_ref(), Expr::Out(_)) {
                         return Err(Error::Contract(
                             "Scale factors must be a declared tensor; declare \
@@ -294,26 +247,15 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
         }
         Expr::Shard { src, axis } => {
             let ty = infer(src, scope)?;
-            // Asked at every world size, including 1, so an out-of-range axis
-            // or rank is still an error at one rank.
             let (start, len) = shard_range(&ty, *axis, scope.partition, &scope.what)?;
             if scope.partition.world <= 1 {
-                // At one rank a shard is its operand (see denotes_its_operand);
-                // infer_slice would refuse the whole-axis band otherwise.
                 return Ok(ty);
             }
-            // Routed through infer_slice so a shard gets the same
-            // quantization-group alignment check a slice does.
             infer_slice(&ty, *axis, start, len)
         }
     }
 }
 
-/// The band of `ty`'s `axis` that `partition` owns. The one place
-/// [`Expr::Shard`] is given meaning; both the checker and [`specialize`] go
-/// through here so their answers agree by construction. At `world <= 1` the
-/// band is the whole axis (neither caller emits a slice denoting the
-/// operand), but this is still where the axis and rank are validated.
 fn shard_range(
     ty: &TensorType,
     axis: Axis,
@@ -329,12 +271,6 @@ fn shard_range(
     )
 }
 
-/// Fills in everything about `expr` that only the target knows: which band a
-/// [`Expr::Shard`] denotes, and what a [`Expr::Transmute`] wildcard stands
-/// for — both extents the author declined to compute, resolved here (rather
-/// than at lowering) so the checked shape and the placed shape agree by
-/// construction. Recurses into children first, so a shard over a shard sees
-/// an operand it can already type.
 fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
     if let Expr::Transmute { src, to } = expr {
         let src = specialize(*src, scope)?;
@@ -342,8 +278,6 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
         let to = infer_transmute(&ty, &to, &src)?;
         return Ok(src.transmute(to));
     }
-    // The two group nodes resolve like Shard, one step earlier: a name and
-    // an offset both stop being symbolic here.
     if let Expr::SrcIndexed(template) = &expr {
         let index = scope.instance("SrcIndexed")?;
         return Ok(Expr::Src(substitute_index(template, index as u32)?));
@@ -361,20 +295,14 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
             .checked_mul(stride)
             .or_overflow("a Select's start offset")?;
         let ty = infer(&src, scope)?;
-        // Routed through infer_slice like Shard: catches an instance that
-        // runs off the end of the grid (arity wider than the bank).
         infer_slice(&ty, axis, start, len)?;
         return Ok(src.slice(axis.0, start, len));
     }
-    // Every other variant is structural: map_children recurses and
-    // reassembles it.
     let Expr::Shard { src, axis } = expr else {
         return expr.map_children(|src| specialize(src, scope));
     };
     let src = specialize(*src, scope)?;
     if scope.partition.world <= 1 {
-        // The operand itself, not a degenerate one-rank slice, so a
-        // single-GPU plan matches one compiled with no sharding at all.
         return Ok(src);
     }
     let ty = infer(&src, scope)?;
@@ -382,7 +310,6 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
     Ok(src.slice(axis.0, start, len))
 }
 
-/// Resolve an [`Axis`] against a rank, rejecting out-of-range axes.
 fn axis_index(axis: Axis, rank: usize, what: &str) -> Result<usize, Error> {
     let index = usize::from(axis.0);
     if index >= rank {
@@ -393,12 +320,6 @@ fn axis_index(axis: Axis, rank: usize, what: &str) -> Result<usize, Error> {
     Ok(index)
 }
 
-/// Which axis a quantized encoding groups along, and how many elements share
-/// one set of factors there.
-///
-/// A planar scheme (AWQ, GPTQ, MLX affine) states a `channel_axis`. A
-/// self-contained scheme (Gguf*, MXFP4) reports `None` but is still grouped
-/// along the fastest (last) axis in this crate's convention.
 fn blocked_axis(ty: &TensorType) -> Option<(usize, i64)> {
     let Encoding::Quant(spec) = &ty.encoding else {
         return None;
@@ -413,16 +334,12 @@ fn blocked_axis(ty: &TensorType) -> Option<(usize, i64)> {
     (group > 1).then_some((channel, group))
 }
 
-/// The group size along `axis`, when the encoding blocks that axis (see
-/// [`blocked_axis`]).
 fn block_granularity(ty: &TensorType, axis: usize) -> Option<i64> {
     blocked_axis(ty)
         .filter(|&(index, _)| index == axis)
         .map(|(_, group)| group)
 }
 
-/// Shared by [`Expr::Slice`] and [`Expr::Stride`]: both name `len` positions
-/// `step` apart from `start`, and both must land inside the axis.
 fn selected_axis(
     ty: &TensorType,
     axis: Axis,
@@ -467,12 +384,6 @@ fn narrowed(ty: &TensorType, index: usize, len: i64) -> TensorType {
     }
 }
 
-/// The rule that stops one tensor from having two spellings: a node that
-/// denotes exactly its operand is refused. [`Expr::Shard`] is the one
-/// deliberate exception — at `world == 1` a shard *is* its operand, and both
-/// [`Resolver::specialize`] and [`infer`] honor that.
-///
-/// [`Expr::Shard`]: crate::contract::Expr::Shard
 fn denotes_its_operand(node: &str, how: &str) -> Error {
     Error::Contract(format!(
         "{node} {how}, so it denotes its operand; say the operand instead"
@@ -509,7 +420,6 @@ fn infer_stride(
             "Stride step must be >= 2, got {step}; a contiguous run is a Slice"
         )));
     }
-    // A progression of one term is a band, whatever its step claims.
     if len == 1 {
         return Err(Error::Contract(format!(
             "Stride of one position from {start} is a Slice, which costs less to \
@@ -517,8 +427,6 @@ fn infer_stride(
         )));
     }
     let index = selected_axis(ty, axis, start, len, step, "Stride")?;
-    // Unlike Slice, a stride may not touch a quantized axis at all: it
-    // would split a block from the scale that describes it.
     if let Some(group) = block_granularity(ty, index) {
         return Err(Error::Contract(format!(
             "Stride with step {step} on quantized axis {index} would split its {group}-element groups"
@@ -527,11 +435,6 @@ fn infer_stride(
     Ok(narrowed(ty, index, len))
 }
 
-/// The general placement; a list expressible as a run or constant-gap run
-/// must instead be written as the cheaper [`Expr::Slice`] or [`Expr::Stride`].
-///
-/// [`Expr::Slice`]: crate::contract::Expr::Slice
-/// [`Expr::Stride`]: crate::contract::Expr::Stride
 fn infer_gather(ty: &TensorType, axis: Axis, indices: &[i64]) -> Result<TensorType, Error> {
     let index = axis_index(axis, ty.rank(), "Gather")?;
     let extent = ty.shape[index];
@@ -547,15 +450,11 @@ fn infer_gather(ty: &TensorType, axis: Axis, indices: &[i64]) -> Result<TensorTy
             )));
         }
     }
-    // Same reason a Stride may not: permuting whole blocks is legal as a
-    // Concat of Slices, but permuting within one leaves it unscaled.
     if let Some(group) = block_granularity(ty, index) {
         return Err(Error::Contract(format!(
             "Gather on quantized axis {index} would split its {group}-element groups"
         )));
     }
-    // `step` is only a progression if positive; descending/repeating lists
-    // are genuine gathers.
     let step = rest.first().map_or(1, |second| second - first);
     if step >= 1
         && rest
@@ -635,8 +534,6 @@ fn infer_concat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
     })
 }
 
-/// Bits one element of `encoding` occupies. `None` when the encoding has no
-/// fixed width.
 fn element_bits(encoding: &Encoding) -> Option<u64> {
     match encoding {
         Encoding::Raw(dtype) => dtype.bytes_ceil().checked_mul(8),
@@ -644,18 +541,11 @@ fn element_bits(encoding: &Encoding) -> Option<u64> {
     }
 }
 
-/// The shape from the blocked axis onward, when the encoding blocks one.
-/// What a rename (Transmute) may not touch, since regrouping it moves data
-/// out from under its scales while the byte count still balances.
 fn blocked_suffix(ty: &TensorType) -> Option<&[i64]> {
     let (channel, _) = blocked_axis(ty)?;
     ty.shape.get(channel..)
 }
 
-/// How many elements of `encoding` a run of `bytes` holds. A blocked scheme
-/// is not a bit width and cannot be priced as one: e.g. a GGUF Q4_K block
-/// spends 144 bytes on 256 elements (only 128 are 4-bit codes, the rest are
-/// scales/minima), so dividing by code width alone overcounts.
 fn elements_in(bytes: u64, encoding: &Encoding) -> Result<i64, Error> {
     if let Encoding::Quant(spec) = encoding
         && let Some((elems, block)) = spec.block_layout()
@@ -679,9 +569,6 @@ fn elements_in(bytes: u64, encoding: &Encoding) -> Result<i64, Error> {
     i64::try_from(total_bits / bits).or_overflow("Transmute element count")
 }
 
-/// [`Expr::Transmute`]: the same bytes named differently. `src` is passed
-/// for its form alone (whether it is a whole tensor), which a type can't say
-/// but a change of element width needs to know.
 fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<TensorType, Error> {
     let from_bytes = ty.byte_size()?;
     let total = elements_in(from_bytes, &to.encoding)?;
@@ -696,8 +583,6 @@ fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<Tenso
             "Transmute changes the byte size, {from_bytes} -> {to_bytes}"
         )));
     }
-    // Checked after -1 is resolved, so an inferred extent is judged by what
-    // it turned out to mean.
     if resolved == *ty {
         return Err(denotes_its_operand(
             "Transmute",
@@ -724,8 +609,6 @@ fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<Tenso
     Ok(resolved)
 }
 
-/// A fill is a leaf, so it is its own declared type — with conditions that
-/// all follow from the plan realizing it by zeroing the destination.
 fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
     if ty.shape.is_empty() {
         return Err(Error::Contract(
@@ -759,25 +642,15 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
     Ok(ty.clone())
 }
 
-/// The geometry a repack kernel needs, derived from the operand's type and
-/// `to`. The destination buffer is sized from `to`
-/// (`batch * target_rows * target_cols`), so an understated `to` is a
-/// device-side overrun; a target larger than the source is legal (zero-filled
-/// tile padding).
 pub(crate) fn repack_spec(
     ty: &TensorType,
     layout: RepackLayout,
     to: &TensorType,
 ) -> Result<RepackSpec, Error> {
-    // The rank `to` carries is the layout's, not the algebra's: Marlin
-    // layouts repack an expert bank ([batch, rows, cols]); tiled affine
-    // layouts repack a dense projection with no such axis ([rows, cols]).
     let to_rank: usize = match layout {
         RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale => 3,
         RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor => 2,
     };
-    // The logical column count (e.g. MXFP4 groups of 32 for a weight), so
-    // padding is comparable to it.
     let (want_rank, cols) = match layout {
         RepackLayout::MarlinMxfp4Weight => {
             if ty.rank() != 4 || ty.shape[3] != 16 {
@@ -797,9 +670,6 @@ pub(crate) fn repack_spec(
             }
             (3, ty.shape[2])
         }
-        // The contraction must be a whole number of TILED_STEP-wide steps;
-        // the kernel walks `k` that many at a time with no tail step, and
-        // cannot pad its way out of a remainder.
         RepackLayout::TiledAffineU4Weight => {
             if ty.rank() != 2 {
                 return Err(Error::Contract(format!(
@@ -845,10 +715,7 @@ pub(crate) fn repack_spec(
             to.shape
         )));
     }
-    // The two trailing extents, wherever the layout put them.
     let (to_rows, to_cols) = (to.shape[to_rank - 2], to.shape[to_rank - 1]);
-    // A tiled affine plane pads rows to exactly the next whole TILED_BAND
-    // quantum; the kernel's grid is carved off the target's row count.
     if to_rank == 2 {
         let banded = rows
             .checked_add(i64::from(TILED_BAND) - 1)
@@ -860,8 +727,6 @@ pub(crate) fn repack_spec(
             )));
         }
     }
-    // Padding only; a target smaller than its source is a truncation, which
-    // belongs to Expr::Slice on the operand instead.
     if to_rows < rows || to_cols < cols {
         return Err(Error::Contract(format!(
             "Repack declares {:?}, smaller than the [{batch}, {rows}, {cols}] it \
@@ -869,9 +734,6 @@ pub(crate) fn repack_spec(
             to.shape
         )));
     }
-    // An element must be the same number of bits on both sides (Repack moves
-    // bytes, it doesn't reinterpret them). Checked per element rather than
-    // per row/tensor, since padding is the one thing that may change size.
     let source_bits = row_bits(&ty.shape[to_rank - 1..], &ty.encoding, "Repack operand")?;
     let target_bits = element_bits(&to.encoding).ok_or_else(|| {
         Error::Contract(format!(
@@ -898,7 +760,6 @@ pub(crate) fn repack_spec(
     })
 }
 
-/// The bits one row of `trailing` extents occupies at `encoding`.
 fn row_bits(trailing: &[i64], encoding: &Encoding, what: &str) -> Result<u64, Error> {
     let bits = element_bits(encoding)
         .ok_or_else(|| Error::Contract(format!("{what} has no fixed element width")))?;
@@ -917,10 +778,6 @@ fn dim_u32(value: i64, what: &str) -> Result<u32, Error> {
     u32::try_from(value).map_err(|_| Error::Contract(format!("{what} {value} does not fit in u32")))
 }
 
-/// A cast keeps the shape and replaces the representation; which of the
-/// three directions (raw-to-raw, encode, decode) falls out of the pair of
-/// encodings. Quantized-to-quantized is refused: no kernel does it in one
-/// step, since the destination's scales aren't a function of the source's.
 fn infer_cast(ty: &TensorType, to: &Encoding) -> Result<TensorType, Error> {
     if *to == ty.encoding {
         return Err(denotes_its_operand(
@@ -937,8 +794,6 @@ fn infer_cast(ty: &TensorType, to: &Encoding) -> Result<TensorType, Error> {
             )));
         }
         (_, Encoding::Quant(spec)) => {
-            // The group size must divide the blocked axis, or the last group
-            // of every row is short and the scales stop lining up.
             if let Some(channel) = spec.channel_axis {
                 let index = axis_index(channel, ty.rank(), "Cast channel_axis")?;
                 let group = i64::from(spec.normalized_group_size());
@@ -960,10 +815,6 @@ fn infer_cast(ty: &TensorType, to: &Encoding) -> Result<TensorType, Error> {
         },
     })
 }
-/// A uniform `Scale` preserves both shape and encoding; only the values
-/// move. Restricted to raw floating-point elements: a `Quant` operand is
-/// ambiguous (decode-multiply-reencode vs. scaling the stored factors), and
-/// an integer operand has no stated rounding rule.
 fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
     let dtype = match ty.encoding {
         Encoding::Raw(dtype) => dtype,
@@ -985,9 +836,6 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
             "Scale factor must be finite, got {factor}"
         )));
     }
-    // Zero is what an all-zero PieLoaderExprNode carries, so an unset
-    // scale_factor_bits must not silently become a tensor of zeros. -0.0
-    // shares the hazard, so it's rejected too.
     if factor == 0.0 {
         return Err(Error::Contract(
             "Scale factor is zero, which is also what an unset factor field \
@@ -1001,13 +849,6 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
     Ok(ty)
 }
 
-/// A `Bias` yields its operand's type, admitting the same operands
-/// `infer_scale` does and for the same reasons. Zero is refused (same
-/// unset-field hazard); unlike `Scale`, 1.0 is a real bias and stays legal.
-/// A `Unary` keeps shape and dtype: it is a function of one element, so
-/// there is nothing for it to change but the value. Quantized operands are
-/// refused for the reason `Bias` refuses them — a code word is not a number
-/// until its scales are named.
 fn infer_unary(ty: TensorType, op: UnaryOp) -> Result<TensorType, Error> {
     let dtype = match ty.encoding {
         Encoding::Raw(dtype) => dtype,
@@ -1058,9 +899,6 @@ fn infer_bias(ty: TensorType, by_bits: u32) -> Result<TensorType, Error> {
     Ok(ty)
 }
 
-/// The per-block `Bias`: like `infer_scale_per_block` but the operand must
-/// already be raw numbers (a quantized operand means the per-block `Scale`
-/// that should decode it first was composed in the wrong order).
 fn infer_bias_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Error> {
     let dtype = match &ty.encoding {
         Encoding::Raw(dtype) => *dtype,
@@ -1126,11 +964,6 @@ fn infer_bias_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Er
     Ok(ty)
 }
 
-/// A per-block `Scale` yields the logical type of what it read: unchanged
-/// over `Raw`, or the scheme's `logical_dtype` over `Quant` (this is
-/// dequantization — the one place the algebra unpacks a quantized tensor).
-/// `by` must be `src` with `axis` divided by `group`, so a partition applied
-/// to only one of weight/scales is a compile error naming both shapes.
 fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Error> {
     let out_dtype = match &ty.encoding {
         Encoding::Raw(dtype) => *dtype,
@@ -1141,8 +974,6 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
             "Scale requires F32, F16 or BF16 elements, got {out_dtype:?}"
         )));
     }
-    // E8M0 is included because that's what a block-scaled checkpoint stores:
-    // a bare exponent, no sign, no mantissa.
     match &by.encoding {
         Encoding::Raw(DType::F32 | DType::F16 | DType::Bf16 | DType::E8m0) => {}
         other => {
@@ -1151,8 +982,6 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
             )));
         }
     }
-    // Equal rank is checked first: a factor tensor of a different rank is a
-    // different tensor paired by mistake, not a coarser view of this one.
     if by.shape.len() != ty.shape.len() {
         return Err(Error::Contract(format!(
             "Scale factors have shape {:?}, which is not a blocking of {:?} \
@@ -1182,9 +1011,6 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
             blocked = true;
         }
     }
-    // A node may not denote exactly its operand: factors shaped like the
-    // weight are a plain elementwise product, not a blocking (and would
-    // shadow Uniform, the rank-0 case).
     if !blocked && !ty.shape.is_empty() {
         return Err(Error::Contract(format!(
             "Scale factors have the operand's own shape {:?}, so they group \

@@ -1,8 +1,3 @@
-//! Shared adapter store: files are the truth, the bank is a cache. [`Vfs`]
-//! resolves a guest-spelled name to a path under the mount; [`Blobs`] is a
-//! single-flight, refcounted host byte cache; [`Stamp`] keys the residency
-//! table so a rewritten file is a new slot.
-
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,37 +8,24 @@ use crate::adapter::{Site, layer_of, role_of, site_of};
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
 
-/// The one file an adapter directory must carry.
 pub const MANIFEST: &str = "adapter.toml";
 
-/// The read-only shared directory adapters are files in. `None` for a root
-/// is the feature off: every `open` is a refusal that says so.
 #[derive(Debug, Clone, Default)]
 pub struct Vfs {
     root: Option<PathBuf>,
 }
 
 impl Vfs {
-    /// Mount `root`, or nothing.
     #[must_use]
     pub fn new(root: Option<PathBuf>) -> Vfs {
         Vfs { root }
     }
 
-    /// Where this mount is, if it is anywhere.
     #[must_use]
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
-    /// Turn a guest-spelled adapter name into a directory inside the mount.
-    /// A leading `/` is cut; every component after that must be a plain name
-    /// — a traversal is refused, not sanitized.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Blob`] for an unmounted shell, an empty name, a component
-    /// that is not a plain one, or a directory that is not there.
     pub fn resolve(&self, name: &str) -> Result<PathBuf> {
         let root = self.root.as_ref().ok_or_else(|| Fault::Blob {
             path: name.to_string(),
@@ -84,18 +66,13 @@ impl Vfs {
     }
 }
 
-/// Which way a source plane is laid out, stated by the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
-    /// `[layers, rank, hidden]` — the rank is the leading axis of a slot.
     RankMajor,
-    /// `[layers, hidden, rank]` — HF's native `B`, the rank a stride inside
-    /// every row.
     OutMajor,
 }
 
 impl Layout {
-    /// How a message names it.
     #[must_use]
     pub fn spelled(self) -> &'static str {
         match self {
@@ -104,7 +81,6 @@ impl Layout {
         }
     }
 
-    /// How a manifest spells it.
     #[must_use]
     pub fn written(self) -> &'static str {
         match self {
@@ -113,9 +89,6 @@ impl Layout {
         }
     }
 
-    /// Which orientation a bank's own rectangle carries: the plan marks
-    /// neither, so this reads the rank axis as the shorter one (a square
-    /// bank is a degenerate tie, taken at the file's word).
     #[must_use]
     pub fn of_bank(seat: &BankSeat) -> Layout {
         match seat.rows <= seat.cols {
@@ -125,39 +98,21 @@ impl Layout {
     }
 }
 
-/// One plane the manifest names: which bank role it fills, from what file,
-/// laid out which way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaneSpec {
-    /// The bank's name with its `layer.{l}.` prefix cut — `lora_a`.
     pub role: String,
-    /// The file inside the adapter's directory.
     pub file: String,
-    /// Which way its bytes run.
     pub layout: Layout,
-    /// Which correction site's banks it fills, or `None` for the banks a
-    /// text named without a site. A spelling outside the vocabulary is
-    /// refused at [`Manifest::read`], never a fallback.
     pub site: Option<Site>,
 }
 
-/// What an adapter directory declares about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    /// The rank the adapter was trained at. May be under the bank's — the
-    /// resolver pads, per orientation — and never over it.
     pub rank: u64,
-    /// Its planes, in the order the file names them.
     pub planes: Vec<PlaneSpec>,
 }
 
 impl Manifest {
-    /// Read `dir/adapter.toml`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Blob`] for a directory with no manifest, a manifest that is
-    /// not TOML, or one that omits a key.
     pub fn read(dir: &Path, name: &str) -> Result<Manifest> {
         let at = dir.join(MANIFEST);
         let refuse = |why: String| Fault::Blob {
@@ -248,21 +203,15 @@ impl Manifest {
     }
 }
 
-/// One file's bytes, host-side, with its content fingerprint.
 #[derive(Debug)]
 pub struct Blob {
-    /// Where it was read from.
     pub at: PathBuf,
-    /// The bytes.
     pub bytes: Vec<u8>,
-    /// FNV-1a over all of them.
     pub fingerprint: u64,
 }
 
 enum Cell {
-    /// Somebody is reading this file right now; everyone else waits.
     Loading,
-    /// Somebody holds it — or held it, and the handle is gone.
     Held(Weak<Blob>),
 }
 
@@ -275,10 +224,6 @@ impl std::fmt::Debug for Cell {
     }
 }
 
-/// The host byte cache: refcounted handles, one read per file per
-/// generation. Single-flight: concurrent opens of the same adapter perform
-/// one read, the rest waiting on it ([`Blobs::loads`] counts it). Holds
-/// `Weak`s, so bytes die with the last handle.
 #[derive(Debug, Default)]
 pub struct Blobs {
     held: Mutex<HashMap<PathBuf, Cell>>,
@@ -287,25 +232,14 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    /// How many times this store has actually read a file.
-    ///
-    /// The single-flight observable: `n` concurrent opens of one path move it
-    /// by one.
     #[must_use]
     pub fn loads(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
     }
 
-    /// A handle on `at`'s bytes, reading them if nobody has.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Blob`] for a file that will not read, named by `path`.
     pub fn open(&self, at: &Path, path: &str) -> Result<Arc<Blob>> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            // The map borrow ends with this `match`, so the upgrade result
-            // is lifted out rather than acted on inside it.
             let seen = match held.get(at) {
                 Some(Cell::Held(weak)) => Some(weak.upgrade()),
                 Some(Cell::Loading) => None,
@@ -340,8 +274,6 @@ impl Blobs {
                 Ok(blob)
             }
             Err(error) => {
-                // The claim is dropped rather than left behind: a waiter that
-                // woke onto a `Loading` nobody is in reads a stale promise.
                 held.remove(at);
                 Err(Fault::Blob {
                     path: path.to_string(),
@@ -355,9 +287,6 @@ impl Blobs {
     }
 }
 
-/// FNV-1a, 64 bit — the content half of the identity. Not cryptographic;
-/// settles only "did the bytes change" against an accident, not an
-/// adversary (the mount is operator-owned).
 #[must_use]
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -368,18 +297,9 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The key a shared slot is held under, snapshotted at bind: the adapter's
-/// resolved directory (not its spelling — `/alice-v2` and `alice-v2` must
-/// share a slot) plus `(file, len, mtime)` for its manifest and every plane.
-/// A rewritten plane is a different stamp and therefore a different slot.
-/// Ordered as well as hashed because the residency table is a `BTreeMap`
-/// over [`crate::adapter::Key`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Stamp {
-    /// Where it resolved to under the mount.
     pub at: String,
-    /// `(file, bytes, mtime nanoseconds)`, manifest first, then the planes in
-    /// the order the manifest names them.
     pub files: Vec<(String, u64, u128)>,
 }
 
@@ -396,8 +316,6 @@ fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
     Ok((file.to_string(), meta.len(), mtime))
 }
 
-/// The mount and the host byte cache together — everything about a shared
-/// adapter that is a question about files, checkable with no GPU in it.
 #[derive(Debug, Default)]
 pub struct Store {
     vfs: Vfs,
@@ -405,39 +323,25 @@ pub struct Store {
 }
 
 impl Store {
-    /// A store mounted nowhere.
     #[must_use]
     pub fn new() -> Store {
         Store::default()
     }
 
-    /// State where the shared adapters live. A verb, not a load field: the
-    /// mount outlives any one load, so a directory that grows an adapter
-    /// while the box serves needs no restart.
     pub fn mount(&mut self, root: Option<PathBuf>) {
         self.vfs = Vfs::new(root);
     }
 
-    /// The mount.
     #[must_use]
     pub fn vfs(&self) -> &Vfs {
         &self.vfs
     }
 
-    /// The host byte cache — [`Blobs::loads`] is the single-flight observable.
     #[must_use]
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
     }
 
-    /// The identity `name` resolves to, the moment the files are stat'ed.
-    /// Computed before a slot is touched, keeping an unknown name from ever
-    /// reaching the residency table.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Blob`] for a name outside the mount, a directory with no
-    /// manifest, or a manifest naming a file that is not there.
     pub fn stamp(&self, name: &str) -> Result<Stamp> {
         let dir = self.vfs.resolve(name)?;
         let manifest = Manifest::read(&dir, name)?;
@@ -452,16 +356,6 @@ impl Store {
         })
     }
 
-    /// The resolver: one shared adapter's files, sliced per layer and padded
-    /// per orientation into one full-capacity plane per bank. Answers the
-    /// planes and the folded fingerprint of the files they came from.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Blob`] for a role this load declares no bank for, banks of one
-    /// role that do not agree on a slot, a source whose orientation the bank's
-    /// is not, a rank past the bank's, or a file whose length is not exactly
-    /// `layers x rank x hidden` elements.
     pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
         let dir = self.vfs.resolve(name)?;
         let manifest = Manifest::read(&dir, name)?;
@@ -472,8 +366,6 @@ impl Store {
         let mut out = Vec::new();
         let mut fingerprint = 0u64;
         for spec in &manifest.planes {
-            // Role and site together pick the banks; no site means the banks
-            // that declare none.
             let mut banks: Vec<&BankSeat> = seats
                 .iter()
                 .filter(|seat| role_of(&seat.name) == spec.role && site_of(&seat.name) == spec.site)
@@ -504,8 +396,6 @@ impl Store {
                     odd.slot
                 )));
             }
-            // A source whose layout disagrees with the bank's would need a
-            // transpose this shell does not ship, so it is refused.
             let bank_layout = Layout::of_bank(seat);
             if bank_layout != spec.layout {
                 return Err(refuse(format!(
@@ -532,8 +422,6 @@ impl Store {
                 )));
             }
             let blob = self.blobs.open(&dir.join(&spec.file), name)?;
-            // Folded, not XORed: two equal fingerprints (e.g. zero A, zero B)
-            // would XOR to zero and record "no content".
             fingerprint = (fingerprint ^ blob.fingerprint).wrapping_mul(0x0000_0100_0000_01b3);
             let stride = manifest
                 .rank
@@ -559,8 +447,6 @@ impl Store {
             let slot = usize::try_from(seat.slot).unwrap_or(usize::MAX);
             for (layer, bank) in banks.iter().enumerate() {
                 let source = &blob.bytes[layer * stride..(layer + 1) * stride];
-                // Zero-padded per orientation: `A`'s unused ranks are
-                // trailing rows, `B`'s are a stride inside every row.
                 let mut plane = vec![0u8; slot];
                 match spec.layout {
                     Layout::RankMajor => plane[..source.len()].copy_from_slice(source),
@@ -586,16 +472,11 @@ impl Store {
 mod tests {
     use super::*;
 
-    /// How many layers the pretend model text declares banks for.
     const LAYERS: u64 = 3;
-    /// The rank the banks seat.
     const BANK_RANK: u64 = 8;
-    /// The width they correct.
     const HIDDEN: u64 = 16;
-    /// bf16, which is what a bank declares and what a blob ships.
     const ELEM: u64 = 2;
 
-    /// One test's own directory, unique per process and per nanosecond.
     fn scratch(what: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -620,7 +501,6 @@ mod tests {
         }
     }
 
-    /// The banks a model text declares: `A` rank-major, `B` out-major.
     fn seats() -> Vec<BankSeat> {
         (0..LAYERS)
             .flat_map(|layer| {
@@ -632,13 +512,10 @@ mod tests {
             .collect()
     }
 
-    /// The source ramp, as a u16 per element — a mis-strided landing shows up
-    /// as a wrong NUMBER and not only a wrong length.
     fn source(element: usize) -> [u8; 2] {
         ((element as u16) | 0x0100).to_le_bytes()
     }
 
-    /// Write one adapter directory into `mount` at `name`.
     fn write_adapter(mount: &Path, name: &str, rank: u64, layouts: (Layout, Layout)) -> PathBuf {
         let dir = mount.join(name);
         std::fs::create_dir_all(&dir).expect("an adapter directory");
@@ -661,7 +538,6 @@ mod tests {
         dir
     }
 
-    /// A store mounted on a fresh directory holding one rank-4 adapter.
     fn mounted(what: &str) -> (PathBuf, Store) {
         let mount = scratch(what);
         write_adapter(&mount, "alice-v2", 4, (Layout::RankMajor, Layout::OutMajor));
@@ -670,7 +546,16 @@ mod tests {
         (mount, store)
     }
 
-    /// Rank, planes in file order, both layouts, and the optional site.
+    fn blob_every_case() {
+        a_manifest_says_its_rank_its_planes_and_their_orientation();
+        the_mount_resolves_a_name_and_refuses_everything_else();
+        one_blob_is_one_stamp_and_a_rewrite_is_another();
+        eight_threads_asking_for_one_blob_read_it_once();
+        a_read_that_refuses_leaves_no_claim_behind();
+        the_resolver_slices_per_layer_and_pads_per_orientation();
+        the_resolver_refuses_by_name();
+    }
+
     #[test]
     fn a_manifest_says_its_rank_its_planes_and_their_orientation() {
         let mount = scratch("manifest");
@@ -696,7 +581,6 @@ mod tests {
             "the planes come back in the order the file names them"
         );
 
-        // The site is optional, and it is a value rather than a wildcard.
         let sited = mount.join("sited");
         std::fs::create_dir_all(&sited).expect("a directory");
         std::fs::write(
@@ -710,9 +594,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// A name is resolved inside the mount or it is refused; a traversal is
-    /// refused rather than sanitized.
-    #[test]
     fn the_mount_resolves_a_name_and_refuses_everything_else() {
         let (mount, store) = mounted("vfs");
         assert_eq!(
@@ -743,16 +624,12 @@ mod tests {
             .to_string();
         assert!(said.contains("nobody"), "names the adapter: {said}");
 
-        // An unmounted shell has no namespace for a name to be in.
         let bare = Store::new();
         let said = bare.stamp("alice-v2").expect_err("nothing mounted").to_string();
         assert!(said.contains("no shared adapter directory mounted"), "{said}");
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// One file is one identity, however it is spelled, and a rewrite is
-    /// another.
-    #[test]
     fn one_blob_is_one_stamp_and_a_rewrite_is_another() {
         let (mount, store) = mounted("identity");
         let first = store.stamp("alice-v2").expect("the adapter is there");
@@ -771,8 +648,6 @@ mod tests {
         );
         assert_eq!(first.files[0].0, MANIFEST, "the manifest is stamped first");
 
-        // A rewrite at a different length is a different stamp regardless of
-        // the filesystem's mtime resolution.
         std::fs::write(mount.join("alice-v2").join("a.bin"), vec![0u8; 8])
             .expect("the plane is rewritten");
         let after = store.stamp("alice-v2").expect("still there");
@@ -784,9 +659,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// Eight threads asking for one file perform one read; the rest wait on
-    /// it. Observed via [`Blobs::loads`].
-    #[test]
     fn eight_threads_asking_for_one_blob_read_it_once() {
         let at = scratch("flight").join("plane.bin");
         std::fs::write(&at, vec![7u8; 1 << 16]).expect("a plane");
@@ -804,8 +676,6 @@ mod tests {
                 .into_iter()
                 .map(|handle| handle.join().expect("a thread"))
                 .collect();
-            // Held together on purpose: keeping the handles alive is also
-            // the assertion that eight references are one allocation.
             assert_eq!(held.len(), 8);
             for blob in &held {
                 assert_eq!(blob.bytes.len(), 1 << 16);
@@ -814,16 +684,12 @@ mod tests {
             assert_eq!(blobs.loads(), 1, "one read, seven waiters");
         });
 
-        // Every handle is gone, so the bytes are too.
         let again = blobs.open(&at, "plane").expect("a second generation");
         assert_eq!(blobs.loads(), 2);
         assert_eq!(again.bytes.len(), 1 << 16);
         let _ = std::fs::remove_file(&at);
     }
 
-    /// A file that will not read is a refusal naming the adapter, and it
-    /// leaves no claim behind for the next caller to wait on forever.
-    #[test]
     fn a_read_that_refuses_leaves_no_claim_behind() {
         let at = scratch("unreadable").join("absent.bin");
         let blobs = Blobs::default();
@@ -832,16 +698,10 @@ mod tests {
             .expect_err("the file is not there")
             .to_string();
         assert!(said.contains("ghost"), "names the adapter: {said}");
-        // The second call reads again rather than waiting on a `Loading`
-        // nobody is in.
         assert!(blobs.open(&at, "ghost").is_err());
         assert_eq!(blobs.loads(), 2, "each attempt is its own read");
     }
 
-    /// A `[layers, ...]` file slices into one full-capacity plane per bank,
-    /// padded per orientation: `A`'s leading rows vs. `B`'s leading columns
-    /// of every row.
-    #[test]
     fn the_resolver_slices_per_layer_and_pads_per_orientation() {
         let (mount, store) = mounted("slice");
         let seats = seats();
@@ -876,10 +736,7 @@ mod tests {
             for col in 0..hidden {
                 let at = (row * hidden + col) * 2;
                 let want = match row < rank {
-                    // The rank-major head is a straight copy of the slice.
                     true => source(hidden * rank + row * hidden + col),
-                    // The trailing ranks are zero — a zero row of `A`
-                    // contributes a zero to the waist, so the padding is exact.
                     false => [0, 0],
                 };
                 assert_eq!(&a[at..at + 2], &want, "A row {row} col {col} of layer 1");
@@ -895,8 +752,6 @@ mod tests {
             for col in 0..bank_rank {
                 let at = (row * bank_rank + col) * 2;
                 let want = match col < rank {
-                    // Out-major: the rank is a stride INSIDE every row, so the
-                    // source's row lands at the head of the bank's row.
                     true => source(hidden * rank + row * rank + col),
                     false => [0, 0],
                 };
@@ -906,16 +761,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// Every way the files and the model text can disagree, refused by
-    /// name, with both numbers wherever there are two.
-    #[test]
     fn the_resolver_refuses_by_name() {
         let mount = scratch("resolver-refusals");
         let mut store = Store::new();
         store.mount(Some(mount.clone()));
         let seats = seats();
 
-        // A role this load declares no bank for.
         let dir = mount.join("mute");
         std::fs::create_dir_all(&dir).expect("a directory");
         std::fs::write(
@@ -932,7 +783,6 @@ mod tests {
         assert!(said.contains("mystery"), "names the role: {said}");
         assert!(said.contains("layer.0.lora_a"), "and the banks there are: {said}");
 
-        // A plane that is not the banks' rectangle, with BOTH numbers.
         write_adapter(&mount, "short", 4, (Layout::RankMajor, Layout::OutMajor));
         std::fs::write(mount.join("short").join("a.bin"), vec![0u8; 16]).expect("a short plane");
         let said = store
@@ -942,7 +792,6 @@ mod tests {
         assert!(said.contains("16"), "names the bytes it was handed: {said}");
         assert!(said.contains("384"), "and the bytes it wanted: {said}");
 
-        // A rank-major `B` — refused rather than repacked.
         write_adapter(&mount, "flipped", 4, (Layout::RankMajor, Layout::RankMajor));
         let said = store
             .planes("flipped", &seats)
@@ -951,7 +800,6 @@ mod tests {
         assert!(said.contains("out-major"), "names the orientation: {said}");
         assert!(said.contains("refused rather than repacked"), "{said}");
 
-        // A rank the banks cannot seat.
         write_adapter(&mount, "wide", 16, (Layout::RankMajor, Layout::OutMajor));
         let said = store
             .planes("wide", &seats)
@@ -960,7 +808,6 @@ mod tests {
         assert!(said.contains("rank 16"), "names the source's rank: {said}");
         assert!(said.contains("seats rank 8"), "and the bank's: {said}");
 
-        // A load with no banks at all has nowhere to put one.
         let said = store
             .planes("wide", &[])
             .expect_err("a load that declares no bank")

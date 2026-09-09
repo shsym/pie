@@ -1,7 +1,3 @@
-//! `Attention`: the merged attention family — the attention anchor, mla,
-//! ssm, index, and pool arms, plus the plan-building prepare phase those
-//! launches ride on.
-
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool};
 use kernels_cuda::attn_dense;
 use model_exec::{DispatchAttention, KernelError};
@@ -18,15 +14,6 @@ impl DispatchAttention for Run<'_> {
 }
 
 impl Run<'_> {
-    /// One launch, or none at all: returns `Ok(())` without touching a
-    /// stream for a load with no slab, a fire no lane captured, or a
-    /// `prefill_lse` node the plan's `attn.scores` seam doesn't name.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`kernels_cuda::attn_score::capture`] refuses: a sliding
-    /// window (the row would not be the softmax the eviction papers define),
-    /// a quantized key plane, a head this kernel is not stamped for.
     #[allow(clippy::too_many_arguments)]
     fn capture_scores(
         &mut self,
@@ -47,8 +34,6 @@ impl Run<'_> {
         };
         let lane_offset = self.window().span().lane_offset;
         let mut slab = seat.slab;
-        // This launch isn't an IR op; its grid reads q + indptr[blockIdx.x]
-        // off rebased boundaries, so it needs the windowed rectangle.
         let mut q_rows = self.ragged(q);
         q_rows.data = self.windowed(q_rows.data);
         kernels_cuda::attn_score::capture(
@@ -69,14 +54,8 @@ impl Run<'_> {
         )
     }
 
-    /// The arms themselves, in `kernels-cuda`'s error vocabulary; each stays
-    /// a plain tail call with `?`, and [`kernel`](crate::error::kernel)
-    /// lifts the whole family into the contract's.
     fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
         match op {
-            // ---- attention (anchor) ----
-            // The builder walks kv_indptr/kv_len's host contents via the
-            // twins Run::planning bound beside them.
             Attention::PlanDecode {
                 kv_indptr,
                 kv_indices: _,
@@ -126,9 +105,6 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
-            // As `PlanDecode`, plus the qo side; which builder runs follows
-            // the plan value's `StructKind`. `causal: true` is
-            // `attention.prefill`'s reading; `attention.masked` ignores it.
             Attention::PlanPrefill {
                 kv_indptr,
                 kv_indices: _,
@@ -144,8 +120,6 @@ impl Run<'_> {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr, *plan);
                     let spans = self.mask_indptr();
-                    // seat.rows is the row axis's half of Run::planning's
-                    // pin, raised to the bucket for row-total kinds.
                     debug_assert_eq!(seat.live.rows, self.total_tokens());
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
@@ -163,10 +137,6 @@ impl Run<'_> {
                                 &fire.device,
                                 seat.workspace,
                             )?;
-                            // `plan-trace=<rows>`: the plan this fire built,
-                            // for a fire of exactly that many rows — both
-                            // arms of a golden print theirs, which is how a
-                            // body's schedule is read beside its walk's.
                             if let Some(wanted) = crate::serve::diag::on().plan_trace.as_deref()
                                 && (wanted == "all" || wanted == seat.rows.to_string())
                             {
@@ -197,9 +167,6 @@ impl Run<'_> {
                                 self.qo_indptr_host(),
                                 &seat.kv_indptr,
                                 &seat.kv_len,
-                                // Hash hygiene, not a live path: the launcher
-                                // refuses before it ever launches an sm90
-                                // prefill, so no gate exercises this.
                                 seat.rows,
                                 seat.shape,
                                 seat.live,
@@ -277,8 +244,6 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            // The relative-bias arm is FA2's; an sm90 schedule has no
-            // launcher for it yet.
             Attention::PrefillRel {
                 q,
                 plan,
@@ -314,9 +279,6 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                 ),
             },
-            // A prefill plan holds either kind the trace declared. Uses
-            // `ragged_q` (FA2's by-value params block CSR must match q's raw
-            // pointer), so cache/schedule state goes absolute with it too.
             Attention::Prefill {
                 q,
                 plan,
@@ -350,19 +312,8 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                 ),
             },
-            // The op names its mask bits now; only their span table still
-            // rides the plan (bound at build by the `PlanPrefill` arm), and
-            // the entry refuses a plan no span table rides.
             Attention::Masked {
-                // The head split is the store's to read off this op
-                // (`store::kv::probe`); the dispatch takes its geometry from
-                // the pool the store already shaped.
                 kv_heads: _,
-                // Dropped, not forgotten: `attention.masked` reads its
-                // causality out of the MASK BITS, and the flag is
-                // `attention.prefill`'s reading of the same word (see the
-                // `PlanPrefill` arm above, which says so). Named and bound
-                // to `_` so the arm still shows what it was handed.
                 causal: _,
                 q,
                 plan,
@@ -383,9 +334,6 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            // The tower's attention: no pool, no plan slot, no window.
-            // `segments` is the patch axis's own indptr, cut at the patch
-            // window so one fire sees only its own images.
             Attention::Dense {
                 q,
                 k,
@@ -447,9 +395,6 @@ impl Run<'_> {
                     &mut self.tensor(*o),
                     &mut self.tensor(*lse),
                 )?;
-                // Asks fire state for which plane this layer owns, matched
-                // against the plan's `attn.scores` exports. `lane_offset`
-                // maps this window's request number to a fire lane.
                 self.capture_scores(*q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse)
             }
             Attention::Sink {
@@ -488,9 +433,6 @@ impl Run<'_> {
             Attention::LogitSoftcap { x, cap, x_out: _ } => {
                 attn::logit_softcap(self.ctx(), &mut self.tensor(*x), *cap)
             }
-            // The op states its write geometry; the arm resolves the
-            // per-token `write_page`/`write_offset` descriptors and the
-            // entry lands each row in the stated cell.
             Attention::KvAppend {
                 k,
                 v,
@@ -517,10 +459,6 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // ---- mla ----
-            // Same host-twin routing as the attention plan arms. The op's
-            // `heads`/`kv_lora_rank` ride in via the seat as
-            // `num_q_heads`/`head_dim`.
             Attention::MlaPlan {
                 kv_indptr,
                 kv_indices: _,
@@ -537,9 +475,6 @@ impl Run<'_> {
                         self.qo_indptr_host(),
                         &seat.kv_indptr,
                         &seat.kv_len,
-                        // seat.rows and seat.shape.num_requests: the carved
-                        // pair Run::planning raises to record::BodyKey's
-                        // numbers.
                         seat.rows,
                         seat.shape.num_requests,
                         seat.live,
@@ -654,8 +589,6 @@ impl Run<'_> {
                 *nope_dim,
                 &mut self.tensor(*o),
             ),
-            // The arm resolves the op's write descriptors; the entry marks
-            // its own remaining seam.
             Attention::MlaKvAppend {
                 kv_c,
                 k_pe,
@@ -754,7 +687,6 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            // ---- ssm ----
             Attention::SsmCausalConv1d {
                 x,
                 weight,
@@ -784,11 +716,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // `x` is the conv's in-projection rows: a `RsVerb::Buffer` lane
-            // scatters them into a slab and `RsVerb::FoldBuffered` gathers
-            // them back over the GEMM output. 2R split: the head runs
-            // `[0, n)` and folds, the tail runs `[n, rows)` from the head's
-            // rolling state (a row folding a prefix can't be one call).
             Attention::ShortConv {
                 x,
                 weight,
@@ -803,8 +730,6 @@ impl Run<'_> {
                 *conv_width,
                 &mut self.tensor(*y),
             ),
-            // The short conv's prefill arm keeps the recurrent conv's state
-            // discipline (the absolute lane door, the committed tail).
             Attention::ShortConvChunked {
                 x,
                 weight,
@@ -852,9 +777,6 @@ impl Run<'_> {
                     );
                 }
                 self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
-                // Only the chunked arms take the absolute lane door: a body
-                // bakes its slot map, so `lane_offset` isn't a function of
-                // the key.
                 let tail = self.recurrent_tail_absolute(*state);
                 attn::ssm::causal_conv1d_chunked(
                     self.ctx(),
@@ -876,9 +798,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // N-gram hasher over the lane's trailing window; same state
-            // discipline as the conv above (decode shifts unconditionally,
-            // chunked advances only the committed prefix).
             Attention::PleNgramIds {
                 ids,
                 state,
@@ -934,8 +853,6 @@ impl Run<'_> {
                     &mut self.tensor(*ngram_ids),
                 )
             }
-            // `ba` is the `[b | a]` projection; the prep is its only reader,
-            // so the move sits directly in front of it.
             Attention::SsmGdnPrep {
                 ba,
                 dt_bias,
@@ -1002,9 +919,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // Same 2R split as the chunked conv above: the head folds the
-            // boundary into the bank, the tail continues from what the head
-            // wrote.
             Attention::SsmGatedDeltaChunked {
                 qkv,
                 z,
@@ -1109,7 +1023,6 @@ impl Run<'_> {
                 *gate_floor,
                 &mut self.tensor(*y),
             ),
-            // ---- index ----
             Attention::IndexLayernormRope {
                 k,
                 positions,
@@ -1146,8 +1059,6 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            // Pooled keys (`ratio > 1`) are read at their boundary cells and
-            // published as the pool's tokens, tail first.
             Attention::IndexTopk {
                 q,
                 weights,
@@ -1168,7 +1079,6 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*selection),
             ),
-            // As `attention.mla_kv_append`.
             Attention::IndexKvAppend {
                 k,
                 keys,
@@ -1181,7 +1091,6 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // ---- pool ----
             Attention::PoolBoundaryDecode {
                 positions,
                 row_valid,
@@ -1214,8 +1123,6 @@ impl Run<'_> {
                 &mut self.tensor(*boundary_req),
                 &mut self.tensor(*boundary_rope),
             ),
-            // The dsv4 compressor state has no IR seat; binds the slabs the
-            // store staged for the gather's own space (`Run::slabs`).
             Attention::PoolGather {
                 boundary_pos,
                 boundary_req,
@@ -1262,7 +1169,6 @@ impl Run<'_> {
                     slabs.state_score,
                 )
             }
-            // As the other appenders.
             Attention::PoolKvAppend {
                 entries,
                 boundary_pos,
@@ -1279,8 +1185,6 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // `entries` names the compressed cache space on this plane, so
-            // it resolves to a pool.
             Attention::PoolLse {
                 q,
                 positions,
@@ -1305,20 +1209,9 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
-            // `pool.cuh` has only the dense `pool_lse_paged` reader, no
-            // selected twin; falling back to it would answer a different
-            // attention (every compressed row, not the indexer's chosen
-            // ones) under this op's name, so the arm refuses by name.
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
             }),
-            // The unpaged joint attention (design D2): q, k, v and o are the
-            // fire-wide PACKED rectangles (their rows are the CSRs' absolute
-            // values), the CSRs are the fire's packing tables handed whole
-            // (indexed by fire-global group, padded with empty segments), so
-            // the launch is one per node whatever the window: a split window
-            // launches on its first interval only, and the per-lane CSR of
-            // `RaggedMask::None` is the same kernel over the lane table.
             Attention::Ragged {
                 q,
                 k,
@@ -1338,18 +1231,12 @@ impl Run<'_> {
                     model_ir::RaggedMask::None | model_ir::RaggedMask::GroupBlockDiagonal => {
                         kernels_cuda::attn_ragged::RaggedMask::None
                     }
-                    // The contract's tag form: the two `ReferenceTag` tables,
-                    // fire-wide and indexed by the packed rows the CSRs name,
-                    // so any number of reference lanes in a group each attend
-                    // themselves alone.
                     model_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
                         kernels_cuda::attn_ragged::RaggedMask::ReferenceTags {
                             q_tags: self.fire_wide(*q_tags),
                             kv_tags: self.fire_wide(*kv_tags),
                         }
                     }
-                    // The table is a `[heads, 2·max_len − 1]` plan constant
-                    // (`Dim::Const` rows), handed whole like the group tables.
                     model_ir::RaggedMask::RelativeBias { table, max_len } => {
                         kernels_cuda::attn_ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
@@ -1370,8 +1257,6 @@ impl Run<'_> {
                     &mut self.fire_wide(*o),
                 )
             }
-            // DFlash2's dynamic block convolution has a Metal kernel and no
-            // CUDA one yet; refused by name rather than approximated.
             Attention::BlockDynConv {
                 x,
                 coeff,
@@ -1415,8 +1300,6 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
-    /// A weight an entry reads whole: the dense handle, or an affine bank
-    /// decoded to bf16 in fire scratch (`[n, k]`, resident planes only).
     pub(crate) fn dense_or_decoded(
         &self,
         op: &'static str,
@@ -1442,13 +1325,6 @@ impl Run<'_> {
     }
 }
 
-/// **THE READ PATH'S RECURRENT ARMS** (`crate::run::RsScratch`): a lane that
-/// replays buffered tokens ahead of its rows runs the conv and the delta scan
-/// over the extended run `[replay | rows]` through the chunked kernels — the
-/// multi-row forms, whatever the lane's class — with the fire's own per-lane
-/// commit tables, which the host already counted in that layout. Only the
-/// lane's own rows land in the op's rectangle; the extended conv output and
-/// gates are kept for the scan by value.
 impl Run<'_> {
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
@@ -1504,8 +1380,6 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let qkv_ext = self.rs_ext_of(op, qkv)?;
         let gates_ext = self.rs_ext_of(op, gates)?;
-        // The gate projection is no buffered plane: the replay rows' slots
-        // stay as they lie, since those rows' outputs are never read.
         let z_ext = self.rs_extend(op, z, false)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;

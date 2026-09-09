@@ -1,30 +1,12 @@
-//! Stream capture: the recorded fire, instantiated and replayed. Capture
-//! does not execute — a launch between `cudaStreamBeginCapture` and
-//! `cudaStreamEndCapture` is written down, not run. [`Graph::capture`] uses
-//! thread-local capture mode and always ends the capture on every path out,
-//! since a stream left mid-capture answers every later call with
-//! `cudaErrorStreamCaptureUnjoined`. [`Event`] lets a capture span more than
-//! one stream: a `cudaStreamWaitEvent` on an event a capturing stream
-//! recorded pulls the waiting stream into the same graph.
-
 use core::ffi::c_void;
 
 use crate::error::{Fault, Result};
 
-/// A recorded fire, before it is instantiated: the topology and every kernel
-/// argument, as the capture wrote them down. Owning one is cheap — it is a
-/// handle, not the thing that runs. [`Graph::instantiate`] turns it into the
-/// executable, and this can then be dropped: the exec does not borrow it.
 #[derive(Debug)]
 pub struct Graph {
     raw: *mut c_void,
 }
 
-/// An instantiated graph: the thing [`launch`](GraphExec::launch) submits.
-/// Kernel arguments are fixed at instantiation to what capture saw (every
-/// pointer, extent, grid dimension), which is why the shell keys its cache
-/// by everything a fire could change about them, and why `inputs.rs`
-/// reserves at the ceiling and never reallocates.
 #[derive(Debug)]
 pub struct GraphExec {
     raw: *mut c_void,
@@ -32,20 +14,6 @@ pub struct GraphExec {
 }
 
 impl Graph {
-    /// Records `body` on `stream` instead of running it.
-    ///
-    /// `body` must enqueue no host work whose effect the replay needs: a
-    /// pageable `cudaMemcpyAsync` or a `cudaMalloc` (refused by thread-local
-    /// mode), or a plan builder's work estimation (would be missing from
-    /// every replay, which is why the prepare phase runs outside this call).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
-    /// for a capture the runtime refused, and whatever the body refused —
-    /// after the capture has been ended either way, because a stream left
-    /// mid-capture answers every later call with
-    /// `cudaErrorStreamCaptureUnjoined` for the rest of the process.
     pub fn capture(stream: *mut c_void, body: impl FnOnce() -> Result<()>) -> Result<Graph> {
         #[cfg(feature = "cuda")]
         {
@@ -90,16 +58,11 @@ impl Graph {
         }
     }
 
-    /// Debug probe: the raw `cudaGraph_t`, for `cuGraphGetNodes` /
-    /// `cuGraphKernelNodeGetParams`. Not read by the fire path;
-    /// `tests/descriptor_abi.rs` is the only caller.
     #[must_use]
     pub fn raw(&self) -> *mut c_void {
         self.raw
     }
 
-    /// Debug probe: write the graph as DOT (verbose, with kernel params and
-    /// attributes) to `path`. `false` when the runtime refused.
     pub fn debug_dot(&self, path: &str) -> bool {
         #[cfg(feature = "cuda")]
         {
@@ -107,7 +70,6 @@ impl Graph {
             let Ok(c_path) = std::ffi::CString::new(path) else {
                 return false;
             };
-            // Verbose | KernelNodeParams | KernelNodeAttributes.
             let flags = 1 | 4 | 512;
             // SAFETY: `raw` is this graph's live handle; `c_path` outlives the call.
             let code =
@@ -121,12 +83,6 @@ impl Graph {
         }
     }
 
-    /// How many nodes it recorded, or `None` when the driver would not say.
-    ///
-    /// `None` and `0` mean different things: a refused query (e.g. a node
-    /// type the query can't represent, such as a conditional node) is not
-    /// proof the graph is empty. Callers must handle `None` rather than
-    /// treating it as zero.
     #[must_use]
     pub fn nodes(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
@@ -148,11 +104,6 @@ impl Graph {
         }
     }
 
-    /// How many edges it recorded — the observable a fork actually has. Node
-    /// count can't see a fork: stream capture turns an event record/wait
-    /// pair into a dependency edge between launches, not new nodes, so a
-    /// sequential and a forked capture report the same node count. `None`
-    /// for a query the driver refused, for [`nodes`](Graph::nodes)'s reasons.
     #[must_use]
     pub fn edges(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
@@ -179,14 +130,6 @@ impl Graph {
         }
     }
 
-    /// Instantiates it, and uploads it to `stream`. The upload isn't
-    /// decoration: skipping it would push instantiation's one-off device-side
-    /// allocation cost into the first `launch`, where it would read as
-    /// replay cost.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn instantiate(&self, stream: *mut c_void) -> Result<GraphExec> {
         #[cfg(feature = "cuda")]
         {
@@ -205,9 +148,6 @@ impl Graph {
             }
             let exec = GraphExec {
                 raw: raw.cast(),
-                // A count the driver refused is stored as 0 here and decides
-                // nothing; the one caller that acts on it asks `Graph::nodes`
-                // directly and handles `None`.
                 nodes: self.nodes().unwrap_or(0),
             };
             // SAFETY: the exec was just created and the stream is the shell's.
@@ -227,17 +167,6 @@ impl Graph {
     }
 }
 
-/// The dependency frontier of the capture in progress on `stream`: the node
-/// handles the next thing enqueued would depend on (for a single-stream
-/// capture, the last node recorded so far). Full node enumeration is refused
-/// mid-capture, so this reads `cuStreamGetCaptureInfo`'s frontier instead.
-/// Not called on the fire path. Handles stay valid after
-/// `cudaStreamEndCapture`.
-///
-/// # Errors
-///
-/// [`Fault::Runtimeless`] for a build with no runtime; [`Fault::Device`]
-/// when the stream is not capturing or the query refuses.
 pub fn capture_frontier(stream: *mut c_void) -> Result<Vec<*mut c_void>> {
     #[cfg(feature = "cuda")]
     {
@@ -248,8 +177,6 @@ pub fn capture_frontier(stream: *mut c_void) -> Result<Vec<*mut c_void>> {
         let mut graph: dr::CUgraph = core::ptr::null_mut();
         let mut deps: *const dr::CUgraphNode = core::ptr::null();
         let mut dep_count: usize = 0;
-        // `_v3` is the one spelling CUDA 12 and 13 share — 13 retired `_v2`.
-        //
         // SAFETY: every out-parameter is a live local; the stream is the
         // shell's and this thread began the capture.
         let code = unsafe {
@@ -292,15 +219,6 @@ pub fn capture_frontier(stream: *mut c_void) -> Result<Vec<*mut c_void>> {
 }
 
 impl GraphExec {
-    /// Launches it on `stream`: one submission in place of the eager walk's
-    /// many `ctx.fire` calls, reading the same buffers they would have read.
-    ///
-    /// Enqueue-only, like every other call this crate makes on a fire: the
-    /// caller synchronizes when it wants numbers.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn launch(&self, stream: *mut c_void) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -320,15 +238,11 @@ impl GraphExec {
         }
     }
 
-    /// How many nodes it replays.
     #[must_use]
     pub fn nodes(&self) -> usize {
         self.nodes
     }
 
-    /// Debug probe: the raw `cudaGraphExec_t`, to price
-    /// `cudaGraphExecKernelNodeSetParams` against it. Not read by the fire
-    /// path.
     #[must_use]
     pub fn raw(&self) -> *mut c_void {
         self.raw
@@ -361,12 +275,6 @@ impl Drop for GraphExec {
     }
 }
 
-/// One `cudaEvent_t`: a point on a stream that another stream can wait for.
-/// Created with `cudaEventDisableTiming`, since nothing asks when it
-/// happened. One event is created per `model_compiler::EventId` at load and
-/// re-recorded on every capturing fire — legal, since recording again just
-/// overwrites what it names, and inside a capture a record/wait pair is a
-/// dependency edge between launches, not a runtime synchronization.
 #[derive(Debug)]
 pub struct Event {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -374,11 +282,6 @@ pub struct Event {
 }
 
 impl Event {
-    /// Create one.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn new() -> Result<Event> {
         #[cfg(feature = "cuda")]
         {
@@ -389,7 +292,7 @@ impl Event {
             unsafe {
                 crate::device::ctx::check(
                     "cudaEventCreateWithFlags",
-                    rt::cudaEventCreateWithFlags(&raw mut raw, 2), // cudaEventDisableTiming
+                    rt::cudaEventCreateWithFlags(&raw mut raw, 2),
                 )?;
             }
             Ok(Event { raw: raw.cast() })
@@ -400,13 +303,6 @@ impl Event {
         }
     }
 
-    /// A timing event: same handle, created without `cudaEventDisableTiming`
-    /// so two can be subtracted. Not for the fire path; used by the
-    /// saturation gate to measure inter-step device gaps.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn timing() -> Result<Event> {
         #[cfg(feature = "cuda")]
         {
@@ -428,16 +324,6 @@ impl Event {
         }
     }
 
-    /// Whether everything recorded behind this event has completed — asked,
-    /// never waited on (`cudaEventQuery`). The routed-expert tier asks this
-    /// before reusing pinned staging words a previous promotion's copies may
-    /// still be reading, skipping that round's promotion rather than
-    /// waiting. An event never recorded answers `true`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], or [`Fault::Device`] for a status that is
-    /// neither "done" nor "not yet".
     pub fn done(&self) -> Result<bool> {
         #[cfg(feature = "cuda")]
         {
@@ -447,8 +333,6 @@ impl Event {
             match status {
                 rt::cudaError::cudaSuccess => Ok(true),
                 rt::cudaError::cudaErrorNotReady => {
-                    // The status is consumed here rather than left to be
-                    // re-reported by the next unrelated call.
                     #[allow(unused_must_use)]
                     unsafe {
                         rt::cudaGetLastError();
@@ -467,16 +351,6 @@ impl Event {
         }
     }
 
-    /// Blocks this thread until everything recorded before this event has
-    /// happened (`cudaEventSynchronize`) — unlike `cudaStreamSynchronize`,
-    /// which also drains work enqueued after this point. An event that was
-    /// never recorded returns at once.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], or [`Fault::Device`] for whatever the recorded
-    /// work said — an asynchronous fault from any launch before the record
-    /// surfaces here.
     pub fn settle(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -497,13 +371,6 @@ impl Event {
         }
     }
 
-    /// Milliseconds of device time from `self` to `end`, for two events
-    /// created by [`Event::timing`] and both already completed.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`], or [`Fault::Device`] when either event has not
-    /// completed or was created with timing disabled.
     pub fn elapsed_ms(&self, end: &Event) -> Result<f32> {
         #[cfg(feature = "cuda")]
         {
@@ -528,13 +395,6 @@ impl Event {
         }
     }
 
-    /// Record this event on `stream`: the fork half. Everything already
-    /// enqueued on `stream` is what a waiter will have waited for. Inside a
-    /// capture this becomes an event-record node.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn record(&self, stream: *mut c_void) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -553,13 +413,6 @@ impl Event {
         }
     }
 
-    /// Make `stream` wait for this event: the join half. Enqueue-only: the
-    /// host does not block, the stream does. Inside a capture this is the
-    /// edge that carries the capture onto `stream` (or back off it).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
     pub fn wait(&self, stream: *mut c_void) -> Result<()> {
         #[cfg(feature = "cuda")]
         {

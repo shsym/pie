@@ -1,21 +1,3 @@
-//! `Ple`: qwen4's n-gram hasher — token ids in, hashed table rows out, with a
-//! per-lane window of trailing ids as the one piece of sequence state.
-//!
-//! Ported from `kernels-cuda/kernels/attn/ple.cuh` and
-//! `kernels-cuda/src/attn/ple.rs`; what differs on this plane is where the
-//! hash constants live. This plane's `ArgValue` has no by-value blob seat,
-//! so the constants ride one `u64` plane the shell lays down and writes once
-//! at load (`engine_metal::scratch`), in the field order of the CUDA
-//! aggregate with its fixed-size arrays cut to the lengths the node states:
-//!
-//! ```text
-//! [ mults[0..ngram] ][ primes[0..heads] ][ offsets[0..heads] ]
-//! ```
-//!
-//! Everything else is the same arithmetic in the same order, and
-//! [`reference`] states it a second time in host Rust so the pins below can
-//! disagree with one of the two.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -24,17 +6,10 @@ use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const FILE: &str = "attn/ple.metal";
 
-/// The ceilings `ple.metal` declares its per-thread window and output arrays
-/// at. Mirrored from `ple.cuh`'s `PLE_MAX_NGRAM` / `PLE_MAX_HEADS`, and
-/// refused here rather than overrun there.
 const MAX_NGRAM: usize = 4;
 
 const MAX_HEADS: usize = 32;
 
-/// The shape a hashing states, checked once for both arms.
-///
-/// `hash_arg` on the CUDA plane, minus the marshalling: the numbers do not
-/// travel through here, only their counts.
 struct Shape {
     ngram: u32,
     heads: u32,
@@ -89,9 +64,6 @@ fn shape(
     })
 }
 
-/// The `u64` plane the constants were written into, checked against the shape
-/// the node states — a plane of the wrong extent is a wrong hash and not a
-/// coarse one, because every read past its end is a table row nothing carved.
 fn hash_plane(op: &'static str, hash: Tensor, shape: &Shape) -> Result<(), Error> {
     if hash.dtype != Dtype::U64 {
         return Err(refuse(
@@ -114,8 +86,6 @@ fn hash_plane(op: &'static str, hash: Tensor, shape: &Shape) -> Result<(), Error
     Ok(())
 }
 
-/// Decode form: one new token per lane, hashed against the lane's window,
-/// which then shifts by one.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids(
     ctx: &Ctx<'_>,
@@ -167,8 +137,6 @@ pub fn ngram_ids(
     )
 }
 
-/// Prefill form: walks the fire's request boundaries, one thread per request —
-/// `ssm::causal_conv1d_chunked`'s own shape, and for its reason.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids_chunked(
     ctx: &Ctx<'_>,
@@ -234,10 +202,6 @@ pub fn ngram_ids_chunked(
     )
 }
 
-/// The plane the hash constants are laid down in, as both this crate's
-/// shaders and `engine_metal::scratch` read it: multipliers, then primes,
-/// then offsets, all `u64`. One function, two readers: the shell writes the
-/// bytes at load and the shader indexes into them at every fire.
 #[must_use]
 pub fn hash_constants(mults: &[u64], primes: &[u64], offsets: &[u64]) -> Vec<u64> {
     let mut plane = Vec::with_capacity(mults.len() + primes.len() + offsets.len());
@@ -247,16 +211,9 @@ pub fn hash_constants(mults: &[u64], primes: &[u64], offsets: &[u64]) -> Vec<u64
     plane
 }
 
-/// The hash, in host Rust: `ple.metal`'s arithmetic restated so a box with
-/// no GPU can hold the shader to it. Worth stating twice because the hash's
-/// output is a table row — a hash that is off by one indexes a different
-/// embedding, so every pin below is an equality rather than a band.
 pub mod reference {
-    /// A hashing, as the node states it.
     pub struct Hash<'a> {
         pub eos: i32,
-        /// One multiplier per n-gram position; `mults.len()` is the n-gram
-        /// size, and the window is one shorter.
         pub mults: &'a [u64],
         pub primes: &'a [u64],
         pub offsets: &'a [u64],
@@ -269,7 +226,6 @@ pub mod reference {
             self.mults.len()
         }
 
-        /// The window a lane keeps: `ngram − 1` trailing ids.
         #[must_use]
         pub fn span(&self) -> usize {
             self.mults.len() - 1
@@ -281,9 +237,6 @@ pub mod reference {
         }
     }
 
-    /// The eos-segmentation rule: a previous id is replaced by eos when a
-    /// nearer previous id is eos — the window crossed a sequence boundary.
-    /// The index loop mirrors the shader's own.
     #[allow(clippy::needless_range_loop)]
     pub fn mask_window(h: &Hash, window: &mut [i32]) {
         let mut crossed = false;
@@ -297,9 +250,6 @@ pub mod reference {
         }
     }
 
-    /// The window `[t, p1, p2, …]` (newest first), hashed for every head.
-    /// Order `g + 2` folds the newest `g + 2` ids and lands the
-    /// `heads_per_ngram` heads at `g · heads_per_ngram`.
     #[must_use]
     #[allow(clippy::needless_range_loop)]
     pub fn hash_row(h: &Hash, window: &[i32]) -> Vec<i32> {
@@ -318,15 +268,11 @@ pub mod reference {
         out
     }
 
-    /// The lane state's own convention: a cell holds `id + 1`, so a zeroed
-    /// slot reads as "no history" and lands on eos.
     #[must_use]
     pub fn cell(state_cell: i32, eos: i32) -> i32 {
         if state_cell == 0 { eos } else { state_cell - 1 }
     }
 
-    /// The decode arm: one token against the lane's window, which then
-    /// shifts. `state` is `span` cells, updated in place.
     #[must_use]
     pub fn step(h: &Hash, id: i32, state: &mut [i32]) -> Vec<i32> {
         let span = h.span();
@@ -344,9 +290,6 @@ pub mod reference {
         out
     }
 
-    /// The chunked arm: one request's tokens in order, each hashed against
-    /// the fire's own rows where reachable and the lane's state otherwise,
-    /// with the state advanced once at the end.
     #[must_use]
     pub fn walk(h: &Hash, ids: &[i32], state: &mut [i32]) -> Vec<i32> {
         let span = h.span();
@@ -364,8 +307,6 @@ pub mod reference {
             mask_window(h, &mut window);
             out.extend(hash_row(h, &window));
         }
-        // The new window: the last `span` ids of (state ++ segment), staged
-        // whole before any of it is written back.
         let mut next = vec![0i32; span];
         for p in 0..span {
             let src = ids.len() as isize - span as isize + p as isize;
@@ -387,33 +328,13 @@ mod tests {
     
     use crate::probe::Probe;
 
-    // ------------------------------------------------------------------
-    // The shipped hashing, at four heads.
-    //
-    // **THE CONSTANTS ARE THE CHECKPOINT'S OWN.** `models::qwen_4`'s
-    // `hash_constants` derives them from `seed: 1234` and the sixteen primes
-    // past twenty million, and
-    // `model/tests/the_qwen4_text_reads_the_two_bit_miniature.rs` holds that
-    // derivation against `Qwen3.8-Flash-Next`'s published
-    // `layer_multipliers` / `ngram_heads_vocab_sizes` / `ngram_heads_offsets`
-    // buffers. So the numbers below are not a fixture: they are the shipped
-    // model's, cut to the first four heads (`heads_per_ngram = 2` over the
-    // two n-gram orders a `ngram_size = 3` has), and the offsets are that
-    // cut's own prefix sums.
-    // ------------------------------------------------------------------
-
     const MULTS: [u64; 3] = [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071];
 
     const PRIMES: [u64; 4] = [20_000_003, 20_000_023, 20_000_033, 20_000_047];
 
     const OFFSETS: [u64; 4] = [0, 20_000_003, 40_000_026, 60_000_059];
 
-    /// `Qwen3.8-Flash-Next`'s own `eos_token_id`.
     const EOS: i32 = 248_044;
-
-    // ---- the arithmetic pins ------------------------------------------
-
-    // ---- the marshalling pins -----------------------------------------
 
     fn i32t(buf: u32, rows: u32, width: u32) -> Tensor {
         Tensor::new(buf, rows, width, Dtype::I32)
@@ -433,8 +354,12 @@ mod tests {
         Tensor::new(12, 1, (MULTS.len() + 2 * PRIMES.len()) as u32, Dtype::U64)
     }
 
-    /// The constants plane is laid down in ONE order and both this crate's
-    /// shaders and the shell's writer read it in that order.
+    fn ple_every_case() {
+        the_constants_plane_is_multipliers_then_primes_then_offsets();
+        a_hash_plane_the_shape_does_not_describe_is_refused();
+        a_head_count_the_orders_do_not_cover_is_refused();
+    }
+
     #[test]
     fn the_constants_plane_is_multipliers_then_primes_then_offsets() {
         let plane = hash_constants(&MULTS, &PRIMES, &OFFSETS);
@@ -444,9 +369,6 @@ mod tests {
         assert_eq!(&plane[7..], &OFFSETS);
     }
 
-    /// A plane of the wrong extent is refused rather than read past: an
-    /// out-of-range prime is a table row nothing carved.
-    #[test]
     fn a_hash_plane_the_shape_does_not_describe_is_refused() {
         let probe = Probe::default();
         let short = Tensor::new(12, 1, 4, Dtype::U64);
@@ -467,9 +389,6 @@ mod tests {
         assert!(probe.fires().is_empty(), "nothing was encoded");
     }
 
-    /// The head count and the n-gram orders have to agree, or a head sits at
-    /// an order nothing hashed for it.
-    #[test]
     fn a_head_count_the_orders_do_not_cover_is_refused() {
         let probe = Probe::default();
         let why = ngram_ids(
@@ -481,7 +400,6 @@ mod tests {
             &MULTS,
             &PRIMES,
             &OFFSETS,
-            // Four heads over two orders is two per order, not three.
             3,
             i32t(2, 6, 4),
         )
@@ -490,12 +408,6 @@ mod tests {
     }
 }
 
-
-/// The committed form (`engine_metal::rs`): [`ngram_ids_chunked`] over the
-/// extended row run, advancing each lane's window only over its `commit`.
-/// `ids` is the extended run; `ngram_ids` is the op's OWN rectangle (the
-/// lane's rows at the window CSR's offsets), since the gathered-table cut
-/// reads it the instant this kernel is enqueued.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids_committed(
     ctx: &Ctx<'_>,

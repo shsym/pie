@@ -1,28 +1,3 @@
-//! **ONE EPILOGUE, TWO EXECUTORS.** The host interpreter is the reference
-//! semantics of an ETA program; this shell's fused kernels are supposed to
-//! compute the same numbers. Nothing ran a single program through both and
-//! compared until a row-parallel `gather_row` was found zero-filling a row's
-//! width past its one output element, and a rematerialising pass re-reading
-//! a row max whose slot the layout had already handed on — both silent for
-//! weeks because the only checks were end-to-end samplers.
-//!
-//! ```text
-//! cargo test -p engine-cuda --features cuda \
-//!   --test an_epilogue_agrees_with_the_host_interpreter -- --nocapture
-//! ```
-//!
-//! The program is the sampler epilogue's shape in small: temperature-scaled
-//! logits read off the intrinsic plane, a softmax across two reductions, a
-//! `gather_row` at a seeded index, an argmax, a `top_k`, and the softmax's
-//! row sums — every construct whose row-view lowering has bitten, in one
-//! row-parallel region plus its library `top_k`. Skips (passing) when no
-//! device is present.
-//!
-//! A third program is the diffusion sampler's half: a keyed `N(0, 1)` draw
-//! and the four F32 unaries (`sin`, `cos`, `sqrt`, `rsqrt`) added for it. Its
-//! failure mode is the one the file was written for — a device arm that
-//! quietly computes a different function, which no end-to-end sampler would
-//! flag because the output is still noise of about the right shape.
 use engine::ProgramRegistration;
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::compile::Disk;
@@ -62,26 +37,26 @@ fn reader(shape: Shape, dtype: Dtype) -> ChannelDecl {
 
 fn epilogue() -> TraceContainer {
     let ops = vec![
-        Op::ChanRead(TEMP),                                                        // 0
-        Op::Reshape { value: 0, shape: Shape::new(&[]).unwrap() },                 // 1
-        Op::ChanTake(INDEX),                                                       // 2
-        Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(ROWS, VOCAB), dtype: Dtype::F32 }, // 3
-        Op::Div(3, 1),                                                             // 4 scaled
-        Op::ReduceMax(4),                                                          // 5
-        Op::Reshape { value: 5, shape: Shape::matrix(ROWS, 1) },                   // 6
-        Op::Broadcast { value: 6, shape: Shape::matrix(ROWS, VOCAB) },             // 7
-        Op::Sub(4, 7),                                                             // 8
-        Op::Exp(8),                                                                // 9
-        Op::ReduceSum(9),                                                          // 10
-        Op::Reshape { value: 10, shape: Shape::matrix(ROWS, 1) },                  // 11
-        Op::Broadcast { value: 11, shape: Shape::matrix(ROWS, VOCAB) },            // 12
-        Op::Div(9, 12),                                                            // 13 probs
-        Op::GatherRow { src: 4, idx: 2 },                                          // 14
-        Op::ReduceArgmax(4),                                                       // 15
-        Op::TopK { input: 4, k: K },                                               // 16, 17
-        Op::ReduceSum(13),                                                         // 18
-        Op::Cast { value: 15, dtype: Dtype::U32 },                                 // 19
-        Op::GatherRow { src: 13, idx: 19 },                                        // 20 p at the argmax
+        Op::ChanRead(TEMP),
+        Op::Reshape { value: 0, shape: Shape::new(&[]).unwrap() },
+        Op::ChanTake(INDEX),
+        Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(ROWS, VOCAB), dtype: Dtype::F32 },
+        Op::Div(3, 1),
+        Op::ReduceMax(4),
+        Op::Reshape { value: 5, shape: Shape::matrix(ROWS, 1) },
+        Op::Broadcast { value: 6, shape: Shape::matrix(ROWS, VOCAB) },
+        Op::Sub(4, 7),
+        Op::Exp(8),
+        Op::ReduceSum(9),
+        Op::Reshape { value: 10, shape: Shape::matrix(ROWS, 1) },
+        Op::Broadcast { value: 11, shape: Shape::matrix(ROWS, VOCAB) },
+        Op::Div(9, 12),
+        Op::GatherRow { src: 4, idx: 2 },
+        Op::ReduceArgmax(4),
+        Op::TopK { input: 4, k: K },
+        Op::ReduceSum(13),
+        Op::Cast { value: 15, dtype: Dtype::U32 },
+        Op::GatherRow { src: 13, idx: 19 },
         Op::ChanPut { chan: PEAK, value: 20 },
         Op::ChanPut { chan: GATHERED, value: 14 },
         Op::ChanPut { chan: ARGMAX, value: 15 },
@@ -107,7 +82,6 @@ fn epilogue() -> TraceContainer {
     }
 }
 
-/// A deterministic plane with a clear argmax and no ties among the top-K.
 fn logits() -> Vec<f32> {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {
@@ -137,8 +111,6 @@ fn wire_f32(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-/// Wire bytes the device published on `channels` after one fire of `bound`
-/// seeded with `seeds`, `rows` rows a lane, the logits plane bound when given.
 fn device_outputs(
     bound: &eta_ir::validate::BoundTrace,
     seeds: &[(u32, Value)],
@@ -160,8 +132,6 @@ fn device_outputs(
     };
     let mut plane = Plane::new(Disk::disabled());
     let program = plane.register(&context, &registration).expect("the program compiles for the device");
-    // The fire's rows: the lane runs a block per row and treats rows past
-    // this count as padding.
     let extents = Extents { row_count: rows, sampled_rows: rows, query_len: rows, ..Extents::default() };
     let wire_seeds: Vec<(u32, Vec<u8>)> = seeds.iter().map(|(c, v)| (*c, v.to_le_bytes())).collect();
     let count = bound.container.channels.len();
@@ -174,8 +144,6 @@ fn device_outputs(
             GeometryClass::Host,
             &vec![None; count],
             &ids,
-            // `bind` cuts the fire-path buffers here, and it cuts them ON THE
-            // STREAM now: the same one this test fires on.
             context.stream(),
         )
         .expect("the instance binds");
@@ -198,7 +166,6 @@ fn device_outputs(
         .collect()
 }
 
-/// The interpreter's answer on `channels` after one step.
 fn host_outputs(
     bound: &eta_ir::validate::BoundTrace,
     seeds: &[(u32, Value)],
@@ -230,6 +197,12 @@ fn bools(value: &Value) -> Vec<bool> {
     }
 }
 
+fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
+    the_device_answers_what_the_interpreter_answers();
+    the_acceptance_rule_agrees_with_the_interpreter();
+    the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter();
+}
+
 #[test]
 fn the_device_answers_what_the_interpreter_answers() {
     if !engine_cuda::device::present() {
@@ -256,8 +229,6 @@ fn the_device_answers_what_the_interpreter_answers() {
     close(&wire_f32(&got[5]), &f32s(&want[5]), 1e-5, "probability at the row's argmax (a row block's gather)");
 }
 
-// ── The acceptance rule: sort, prefix sum, compare, scatter, select ──────
-
 const ENTROPY: u32 = 0;
 const SAMPLED: u32 = 1;
 const NOISE: u32 = 2;
@@ -268,45 +239,40 @@ const COUNT: u32 = 6;
 const DONE: u32 = 7;
 const ORDER: u32 = 8;
 
-/// `entropy_bound_accept` and `stable_and_confident` as the guests spell
-/// them: rows accepted while the running sum of the others' entropies stays
-/// under a bound (a sort, a prefix sum, a scatter through the sort's
-/// permutation), the next canvas selected from a sample and a noise draw,
-/// and the stop flag off the previous canvas and the mean entropy.
 fn acceptance() -> TraceContainer {
     use eta_ir::types::Literal;
     let ops = vec![
-        Op::ChanTake(ENTROPY),                                     // 0 h [ROWS]
-        Op::Neg(0),                                                // 1
-        Op::SortDesc(1),                                           // 2 sorted (-h) desc, 3 order
-        Op::Neg(2),                                                // 4 h ascending
-        Op::CumSum(4),                                             // 5
-        Op::Sub(5, 4),                                             // 6 running sum of the others
-        Op::Const(Literal::F32(3.0)),                              // 7 bound
-        Op::Le(6, 7),                                              // 8 below, in sorted order
-        Op::Iota { len: ROWS },                                    // 9
-        Op::Const(Literal::U32(0)),                                // 10
-        Op::Lt(9, 10),                                             // 11 all false
-        Op::ScatterSet { base: 11, idx: 3, vals: 8 },              // 12 accept, canvas order
-        Op::ChanTake(SAMPLED),                                     // 13
-        Op::ChanTake(NOISE),                                       // 14
-        Op::Select { cond: 12, a: 13, b: 14 },                     // 15 next
-        Op::Cast { value: 12, dtype: Dtype::I32 },                 // 16
-        Op::ReduceSum(16),                                         // 17 accepted count
-        Op::Reshape { value: 17, shape: Shape::vector(1) },        // 18
-        Op::ChanTake(PREVIOUS),                                    // 19
-        Op::Eq(13, 19),                                            // 20
-        Op::Cast { value: 20, dtype: Dtype::I32 },                 // 21
-        Op::ReduceSum(21),                                         // 22
-        Op::Const(Literal::I32(ROWS as i32)),                      // 23
-        Op::Eq(22, 23),                                            // 24 stable
-        Op::ReduceSum(0),                                          // 25
-        Op::Const(Literal::F32(ROWS as f32)),                      // 26
-        Op::Div(25, 26),                                           // 27 mean entropy
-        Op::Const(Literal::F32(0.5)),                              // 28
-        Op::Lt(27, 28),                                            // 29 confident
-        Op::And(24, 29),                                           // 30 done
-        Op::Reshape { value: 30, shape: Shape::vector(1) },        // 31
+        Op::ChanTake(ENTROPY),
+        Op::Neg(0),
+        Op::SortDesc(1),
+        Op::Neg(2),
+        Op::CumSum(4),
+        Op::Sub(5, 4),
+        Op::Const(Literal::F32(3.0)),
+        Op::Le(6, 7),
+        Op::Iota { len: ROWS },
+        Op::Const(Literal::U32(0)),
+        Op::Lt(9, 10),
+        Op::ScatterSet { base: 11, idx: 3, vals: 8 },
+        Op::ChanTake(SAMPLED),
+        Op::ChanTake(NOISE),
+        Op::Select { cond: 12, a: 13, b: 14 },
+        Op::Cast { value: 12, dtype: Dtype::I32 },
+        Op::ReduceSum(16),
+        Op::Reshape { value: 17, shape: Shape::vector(1) },
+        Op::ChanTake(PREVIOUS),
+        Op::Eq(13, 19),
+        Op::Cast { value: 20, dtype: Dtype::I32 },
+        Op::ReduceSum(21),
+        Op::Const(Literal::I32(ROWS as i32)),
+        Op::Eq(22, 23),
+        Op::ReduceSum(0),
+        Op::Const(Literal::F32(ROWS as f32)),
+        Op::Div(25, 26),
+        Op::Const(Literal::F32(0.5)),
+        Op::Lt(27, 28),
+        Op::And(24, 29),
+        Op::Reshape { value: 30, shape: Shape::vector(1) },
         Op::ChanPut { chan: ACCEPT, value: 12 },
         Op::ChanPut { chan: NEXT, value: 15 },
         Op::ChanPut { chan: COUNT, value: 18 },
@@ -332,7 +298,6 @@ fn acceptance() -> TraceContainer {
     }
 }
 
-#[test]
 fn the_acceptance_rule_agrees_with_the_interpreter() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
@@ -362,9 +327,6 @@ fn the_acceptance_rule_agrees_with_the_interpreter() {
     assert!(accepted > 0 && accepted < ROWS as usize, "the bound should split the rows, accepted {accepted}");
 }
 
-
-// ── The sampler's own arithmetic: a Gaussian draw and four transcendentals ──
-
 const LATENT: u32 = 0;
 const STATE: u32 = 1;
 const GAUSSIAN: u32 = 2;
@@ -378,37 +340,22 @@ const STEPPED: u32 = 9;
 
 const WIDTH: u32 = 16;
 
-/// The shape a diffusion epilogue's noise injection has: a keyed `N(0, 1)`
-/// draw over the whole latent rectangle, the four F32 unaries the sampler's
-/// trigonometry and norms need, and one Euler-style `x + z` to prove the
-/// draw is a value and not just a channel put.
-///
-/// On the tolerance: `1e-6` relative, not exact bits. The device spells the
-/// Box-Muller transform expression for expression with
-/// `eta_ir::rng::hash_normal` and reads the same two uniform lanes, but
-/// `logf`/`cosf` on the device and `ln`/`cos` in Rust's libm are each within
-/// a few ulp of the true value and not always the same few. This is the
-/// slack `RngKind::Gumbel` has always had -- its `-logf(-logf(u))` is one
-/// call deeper into the same libraries -- and it is orders of magnitude
-/// below any scale a sampler is sensitive to. What is exact is the
-/// *integer* half: the seed, the lane pairing and the uniform draws, which
-/// is what a wrong pairing or a drifted constant would break.
 fn sampler_arithmetic() -> TraceContainer {
     use eta_ir::types::RngKind;
     let plane = Shape::matrix(ROWS, WIDTH);
     let ops = vec![
-        Op::ChanRead(STATE),                                                   // 0
-        Op::RngKeyed { state: 0, shape: plane, kind: RngKind::Normal },        // 1 z
-        Op::ChanTake(LATENT),                                                  // 2 x
-        Op::Sin(2),                                                            // 3
-        Op::Cos(2),                                                            // 4
-        Op::Mul(3, 3),                                                         // 5
-        Op::Mul(4, 4),                                                         // 6
-        Op::Add(5, 6),                                                         // 7 sin^2 + cos^2
-        Op::Sqrt(2),                                                           // 8
-        Op::Rsqrt(2),                                                          // 9
-        Op::Mul(8, 9),                                                         // 10 sqrt * rsqrt
-        Op::Add(2, 1),                                                         // 11 x + z
+        Op::ChanRead(STATE),
+        Op::RngKeyed { state: 0, shape: plane, kind: RngKind::Normal },
+        Op::ChanTake(LATENT),
+        Op::Sin(2),
+        Op::Cos(2),
+        Op::Mul(3, 3),
+        Op::Mul(4, 4),
+        Op::Add(5, 6),
+        Op::Sqrt(2),
+        Op::Rsqrt(2),
+        Op::Mul(8, 9),
+        Op::Add(2, 1),
         Op::ChanPut { chan: GAUSSIAN, value: 1 },
         Op::ChanPut { chan: SINE, value: 3 },
         Op::ChanPut { chan: COSINE, value: 4 },
@@ -438,15 +385,12 @@ fn sampler_arithmetic() -> TraceContainer {
     }
 }
 
-/// A latent whose entries are strictly positive (so `sqrt`/`rsqrt` are
-/// defined) and span two decades (so a scale error in either shows).
 fn latent() -> Vec<f32> {
     (0..(ROWS * WIDTH) as usize)
         .map(|i| 0.05 + (i % 97) as f32 * 0.11)
         .collect()
 }
 
-#[test]
 fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
@@ -473,23 +417,17 @@ fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
     close(&wire_f32(&got[6]), &f32s(&want[6]), 1e-5, "sqrt * rsqrt");
     close(&wire_f32(&got[7]), &f32s(&want[7]), 1e-5, "x + z");
 
-    // Agreeing with the interpreter is not enough on its own: both could be
-    // computing the wrong function. These pin the identities.
     let n = (ROWS * WIDTH) as usize;
     close(&wire_f32(&got[3]), &vec![1.0; n], 1e-5, "sin^2 + cos^2 against one");
     close(&wire_f32(&got[6]), &vec![1.0; n], 1e-5, "sqrt * rsqrt against one");
     let want_root: Vec<f32> = x.iter().map(|v| v.sqrt()).collect();
     close(&wire_f32(&got[4]), &want_root, 1e-6, "sqrt against the host's");
 
-    // And the draw is the RNG contract's own numbers, not merely a normal:
-    // a device that paired the uniforms differently would still look
-    // Gaussian in aggregate.
     let seed = eta_ir::rng::keyed_seed(key, counter);
     let want_noise: Vec<f32> =
         (0..n as u32).map(|i| eta_ir::rng::hash_normal(seed, i)).collect();
     close(&wire_f32(&got[0]), &want_noise, 1e-5, "the normal draw against `rng::hash_normal`");
 
-    // The draw has to be noise, not a constant the tolerance would forgive.
     let drawn = wire_f32(&got[0]);
     let mean = drawn.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
     let variance =

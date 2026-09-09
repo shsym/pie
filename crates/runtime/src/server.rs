@@ -1,7 +1,3 @@
-//! Manages TCP connections and routes messages between clients and process
-//! instances. Sessions register in a global registry and receive messages
-//! via direct addressing, bypassing the Server actor.
-
 mod data_transfer;
 mod handler;
 pub(crate) mod inbox;
@@ -23,10 +19,7 @@ use crate::inferlet::process;
 use crate::inferlet::{ProcessEvent, ProcessId, ProgramName};
 use crate::service::{ServiceHandler, ServiceMap};
 
-/// Unique identifier for a connected client.
 pub type ClientId = u32;
-
-// Server Public API
 
 static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
 static SESSION_OUTBOX: LazyLock<
@@ -53,22 +46,15 @@ fn get_state() -> Result<Arc<ServerState>> {
         .ok_or_else(|| anyhow!("server not initialized; call server::init first"))
 }
 
-/// Initialize the runtime session broker used by worker tarpc sessions.
-///
-/// Idempotent: the first call installs the upload cap; subsequent calls keep
-/// the original state.
 pub(crate) fn init(max_upload_bytes: usize) {
     let _ = install_state(max_upload_bytes);
     inbox::spawn();
 }
 
-/// Open a new in-process session for the worker edge-rpc service.
 pub fn open_session() -> Result<ClientId> {
     let state = get_state()?;
     let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
-    // One outbox per session, shared by all its turns: a session's lifetime is
-    // one websocket connection, so its turns share that socket's fate anyway.
     let (out_tx, out_rx) = mpsc::channel(1000);
     SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
 
@@ -77,22 +63,16 @@ pub fn open_session() -> Result<ClientId> {
     Ok(id)
 }
 
-/// Close an in-process session and release its resources.
 pub fn close_session(client_id: ClientId) {
     SESSION_OUTBOX.remove(&client_id);
     CLIENT_SERVICES.remove(&client_id);
     tracing::debug!(client_id, "session closed");
 }
 
-/// Submit one client message to a live in-process session.
 pub fn send_client_message(client_id: ClientId, msg: ClientMessage) -> Result<()> {
     CLIENT_SERVICES.send(&client_id, SessionMessage::ClientRequest(msg))
 }
 
-/// Long-poll outgoing server messages for a session.
-///
-/// Waits up to `max_wait_ms` for the first message, then drains up to
-/// `max_messages` immediately available messages.
 pub async fn recv_messages(
     client_id: ClientId,
     max_wait_ms: u64,
@@ -138,12 +118,9 @@ pub async fn recv_messages(
     Ok(out)
 }
 
-// Client Session Public API
-
 static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> =
     LazyLock::new(ServiceMap::new);
 
-/// Sends a typed process event to a client.
 pub(crate) fn send_event(
     client_id: ClientId,
     process_id: ProcessId,
@@ -159,10 +136,6 @@ pub(crate) fn send_event(
     )
 }
 
-/// Sends a binary file to a client for a specific process.
-///
-/// `name` is the file name the inferlet suggested, when it suggested one:
-/// `session.send-frames` and `send-pcm` do, plain `send-file` does not.
 pub(crate) fn send_file(
     client_id: ClientId,
     process_id: ProcessId,
@@ -179,7 +152,6 @@ pub(crate) fn send_file(
     )
 }
 
-/// Registers a file waiter for a process. Returns the file bytes when the client delivers them.
 pub(crate) async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<Bytes> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     CLIENT_SERVICES.send(
@@ -192,67 +164,43 @@ pub(crate) async fn receive_file(client_id: ClientId, process_id: ProcessId) -> 
     Ok(rx.await?)
 }
 
-/// Checks if a session exists for the given client.
-#[allow(dead_code)] // no current caller; part of the documented session surface.
+#[allow(dead_code)]
 pub(crate) fn exists(client_id: ClientId) -> bool {
     CLIENT_SERVICES.contains(&client_id)
 }
 
-// Shared State
-
-/// State shared between the Server and all Sessions.
 struct ServerState {
-    /// Counter for generating unique client IDs.
     next_client_id: AtomicU32,
-    /// Per-upload byte cap (program installs + blob transfers).
     pub(super) max_upload_bytes: usize,
 }
 
-// Session Messages
-
-/// Messages handled by Session actors.
 #[derive(Debug)]
 enum SessionMessage {
-    /// Text event to push to the client (stdout, stderr, message, return, error).
     Event {
         process_id: ProcessId,
         event: String,
         value: String,
     },
-    /// Binary file to push to the client, under the name the inferlet
-    /// suggested when it suggested one.
     File {
         process_id: ProcessId,
         data: Bytes,
         name: Option<String>,
     },
-    /// WebSocket message received from client.
     ClientRequest(ClientMessage),
-    /// Register a file waiter for a process (client → process delivery).
     ReceiveFile {
         process_id: ProcessId,
         sender: tokio::sync::oneshot::Sender<Bytes>,
     },
 }
 
-// Session State
-
-/// Which upload a chunk belongs to. Not the payload's hash: two concurrent
-/// uploads of the same bytes on one session would collide on that.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) enum UploadKey {
-    /// One `add-program` request, named by the correlation id its chunks share.
     Program(u32),
-    /// One file transfer, named by the process it is bound for and its hash.
     File(ProcessId, String),
 }
 
-/// How many uploads one session may have part-finished at once. Bounds the
-/// number of open upload buffers (`InFlightUpload` bounds only each one's
-/// bytes, not the count); generous relative to real client usage.
 pub(super) const MAX_INFLIGHT_UPLOADS: usize = 16;
 
-/// A client session managing a WebSocket connection.
 struct Session {
     pub(super) id: ClientId,
     pub(super) username: String,
@@ -260,13 +208,11 @@ struct Session {
     pub(super) inflight_uploads: DashMap<UploadKey, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
     pub(super) installed_programs: HashSet<ProgramName>,
-    /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     out_tx: mpsc::Sender<WireServerMessage>,
 }
 
 impl Session {
-    /// Create a headless session served over worker edge-rpc.
     fn new_inproc(
         id: ClientId,
         state: Arc<ServerState>,
@@ -274,7 +220,6 @@ impl Session {
     ) -> Self {
         Session {
             id,
-            // The gateway authenticates; every session is served as "internal".
             username: "internal".to_string(),
             state,
             inflight_uploads: DashMap::new(),
@@ -285,7 +230,6 @@ impl Session {
         }
     }
 
-    /// Cleanup when session is terminated.
     fn cleanup(&mut self) {
         for process_id in self.attached_processes.drain(..) {
             process::detach(process_id);
@@ -301,8 +245,6 @@ impl Drop for Session {
         self.cleanup();
     }
 }
-
-// ServiceHandler Implementation
 
 impl ServiceHandler for Session {
     type Message = SessionMessage;
@@ -332,8 +274,6 @@ impl ServiceHandler for Session {
         }
     }
 }
-
-// Session - Wire Helpers
 
 impl Session {
     async fn send(&self, msg: WireServerMessage) {
@@ -366,8 +306,6 @@ impl Session {
         .await;
     }
 }
-
-// Session - Command Dispatch
 
 impl Session {
     async fn handle_client_message(&mut self, message: ClientMessage) {

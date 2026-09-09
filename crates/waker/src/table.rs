@@ -1,22 +1,13 @@
-//! The waker slot table: generation-tagged SPSC slots, epoch-filtered
-//! wakes, and the two-fixed-slots-per-channel [`ChannelWakers`].
-//!
-//! Every generation-sensitive field is protected by one per-slot mutex. An old
-//! id therefore cannot validate one generation and later touch a recycled one.
-
 use std::task::Waker;
 
 #[cfg(not(loom))]
 use crate::r#loom::OnceLock;
 use crate::r#loom::{AtomicU64, Mutex, Ordering, RwLock};
 
-/// Opaque slot id: `generation:u32 << 32 | index:u32`. `0` is never valid.
 pub type WakerSlotId = u64;
 
-/// The first valid epoch for a payload-free completion callback.
 pub const FIRST_COMPLETION_EPOCH: u64 = 1;
 
-/// Reserved waiter sentinel. It is rejected by public epoch-taking methods.
 const EPOCH_NONE: u64 = u64::MAX;
 
 fn slot_id(generation: u32, index: u32) -> WakerSlotId {
@@ -54,22 +45,15 @@ impl Slot {
     }
 }
 
-/// What a wake attempt did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeOutcome {
-    /// A parked waker was woken.
     Woken,
-    /// Valid slot, nobody parked.
     Empty,
-    /// The supplied epoch has not passed the waiter's observation.
     Filtered,
-    /// Stale generation, retired slot, or out-of-range index.
     Stale,
-    /// The caller supplied a reserved completion epoch.
     InvalidEpoch,
 }
 
-/// Monotonic counters for the X0 probes.
 #[derive(Debug, Default)]
 pub struct WakerMetrics {
     pub woken: AtomicU64,
@@ -80,7 +64,6 @@ pub struct WakerMetrics {
     pub swept: AtomicU64,
 }
 
-/// Snapshot of [`WakerMetrics`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub woken: u64,
@@ -91,8 +74,6 @@ pub struct MetricsSnapshot {
     pub swept: u64,
 }
 
-/// The Rust-owned waker slot table. Slot storage is leaked for process-stable
-/// addresses; freed indices are recycled until their generation would wrap.
 pub struct WakerTable {
     slots: RwLock<Vec<&'static Slot>>,
     free: Mutex<Vec<u32>>,
@@ -108,7 +89,6 @@ impl WakerTable {
         }
     }
 
-    /// The process-global table used by the C ABI callbacks.
     #[cfg(not(loom))]
     pub fn global() -> &'static WakerTable {
         static GLOBAL: OnceLock<WakerTable> = OnceLock::new();
@@ -144,8 +124,6 @@ impl WakerTable {
         outcome
     }
 
-    /// Allocate a slot. A recycled index is visible here only after [`free`]
-    /// completed its generation bump and full state reset.
     pub fn alloc(&self) -> WakerSlotId {
         loop {
             let reused = self.free.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -169,11 +147,6 @@ impl WakerTable {
         }
     }
 
-    /// Invalidate and reset a slot atomically. The residual waker is invoked only
-    /// after the slot guard is released; the index reaches the freelist last.
-    ///
-    /// A slot at generation `u32::MAX` is retired instead of wrapping to zero or
-    /// reusing an earlier generation.
     pub fn free(&self, id: WakerSlotId) {
         let (generation, index) = split_id(id);
         let Some(slot) = self.slot(index) else {
@@ -212,12 +185,6 @@ impl WakerTable {
         }
     }
 
-    /// Park a waker tagged with the epoch the waiter observed.
-    ///
-    /// The caller must re-check its ready condition after this returns. The
-    /// per-slot mutex linearizes registration against wake/publication; if the
-    /// committer won the mutex first, its external condition publication
-    /// happens-before this lock acquisition and therefore the mandatory re-check.
     pub fn register(&self, id: WakerSlotId, waker: &Waker, observed_epoch: u64) -> bool {
         if observed_epoch == EPOCH_NONE {
             return false;
@@ -240,7 +207,6 @@ impl WakerTable {
         true
     }
 
-    /// Clear the parked waker for this exact generation.
     pub fn deregister(&self, id: WakerSlotId) {
         let (generation, index) = split_id(id);
         let Some(slot) = self.slot(index) else {
@@ -257,12 +223,10 @@ impl WakerTable {
         drop(removed);
     }
 
-    /// Unconditionally wake the waiter parked on this exact generation.
     pub fn wake(&self, id: WakerSlotId) -> WakeOutcome {
         self.wake_impl(id, None)
     }
 
-    /// Wake iff `ring_index` passed the registered observation.
     pub fn wake_past(&self, id: WakerSlotId, ring_index: u64) -> WakeOutcome {
         if ring_index == EPOCH_NONE {
             return self.invalid_epoch();
@@ -270,10 +234,6 @@ impl WakerTable {
         self.wake_impl(id, Some(ring_index))
     }
 
-    /// Publish a completion epoch monotonically and wake a passed waiter.
-    ///
-    /// Epoch zero means "not completed" and `u64::MAX` is reserved, so both are
-    /// rejected in release builds.
     pub fn publish(&self, id: WakerSlotId, epoch: u64) -> WakeOutcome {
         if !(FIRST_COMPLETION_EPOCH..EPOCH_NONE).contains(&epoch) {
             return self.invalid_epoch();
@@ -315,7 +275,6 @@ impl WakerTable {
         outcome
     }
 
-    /// Read the latest completion epoch for this exact generation.
     pub fn published(&self, id: WakerSlotId) -> Option<u64> {
         let (generation, index) = split_id(id);
         let slot = self.slot(index)?;
@@ -359,7 +318,6 @@ impl WakerTable {
         outcome
     }
 
-    /// Wake every listed endpoint after poison/close/abort.
     pub fn sweep(&self, ids: &[WakerSlotId]) {
         for &id in ids {
             self.wake(id);
@@ -386,7 +344,6 @@ impl Default for WakerTable {
     }
 }
 
-/// The two fixed waiter slots of one host-visible SPSC channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelWakers {
     pub reader: WakerSlotId,

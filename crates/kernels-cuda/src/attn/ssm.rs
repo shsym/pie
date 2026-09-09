@@ -1,16 +1,3 @@
-//! `Attention`'s recurrent-state mixers — causal conv, gated delta nets,
-//! KDA: the `Ssm*` variants, whose sequence cache is a recurrent state
-//! rather than a kv pool. One entry per IR variant; [`RecurrentPool`] is
-//! that state, updated in place.
-//! The chunked forms are the prefill path: they take the fire's ragged view
-//! and launch one scan per request instead of one per token.
-//!
-//! The delta and KDA recurrences stage first: a prep launch widens and
-//! normalises the packed projection into f32 planes in process-global
-//! scratch (grown, never shrunk — an entry may not allocate per fire), and
-//! the scan reads the planes. Both launches ride the same stream, so the
-//! staging is ordered like everything else and nothing synchronises.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -25,34 +12,22 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
-/// Bytes per f32, for shared-memory and scratch sizing.
 const FLOAT: u32 = 4;
 
-/// The prep launches' block.
 const PREP_BLOCK: u32 = 128;
 
-/// Channels one thread of the vectorised conv update moves.
 const CONV_VEC: u32 = 8;
 
-/// The widest window the vectorised conv update unrolls.
 const CONV_K_MAX: u32 = 8;
 
-/// The vectorised conv update's block: small, so a one-token row still
-/// spreads over a few dozen SMs.
 const CONV_BLOCK: u32 = 64;
 
-/// The delta scans' block.
 const GDN_BLOCK: u32 = 128;
 
-/// The KDA kernels' dynamic shared memory: three f32 rows of the head width.
 const fn kda_shmem(d: u32) -> u32 {
     3u32.saturating_mul(d).saturating_mul(FLOAT)
 }
 
-/// The request count a ragged fire spans: the indptr is `[lanes + 1]`. The
-/// boundary vector is driver-assembled, not an operand the validator sees,
-/// so a wrong dtype is refused, not asserted (the boundary rule at
-/// [`refuse`]).
 fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     if x.indptr.dtype != Dtype::I32 {
         return Err(refuse(
@@ -69,7 +44,6 @@ fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     }
 }
 
-/// A named f32 scratch plane, returned as the address the launch binds.
 fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, Error> {
     let bytes = elems.checked_mul(u64::from(FLOAT)).ok_or_else(|| {
         refuse(
@@ -82,20 +56,6 @@ fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<
     Ok(ctx.scratch(op, name, bytes)? as u64)
 }
 
-/// **The RS seats, checked against the arm that is about to run.**
-///
-/// `attn/ssm.cuh` does not carry the fold predicate, the commit length and
-/// the segment origin on every instantiation: the CHUNKED conv takes all
-/// three, the chunked delta scan takes all three on its fla arm and the
-/// predicate alone on the warp-tiled one, and the DECODE (per-step) kernels
-/// take none — a step kernel updates the
-/// bank in place, interleaved with the output it is computing, so predicating
-/// it would need a shadow slot the pool does not carry.
-///
-/// So a pool that CARRIES a seat this arm has no parameter for is refused by
-/// name. The alternative is the one failure a typed seat exists to prevent:
-/// a speculative fire whose refused pass silently folds anyway, or a replay
-/// that folds the whole buffered window instead of the accepted prefix of it.
 fn seated(
     op: &'static str,
     state: &RecurrentPool,
@@ -141,7 +101,6 @@ fn seated(
     Ok(())
 }
 
-/// The conv's stated extents, shared by both forms.
 fn conv_extents(
     op: &'static str,
     x: Tensor,
@@ -163,9 +122,6 @@ fn conv_extents(
     ))
 }
 
-/// What a conv tap lands: the recurrent mixers' `silu(acc)`, or Inkling's
-/// short convolution's `x + acc` (`conv_out` in `ssm.cuh`). Spelled as the
-/// template tail every conv kernel takes after its element type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConvOut {
     Silu,
@@ -194,9 +150,6 @@ pub fn causal_conv1d(
     conv1d_update(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
 }
 
-/// Decode form of Inkling's short convolution (`Attention::ShortConv`):
-/// `y = x + conv(x)`, no activation, the same state slab as the recurrent
-/// mixers' conv.
 pub fn short_conv(
     ctx: &Ctx,
     x: Tensor,
@@ -244,7 +197,7 @@ fn conv1d_update(
     let mut args = vec![
         x.arg(),
         weight.arg(),
-        ArgValue::ABSENT, // the bias seat; this point carries none
+        ArgValue::ABSENT,
         state.conv_slab.arg(),
         state.slot_ids.arg(),
         state.conv_stride.arg(),
@@ -274,14 +227,10 @@ fn conv1d_update(
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
         )
     };
-    // ctx.stage(): the region's live-rows word, or ABSENT.
     args.push(ctx.stage());
     ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
-/// Prefill form: walks the fire's request boundaries, one grid row per
-/// request. Two instantiations; the channel-tiled form wins once the fire
-/// is wide enough to fill it.
 pub fn causal_conv1d_chunked(
     ctx: &Ctx,
     x: RaggedTensor,
@@ -295,7 +244,6 @@ pub fn causal_conv1d_chunked(
     conv1d_chunked(ctx, OP, x, weight, state, conv_width, dilation, y, ConvOut::Silu)
 }
 
-/// Prefill form of Inkling's short convolution (`Attention::ShortConvChunked`).
 pub fn short_conv_chunked(
     ctx: &Ctx,
     x: RaggedTensor,
@@ -358,7 +306,7 @@ fn conv1d_chunked(
         &[
             x.data.arg(),
             weight.arg(),
-            ArgValue::ABSENT, // the bias seat
+            ArgValue::ABSENT,
             y.arg(),
             state.conv_slab.arg(),
             state.slot_ids.arg(),
@@ -367,22 +315,15 @@ fn conv1d_chunked(
             c.arg(),
             k.arg(),
             dil.arg(),
-            // The three RS seats: fold predicate, commit-length truncation,
-            // and the accepted boundary.
             state.write_state.arg(),
             state.write_state_mask.arg(),
             state.commit_len.arg(),
-            // The segment's origin: bound only on the tail launch of a row
-            // whose fold boundary falls inside its own tokens.
             state.begin_at.arg(),
-            // Read on the lane axis (both arms above grid on requests):
-            // passed unconditionally, so pointers are always pre-shifted.
             ctx.stage(),
         ],
     )
 }
 
-/// Folds `ba` with the dt bias and A-log into per-head decay gates.
 pub fn gdn_prep(
     ctx: &Ctx,
     ba: Tensor,
@@ -422,13 +363,11 @@ pub fn gdn_prep(
             gates.arg(),
             stated(OP, rows)?.arg(),
             stated(OP, v_heads)?.arg(),
-            // ctx.stage(): the region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The gated-delta shape: four stated head numbers against the fused rows.
 #[derive(Clone, Copy)]
 struct Delta {
     n: u32,
@@ -436,12 +375,9 @@ struct Delta {
     v_heads: u32,
     k_dim: u32,
     v_dim: u32,
-    /// The packed post-convolution row's width, which the preps stride by.
     conv_dim: u32,
 }
 
-/// The staged f32 planes a delta scan reads: addresses into the scratch
-/// slabs.
 #[derive(Clone, Copy)]
 struct DeltaStaged {
     q_norm: u64,
@@ -502,8 +438,6 @@ impl Delta {
         self.n as u64 * heads as u64 * width as u64
     }
 
-    /// Widen and normalise the packed projection into f32 planes: q/k
-    /// L2-normed per head, v copied, the fused gates split.
     fn stage(
         self,
         ctx: &Ctx,
@@ -540,7 +474,6 @@ impl Delta {
                 stated(op, self.k_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
                 q_scale.arg(),
-                // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )?;
@@ -559,7 +492,6 @@ impl Delta {
                 stated(op, self.k_dim)?.arg(),
                 stated(op, self.v_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
-                // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )?;
@@ -567,8 +499,6 @@ impl Delta {
     }
 }
 
-/// The gated-delta recurrent step, one token per lane. `z` goes unread:
-/// this plane gates afterwards (`elementwise.rmsnorm_gated`).
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
     ctx: &Ctx,
@@ -584,7 +514,6 @@ pub fn gated_delta(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta";
 
-    /// Both head widths at exactly this hit the shared-memory arm.
     const SMEM_ARM_WIDTH: u32 = 128;
 
     const SMEM_BV: u32 = 128;
@@ -629,22 +558,15 @@ pub fn gated_delta(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
-            // ctx.stage(): the region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The fused step's block: 256 threads, eight state columns per thread.
 const FUSED_BLOCK: u32 = 256;
 
-/// The state columns one fused block owns — narrow, so a one-token fire
-/// still spreads a head over the device. The block then stands
-/// `FUSED_BLOCK * 8 / FUSED_BV` rows tall, which bounds the key width.
 const FUSED_BV: u32 = 16;
 
-/// Whether the one-launch step fits this geometry: eight-wide vectors land
-/// on every plane and the key width fits the tile.
 fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
     const VEC: u32 = 8;
     shape.conv_dim % VEC == 0
@@ -656,8 +578,6 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
 }
 
 impl Delta {
-    /// The one-launch decode step: reads the projection and the gate row
-    /// directly, no staging planes.
     fn decode_fused(
         self,
         ctx: &Ctx,
@@ -688,17 +608,12 @@ impl Delta {
                 stated(op, self.v_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
                 q_scale.arg(),
-                // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )
     }
 }
 
-/// Prefill form of [`gated_delta`]: one chunked scan per request. Three
-/// instantiations, picked on head geometry: fla tiling when the value width
-/// fills it, a warp-tiled sweep for narrow keys, else the plain block scan
-/// (key planes repeated across the GQA fan). `z` goes unread, as above.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked(
     ctx: &Ctx,
@@ -757,18 +672,11 @@ pub fn gated_delta_chunked(
                 stated(OP, v_heads)?.arg(),
                 stated(OP, k_dim)?.arg(),
                 stated(OP, v_dim)?.arg(),
-                // The one chunked arm carrying all three: fold predicate
-                // and accepted length, which is why a buffered replay is
-                // dispatchable at all.
                 state.write_state.arg(),
                 state.commit_len.arg(),
                 state.write_state_mask.arg(),
-                // The segment's origin (tail of an interior split) and the
-                // decay rounding policy.
                 state.begin_at.arg(),
                 state.fused_decay.arg(),
-                // Read on the lane axis; the staged scratch and window CSR
-                // stay launch-local.
                 ctx.stage(),
             ],
         );
@@ -810,15 +718,12 @@ pub fn gated_delta_chunked(
                 stated(OP, v_dim)?.arg(),
                 state.write_state.arg(),
                 state.write_state_mask.arg(),
-                // Read on the lane axis, as the fla arm above.
                 ctx.stage(),
             ],
         );
     }
 
     seated(OP, state, "ssm_gated_delta_chunked_batched", false, false, false)?;
-    // The plain scan reads one key plane per value head; a GQA fan repeats
-    // the staged planes across it first.
     let (q_norm, k_norm) = if v_heads == k_heads {
         (staged.q_norm, staged.k_norm)
     } else {
@@ -837,7 +742,6 @@ pub fn gated_delta_chunked(
                     stated(OP, v_heads)?.arg(),
                     stated(OP, k_dim)?.arg(),
                     stated(OP, v_heads / k_heads)?.arg(),
-                    // ctx.stage(): the region's live-rows word, or ABSENT.
                     ctx.stage(),
                 ],
             )?;
@@ -865,23 +769,19 @@ pub fn gated_delta_chunked(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
-            // Read on the lane axis, as the fla arm above.
             ctx.stage(),
         ],
     )
 }
 
-/// The KDA shape: two stated head numbers against the mixed rows.
 #[derive(Clone, Copy)]
 struct Kda {
     n: u32,
     heads: u32,
     head_dim: u32,
-    /// `heads x head_dim`, the plane every staged buffer is one of.
     width: u32,
 }
 
-/// The staged f32 planes the KDA recurrence reads.
 #[derive(Clone, Copy)]
 struct KdaStaged {
     q_norm: u64,
@@ -935,8 +835,6 @@ impl Kda {
         })
     }
 
-    /// Split, norm and widen `[q | k | v]`, then fold the forget/beta
-    /// projections with the decay weights into f32 gates.
     fn stage(
         self,
         ctx: &Ctx,
@@ -949,7 +847,6 @@ impl Kda {
         norm_eps: f32,
         gate_floor: f32,
     ) -> Result<KdaStaged, Error> {
-        /// q, k, v — the prep's grid-y axis.
         const PLANES: u32 = 3;
 
         let wide = u64::from(self.n) * u64::from(self.width);
@@ -977,7 +874,6 @@ impl Kda {
                 stated(op, self.width)?.arg(),
                 stated(op, self.head_dim)?.arg(),
                 norm_eps.arg(),
-                // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )?;
@@ -998,7 +894,6 @@ impl Kda {
                 stated(op, self.heads)?.arg(),
                 stated(op, self.head_dim)?.arg(),
                 gate_floor.arg(), // the decay's lower bound; zero leaves it unbounded
-                // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )?;
@@ -1006,9 +901,6 @@ impl Kda {
     }
 }
 
-
-/// The KDA kernels keep the recurrent state in f32; a slab declared narrower
-/// would be written past its end.
 fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
     if state.slab.dtype != Dtype::F32 {
         return Err(refuse(
@@ -1067,13 +959,11 @@ pub fn kda_step(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
-            // ctx.stage(): the region's live-rows word, or ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Prefill form of [`kda_step`]: one scan per request.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked(
     ctx: &Ctx,
@@ -1091,7 +981,6 @@ pub fn kda_chunked(
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
 
-    /// The widest block the prefill scan spans, in warps.
     const PREFILL_MAX_WARPS: u32 = 32;
 
     dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => () });
@@ -1125,8 +1014,6 @@ pub fn kda_chunked(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
-            // Read on the lane axis; the staged scratch and window CSR
-            // stay launch-local.
             ctx.stage(),
         ],
     )

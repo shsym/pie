@@ -94,13 +94,9 @@ __device__ __forceinline__ float m1_bits_f32(m1_u32 value) {
   return __uint_as_float(value);
 }
 
-// Monotone map float -> m1_u32 that REVERSES value order: a larger float yields
-// a smaller key, so a plain unsigned radix select over the keys walks the values
-// in descending order. NaN maps to the maximum key (sorts last), and no finite
-// float can collide with that sentinel.
 __device__ __forceinline__ m1_u32 m1_desc_key(float value) {
   if (m1_isnan(value)) return 0xFFFFFFFFu;
-  if (value == 0.0f) value = 0.0f;   // -0.0 compares equal to +0.0
+  if (value == 0.0f) value = 0.0f;
   const m1_u32 u = __float_as_uint(value);
   const m1_u32 ascending = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
   return ~ascending;

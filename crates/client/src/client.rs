@@ -23,46 +23,23 @@ use uuid::Uuid;
 
 type CorrId = u32;
 
-/// Events received from a running process.
 #[derive(Debug)]
 pub enum ProcessEvent {
-    /// Stdout output from the process.
     Stdout(String),
-    /// Stderr output from the process.
     Stderr(String),
-    /// An inferlet text message (via session::send).
     Message(String),
-    /// A binary file sent from the inferlet.
     File(ReceivedFile),
-    /// Process completed successfully with a return value.
     Return(String),
-    /// Process terminated with an error.
     Error(String),
 }
 
-/// One complete file the inferlet sent, reassembled and hash-checked.
-///
-/// The name is the one the inferlet suggested (`session.send-frames` /
-/// `send-pcm` name their output; plain `send-file` does not), UNSANITISED —
-/// it came off the wire. [`ReceivedFile::file_name`] is the accessor that
-/// makes it safe to join onto a directory, and it is the one a writer should
-/// use.
 #[derive(Debug, Clone)]
 pub struct ReceivedFile {
-    /// The name the inferlet suggested, verbatim, or `None`.
     pub name: Option<String>,
-    /// The file's bytes.
     pub data: Vec<u8>,
 }
 
 impl ReceivedFile {
-    /// A file name safe to join onto a directory: the suggested name with any
-    /// directory part, `..`, and NUL stripped, falling back to `fallback`
-    /// when nothing usable is left.
-    ///
-    /// The runtime sanitises on the way out too; this is the check that
-    /// counts, because a client does not get to assume the server it is
-    /// talking to is the one that wrote that code.
     pub fn file_name(&self, fallback: &str) -> String {
         let raw = self.name.as_deref().unwrap_or("");
         let tail = raw.rsplit(['/', '\\']).next().unwrap_or("");
@@ -93,37 +70,28 @@ const MAX_BUFFERED_PROCESSES: usize = 1024;
 const MAX_BUFFERED_EVENTS_PER_PROCESS: usize = 1024;
 const BUFFERED_PROCESS_TTL: Duration = Duration::from_secs(60);
 
-/// Holds the state for a file being downloaded from the server.
 #[derive(Debug)]
 struct DownloadState {
     process_id: String,
     buffer: Vec<u8>,
-    /// The name the first chunk carried, if any.
     name: Option<String>,
 }
 
-/// A client that interacts with the server.
 pub struct Client {
     inner: Arc<ClientInner>,
     reader_handle: task::JoinHandle<()>,
     writer_handle: task::JoinHandle<()>,
 }
 
-/// State shared between the Client and its Processes.
 #[derive(Debug)]
 struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
     corr_id_pool: IdPool<CorrId>,
-    /// Single pending-request map: all request/reply commands use this.
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
-    /// Per-process event routes. Events can precede the launch response, so
-    /// unmatched events remain buffered until `launch_process` attaches.
     process_events: StdMutex<HashMap<String, ProcessEventRoute>>,
-    /// In-flight file downloads (key: file_hash).
     pending_downloads: DashMap<String, Mutex<DownloadState>>,
 }
 
-/// Represents a running process on the server.
 #[derive(Debug)]
 pub struct Process {
     id: String,
@@ -131,18 +99,15 @@ pub struct Process {
     event_rx: mpsc::Receiver<ProcessEvent>,
 }
 
-/// Computes the blake3 hash for a slice of bytes.
 pub fn hash_blob(blob: &[u8]) -> String {
     blake3::hash(blob).to_hex().to_string()
 }
 
 impl Process {
-    /// Returns the process UUID string.
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// Sends a string message to the process (fire-and-forget).
     pub async fn signal<T: ToString>(&self, message: T) -> Result<()> {
         let msg = ClientMessage::SignalProcess {
             process_id: self.id.clone(),
@@ -154,7 +119,6 @@ impl Process {
         Ok(())
     }
 
-    /// Uploads a binary file to the process (fire-and-forget, chunked).
     pub async fn transfer_file(&self, blob: &[u8]) -> Result<()> {
         let file_hash = hash_blob(blob);
         let total_size = blob.len();
@@ -181,7 +145,6 @@ impl Process {
         Ok(())
     }
 
-    /// Receives the next event from the process. Blocks until one is available.
     pub async fn recv(&mut self) -> Result<ProcessEvent> {
         self.event_rx
             .recv()
@@ -189,7 +152,6 @@ impl Process {
             .ok_or(anyhow!("Event channel closed"))
     }
 
-    /// Non-blocking receive. Returns None if no event is available.
     pub fn try_recv(&mut self) -> Result<Option<ProcessEvent>> {
         match self.event_rx.try_recv() {
             Ok(event) => Ok(Some(event)),
@@ -198,9 +160,6 @@ impl Process {
         }
     }
 
-    /// Drain process events until the process returns, returning its `Return`
-    /// value. `Stdout`/`Stderr` are forwarded to the host's stderr;
-    /// `Message`/`File` are ignored. `Err` on a process `Error` or channel close.
     pub async fn wait_for_return(&mut self) -> Result<String> {
         loop {
             match self.recv().await? {
@@ -218,8 +177,6 @@ impl Client {
         Self::connect_inner(connect_async(ws_host).await?.0)
     }
 
-    /// Connect, injecting the `x-pie-identity` trust-edge header the
-    /// gateway's `/v1/ws` upgrade requires (missing/empty is rejected with 401).
     pub async fn connect_with_identity(ws_host: &str, identity: &str) -> Result<Client> {
         let mut request = ws_host.into_client_request()?;
         request
@@ -276,12 +233,6 @@ impl Client {
         })
     }
 
-    /// Close the connection and clean up background tasks.
-    ///
-    /// Order matters: the writer task ends only when every sender for its
-    /// channel drops. `self.inner`, the reader task, and any live [`Process`]
-    /// each hold one, so the reader must stop (and its `Arc` clone drop)
-    /// before the writer is awaited — otherwise this deadlocks.
     pub async fn close(self) -> Result<()> {
         let Client {
             inner,
@@ -289,14 +240,12 @@ impl Client {
             writer_handle,
         } = self;
         reader_handle.abort();
-        // Awaited, not just aborted: the task's `Arc` lives until it stops.
         let _ = reader_handle.await;
         drop(inner);
         writer_handle.await?;
         Ok(())
     }
 
-    /// Send a command and wait for a Response { corr_id, ok, result }.
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let corr_id_ref = match &mut msg {
@@ -323,7 +272,6 @@ impl Client {
         Ok((ok, result))
     }
 
-    /// Authenticates the client with the server using a username and private key.
     pub async fn authenticate(
         &self,
         username: &str,
@@ -342,8 +290,6 @@ impl Client {
             anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
-        // Two no-challenge successes: key-auth disabled, or the trust-edge
-        // gateway path where the session is already pre-authenticated.
         if result == "Authenticated (Engine disabled authentication)"
             || result == "Already authenticated"
         {
@@ -395,9 +341,6 @@ impl Client {
         }
     }
 
-    /// Check if a program exists on the server.
-    ///
-    /// The `inferlet` must be in `name@version` format (e.g., "chat-completion@0.1.0").
     pub async fn check_program(
         &self,
         inferlet: &str,
@@ -449,7 +392,6 @@ impl Client {
         }
     }
 
-    /// For backward compatibility. Delegates to `check_program`.
     pub async fn program_exists(
         &self,
         inferlet: &str,
@@ -459,7 +401,6 @@ impl Client {
         self.check_program(inferlet, wasm_path, manifest_path).await
     }
 
-    /// Upload a program to the server.
     pub async fn add_program(
         &self,
         wasm_path: &Path,
@@ -508,7 +449,6 @@ impl Client {
         }
     }
 
-    /// Launches an instance of a program. Returns a `Process` for interaction.
     pub async fn launch_process(
         &self,
         inferlet: String,
@@ -527,7 +467,6 @@ impl Client {
             anyhow::bail!("Launch process failed: {}", result);
         }
 
-        // result is the UUID string
         let process_id = result;
         let rx = attach_process_events(&self.inner, &process_id);
 
@@ -539,7 +478,6 @@ impl Client {
     }
 
     pub async fn attach_process(&self, process_id: &str) -> Result<Process> {
-        // Validate UUID format
         let _uuid = Uuid::parse_str(process_id)?;
         let msg = ClientMessage::AttachProcess {
             corr_id: 0,
@@ -570,7 +508,6 @@ impl Client {
         }
     }
 
-    /// List running processes. Returns a list of process UUID strings.
     pub async fn list_processes(&self) -> Result<Vec<String>> {
         let msg = ClientMessage::ListProcesses { corr_id: 0 };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
@@ -592,7 +529,6 @@ impl Client {
         }
     }
 
-    /// Terminates a process by its UUID string.
     pub async fn terminate_process(&self, process_id: &str) -> Result<()> {
         let msg = ClientMessage::TerminateProcess {
             corr_id: 0,
@@ -607,11 +543,6 @@ impl Client {
     }
 }
 
-// =============================================================================
-// Server Message Handler
-// =============================================================================
-
-/// Routes incoming server messages to the appropriate handler.
 async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
     match msg {
         ServerMessage::Response {
@@ -649,7 +580,6 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             chunk_data,
             name,
         } => {
-            // Initialize download state on first chunk
             if !inner.pending_downloads.contains_key(&file_hash) {
                 let state = DownloadState {
                     process_id: process_id.clone(),
@@ -661,17 +591,13 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                     .insert(file_hash.clone(), Mutex::new(state));
             }
 
-            // The DashMap Ref guard must drop before .remove(): .get() holds a
-            // shard read-lock and .remove() needs a write-lock on the same shard.
             let is_last = chunk_index == total_chunks - 1;
             if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;
                 state.buffer.extend_from_slice(&chunk_data);
-                drop(state); // release Mutex guard
+                drop(state);
             }
-            // DashMap Ref dropped here (end of `if let` scope)
 
-            // Finalize on last chunk — no guards held
             if is_last && let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
                 let final_state = state_mutex.into_inner();
                 if hash_blob(&final_state.buffer) == file_hash {
@@ -690,7 +616,6 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
     }
 }
 
-/// When the server terminates, clear all pending state.
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
     inner

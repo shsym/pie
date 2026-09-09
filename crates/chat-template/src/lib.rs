@@ -1,10 +1,3 @@
-//! A chat template is two halves of one agreement, sharing the same markers:
-//! the writing half turns a role and a message into the tokens the model was
-//! trained to see around them, and the reading half watches generated tokens
-//! go by and says when a reply began, a reasoning block closed, or a tool
-//! was called. This crate ships the formats — [`chatml`], [`harmony`],
-//! [`gemma`], [`deepseek`], [`kimi`], [`atem`] — knowing nothing about model SKUs.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -21,17 +14,10 @@ pub mod kimi;
 
 pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
 
-/// The grammar that constrains well-formed tool-call output, in the EBNF the
-/// grammar engine compiles.
 pub struct ToolGrammar {
     pub source: String,
 }
 
-/// The id of a marker the template spells, or a panic naming the marker.
-///
-/// Every marker is one token in the vocabulary the model was trained with. A
-/// tokenizer that cannot spell one is paired with the wrong model, and the
-/// failure belongs at the moment the template is built.
 #[must_use]
 pub fn special(tokenizer: &Tokenizer, marker: &str) -> u32 {
     match tokenizer.token_to_id(marker) {
@@ -42,7 +28,6 @@ pub fn special(tokenizer: &Tokenizer, marker: &str) -> u32 {
     }
 }
 
-/// [`special`] over a list — the shape a stop list arrives in.
 #[must_use]
 pub fn specials(tokenizer: &Tokenizer, markers: &[&str]) -> Vec<u32> {
     markers
@@ -71,20 +56,13 @@ pub enum ReasoningEvent {
 
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
-    /// Nothing has happened yet. A decoder never yields this (an idle batch
-    /// yields no events), but a caller that must answer with one event per
-    /// feed needs a value for "still nothing".
     None,
 
-    /// A tool-call span opened.
     Start,
 
-    /// A complete call: the function's name, and its arguments as JSON.
     Call(String, String),
 }
 
-/// The three readers all take a batch of tokens and answer with everything
-/// that batch contained, in order — the `Vec` is not decoration.
 pub trait ChatDecoder: Send {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ChatEvent>;
     fn reset(&mut self);
@@ -100,14 +78,7 @@ pub trait ToolDecoder: Send {
     fn reset(&mut self);
 }
 
-/// One format, both directions. `equip` and `answer` default to writing
-/// nothing, for a format without a tool grammar.
 pub trait Instruct: Send + Sync {
-    /// The tokens a conversation — or a raw completion prompt — starts
-    /// with, before any text: `<bos>` for a family whose model reads nothing
-    /// sensible without it (gemma), nothing for one whose tokenizer states
-    /// no opening. A raw-prompt inferlet prepends this to `encode(text)`;
-    /// the turn builders below already include it.
     fn prefix(&self) -> Vec<u32> {
         Vec::new()
     }
@@ -151,5 +122,4 @@ pub trait Instruct: Send + Sync {
     }
 }
 
-/// The constructor every format exposes to the catalog beside it.
 pub type Build = fn(Arc<Tokenizer>) -> Arc<dyn Instruct>;

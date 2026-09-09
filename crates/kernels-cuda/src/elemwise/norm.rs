@@ -1,5 +1,3 @@
-//! `Norm`: the rms family, residual folds, and scalar gains — one entry per IR variant.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -14,17 +12,12 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
-/// Elements one thread of a vectorised row kernel moves at once.
 const VEC_WIDTH: u32 = 8;
 
-/// The single-row rms unit's two weight readings: the bank read absolutely,
-/// or offset by one (`w + 1`).
 const ABSOLUTE_BANK: &str = "rmsnorm";
 
 const OFFSET_BANK: &str = "rmsnorm_plus_one";
 
-/// One block per normed span: whole rows when `head_dim` is zero, else one
-/// per head.
 fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     if head_dim == 0 {
@@ -48,15 +41,10 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
     Ok(Launch::per_row(blocks, BLOCK))
 }
 
-/// The head count `rows_per_head` flattens into `blockIdx.x`; seated kernels
-/// divide by it to recover the token row.
 const fn per_head_split(width: u32, head_dim: u32) -> u32 {
     if head_dim == 0 { 1 } else { width / head_dim }
 }
 
-/// One thread per element, flattened — refused rather than truncated when
-/// the extent outgrows a 32-bit launch, because a clamped grid would leave
-/// the tail unwritten.
 fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
@@ -69,7 +57,6 @@ fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     Ok((Launch::flat(lanes, BLOCK), n))
 }
 
-/// One block per row, sized to the row in whole warps.
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;
 
@@ -107,7 +94,6 @@ fn rms_row(
         )?,
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
-    // How many blocks stand in one token row.
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
     ctx.fire(
         op,
@@ -116,8 +102,6 @@ fn rms_row(
             symbol(&format!("::pie::elemwise::{template}<{t}, 256>")),
         )
         .apply(launch),
-        // hidden three times: the normed width and the source/destination
-        // row pitches, which coincide on dense handles.
         &[
             x.arg(),
             weight.arg(),
@@ -127,7 +111,6 @@ fn rms_row(
             hidden.arg(),
             eps.arg(),
             heads.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -243,14 +226,11 @@ pub fn rmsnorm_no_scale(
             hidden.arg(),
             eps.arg(),
             heads.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `x` and `weight` are f32 (the recurrent accumulator); the gate carries
-/// the model dtype and the output lands in it.
 pub fn rmsnorm_gated(
     ctx: &Ctx,
     x: Tensor,
@@ -291,16 +271,11 @@ pub fn rmsnorm_gated(
             eps.arg(),
             i32::from(sigmoid_gate).arg(),
             heads.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The hyper-connection norm: moments per `group`-wide slice, `weight + 1`
-/// over the row's full width. The launch is [`rows_per_head`]'s flattening —
-/// one block per (row, group) — and the kernel recovers the group from the
-/// block index to read its own slice of the weight.
 pub fn rmsnorm_grouped_plus_one(
     ctx: &Ctx,
     x: Tensor,
@@ -339,14 +314,11 @@ pub fn rmsnorm_grouped_plus_one(
             stated(OP, group)?.arg(),
             stated(OP, groups)?.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Like [`rmsnorm_gated`], grouped by a stated head count instead of a
-/// stated head width — the kda output norm.
 pub fn rmsnorm_gated_by(
     ctx: &Ctx,
     x: Tensor,
@@ -395,13 +367,11 @@ pub fn rmsnorm_gated_by(
             stated(OP, heads)?.arg(),
             stated(OP, d)?.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `y += x`, in place on `y` (the IR aliases `y_out` onto `y`).
 pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -413,17 +383,12 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             y.arg(),
             x.arg(),
             n.arg(),
-            // Element-form seat's width: launch is flat over rows*width, so
-            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, y.width)?.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `y += x` in place, then `out = rmsnorm(y)` (`weight + 1` when
-/// `plus_one`): what [`residual_add`] then [`rmsnorm`] land, one launch.
 pub fn residual_add_rmsnorm(
     ctx: &Ctx,
     x: Tensor,
@@ -467,13 +432,11 @@ pub fn residual_add_rmsnorm(
             out.arg(),
             hidden.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// What a fused chain's trailing norm reads and writes.
 pub struct PostNorm<'a> {
     pub weight: Tensor,
     pub plus_one: bool,
@@ -481,9 +444,6 @@ pub struct PostNorm<'a> {
     pub out: &'a mut Tensor,
 }
 
-/// `t = rmsnorm(x) * w0`, `y += t` in place, then optionally `scaled = y *
-/// s` (a device-held scalar) and `out = rmsnorm(scaled or y)`: what
-/// [`rmsnorm`], [`residual_add`], [`scale`] and [`rmsnorm`] land, one launch.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_residual_add(
     ctx: &Ctx,
@@ -496,9 +456,6 @@ pub fn rmsnorm_residual_add(
     post: Option<PostNorm<'_>>,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_residual_add";
-    // Elements a thread keeps in registers between the phases: the narrowest
-    // of 8/16/32 that seats the row at `BLOCK` threads. Wider rows are
-    // refused; `model_ir::fuse::residual_chains` fuses nothing past that.
     let per_thread = [8u32, 16, 32]
         .into_iter()
         .find(|per| y.width <= BLOCK * per)
@@ -535,8 +492,6 @@ pub fn rmsnorm_residual_add(
             "false",
         ),
     };
-    // The eight-wide form for bf16 rows that are whole vectors on aligned
-    // planes: one block a row still, `chunks` vectors a thread.
     let mut aligned = vec![x.ptr, w0.ptr, t.ptr, y.ptr];
     if let Some((_, scaled)) = &scale {
         aligned.push(scaled.ptr);
@@ -580,17 +535,13 @@ pub fn rmsnorm_residual_add(
             hidden.arg(),
             eps0.arg(),
             eps1.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `out += bias` per row, in place on `out`.
 pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
-    // f32 planes are the lane-axis vectors (a timestep MLP's rows): the same
-    // kernel body, one element type wider.
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     let tb = dtype_dispatch!(OP, bias.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     nonzero(OP, "rows", out.rows)?;
@@ -603,20 +554,11 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
             out.arg(),
             bias.arg(),
             width.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `out = (out - bias) * scale` per row, in place on `out`, both planes
-/// `[width]`. The difference is taken and scaled in f32 and rounded once at
-/// the store, to avoid rounding error where `out` and `bias` nearly cancel.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
-/// mismatched plane, an empty rectangle, or an extent past a 32-bit launch.
 pub fn standardize(
     ctx: &Ctx,
     bias: Tensor,
@@ -627,7 +569,6 @@ pub fn standardize(
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", out.rows)?;
     let width = stated(OP, nonzero(OP, "the standardized row's width", out.width)?)?;
-    // Both planes are per-column (unlike `scale`'s one device-held scalar).
     for (what, plane) in [("bias", bias), ("scale", scale)] {
         if plane.dtype != out.dtype {
             return Err(refuse(
@@ -658,8 +599,6 @@ pub fn standardize(
     )
 }
 
-/// `x *= s` for a plan-stated scalar, in place on `x`.
-/// `silu(s * x)`, in place.
 pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.silu_scaled";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -671,19 +610,12 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // Element-form seat's width: launch is flat over rows*width, so
-            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `x *= s`, in place. bf16, f16, or f32 — the last for a lane vector's
-/// chain (a `[Lanes, 1]` timestep scaled before its embedding), where the
-/// scalar is not rounded through the plane's element (`Elem<float>` is the
-/// identity) and the product rounds once at the store.
 pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
@@ -695,16 +627,12 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // Element-form seat's width: launch is flat over rows*width, so
-            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `x *= s` for a device-held scalar, in place on `x`.
 pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.scale";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -716,17 +644,12 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // Element-form seat's width: launch is flat over rows*width, so
-            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// This plane claims the point, but the launch lives with the attention
-/// family; this entry is the seam, `crate::attn::res_blend` is the launch.
 pub fn res_blend(
     ctx: &Ctx,
     prefix: Tensor,

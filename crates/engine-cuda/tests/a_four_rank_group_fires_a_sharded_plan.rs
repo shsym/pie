@@ -1,22 +1,3 @@
-//! **FOUR RANKS, ONE ENGINE: a hand-written plan whose attention heads are
-//! cut across ranks (one head each) and whose output projections meet in
-//! an `all_reduce` fires through `engine_cuda::open_group` over four devices
-//! and lands what the same plan lands at one rank — the host f32 reference
-//! — with the readouts read from rank 0.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=0,1,2,3 cargo test -p engine-cuda --features cuda \
-//!   --test a_four_rank_group_fires_a_sharded_plan
-//! ```
-//!
-//! The plan: latents → layernorm → q/k/v (column-cut, 4 heads of 64 → 1 per
-//! rank) → `attention.ragged` per lane (no collective: the softmax is per
-//! head) → output projection (row-cut) → `all_reduce` → residual →
-//! `velocity`. The weights are random, written whole to a serving artifact,
-//! and every rank's contract lands its own band (`checkpoint_dsl::own_contract`
-//! at the group's width, read off the trace name's `-tp<n>`). Skips when
-//! fewer than four devices are visible.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -45,7 +26,6 @@ use model_dsl::{
     Weight, ops, seam, trace_hybrid,
 };
 
-/// Four heads of 64: the residual width.
 const HEADS: u32 = 4;
 const RANKS: usize = 4;
 
@@ -68,7 +48,6 @@ fn classify_for(_: &str) -> Option<model_ir::ClassifyFn> {
     Some(classify)
 }
 
-/// The plan, at `tp` ranks: the projections cut by heads and by rows.
 struct Sharded {
     tp: u32,
 }
@@ -79,8 +58,6 @@ impl ForwardHybrid for Sharded {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input<NoFacts>) -> Value {
-        // A param's declared shape is the rank's OWN band: the checkpoint
-        // holds `tp` of them along the cut axis.
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
         let h = ops::elemwise::layernorm_no_scale(&x, 1e-6);
@@ -125,7 +102,6 @@ fn plan(tp: u32) -> Trace {
     trace_hybrid(&name, &Sharded { tp }, Platform::Cuda)
 }
 
-/// The contract lands each rank's band: the width is the trace name's.
 fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let tp = trace
         .name
@@ -137,7 +113,6 @@ fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
         .map_err(|why| why.to_string())
 }
 
-/// One lane's velocity rows on the host.
 fn reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
     let w = WIDTH as usize;
     let hd = HEAD_DIM as usize;
@@ -204,8 +179,6 @@ fn reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
     out
 }
 
-/// The epilogue: takes the latent cell (so a second fire reads a fresh one)
-/// and puts the velocity intrinsic on the reader channel.
 fn epilogue(rows: u32) -> TraceContainer {
     let decl = |shape: Shape, host_role: HostRole| ChannelDecl {
         shape,
@@ -250,8 +223,6 @@ fn four_ranks_land_what_one_rank_lands() {
     }
     let tp = RANKS as u32;
     let plan = plan(tp);
-    // Random weights for the ONE-rank plan's params (the same names and
-    // whole shapes), written whole; the group's contract bands them.
     let weights = Weights::random(&super_plan(), 53);
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = weights.write(dir.path());
@@ -289,7 +260,6 @@ fn four_ranks_land_what_one_rank_lands() {
         .expect("the sharded plan loads on four ranks");
     assert!(loaded.caps.profile.has_velocity);
 
-    // Two lanes of unequal length, one instance each.
     let rows = [5u32, 11];
     let mut rng = Lcg::seeded(59);
     let w = WIDTH as usize;
@@ -401,12 +371,6 @@ fn four_ranks_land_what_one_rank_lands() {
             &want[at],
             &format!("lane {at} velocity, rank 0's readout"),
         );
-        // How far the four-rank answer sits from the host's, said out loud:
-        // the reduction is one bf16 `ncclAllReduce` over four partials, so a
-        // sound one lands within a bf16 rounding or two of the host's own
-        // bf16 walk — well inside `assert_close`'s 4e-2. A number that
-        // creeps toward the assertion is the signal that the reduce, not
-        // the arithmetic, is what moved.
         let worst = readout
             .values
             .iter()
@@ -420,7 +384,6 @@ fn four_ranks_land_what_one_rank_lands() {
              one bf16 all-reduce over four partials does not cost that much"
         );
     }
-    // The epilogue's road, off rank 0's ring: the same numbers.
     for (at, &instance) in instances.iter().enumerate() {
         let bytes = group
             .take_channel(instance, 1)
@@ -439,7 +402,6 @@ fn four_ranks_land_what_one_rank_lands() {
     let _ = BTreeMap::<u64, u64>::new();
 }
 
-/// The one-rank plan, whose params are the whole planes the artifact holds.
 fn super_plan() -> Trace {
     plan(1)
 }

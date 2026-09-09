@@ -1,26 +1,3 @@
-//! **A PER-LANE MODULATION VECTOR REACHES EVERY ROW OF ITS LANE THROUGH THE
-//! FIRE'S OWN TOKEN→LANE MAP, KV SPACE OR NO KV SPACE.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_modulate_over_lanes_broadcasts_by_request_of_token
-//! ```
-//!
-//! adaLN (D6) computes `[Lanes, k·width]` off a per-lane timestep and
-//! applies it to `[Tokens, width]` rows. The broadcast is not a shape-algebra
-//! operation — the IR has none — it is the op reading `request_of_token`.
-//! A denoiser declares no kv space, so that table must be readable without
-//! one:
-//!
-//! ```text
-//! (a) the timestep chain types as stated: lane_vector [Lanes, 1] f32 →
-//!     sinusoid [Lanes, dim] f32 → matmul [Lanes, 2·width]
-//! (b) modulate over it names `lane_of_row` = RequestOfToken in space 0,
-//!     on a plan with no cache row at all, and answers x's own type
-//! (c) the per-token form (Wan TI2V) names no lane map and wants m on x's rows
-//! (d) the gated residual fold aliases the stream it folds into
-//! (e) a vector of the wrong width is refused at trace time, by width
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Request, Value,
     Weight, ops, seam, trace_hybrid,
@@ -41,7 +18,6 @@ impl Classify for NoFacts {
 const WIDTH: u32 = 64;
 const FREQ: u32 = 32;
 
-/// Which broadcast the text under test states.
 #[derive(Clone, Copy)]
 enum By {
     Lane,
@@ -72,7 +48,6 @@ impl ForwardHybrid for AdaLn {
                 )
             }
             By::Token => {
-                // A per-token timestep: one scalar per row, embedded per row.
                 let t = inputs.latents(1, 1, Dtype::F32);
                 let emb = ops::elemwise::sinusoid(&t, FREQ, 10_000.0, false, 1000.0);
                 (
@@ -100,7 +75,12 @@ fn tensor(rows: Dim, width: u64, dtype: Dtype) -> Ty {
     }
 }
 
-/// (a), (b), (d).
+fn a_modulate_over_lanes_broadcasts_by_request_of_token_every_case() {
+    a_lane_vector_is_embedded_per_lane_and_broadcast_per_row();
+    a_per_token_vector_names_no_lane_map();
+    a_vector_of_the_wrong_width_is_refused_by_width();
+}
+
 #[test]
 fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
     let trace = trace_hybrid("adaln", &AdaLn(By::Lane), Platform::Cuda);
@@ -202,8 +182,6 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
     assert_eq!(pairs, vec![(fold.3, fold.0)], "in place on the stream");
 }
 
-/// (c).
-#[test]
 fn a_per_token_vector_names_no_lane_map() {
     let trace = trace_hybrid("adaln", &AdaLn(By::Token), Platform::Cuda);
     let (x, m, lanes) = trace
@@ -237,7 +215,6 @@ fn a_per_token_vector_names_no_lane_map() {
     );
 }
 
-/// (e).
 struct WrongWidth;
 
 impl ForwardHybrid for WrongWidth {
@@ -247,7 +224,7 @@ impl ForwardHybrid for WrongWidth {
     }
     fn forward(&self, inputs: Input<NoFacts>) -> Value {
         let x = inputs.latents(0, WIDTH, Dtype::Bf16);
-        let m = inputs.lane_vector(0, WIDTH); // one slice where ScaleShift wants two
+        let m = inputs.lane_vector(0, WIDTH);
         ops::elemwise::modulate(
             &x,
             &m,
@@ -257,7 +234,6 @@ impl ForwardHybrid for WrongWidth {
     }
 }
 
-#[test]
 fn a_vector_of_the_wrong_width_is_refused_by_width() {
     let refused = std::panic::catch_unwind(|| trace_hybrid("wrong", &WrongWidth, Platform::Cuda));
     let message = match refused {

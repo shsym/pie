@@ -1,6 +1,3 @@
-//! Structural (not semantic) checks on every source both backends emit for
-//! the whole corpus: balanced brackets, and source/entry-point consistency.
-
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
@@ -12,7 +9,6 @@ use msl_corpus::{
     GOLDEN_NAMES, extended_traces, golden_container, golden_profile, synthetic_traces,
 };
 
-/// Every kernel the corpus produces, tagged with where it came from.
 fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
     let mut traces: Vec<_> = GOLDEN_NAMES
         .iter()
@@ -30,7 +26,6 @@ fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
 
     let mut out = Vec::new();
     for (name, container, profile) in traces {
-        // The `neg_*` goldens exist to fail binding; they contribute nothing.
         let Ok(bound) = bind(container, profile) else {
             continue;
         };
@@ -44,8 +39,6 @@ fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
     out
 }
 
-/// A kernel is either a source with an entry point, or a refusal with a
-/// reason: source and error are exactly one-of.
 #[test]
 fn every_emitted_kernel_is_a_source_or_a_reason() {
     for (trace, backend, kernel) in every_emitted_kernel() {
@@ -80,4 +73,3 @@ fn every_emitted_kernel_is_a_source_or_a_reason() {
         );
     }
 }
-

@@ -1,13 +1,3 @@
-//! `attention.ragged` under `RaggedMask::ReferenceTags` — the contract's tag
-//! form of the reference mask — lands what an f32 host reference lands for
-//! three groups holding zero, one and three reference lanes: a query tagged
-//! `t` sees only the keys tagged `t` (each reference lane attends itself
-//! alone), a query tagged `-1` sees its whole segment, references included;
-//! at head widths 64, 128 and 256, with grouped heads. A tag table shorter
-//! than its rectangle is refused by name.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_keeps_each_reference_lane_to_itself`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -19,14 +9,11 @@ use kernels_cuda::tensor::Tensor;
 
 const TOLERANCE: f32 = 1.0e-2;
 
-/// One group: its non-reference rows, then its reference lanes' rows.
 struct Group {
     plain: u32,
     references: Vec<u32>,
 }
 
-/// The CSR over the groups, and the tag per packed row (`-1` for a plain
-/// row, the lane's index — counted across the fire — for a reference row).
 fn tables(groups: &[Group]) -> (Vec<i32>, Vec<i32>) {
     let mut indptr = vec![0i32];
     let mut tags = Vec::new();
@@ -172,22 +159,26 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
     eprintln!("head width {hd}: worst |diff| {worst:.2e}");
 }
 
+fn the_ragged_arm_keeps_each_reference_lane_to_itself_every_case() {
+    each_reference_lane_attends_itself_alone_at_head_width_64();
+    each_reference_lane_attends_itself_alone_at_head_width_128();
+    each_reference_lane_attends_itself_alone_at_head_width_256();
+    a_short_tag_table_is_refused();
+}
+
 #[test]
 fn each_reference_lane_attends_itself_alone_at_head_width_64() {
     check(64, 4, 2, 0x71);
 }
 
-#[test]
 fn each_reference_lane_attends_itself_alone_at_head_width_128() {
     check(128, 2, 2, 0x72);
 }
 
-#[test]
 fn each_reference_lane_attends_itself_alone_at_head_width_256() {
     check(256, 2, 1, 0x73);
 }
 
-#[test]
 fn a_short_tag_table_is_refused() {
     let mut gpu = Gpu::open();
     let q_at = gpu.zeros(8 * 128);

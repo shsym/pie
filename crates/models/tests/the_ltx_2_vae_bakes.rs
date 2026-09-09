@@ -1,31 +1,3 @@
-//! **THE LTX-2.5 VIDEO VAE DECODER TRACES ON THE VOXEL AXIS AS THE
-//! REFERENCE IS WRITTEN, AND THE IMPORT READS EVERY DECODER TENSOR OF THE
-//! REAL SNAPSHOT ONCE.** (design D8, milestone M4)
-//!
-//! ```text
-//! cargo test -p models --test the_ltx_2_vae_bakes
-//! ```
-//!
-//! ```text
-//! (a) the flagship declares `vae.decode` at code 3 after its three token
-//!     readings — a token-less, kv-less `Video` lane with one 128-wide
-//!     `Voxels` port and a 3-wide `pixels` readout; the miniature declares
-//!     no such reading and traces no voxel port
-//! (b) the shapes are `AutoencoderKLLTX2Video`'s decoder: 41 convolutions,
-//!     every one `3x3x3` at stride 1, pad 1, SYMMETRIC in time with
-//!     `TimePad::Replicate` (the non-causal decoder pads with the clip's own
-//!     end frames) and NO cache; five depth-to-space shuffles — `(2, 2, 2)`,
-//!     `(2, 2, 2)`, `(2, 1, 1)` each trimming ONE frame, `(1, 2, 2)` and the
-//!     final `(1, 4, 4)` trimming none — and no upsample, no GroupNorm, no
-//!     attention, no LayerNorm anywhere; every scale-free RMS norm at 1e-8
-//! (c) the plan holds no state: a clip is one fire
-//! (d) over the real `Lightricks/LTX-2.5-Diffusers` snapshot (skipped by
-//!     name when the HuggingFace cache holds no `vae/`): the 84 `decoder.*`
-//!     tensors and the two `latents_*` buffers are each read exactly once,
-//!     every conv kernel as a transmute of its own bytes, and not one
-//!     `encoder.*` tensor is touched
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -46,7 +18,12 @@ fn trace(sku: &str) -> Trace {
     (row(sku).trace)(Platform::Cuda)
 }
 
-/// (a)
+fn the_ltx_2_vae_bakes_every_case() {
+    the_flagship_declares_the_decode_reading_and_the_miniature_does_not();
+    the_shapes_are_the_ltx_decoders();
+    the_import_reads_every_decoder_tensor_of_the_real_snapshot_once();
+}
+
 #[test]
 fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
     let facts = row(FLAGSHIP).generative.as_ref().expect("facts");
@@ -84,8 +61,6 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
     }
 }
 
-/// (b), (c)
-#[test]
 fn the_shapes_are_the_ltx_decoders() {
     let plan = trace(FLAGSHIP);
     assert!(plan.caches.is_empty(), "a non-causal decoder holds nothing between fires");
@@ -127,7 +102,6 @@ fn the_shapes_are_the_ltx_decoders() {
             _ => {}
         }
     }
-    // conv_in, 2 mid resnets x 2, (1 upsampler + resnets x 2) x 4, conv_out.
     let resnets: u32 = model::VAE_MID_RESNETS + model::VAE_UP_RESNETS.iter().sum::<u32>();
     assert_eq!(convs, 2 + 4 + 2 * resnets as usize, "41 convolutions");
     assert_eq!(
@@ -141,7 +115,6 @@ fn the_shapes_are_the_ltx_decoders() {
         ],
         "four upsamplers, the temporal ones trimming one frame, then the un-patchify"
     );
-    // The VAE's norms are all at 1e-8; the DiT's and connectors' at 1e-6.
     assert!(
         rms_eps.contains(&format!("{:e}", model::VAE_EPS)),
         "`PerChannelRMSNorm` at 1e-8: {rms_eps:?}"
@@ -175,8 +148,6 @@ fn snapshot() -> Option<PathBuf> {
         })
 }
 
-/// (d)
-#[test]
 fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no Lightricks/LTX-2.5-Diffusers snapshot with a vae/ in the HuggingFace cache");
@@ -207,8 +178,6 @@ fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
         !read.iter().any(|n| n.starts_with("vae.encoder.")),
         "the encoder is not traced and not read"
     );
-    // The one plane read from NOTHING — no checkpoint tensor and no
-    // internal stage — is the stated zero row.
     let stated: Vec<&str> = contract
         .tensors
         .iter()

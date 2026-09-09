@@ -4,10 +4,6 @@ use model_dsl::Platform;
 
 use super::model::Model;
 
-/// Where the safetensors checkpoint puts its trunk: transformers'
-/// `model.language_model.*` with the head at `lm_head.weight`. The vision
-/// tower beside it (`model.vision_*`) is nobody's here — this row reads the
-/// text alone.
 const TRUNK: &str = "model.language_model.";
 
 impl Model {

@@ -1,34 +1,3 @@
-//! **THE Z-IMAGE VAE'S TWO READINGS TRACE AND BAKE ON THE VOXEL AXIS, AND
-//! THE IMPORT READS EVERY `vae.` TENSOR OF THE REAL SNAPSHOT ONCE.**
-//! (design D8, milestone M1)
-//!
-//! ```text
-//! cargo test -p models --test the_z_image_vae_bakes
-//! ```
-//!
-//! ```text
-//! (a) the flagship declares `vae.decode` and `vae.encode` after its three
-//!     token readings, each a token-less, kv-less `Image` lane with one
-//!     `Voxels` port (16 wide in, 3 wide in) and a `pixels` readout (3
-//!     wide out, 16 wide out); the miniature declares neither
-//! (b) the trace reads exactly those two voxel ports and plants `pixels`
-//!     twice — the decoder's `[VoxelsTimes(64), 3]` plane (three nearest
-//!     ×2 upsamples) and the encoder's `[Voxels, 16]` mean — each beside
-//!     its `[Clips, 4]` grid
-//! (c) the shapes of the FLUX VAE: 2 whole-row attentions at 512, 3
-//!     upsamples, 3 stride-2 convolutions padded `(0, 1, 0, 1)` behind the
-//!     box, every conv weight interned tap-major at its own `c_in`, every
-//!     GroupNorm 32 groups at 1e-6 (SiLU fused on all but the attention's)
-//! (d) each VAE lane classifies into its own class, apart from the token
-//!     readings'
-//! (e) the plan bakes on CUDA against a voxel ladder sized for one 64x64
-//!     latent (its 512x512 image), the voxel regions their own units
-//! (f) over the real `Tongyi-MAI/Z-Image-Turbo` snapshot (skipped by name
-//!     when the HuggingFace cache holds none): every one of the 244 `vae.`
-//!     tensors is read exactly once, every conv kernel as a transmute of
-//!     its own bytes, and every plane type-checks
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -59,7 +28,15 @@ fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::Reading
         .unwrap_or_else(|| panic!("no reading `{name}`"))
 }
 
-/// (a)
+fn the_z_image_vae_bakes_every_case() {
+    the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
+    the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
+    the_shapes_are_the_flux_vaes();
+    each_vae_lane_has_a_class_of_its_own();
+    the_plan_bakes_against_a_voxel_ladder();
+    the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
+}
+
 #[test]
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(TURBO).generative.as_ref().expect("facts");
@@ -95,8 +72,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         ("pixels", vae::RGB, model::CHANNELS)
     );
     assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    // Its STATED index, not its position: `vae.encode`'s only voxel
-    // port is read at index 1 so `vae.decode`'s 16-wide latent keeps 0.
     assert_eq!(
         encode.port("pixels").map(|(index, _)| index),
         Some(model::port::PIXEL_VOXELS)
@@ -118,8 +93,6 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     );
 }
 
-/// (b)
-#[test]
 fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     let plan = trace(TURBO);
     let mut ports: Vec<(u8, u32, String)> = plan
@@ -134,9 +107,6 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         })
         .collect();
     ports.sort_unstable();
-    // Two voxel INDICES, not one: the engine seats one rectangle per
-    // `(kind, index)` for the whole plan, so the 16-wide latent clip and the
-    // 3-wide pixel clip cannot share index 0.
     assert_eq!(
         ports,
         vec![
@@ -186,8 +156,6 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     );
 }
 
-/// (c)
-#[test]
 fn the_shapes_are_the_flux_vaes() {
     let plan = trace(TURBO);
     let (mut attentions, mut upsamples, mut strided, mut convs, mut norms) = (0, 0, 0, 0, 0);
@@ -277,19 +245,11 @@ fn the_shapes_are_the_flux_vaes() {
     assert_eq!(attentions, 2, "one mid-block attention per reading");
     assert_eq!(upsamples, 3);
     assert_eq!(strided, 3);
-    // Decoder: conv_in, 2 mid resnets x2, 12 resnets x2 + 2 shortcuts, 3
-    // upsamplers, conv_out = 1+4+24+2+3+1 = 35. Encoder: conv_in, 8 resnets
-    // x2 + 2 shortcuts, 3 downsamplers, 2 mid resnets x2, conv_out =
-    // 1+16+2+3+4+1 = 27.
     assert_eq!(convs, 62);
-    // Two norms per resnet (14 + 10 resnets), one per attention, one out
-    // norm per side: 48 + 2 + 2.
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
 }
 
-/// (d)
-#[test]
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(TURBO);
     let classes = model_dsl::resolve_classes(&plan).expect("every merge resolves");
@@ -315,8 +275,6 @@ fn each_vae_lane_has_a_class_of_its_own() {
     assert_eq!(seen.len(), 6, "six lanes, six classes");
 }
 
-/// (e)
-#[test]
 fn the_plan_bakes_against_a_voxel_ladder() {
     let plan = trace(TURBO);
     let budget = model_compiler::Budget {
@@ -325,7 +283,6 @@ fn the_plan_bakes_against_a_voxel_ladder() {
         buckets: vec![1024, 4096],
         max_adapters: 0,
     };
-    // One 64x64 latent (a 512x512 image) per fire.
     let budgets = model_compiler::Budgets::of(budget)
         .with_voxels(model_compiler::VoxelLadder::new(64 * 64, 1));
     let compiled =
@@ -344,10 +301,6 @@ fn the_plan_bakes_against_a_voxel_ladder() {
         "and against no voxel ladder the plan is refused, not sized at zero"
     );
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// (f) the real snapshot
-// ─────────────────────────────────────────────────────────────────────────
 
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
@@ -381,7 +334,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-#[test]
 fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no Tongyi-MAI/Z-Image-Turbo snapshot in the HuggingFace cache");
@@ -419,8 +371,6 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
         "each exactly once"
     );
 
-    // Every conv kernel is a transmute of its own bytes into the natural
-    // `[C_out, C_in·k·k]` rectangle; every plane types to its extents.
     let types = Types(&src);
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
     let mut kernels = 0;
@@ -431,9 +381,6 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
         if let Expr::Transmute { .. } = &tensor.expr {
             assert!(tensor.name.starts_with("vae."), "`{}`", tensor.name);
         }
-        // The encoder's `conv_out` declares the mean's 16 output rows of the
-        // stored 32: a slice of the transmuted kernel, and of its bias.
-        // (the bias through an internal `.head` step under its root cast).
         if tensor.name == "vae.enc.conv_out" || tensor.name == "vae.enc.conv_out.bias.head" {
             assert!(
                 format!("{:?}", tensor.expr).contains("Slice"),

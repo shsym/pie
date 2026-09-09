@@ -1,5 +1,3 @@
-//! `emit_scan_region_cuda`: the `cumsum`/`cumprod` library region. Float addition is not associative, so the fold stays sequential; parallelism is one row per thread. Scanned in the operand's dtype.
-
 use crate::codegen::error::{EmitError, EmitterKind, RegionForm, ValueLayoutSite};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,13 +12,7 @@ use super::fused::{PREAMBLE, PROLOGUE, SIGNATURE};
 use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
 
-/// The kernel body, after the three `constexpr`s the emitter writes: the
-/// operand value id, the result value id, and which fold this is.
-///
-/// No `__syncthreads()`: the row loop's bound differs per thread, so a
-/// barrier inside it would be UB, and nothing here needs one.
 const BODY: &str = r#"
-  // Bound to the fused ABI, and this kernel reads only part of it.
   (void)channels;
   (void)params;
   (void)pending_flags;
@@ -68,10 +60,6 @@ const BODY: &str = r#"
   }
 "#;
 
-/// Whether `region` is the single-node scan library region this emitter
-/// serves. The tag is re-read off the node rather than trusted from
-/// `region.kind`, since a mislabelled region would otherwise be emitted
-/// here over the wrong operand.
 pub fn is_scan_region(stage: &CompiledStage, region: &Region) -> bool {
     if region.kind != RegionKind::Library(LibraryOp::Scan) || region.nodes.len() != 1 {
         return false;
@@ -83,14 +71,6 @@ pub fn is_scan_region(stage: &CompiledStage, region: &Region) -> bool {
     matches!(view.tag, tags::CUMSUM | tags::CUMPROD) && view.args.len() == 1 && view.results == 1
 }
 
-/// `emit_scan_region_cuda`.
-///
-/// # Errors
-///
-/// [`EmitError::EntryNameNotCIdentifier`] when the entry is not spellable in
-/// C, [`EmitError::LibraryRegionAbiInvalid`] when the region is not the
-/// single-node `cumsum`/`cumprod` this emitter serves, and the
-/// plan-well-formedness refusals `validate_generated_region` raises.
 pub fn emit_scan_region(
     entry_name: &str,
     stage: &CompiledStage,

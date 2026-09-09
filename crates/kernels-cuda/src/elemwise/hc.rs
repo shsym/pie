@@ -1,12 +1,3 @@
-//! `Hc`: hyper-connections — residual streams expanded, mixed by learned
-//! gates, and folded back layer by layer. One entry per IR variant, all
-//! over `elemwise/hc.cuh`.
-//!
-//! The stream count `M` rides the row width — a `[N, M·H]` rectangle beside
-//! a `[N, H]` one — and the mixers hold their `M` (or `M²`) coefficients in
-//! registers and shared arrays, which is why [`MAX_HC_MULT`] is a hard
-//! refusal and not a shape check.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -17,13 +8,8 @@ const FILE: &str = "elemwise/hc.cuh";
 
 const BLOCK: u32 = 256;
 
-/// The largest stream count the mixers hold in registers (`hc_fold`'s
-/// in-place read-before-write array) and shared gate vectors.
 const MAX_HC_MULT: u32 = 8;
 
-/// The stream fan `M`: how many `hidden`-wide streams the wide row holds.
-/// The variants that state a count beside their rows assert agreement at
-/// their own entries; `fold` states none.
 fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
     if wide == 0 || wide % hidden != 0 {
@@ -48,9 +34,6 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     Ok(fan)
 }
 
-/// One thread per INPUT element — these kernels' grids cover the `[N, H]`
-/// side and each thread writes its `M` outputs. Refused rather than clamped
-/// past a 32-bit launch.
 fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     nonzero(op, "width", width)?;
@@ -64,7 +47,6 @@ fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Err
     Ok(Launch::flat(lanes, BLOCK))
 }
 
-/// Tiles `x` across `streams` residual streams.
 pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_expand";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -84,15 +66,11 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
             stated(OP, x.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// RMS-normalises the wide stream row and widens it to f32 — the mix
-/// coefficients derived downstream are too sensitive for a bf16 round-trip.
 pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_rmsnorm_f32";
     dtype_dispatch!(OP, streams.dtype, { Bf16 => () });
@@ -111,20 +89,11 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
             y.arg(),
             stated(OP, nonzero(OP, "the normed row's width", y.width)?)?.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The per-token mix row: `mixes = normed · hc_fn^T`, `[N, M·H]` against a
-/// `[2M + M², M·H]` plane, all f32 — the layer's dynamic hyper plane
-/// (`{attn,ffn}_hc.fn`) fired, which is what [`gates`] below splits.
-///
-/// Not `linear.matmul`: both operands are f32 (the dense gemm points are
-/// bf16) since the sinkhorn is f32 by design. One block per `(row, mix
-/// column)`.
 pub fn project(
     ctx: &Ctx,
     normed: Tensor,
@@ -160,9 +129,6 @@ pub fn project(
             ),
         ));
     }
-    // The mix row is as wide as the plane says: a layer's plane lands the
-    // `2M + M²` row `gates` splits, the trunk's the `M` gates `collapse`
-    // folds under.
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
     if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
@@ -178,8 +144,6 @@ pub fn project(
     let rows = nonzero(OP, "rows", mixes.rows)?;
     ctx.fire(
         OP,
-        // One block per `(row, column)`, laid on ONE axis — the shader's own
-        // point derives the pair, mirroring `elemwise/hc.metal`.
         Fire::at(FILE, "::pie::elemwise::hc_project<256>")
             .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
         &[
@@ -188,19 +152,11 @@ pub fn project(
             mixes.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, mix_hc)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Splits the mix row, Sinkhorn-normalises the combiner, and collapses the
-/// `M` streams into the layer's input — one block per token, the gate
-/// matrices landing beside it.
-///
-/// `normed` is the mix row [`project`] lands, `[N, 2M + M²]` — the stride the
-/// kernel reads it at, which is now the width of what it is handed.
 #[allow(clippy::too_many_arguments)]
 pub fn gates(
     ctx: &Ctx,
@@ -255,16 +211,11 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Mixes the layer's output back into the streams under the gate matrices —
-/// in place across the wide row, which is why each thread owns its whole
-/// `(n, h)` column.
 pub fn fold(
     ctx: &Ctx,
     x: Tensor,
@@ -297,18 +248,11 @@ pub fn fold(
             stated(OP, y.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// **THE TRUNK COLLAPSE**: `y[n, h] = Σᵢ gᵢ · streams[n, i·H + h]` under
-/// `gᵢ = σ(mixes[n, i] · scale[0] + base[i]) + hc_eps` — `hc_head`, the `M`
-/// streams folded into the row the final norm reads. `hc_head_postprocess`
-/// waited in the device text for a producer of its `[N, M]` mix plane since
-/// review R5; `hc_project` through `hc_head.fn` is that producer.
 #[allow(clippy::too_many_arguments)]
 pub fn collapse(
     ctx: &Ctx,
@@ -357,17 +301,11 @@ pub fn collapse(
             stated(OP, fan)?.arg(),
             stated(OP, nonzero(OP, "the hidden width", y.width)?)?.arg(),
             hc_eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )
 }
 
-// ---- The gated-residual flavor (qwen4) ----------------------------------
-
-/// `y[h] = meanₛ(σ(gates[s·H+h]) · normed[s·H+h])`: one `hidden`-wide layer
-/// input mixed out of the stream fan under per-element sigmoid gates.
 pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_mix";
     let t = dtype_dispatch!(OP, normed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -389,16 +327,11 @@ pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tenso
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, y.width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// `hyper[s·H+h] += 2·σ(gates[s]/streams)·o[h]`, in place on the wide
-/// residual: the layer output injected back into every stream under its own
-/// scalar gate.
 pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_inject";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -419,15 +352,11 @@ pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Ten
             hyper.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, o.width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The PLE gate: per stream, `σ(signed_sqrt(key·query / √H)) · value`. One
-/// block per (row, stream), the grouped norms' own flattening.
 pub fn ple_gate(
     ctx: &Ctx,
     key: Tensor,
@@ -463,8 +392,6 @@ pub fn ple_gate(
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, value.width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )

@@ -1,22 +1,3 @@
-//! **THE SELECTOR'S TWO KERNELS, AGAINST HOST REFERENCES** — the gate for
-//! `layout/topk.metal` and `attn/selector_walk.metal` (DFlash2's readout).
-//!
-//! 1. `topk_rows` over a wide bf16 row (a vocabulary's width, 248 320) must
-//!    answer the host's sort: the same sixteen indices in the same order,
-//!    values equal — with a planted tie, which must go to the LOWER column,
-//!    and a planted NaN, which must never be chosen.
-//! 2. `selector_walk` over two requests of different spans must pick what the
-//!    reference's `lattice` + `walk_greedy` (`mlx_dspark.dflash_model.
-//!    CandidateSelector`) pick, written out on the host in f32: slot by slot,
-//!    `argmax_c unary[c] + Σ_r A[prev][r]·hp[r]·B[cand[c]][r]`, `prev` the
-//!    anchor first and the previous pick after. The bilinear is checked to
-//!    matter (a walk that ignored it would pick the unary argmax), and the
-//!    second request must not read the first's anchor or picks.
-//!
-//! ```text
-//! cargo test -p engine-metal --release --test the_selector_reads_out_the_reference_walk -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
@@ -29,8 +10,6 @@ use model_ir::Dtype;
 
 const K: u32 = 16;
 const RANK: u32 = 256;
-/// A small vocabulary for the walk's codebooks; the top-k check uses the
-/// real one.
 const VOCAB: u32 = 4096;
 const WIDE: u32 = 248_320;
 const SPANS: [u32; 2] = [8, 5];
@@ -106,6 +85,11 @@ impl Dev {
     }
 }
 
+fn the_selector_reads_out_the_reference_walk_every_case() {
+    topk_answers_the_host_sort_with_ties_low_and_nans_never();
+    the_walk_picks_what_the_reference_picks();
+}
+
 #[test]
 fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     let Ok(device) = Context::bind() else {
@@ -115,8 +99,6 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     let dev = Dev { device, handles: Handles::new(), pipelines: Pipelines::new() };
     let rows = 3u32;
     let mut x: Vec<f32> = (0..(rows * WIDE) as u64).map(|at| bf16_round(4.0 * unit(at))).collect();
-    // Row 1: a planted tie at the top between columns 777 and 100_000 — the
-    // lower column must come first. Row 2: a NaN that would win by value.
     let w = WIDE as usize;
     x[w + 100_000] = 8.0;
     x[w + 777] = 8.0;
@@ -147,7 +129,6 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     eprintln!("topk: three rows of {WIDE} agree with the host sort; tie low, NaN never");
 }
 
-#[test]
 fn the_walk_picks_what_the_reference_picks() {
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
@@ -164,8 +145,6 @@ fn the_walk_picks_what_the_reference_picks() {
     };
     let k = K as usize;
     let rank = RANK as usize;
-    // Candidates: distinct ids a row; unary logits close together so the
-    // bilinear decides; codebooks and hp at bf16 precision.
     let cand: Vec<i32> = (0..rows as usize)
         .flat_map(|r| (0..k).map(move |c| (noise((r * k + c) as u64) % VOCAB) as i32))
         .collect();
@@ -206,7 +185,6 @@ fn the_walk_picks_what_the_reference_picks() {
     };
     let picks = walk(&dev, Some(Tensor::new(hh, rows, RANK, Dtype::Bf16)), 1);
 
-    // The reference walk, and the unary-only walk it must differ from.
     let mut want = vec![0i32; rows as usize];
     let mut unary_only = vec![0i32; rows as usize];
     let mut bilinear_mattered = false;
@@ -249,8 +227,6 @@ fn the_walk_picks_what_the_reference_picks() {
     assert_ne!(picks, unary_only, "the walk is the unary argmax");
     eprintln!("walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot", rows);
 
-    // The bigram form (DSpark's markov head): no hidden term, and every row a
-    // slot — the anchor row's predecessor is its own token.
     let picks = walk(&dev, None, 0);
     let mut want = vec![0i32; rows as usize];
     for (r, &span) in SPANS.iter().enumerate() {

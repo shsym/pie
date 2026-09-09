@@ -1,9 +1,3 @@
-//! `emit_grouped_nucleus_msl` — the grouped nucleus-sampling library kernel.
-//! One threadgroup per (lane, row): a radix ordering of the row's logits, a
-//! stable prefix sum over the softmax, and the cutoff draw, as a single
-//! dispatch. The body is one long MSL literal lifted verbatim from the C++
-//! oracle; only the four value slots and the kernel name are interpolated.
-
 use crate::codegen::error::{EmitError, RegionForm};
 use alloc::string::String;
 use core::fmt::Write as _;
@@ -29,10 +23,6 @@ inline uint m3_nucleus_order_digit(float value, uint pass) {
 
 kernel void "#;
 
-/// The eleven bindings and three ids every grouped library sampler takes.
-/// Published so `engine-metal` can be held to this order: it writes eleven
-/// `setBuffer:` calls in this order and dispatches at the one width the
-/// first line refuses every other value of.
 pub const SIGNATURE: &str = r#"(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -289,14 +279,6 @@ const BODY: &str = r#"
 }
 "#;
 
-/// `emit_grouped_nucleus_msl`.
-///
-/// The C++ guard is not the same as `nucleus_library_region_valid`: a
-/// generated region carries a `library_op` byte of 0
-/// (`PTIR_LIBRARY_NUCLEUS_SAMPLE`), so it reaches the body with its
-/// inputs/outputs indexed unchecked. This port keeps the guard as written
-/// but adds the arity test the C++ omits, rather than reproducing the
-/// out-of-bounds read.
 pub fn emit_grouped_nucleus(
     function_name: &str,
     stage: &CompiledStage,
@@ -312,8 +294,6 @@ pub fn emit_grouped_nucleus(
             RegionForm::GroupedNucleus,
         ));
     }
-    // scaled arity carries the pre-division logits and divisor ahead of the
-    // operands this kernel reads; the body below is identical for both forms.
     let logits_value = region.inputs[if scaled { 2 } else { 0 }];
     let top_p_value = region.inputs[if scaled { 3 } else { 1 }];
     let state_value = region.inputs[if scaled { 4 } else { 2 }];

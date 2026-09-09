@@ -1,18 +1,3 @@
-//! `pie.tokenizer/1` against the pipelines it actually has to carry.
-//!
-//! The unit tests in `canonical.rs` cover the byte layout and the refusals,
-//! but they build tokenizers from `from_vocab`, which is the `RawChar` fixture
-//! path: no merges, no added tokens, no regex splitters, no byte fallback.
-//! Everything that makes the format non-trivial is therefore untested there.
-//!
-//! These run the round trip against the same fixtures `profiles.rs` checks
-//! against HuggingFace's own tokenizer — a byte-level BPE profile (Qwen-style:
-//! NFC, regex splitters, an explicit merge table, a special token) and a
-//! byte-fallback profile (Gemma-style: a `▁` normalizer, `<0xNN>` atoms, an
-//! unk token). The assertion is behavioral: the rebuilt tokenizer must encode
-//! and decode every sample in the shared corpus identically, because that —
-//! not field equality — is what "the artifact serves the same model" means.
-
 mod common;
 
 use common::{MergeFormat, TEXTS, byte_level_json, gemma_json};
@@ -28,7 +13,6 @@ fn load(json: &serde_json::Value) -> Tokenizer {
         .unwrap()
 }
 
-/// Round-trips `original` and returns the serialized form.
 fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     let canonical = original
         .to_canonical()
@@ -50,8 +34,6 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     for text in TEXTS {
         let expected = original.encode(text);
         assert_eq!(rebuilt.encode(text), expected, "{what}: encoding {text:?}");
-        // Both `skip_special` settings: the special-id set is rebuilt from the
-        // descriptor, and only the `true` path consults it.
         for skip in [false, true] {
             assert_eq!(
                 rebuilt.decode(&expected, skip),
@@ -61,9 +43,6 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
         }
     }
 
-    // Byte-for-byte reproducible: the merge table is a hash map, so an
-    // unsorted serialization would produce a different artifact — and a
-    // different manifest digest — on every run.
     let again = rebuilt.to_canonical().unwrap();
     assert_eq!(
         again, canonical,
@@ -72,8 +51,16 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     canonical
 }
 
-/// Qwen-style: NFC, one regex splitter, an explicit merge table, a special
-/// token above the base vocabulary.
+fn canonical_every_case() {
+    a_byte_level_bpe_profile_round_trips();
+    splitter_order_survives();
+    the_prefer_whole_token_mode_survives();
+    a_byte_fallback_profile_round_trips();
+    an_absent_byte_fallback_table_stays_absent();
+    the_objects_survive_a_name_addressed_round_trip();
+    objects_are_offered_in_ascending_name_order();
+}
+
 #[test]
 fn a_byte_level_bpe_profile_round_trips() {
     let tokenizer = load(&byte_level_json(
@@ -85,9 +72,6 @@ fn a_byte_level_bpe_profile_round_trips() {
     ));
     let canonical = assert_round_trips(&tokenizer, "byte-level");
 
-    // The merge table is not empty — otherwise this test would pass on a
-    // serializer that dropped merges entirely, since a vocabulary of byte
-    // atoms alone still decodes.
     assert!(
         !canonical.merge_table.is_empty(),
         "the fixture's merges did not survive"
@@ -95,10 +79,6 @@ fn a_byte_level_bpe_profile_round_trips() {
     assert_eq!(canonical.merge_table.len() % 16, 0);
 }
 
-/// Qwen-3.5-style: several splitters applied in sequence. Their *order* is
-/// semantic, and a serialization that reordered them would still round-trip
-/// the vocabulary while changing how text is split.
-#[test]
 fn splitter_order_survives() {
     let tokenizer = load(&byte_level_json(
         json!({"type": "NFC"}),
@@ -117,10 +97,6 @@ fn splitter_order_survives() {
     );
 }
 
-/// `ignore_merges` compiles to the `PreferWholeToken` BPE mode, which changes
-/// which ids a known whole piece produces. It is one bool in the descriptor
-/// and nothing else records it.
-#[test]
 fn the_prefer_whole_token_mode_survives() {
     let tokenizer = load(&byte_level_json(
         json!({"type": "NFC"}),
@@ -135,9 +111,6 @@ fn the_prefer_whole_token_mode_survives() {
     assert_eq!(descriptor["pipeline"]["prefer_whole_token"], json!(true));
 }
 
-/// Gemma-style: a `Replace` normalizer, `<0xNN>` byte atoms, an unk token.
-/// This is the profile whose byte-fallback table is populated.
-#[test]
 fn a_byte_fallback_profile_round_trips() {
     let tokenizer = load(&gemma_json());
     let canonical = assert_round_trips(&tokenizer, "byte-fallback");
@@ -150,9 +123,6 @@ fn a_byte_fallback_profile_round_trips() {
     assert_eq!(descriptor["pipeline"]["normalizer_from"], json!(" "));
     assert_eq!(descriptor["pipeline"]["normalizer_to"], json!("▁"));
 
-    // Every one of the 256 entries resolves to a real token here, which is
-    // what distinguishes this profile from the byte-level one and what the
-    // decoder depends on for invalid UTF-8.
     let entries: Vec<u32> = canonical
         .byte_fallback
         .chunks_exact(4)
@@ -165,11 +135,6 @@ fn a_byte_fallback_profile_round_trips() {
     );
 }
 
-/// The byte-level profile leaves the byte-fallback table empty, and that
-/// asymmetry is a fact about the tokenizer rather than an accident — a
-/// serializer that "helpfully" recomputed the table by scanning for `<0xNN>`
-/// literals would change how these tokenizers decode.
-#[test]
 fn an_absent_byte_fallback_table_stays_absent() {
     let tokenizer = load(&byte_level_json(
         json!({"type": "NFC"}),
@@ -187,9 +152,6 @@ fn an_absent_byte_fallback_table_stays_absent() {
     assert!(entries.iter().all(|&id| id == u32::MAX));
 }
 
-/// The objects survive a trip through a name-addressed store, which is how
-/// they reach an artifact: written under `__meta__/…`, read back by name.
-#[test]
 fn the_objects_survive_a_name_addressed_round_trip() {
     let tokenizer = load(&gemma_json());
     let canonical = tokenizer.to_canonical().unwrap();
@@ -208,9 +170,6 @@ fn the_objects_survive_a_name_addressed_round_trip() {
     assert_eq!(rebuilt.encode("a b"), tokenizer.encode("a b"));
 }
 
-/// Objects are handed to the writer in ascending name order, because
-/// canonical `.zt` form requires it and the writer trusts its caller.
-#[test]
 fn objects_are_offered_in_ascending_name_order() {
     let canonical = load(&gemma_json()).to_canonical().unwrap();
     let names: Vec<&str> = canonical.objects().iter().map(|(name, _)| *name).collect();
@@ -218,4 +177,3 @@ fn objects_are_offered_in_ascending_name_order() {
     sorted.sort_unstable();
     assert_eq!(names, sorted);
 }
-

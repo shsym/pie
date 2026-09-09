@@ -1,21 +1,3 @@
-//! **`RngKind::Normal` IS N(0, 1), NOT SOMETHING NEAR IT.** A diffusion
-//! sampler's whole first step is `x = sigma_max * z`, so a draw whose
-//! variance is off by a few percent — a Box-Muller written with the wrong
-//! angle constant, a pairing that reuses one uniform, an inverse-CDF
-//! approximation — produces a latent of the wrong scale and an image that
-//! is merely a bit wrong. Nothing downstream would say so. This measures the
-//! first four moments of a million draws and pins the shape of the
-//! distribution rather than the plausibility of one number.
-//!
-//! ```text
-//! cargo test -p eta-ir --test the_normal_kind_draws_a_standard_normal
-//! ```
-//!
-//! The tolerances are the standard errors of the estimators at `N = 1e6`
-//! (mean 1/sqrt(N) = 1e-3, variance sqrt(2/N) = 1.4e-3) widened ~5x, which
-//! is loose enough that a correct draw never trips it and tight enough that
-//! a 1% scale error always does.
-
 use eta_ir::rng::{NORMAL_PAIR_STRIDE, NORMAL_TWO_PI, hash_normal, hash_uniform, keyed_seed};
 
 const N: usize = 1_000_000;
@@ -23,6 +5,12 @@ const N: usize = 1_000_000;
 fn draws(key: u32, counter: u32) -> Vec<f32> {
     let seed = keyed_seed(key, counter);
     (0..N as u32).map(|i| hash_normal(seed, i)).collect()
+}
+
+fn the_normal_kind_draws_a_standard_normal_every_case() {
+    a_million_draws_have_the_moments_of_a_standard_normal();
+    the_draw_is_the_pair_transform_the_contract_states();
+    two_counters_of_one_key_draw_independent_noise();
 }
 
 #[test]
@@ -58,8 +46,6 @@ fn a_million_draws_have_the_moments_of_a_standard_normal() {
         "kurtosis {kurtosis} is not three"
     );
 
-    // The tails are the half a moment test can miss: a truncated or clamped
-    // draw keeps its mean and variance and loses its shape.
     let beyond = |t: f32| z.iter().filter(|&&x| x.abs() > t).count() as f64 / N as f64;
     assert!(
         (beyond(1.0) - 0.317_310).abs() < 3e-3,
@@ -79,10 +65,7 @@ fn a_million_draws_have_the_moments_of_a_standard_normal() {
     assert!(z.iter().all(|x| x.is_finite()), "a draw was not finite");
 }
 
-#[test]
 fn the_draw_is_the_pair_transform_the_contract_states() {
-    // Not "some normal": the exact expression every backend projects, over
-    // the exact two lanes the stride names.
     let seed = keyed_seed(11, 3);
     for index in [0u32, 1, 2, 97, 65_535] {
         let lane = index * NORMAL_PAIR_STRIDE;
@@ -97,10 +80,7 @@ fn the_draw_is_the_pair_transform_the_contract_states() {
     }
 }
 
-#[test]
 fn two_counters_of_one_key_draw_independent_noise() {
-    // The denoise loop advances `ctr` a step and expects fresh noise; a
-    // state word folded in weakly would leave the two draws correlated.
     let a = draws(0x51ee, 0);
     let b = draws(0x51ee, 1);
     let mean_a = a.iter().map(|&x| f64::from(x)).sum::<f64>() / N as f64;

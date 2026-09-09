@@ -1,6 +1,3 @@
-//! `GrammarMatcher`: DFA-based pushdown automaton for token acceptance,
-//! next-token bitmask generation, rollback, and jump-forward decoding.
-
 mod single_dfa;
 mod stack_parser;
 
@@ -16,56 +13,30 @@ use tokenizer::Tokenizer;
 use single_dfa::SingleDfaEngine;
 use stack_parser::{SmallDedup, StackParser, StackState};
 
-// ---------------------------------------------------------------------------
-// Parser Engine
-// ---------------------------------------------------------------------------
-
-/// Not boxed despite the 48-vs-376-byte spread: one instance per matcher,
-/// built once and dispatched per byte; boxing would add a pointer chase to
-/// the hot per-byte path.
 #[allow(
     clippy::large_enum_variant,
     reason = "constructed once per matcher, dispatched per byte; see above"
 )]
 #[derive(Clone)]
 enum ParserEngine {
-    /// Single-DFA fast path: raw byte_table lookups (~2ns/byte).
     SingleDfa(SingleDfaEngine),
-    /// Stack parser: DFA-based pushdown automaton for multi-rule grammars.
     Stack(StackParser),
 }
 
-// ---------------------------------------------------------------------------
-// Grammar Matcher
-// ---------------------------------------------------------------------------
-
-/// Grammar-guided token matcher.
-///
-/// Wraps a parser engine with token-level operations: accept/reject
-/// tokens, generate next-token bitmasks, rollback, and jump-forward decoding.
 pub struct GrammarMatcher {
     engine: ParserEngine,
     compiled: Arc<CompiledGrammar>,
     tokenizer: Arc<Tokenizer>,
-    /// Token IDs that signal end of generation.
     stop_token_ids: Vec<u32>,
-    /// Length of each accepted token (in bytes), for rollback.
     token_length_history: VecDeque<usize>,
-    /// Whether a stop token has been accepted.
     terminated: bool,
-    /// Maximum number of tokens that can be rolled back.
     max_rollback_tokens: usize,
-    /// Reusable scratch buffers for trie walk (avoids per-call heap allocations).
     trie_scratch: TrieWalkScratch,
-    /// Reusable source buffer for owned masks returned to the WIT boundary.
     bitmask_scratch: Vec<u32>,
-    /// Reused full-state key for the bounded runtime mask cache.
     bitmask_cache_key: Vec<u64>,
 }
 
-/// Reusable scratch buffers for the trie walk in `fill_next_token_bitmask`.
 struct TrieWalkScratch {
-    // Stack parser trie walk arenas
     stack_states: Vec<StackState>,
     stack_state_offsets: Vec<usize>,
     stack_returns: Vec<(u16, StackState)>,
@@ -75,7 +46,6 @@ struct TrieWalkScratch {
     visited_buf: SmallDedup<StackState>,
     scanable_buf: Vec<StackState>,
     returns_buf: Vec<(u16, StackState)>,
-    // Single-DFA trie walk
     dfa_stack: Vec<u16>,
     dfa_active_prefix: Vec<u8>,
 }
@@ -99,7 +69,6 @@ impl TrieWalkScratch {
 }
 
 impl GrammarMatcher {
-    /// Create a new grammar matcher.
     pub fn new(
         grammar: Arc<Grammar>,
         tokenizer_info: Arc<Tokenizer>,
@@ -110,7 +79,6 @@ impl GrammarMatcher {
         Self::with_compiled(compiled, stop_token_ids, max_rollback_tokens)
     }
 
-    /// Create a grammar matcher from a pre-compiled grammar.
     pub fn with_compiled(
         compiled: Arc<CompiledGrammar>,
         stop_token_ids: Vec<u32>,
@@ -143,7 +111,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Accept a token by its ID. Returns true if the token was valid.
     pub fn accept_token(&mut self, token_id: u32) -> bool {
         if self.terminated {
             return false;
@@ -182,7 +149,6 @@ impl GrammarMatcher {
         true
     }
 
-    /// Accept a string. Returns true if the entire string was valid.
     pub fn accept_string(&mut self, s: &str) -> bool {
         if self.terminated {
             return false;
@@ -200,7 +166,6 @@ impl GrammarMatcher {
         true
     }
 
-    /// Push a token length to history and trim if needed.
     fn push_token_history(&mut self, len: usize) {
         self.token_length_history.push_back(len);
         while self.token_length_history.len() > self.max_rollback_tokens {
@@ -211,12 +176,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Fill the bitmask with valid next tokens.
-    ///
-    /// Strategy:
-    /// 1. Check runtime bitmask cache.
-    /// 2. DFA mask fast path: OR pre-computed accepted masks for (rule_id, dfa_state).
-    /// 3. Batch trie walk for uncertain tokens.
     pub fn fill_next_token_bitmask(&mut self, bitmask: &mut [u32]) {
         bitmask::clear_bitmask(bitmask);
 
@@ -255,9 +214,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Fill the next-token bitmask and return it as a packed `[ceil(vocab/32)]`
-    /// `u32` allowed-token bitmask (bit `i` set ⇒ token `i` allowed) — the
-    /// de-hardwired `mask-apply` (`0x65`) mask operand used by the WIT boundary.
     pub fn fill_next_token_mask(&mut self) -> Vec<u32> {
         let mut scratch = std::mem::take(&mut self.bitmask_scratch);
         self.fill_next_token_bitmask(&mut scratch);
@@ -266,14 +222,12 @@ impl GrammarMatcher {
         mask
     }
 
-    /// Fill bitmask using the stack parser (multi-rule path).
     fn fill_bitmask_stack(&mut self, bitmask: &mut [u32]) {
         let parser = match &self.engine {
             ParserEngine::Stack(p) => p,
             _ => unreachable!(),
         };
 
-        // Check runtime bitmask cache
         parser.write_cache_key(&mut self.bitmask_cache_key);
         if self
             .compiled
@@ -282,8 +236,6 @@ impl GrammarMatcher {
             return;
         }
 
-        // DFA mask fast path — direct (rule_id, dfa_state) lookup
-        // Inline dedup for the common case of 1-8 unique DFA states (avoids FxHashSet alloc).
         let current_states = parser.current_states();
         let mut seen_keys = [(0u32, 0u32); 16];
         let mut seen_count = 0usize;
@@ -291,7 +243,6 @@ impl GrammarMatcher {
 
         for state in current_states {
             let dfa_key = (state.rule_id as u32, state.dfa_state as u32);
-            // Inline linear dedup (typical: 1-5 unique states)
             let already_seen = seen_keys[..seen_count].contains(&dfa_key);
             if !already_seen {
                 if seen_count < seen_keys.len() {
@@ -317,17 +268,12 @@ impl GrammarMatcher {
             return;
         }
 
-        // Batch trie walk for remaining tokens
         self.fill_bitmask_trie_walk(bitmask);
 
         self.compiled
             .cache_bitmask(&self.bitmask_cache_key, bitmask);
     }
 
-    /// Batch trie walk: process sorted vocabulary tokens with shared prefix optimization.
-    ///
-    /// Uses flat arena storage for the trie walk stack to avoid per-probe allocations.
-    /// Scratch buffers are reused across calls via `self.trie_scratch`.
     fn fill_bitmask_trie_walk(&mut self, bitmask: &mut [u32]) {
         let parser = match &self.engine {
             ParserEngine::Stack(p) => p,
@@ -337,7 +283,6 @@ impl GrammarMatcher {
         let sorted = self.tokenizer.sorted_token_ids();
         let trie_end = self.tokenizer.trie_subtree_end();
 
-        // Reuse scratch buffers (clear but keep allocated capacity)
         let s = &mut self.trie_scratch;
         s.stack_states.clear();
         s.stack_state_offsets.clear();
@@ -345,7 +290,6 @@ impl GrammarMatcher {
         s.stack_return_offsets.clear();
         s.active_prefix.clear();
 
-        // Push initial level (current parser state)
         s.stack_state_offsets.push(0);
         s.stack_states.extend_from_slice(parser.current_states());
         s.stack_return_offsets.push(0);
@@ -359,18 +303,15 @@ impl GrammarMatcher {
                 .decoded_token_bytes(token_id)
                 .expect("sorted token IDs have decoded bytes");
 
-            // Skip tokens already accepted by DFA mask
             if bitmask::get_bit(bitmask, token_id as usize) {
                 i += 1;
                 continue;
             }
 
-            // Rewind stack to common prefix
             let s = &mut self.trie_scratch;
             let common = longest_common_prefix(bytes, &s.active_prefix);
             if common < s.active_prefix.len() {
-                let depth = common + 1; // keep `depth` levels (0..=common)
-                // Truncate arenas to the end of the `common` level
+                let depth = common + 1;
                 if depth < s.stack_state_offsets.len() {
                     let s_end = s.stack_state_offsets[depth];
                     s.stack_states.truncate(s_end);
@@ -382,7 +323,6 @@ impl GrammarMatcher {
                 s.active_prefix.truncate(common);
             }
 
-            // Advance through remaining bytes
             let parser = match &self.engine {
                 ParserEngine::Stack(p) => p,
                 _ => unreachable!(),
@@ -404,7 +344,6 @@ impl GrammarMatcher {
                     &mut s.scanable_buf,
                     &mut s.returns_buf,
                 ) {
-                    // Push new level
                     s.stack_state_offsets.push(s.stack_states.len());
                     s.stack_states.extend_from_slice(&s.scanable_buf);
                     s.stack_return_offsets.push(s.stack_returns.len());
@@ -428,9 +367,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Split off an independent matcher at this matcher's current position.
-    /// Copies only the parser state; grammar and tokenizer are shared, and
-    /// scratch arenas start empty (they carry no semantic state).
     pub fn fork(&self) -> Self {
         Self {
             engine: self.engine.clone(),
@@ -446,12 +382,10 @@ impl GrammarMatcher {
         }
     }
 
-    /// The number of accepted tokens that `rollback` can still undo.
     pub fn rollback_capacity(&self) -> usize {
         self.token_length_history.len()
     }
 
-    /// Rollback the last `num_tokens` accepted tokens.
     pub fn rollback(&mut self, mut num_tokens: usize) {
         if num_tokens == 0 {
             return;
@@ -482,7 +416,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Find a deterministic prefix string that all states must accept.
     pub fn find_jump_forward_string(&mut self) -> String {
         if self.terminated {
             return String::new();
@@ -557,12 +490,10 @@ impl GrammarMatcher {
         }
     }
 
-    /// Whether the matcher has accepted a stop token.
     pub fn is_terminated(&self) -> bool {
         self.terminated
     }
 
-    /// Whether the grammar can terminate at the current position.
     pub fn can_terminate(&self) -> bool {
         match &self.engine {
             ParserEngine::SingleDfa(e) => e.is_completed(&self.compiled),
@@ -570,7 +501,6 @@ impl GrammarMatcher {
         }
     }
 
-    /// Reset to initial state.
     pub fn reset(&mut self) {
         match &mut self.engine {
             ParserEngine::SingleDfa(e) => e.reset(&self.compiled),
@@ -581,14 +511,10 @@ impl GrammarMatcher {
     }
 }
 
-/// Longest common prefix of two byte slices.
 fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// Check if a DFA state's edges have exactly one deterministic next byte.
-/// Returns `Some(byte)` if all CharRange edges point to the same single byte,
-/// `None` if there's a range, no char edges, or conflicting bytes.
 fn deterministic_byte(edges: &[FsmEdge]) -> Option<u8> {
     let mut result = None;
     for edge in edges {
@@ -606,27 +532,17 @@ fn deterministic_byte(edges: &[FsmEdge]) -> Option<u8> {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     
     use crate::grammar::Grammar;
 
-    // ---- Basic accept_string tests ----
-
-    // ---- Token acceptance ----
-
-    // ---- Bitmask tests ----
-
-    // ---- Rollback tests ----
-
-    // ---- Jump forward tests ----
-
-    // ---- Repetition tests ----
+    fn matcher_every_case() {
+        test_star_quantifier();
+        test_plus_quantifier();
+        test_question_quantifier();
+    }
 
     #[test]
     fn test_star_quantifier() {
@@ -636,14 +552,13 @@ mod tests {
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.can_terminate()); // * allows empty
+        assert!(m.can_terminate());
         assert!(m.accept_string("a"));
         assert!(m.can_terminate());
         assert!(m.accept_string("aa"));
         assert!(m.can_terminate());
     }
 
-    #[test]
     fn test_plus_quantifier() {
         let ebnf = r#"root ::= "a"+"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
@@ -651,12 +566,11 @@ mod tests {
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(!m.can_terminate()); // + requires at least one
+        assert!(!m.can_terminate());
         assert!(m.accept_string("a"));
         assert!(m.can_terminate());
     }
 
-    #[test]
     fn test_question_quantifier() {
         let ebnf = r#"root ::= "a"?"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
@@ -664,13 +578,9 @@ mod tests {
         let tok = Arc::new(Tokenizer::from_vocab(&vocab));
 
         let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.can_terminate()); // ? allows empty
+        assert!(m.can_terminate());
         assert!(m.accept_string("a"));
         assert!(m.can_terminate());
     }
-
-    // ---- Unicode tests ----
-
-    // ---- Complex grammar tests ----
 
 }

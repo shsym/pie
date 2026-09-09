@@ -29,32 +29,6 @@ METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
                               : -INFINITY;
 }
 
-/// **THE LOG-SUM-EXP PLANE THIS KERNEL PUBLISHES IS THE SCALAR KERNEL'S, TO
-/// THE DEFINITION AND NOT MERELY TO THE TOLERANCE.** `WITH_LSE` writes
-/// `sdpa_lse_base2(max_score, sum_exp)` — base 2, one f32 per query row per
-/// query head at `lse[row * n_q_heads + q_head]`, and `-INFINITY` exactly
-/// when the row kept no key — which is byte-for-byte the arm
-/// `sdpa_paged_tiled_lse` in `attn/sdpa_paged.metal` takes, out of the same
-/// helper. The two consumers (`attn/merge_lse.metal`'s fold and
-/// `attn/attn_sink.metal`'s rescale) both branch on `isfinite` and both read
-/// base 2, so the empty row has to be a true `-inf` and not a large
-/// negative: `NEG_INF` is the running max's SEED and never its published
-/// value.
-///
-/// **The granularity is per row, and the fold that gets it there is already
-/// done.** A simdgroup owns eight whole query rows (`RPS == 8`), so no
-/// cross-simdgroup reduction exists or is owed — the only fold is across the
-/// four lanes that hold one fragment row's eight columns, and the online
-/// softmax already runs it every tile (`simd_shuffle_xor` by 1 and by 8, the
-/// two bits that leave `fm` fixed and move `fn`). `max_score` and `sum_exp`
-/// are therefore the whole row's, replicated on those four lanes, and the
-/// epilogue publishes from the one lane holding column zero (`fn == 0`),
-/// which is exactly one lane per row of the fragment.
-///
-/// **A folded sink and a published lse are two readings of one denominator**,
-/// so they are mutually exclusive here as they are next door: gpt-oss takes
-/// the `_lse` arm and `attention.sink` folds that mass in afterwards off the
-/// plane this writes.
 template <typename T, int D, int KT, bool WITH_SINK, bool WITH_LSE>
 inline void sdpa_paged_mma_body(
     const device T* queries,
@@ -126,8 +100,7 @@ inline void sdpa_paged_mma_body(
 
   const int q_pos    = live ? position_ids[my_row] : 0;
   const int my_start = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
-  // Mask word 2: this row's mask is authoritative and the causal upper bound
-  // does not apply (a bidirectional lane); 1 is a mask under the bound.
+
   const int mask_word = live ? int(attention_mask_enabled[my_row]) : 0;
   const bool masked  = mask_word != 0;
   const bool wide    = mask_word == 2;
@@ -155,8 +128,7 @@ inline void sdpa_paged_mma_body(
       wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
-    // A group with a bidirectional row walks every cell the request's pages
-    // hold; its mask does the bounding (a cell past the sequence reads 0).
+
     if (wide_here) {
       kp_hi = int(kv_page_indptr[r + 1] - uint(page_base)) * page_size - 1;
     }

@@ -1,16 +1,3 @@
-//! **A PIXELS SEAM THE MODEL DOES NOT HAVE IS A BIND ERROR, NOT A FIRE
-//! ERROR.** `IntrinsicId::Pixels` (design D8) is what a guest reads a VAE
-//! decode back through, and it exists only on a text whose VAE reading
-//! lands one. Left ungated it would type-check against every model and
-//! fault on the first fire; its width is checked against the model's when
-//! the model states one for every pixels planting, and for rank and rows
-//! alone when it plants several widths (a decode's RGB beside an encode's
-//! 16-channel mean), which is what `pixels_width == 0` means.
-//!
-//! ```text
-//! cargo test -p eta-ir --test the_pixels_intrinsic_is_gated_by_the_model
-//! ```
-
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{ModelProfile, Stage, intrinsic_available, intrinsic_stages};
@@ -54,6 +41,12 @@ fn epilogue_reading(shape: Shape, dtype: Dtype) -> TraceContainer {
     }
 }
 
+fn the_pixels_intrinsic_is_gated_by_the_model_every_case() {
+    a_model_with_a_vae_serves_the_pixels_and_one_without_refuses_them();
+    the_declared_width_is_the_models_when_it_states_one();
+    the_pixels_are_an_epilogue_value_only();
+}
+
 #[test]
 fn a_model_with_a_vae_serves_the_pixels_and_one_without_refuses_them() {
     let plane = Shape::matrix(ROWS, RGB);
@@ -77,7 +70,6 @@ fn a_model_with_a_vae_serves_the_pixels_and_one_without_refuses_them() {
     );
 }
 
-#[test]
 fn the_declared_width_is_the_models_when_it_states_one() {
     let wrong = Shape::matrix(ROWS, RGB + 1);
     let refusal = bind(epilogue_reading(wrong, Dtype::F32), profile(RGB))
@@ -92,8 +84,6 @@ fn the_declared_width_is_the_models_when_it_states_one() {
         ),
         "refused for the wrong reason: {refusal:?}"
     );
-    // A model whose plantings disagree on the width states none, and any
-    // rank-2 f32 plane of rows binds — a decode's RGB and an encode's mean.
     for width in [RGB, 16] {
         bind(epilogue_reading(Shape::matrix(ROWS, width), Dtype::F32), profile(0))
             .unwrap_or_else(|why| panic!("a {width}-wide plane against an unstated width: {why:?}"));
@@ -109,7 +99,6 @@ fn the_declared_width_is_the_models_when_it_states_one() {
     }
 }
 
-#[test]
 fn the_pixels_are_an_epilogue_value_only() {
     assert_eq!(
         intrinsic_stages(IntrinsicId::Pixels),

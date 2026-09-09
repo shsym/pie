@@ -1,13 +1,3 @@
-//! Groups: one plan, compiled once, run `arity` times.
-//!
-//! A [`GroupContract`](crate::contract::GroupContract) declares tensors that
-//! differ from each other only in which bytes they read. Every instance is
-//! compiled independently and required to be identical to instance 0 in
-//! every field except `file_id`, `tensor_id`, `file_offset`; any other
-//! disagreement rejects the group rather than producing slots that quietly
-//! differ in layout. The plan then carries one instance's instructions plus
-//! an `arity`-long table of source rebindings.
-
 use std::collections::HashMap;
 
 use crate::file::Metadata;
@@ -15,7 +5,6 @@ use crate::contract::{GroupContract, ModelContract};
 use crate::error::{Error, Result};
 use crate::plan::{GroupPlan, LoadPlan, SourceBinding, StorageInstr, StorageTarget};
 
-/// Compile every group in `contract`.
 pub(crate) fn compile_all(
     metadata: &Metadata,
     contract: &ModelContract,
@@ -54,8 +43,6 @@ fn compile_one(
         )));
     }
 
-    // compiled as a contract of its own, so its instructions are a
-    // self-contained program the engine can run against any destination.
     let sub = ModelContract {
         alignment: contract.alignment,
         tensors: group.tensors.clone(),
@@ -96,13 +83,10 @@ fn compile_instance(
     Ok(plan)
 }
 
-/// Name the instance in a group's diagnostics, so a failure can point back
-/// to the template that produced it.
 fn at_index(err: Error, group: &GroupContract, index: u32) -> Error {
     Error::Contract(format!("group '{}' index {index}: {err}", group.name))
 }
 
-/// Every source an instance reads, in instruction order.
 fn read_bindings(plan: &LoadPlan) -> Vec<SourceBinding> {
     plan.instrs
         .iter()
@@ -128,9 +112,6 @@ fn read_bindings(plan: &LoadPlan) -> Vec<SourceBinding> {
         .collect()
 }
 
-/// Prove that `instance` differs from `template` only where a binding says
-/// it may, by rewriting the instance back onto the template's sources and
-/// demanding exact equality.
 fn assert_interchangeable(
     template: &LoadPlan,
     instance: &LoadPlan,

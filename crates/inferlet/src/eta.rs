@@ -1,11 +1,3 @@
-//! `inferlet::eta` — the author-facing ETA bridge over the WIT forward surface.
-//!
-//! `ForwardPass` lives in one of three modules ([`self::attention`],
-//! [`self::recurrent`], [`self::hybrid`]), selected by `model::pass_kind()`.
-//! It wraps the WIT resources and drives the neutral [`Builder`](eta_dsl::Builder),
-//! lowering author stage closures to the ETA container. A [`Channel`] owns
-//! both the trace declaration and the WIT resource.
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
@@ -28,8 +20,6 @@ use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
 pub use eta_dsl::intrinsics;
 
-// Re-export the eDSL vocabulary so an author writes stage closures with a
-// single `use inferlet::eta::<kind>::prelude::*;`.
 pub use eta_dsl::Dtype;
 pub use eta_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cos, cummass_le, cumprod, cumsum, div, dtype,
@@ -40,12 +30,6 @@ pub use eta_dsl::{
     rsqrt, scalar_gather, scatter_add, scatter_set, select, sign, sin, sink_window_mask,
     sliding_window_mask, softmax, sort_desc, sqrt, sub, top_k, transpose,
 };
-
-// ---------------------------------------------------------------------------
-// gid -> WIT channel registry
-// ---------------------------------------------------------------------------
-// Interns channels by dsl gid; thread-local since inferlets are single-threaded (wasm).
-// The WIT resource is created on first use so `.capacity(n)` can still edit it beforehand.
 
 thread_local! {
     static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit_channel::Channel>>> = RefCell::new(HashMap::new());
@@ -65,7 +49,6 @@ fn declare_channel(gid: u64, spec: ChannelSpec) {
     });
 }
 
-/// Whether `gid`'s WIT resource exists yet (a declared-but-unused channel has none).
 fn channel_exists(gid: u64) -> bool {
     WIT_CHANNELS.with(|m| m.borrow().contains_key(&gid))
 }
@@ -78,7 +61,6 @@ fn set_declared_capacity(gid: u64, capacity: u32) {
     });
 }
 
-/// The WIT handle for `gid`, creating it from the declaration on first ask.
 fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
     if let Some(wit) = WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned()) {
         return Some(wit);
@@ -101,8 +83,6 @@ fn to_wit_dtype(d: Dtype) -> WitDtype {
         Dtype::I32 => WitDtype::I32,
         Dtype::U32 => WitDtype::U32,
         Dtype::Bool => WitDtype::Bool,
-        // The WIT enum is four wide; `Dtype` is the tree's, seventeen wide.
-        // There is no tag to hand the host for anything else.
         other => panic!("{other:?} is not a dtype ETA computes in; it has no WIT tag"),
     }
 }
@@ -111,20 +91,12 @@ fn dims_of(shape: Shape) -> Vec<u32> {
     shape.dims().to_vec()
 }
 
-// ---------------------------------------------------------------------------
-// Channel
-// ---------------------------------------------------------------------------
-
-/// Records the port's endpoint claim at pass construction (not first-submit
-/// build), so a later-constructed sibling pass sees it too.
 fn claim_port(port: Port, ch: &Channel) -> DslChannel {
     let dsl = ch.dsl();
     dsl.note_desc_claim(port.consumes());
     dsl
 }
 
-/// A GPU-resident bounded queue, backing both the `eta-dsl` trace and the
-/// WIT `channel` resource. Cheap `Copy` token over gid-keyed registry state.
 #[derive(Clone, Copy)]
 pub struct Channel {
     gid: u64,
@@ -132,36 +104,27 @@ pub struct Channel {
     dtype: Dtype,
 }
 
-/// In-band validity sentinel: `-1` marks a token slot as not existing — it
-/// embeds nothing, appends no KV, and advances no position.
 pub const TOKEN_PAD: i32 = -1;
 
 impl Channel {
-    /// `Channel::new([shape], dtype)` at capacity 1.
     pub fn new(shape: impl IntoShape, dtype: Dtype) -> Channel {
         Channel::build(shape.into_shape(), dtype, false)
     }
 
-    /// An initially empty channel whose producer is the host, so a consuming
-    /// pass may be submitted run-ahead and receive the value later.
     pub fn writer(shape: impl IntoShape, dtype: Dtype) -> Channel {
         let channel = Channel::build(shape.into_shape(), dtype, false);
         channel.dsl().note_host_put();
         channel
     }
 
-    /// Registry-resolved DSL trace state; panics if `gid` isn't registered.
     fn dsl(&self) -> DslChannel {
         DslChannel::by_gid(self.gid).expect("channel token resolves in the DSL registry")
     }
 
-    /// The registry-resolved WIT handle.
     fn wit(&self) -> Rc<wit_channel::Channel> {
         lookup_channel(self.gid).expect("channel token resolves in the WIT registry")
     }
 
-    /// Widen the ring to `n` cells (deeper run-ahead). Must be called before
-    /// the channel is first used — the WIT resource takes capacity at construction.
     pub fn capacity(self, n: u32) -> Channel {
         assert!(
             !channel_exists(self.gid),
@@ -172,14 +135,11 @@ impl Channel {
         self
     }
 
-    /// Name the channel (improves trace-error messages).
     pub fn named(self, name: &str) -> Channel {
         let _ = self.dsl().named(name);
         self
     }
 
-    /// `Channel::from(v)` — a channel seeded full with the per-instance value
-    /// `v`, rides as a pre-submit `put`, never the container.
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let ch = Channel::build(data.shape, data.dtype, true);
@@ -189,14 +149,10 @@ impl Channel {
         ch
     }
 
-    /// A seeded channel of a given shape whose seed value is supplied at
-    /// instantiation (device loop-carried multi-dim channels).
     pub fn seeded(shape: impl IntoShape, dtype: Dtype) -> Channel {
         Channel::build(shape.into_shape(), dtype, true)
     }
 
-    /// Like [`from`], but reinterprets flat seed `v` under an explicit multi-dim
-    /// `shape` (element counts must match) — e.g. a `[B, POOL]` bool mask.
     pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let shape = shape.into_shape();
@@ -237,21 +193,14 @@ impl Channel {
         self.shape
     }
 
-    /// Consume a cell, inside a stage closure — records a `ChanTake`. Host
-    /// counterpart is [`take_host`](Self::take_host).
     pub fn take(&self) -> Tensor {
         self.dsl().take()
     }
 
-    /// `read()` — peek a cell (leaves it full), inside a stage closure. Device
-    /// counterpart of [`read_host`](Self::read_host).
     pub fn read(&self) -> Tensor {
         self.dsl().read()
     }
 
-    /// Consume a cell on the host, decoded as `T`. Awaits in-flight fires; a
-    /// poisoned channel returns `Err`. `T`'s element type must match the
-    /// channel's own dtype — decoding across dtypes reinterprets bytes.
     pub async fn take_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("take")?;
         self.dsl().note_host_take();
@@ -259,14 +208,6 @@ impl Channel {
         self.decode_host::<T>(raw, "take")
     }
 
-    /// Take this channel's cell as a `frames` handle, WITHOUT the pixels
-    /// entering linear memory (design D8/D11). The VAE road: a `vae.decode`
-    /// pass's epilogue puts `intrinsics::pixels(rows, 3)` here, and this
-    /// hands the plane to the host's encoders — `[-1, 1]` f32, one row per
-    /// output voxel in `(t, h, w)` order, mapped to RGB8 with a clamp.
-    ///
-    /// Consumes the cell, exactly as [`take_host`](Self::take_host) does,
-    /// and waits on the fire that fills it the same way.
     pub fn take_frames(
         &self,
         width: u32,
@@ -279,22 +220,12 @@ impl Channel {
             .map_err(|why| format!("{}: {why}", self.host_label("take-frames")))
     }
 
-    /// The inverse of [`take_frames`](Self::take_frames): SEED this cell
-    /// from a picture the host holds, without the pixels entering linear
-    /// memory. `[-1, 1]` f32, one row per voxel in `(t, h, w)` order —
-    /// what a `vae.encode` reading's pixel port reads.
-    ///
-    /// The put is `put`'s — the SEED a channel takes before its first fire —
-    /// so this is a channel a pass binds as an INPUT, never one an epilogue
-    /// writes, and it is seeded exactly once.
     pub fn set_frames(&self, pixels: &crate::pie::inferlet::frames::Frames) -> Result<(), String> {
         pixels
             .to_channel(&self.wit())
             .map_err(|why| format!("{}: {why}", self.host_label("set-frames")))
     }
 
-    /// Peek a cell on the host (leaves it full). Same as
-    /// [`take_host`](Self::take_host) otherwise.
     pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
         self.check_host::<T>("read")?;
         self.dsl().note_host_read();
@@ -302,7 +233,6 @@ impl Channel {
         self.decode_host::<T>(raw, "read")
     }
 
-    /// Prefix for host readback errors ("{channel} take"/"{channel} read").
     fn host_label(&self, verb: &str) -> String {
         format!("{} {verb}", self.dsl().name())
     }
@@ -329,9 +259,6 @@ impl Channel {
         T::from_bytes(&raw).map_err(|e| format!("{label}: {e}"))
     }
 
-    /// In a stage closure, records a `ChanPut` device-side; on the host, stages
-    /// `v` for the next submit (fire-and-forget — failures surface via
-    /// [`take_host`](Self::take_host)).
     pub fn put(&self, v: impl IntoPut) {
         match v.into_put() {
             PutValue::Tensor(t) => {
@@ -344,15 +271,12 @@ impl Channel {
         }
     }
 
-    /// Atomically replace the committed front cell without changing queue
-    /// occupancy. A host operation; unlike a stage `put`, it records no ETA op.
     pub fn set(&self, v: impl IntoConst) -> Result<(), String> {
         let data: ConstData = v.into_const();
         self.wit().set(&data.bytes)
     }
 }
 
-/// Seed a channel from an iterator without materializing a `Vec` first.
 macro_rules! channel_from_iter {
     ($t:ty) => {
         impl FromIterator<$t> for Channel {
@@ -367,7 +291,6 @@ channel_from_iter!(i32);
 channel_from_iter!(f32);
 channel_from_iter!(bool);
 
-/// A host-readable element type (little-endian, 4 bytes/elem; `bool` is 1 byte).
 pub trait HostElem: Copy {
     const DTYPE: Dtype;
     fn decode(raw: &[u8]) -> Vec<Self>;
@@ -403,9 +326,7 @@ impl HostElem for bool {
     }
 }
 
-/// A type [`Channel::take_host`] can decode into: a whole `Vec<T>`, or one bare `T`.
 pub trait FromChannel: Sized {
-    /// The dtype the channel must hold.
     const DTYPE: Dtype;
     fn from_bytes(raw: &[u8]) -> Result<Self, String>;
 }
@@ -434,13 +355,6 @@ from_channel!(u32);
 from_channel!(f32);
 from_channel!(bool);
 
-// ---------------------------------------------------------------------------
-// WorkingSet
-// ---------------------------------------------------------------------------
-
-/// The attention working set — a logical page address space over the KV
-/// mapping trie. Every page reference is working-set-relative, never a
-/// physical page id; `reserve` is purely logical until a forward writes.
 pub struct WorkingSet {
     kv: Rc<KvWorkingSet>,
 }
@@ -452,14 +366,10 @@ impl WorkingSet {
         }
     }
 
-    /// Current logical extent in pages, including reserved-but-unwritten space.
     pub fn page_len(&self) -> u32 {
         self.kv.page_len()
     }
 
-    /// Extend the logical address space by `pages`; returns the granted index
-    /// range. Purely logical — physical pages allocate only when a forward
-    /// writes them.
     pub fn reserve(&self, pages: u32) -> Result<PageGrant, String> {
         let range = self.kv.reserve(pages)?;
         Ok(PageGrant {
@@ -468,48 +378,33 @@ impl WorkingSet {
         })
     }
 
-    /// Insert or atomically replace an opaque, model-scoped index entry for
-    /// this fully mapped and settled working set.
     pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
         self.kv.update_index(key)
     }
 
-    /// Exact best-effort lookup of an opaque, model-scoped working-set index.
     pub fn from_index(key: &[u8]) -> Result<Option<WorkingSet>, String> {
         Ok(KvWorkingSet::from_index(key)?.map(|kv| WorkingSet { kv: Rc::new(kv) }))
     }
 
-    /// Remove only an index root. Working sets returned by an earlier lookup
-    /// remain valid.
     pub fn remove_index(key: &[u8]) -> Result<bool, String> {
         KvWorkingSet::remove_index(key)
     }
 
-    /// Remove `ranges` (pre-discard indexes, applied atomically), ordered on
-    /// `on`. Suffix indexes shift down — publish new geometry after. A
-    /// shared-path interior range errs.
     pub fn discard(&self, on: &Pipeline, ranges: &[PageRange]) -> Result<(), String> {
         self.kv.discard(&on.wit, ranges)
     }
 
-    /// O(1) copy-on-write child over the complete logical address space,
-    /// ordered on `on` — the branching primitive (beam/MCTS/self-correct).
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {
             kv: Rc::new(self.kv.fork(&on.wit)?),
         })
     }
 
-    /// Structurally shared child over `[start, start+len)`, rebased to page
-    /// zero in the child, ordered on `on`.
     pub fn slice(&self, on: &Pipeline, start: u32, len: u32) -> Result<WorkingSet, String> {
         let child = self.kv.slice(&on.wit, PageRange { start, len })?;
         Ok(WorkingSet { kv: Rc::new(child) })
     }
 
-    /// Move KV cells across all layers from (`src_page_ids[i]`,
-    /// `src_tok_idx[i]`) to (`dst_page_ids[i]`, `dst_tok_idx[i]`); the four
-    /// lists are parallel. Caller guarantees disjoint src/dst spans.
     pub fn copy_into(
         &self,
         on: &Pipeline,
@@ -534,20 +429,16 @@ impl Default for WorkingSet {
     }
 }
 
-/// A grant of fresh logical page indexes from [`WorkingSet::reserve`] —
-/// per-instance data. Puttable into a channel.
 pub struct PageGrant {
     start: u32,
     ids: Vec<u32>,
 }
 
 impl PageGrant {
-    /// The granted WorkingSet-relative page indexes (contiguous).
     pub fn ids(&self) -> &[u32] {
         &self.ids
     }
 
-    /// The grant as a WIT `page-range` (e.g. to `discard` it later).
     pub fn range(&self) -> PageRange {
         PageRange {
             start: self.start,
@@ -562,12 +453,6 @@ impl IntoPut for PageGrant {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RsWorkingSet
-// ---------------------------------------------------------------------------
-
-/// Runtime recurrent-state slots for hybrid / linear-attention models (GDN,
-/// Mamba2), one per request in resolved order.
 pub struct RsWorkingSet {
     rs: Rc<crate::working_set::RsWorkingSet>,
 }
@@ -579,8 +464,6 @@ impl RsWorkingSet {
         }
     }
 
-    /// Size in bytes of one folded recurrent-state object for this model.
-    /// A cached [`crate::model::rs_state_size`]; see [`WorkingSet::page_size`].
     pub fn state_size(&self) -> u64 {
         thread_local! {
             static SIZE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
@@ -588,13 +471,10 @@ impl RsWorkingSet {
         SIZE.with(|c| *c.get_or_init(crate::model::rs_state_size))
     }
 
-    /// Current number of buffered page slots.
     pub fn buffer_size(&self) -> u32 {
         self.rs.buffer_size()
     }
 
-    /// Tokens per buffered RS page for this model/engine. A cached
-    /// [`crate::model::rs_buffer_page_size`]; see [`WorkingSet::page_size`].
     pub fn buffer_page_size(&self) -> u32 {
         thread_local! {
             static SIZE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
@@ -602,34 +482,22 @@ impl RsWorkingSet {
         SIZE.with(|c| *c.get_or_init(crate::model::rs_buffer_page_size))
     }
 
-    /// Append `n` reserved buffered page slots; returns the contiguous
-    /// range. Purely logical — a slot is materialized by the first fire whose
-    /// `fold-len` leaves tokens in the buffer.
     pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
         self.rs.alloc_buffer(n)
     }
 
-    /// Drop the buffered slots at `indices` and densely compact — the
-    /// reject half of fold-commit: a speculative tail that was buffered but
-    /// never folded is abandoned, and no folded state was ever perturbed by it.
     pub fn free_buffer(&self, indices: &[u32]) -> Result<(), String> {
         self.rs.free_buffer(indices)
     }
 
-    /// Forget the last `count` buffered tokens — free, since the slots it
-    /// releases are overwritten by the next append. Twin of `fold-len`, which
-    /// moves the folded boundary right and cannot be undone.
     pub fn discard_buffered(&self, count: u32) -> Result<(), String> {
         self.rs.discard_buffered(count)
     }
 
-    /// Reorder the buffered slots by the full bijection `perm`.
     pub fn reorder_buffer(&self, perm: &[u32]) -> Result<(), String> {
         self.rs.reorder_buffer(perm)
     }
 
-    /// Copy-on-write child sharing the current folded state and buffered
-    /// suffix, ordered on `on`.
     pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
         Ok(RsWorkingSet {
             rs: Rc::new(self.rs.fork(&on.wit)?),
@@ -643,14 +511,8 @@ impl Default for RsWorkingSet {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ForwardPass
-// ---------------------------------------------------------------------------
-
 type StageClosure = Box<dyn Fn()>;
 
-/// The forward-pass resource of one `pie:inferlet` forward interface: one of
-/// `forward`, `forward-recurrent`, `forward-hybrid`, `forward-diffusion`.
 pub trait PassWit: Sized + 'static {
     fn new() -> Self;
 
@@ -662,20 +524,14 @@ pub trait PassWit: Sized + 'static {
 
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
 
-    /// The pass's layer truncation.
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
 
-    /// Mark this pass's rows a block drafter's proposal, so the model's
-    /// trunk does not run over them. See the WIT door for what it means.
     fn set_drafting_block(&self, on: bool) -> Result<(), String>;
 
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
 
-    /// The reading-and-ports verbs (design D1), carried by `forward` and
-    /// `forward-diffusion`; the recurrent and hybrid interfaces refuse them
-    /// by name.
     fn reading(&self, name: &str) -> Result<(), String> {
         Err(format!(
             "this pass interface carries no readings; `reading(\"{name}\")` is a `forward` / \
@@ -856,11 +712,9 @@ impl PassWit for wit_hybrid::ForwardPass {
     }
 }
 
-/// The PEFT adapter surface's expression vocabulary, used by [`Pass::adapter`].
 pub mod adapter {
     use super::Channel;
 
-    /// Model projection sites; the engine refuses unconsumed sites loudly.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Site {
         Q,
@@ -884,7 +738,6 @@ pub mod adapter {
         }
     }
 
-    /// One adapter expression node, consumed by the classifier — never executed directly.
     pub struct Expr {
         pub(crate) kind: ExprKind,
     }
@@ -906,16 +759,12 @@ pub mod adapter {
         }
     }
 
-    /// `mm(w, e)` — multiply by the channel-borne weight (leading dim is
-    /// the layer axis).
     pub fn mm(w: &Channel, e: Expr) -> Expr {
         Expr {
             kind: ExprKind::Mm(*w, Box::new(e)),
         }
     }
 
-    /// `scale(e, l)` — elementwise multiply by the channel-borne vector
-    /// `l: [num_layers, d_out]` (IA3's form).
     pub fn scale(e: Expr, l: &Channel) -> Expr {
         Expr {
             kind: ExprKind::Scale(*l, Box::new(e)),
@@ -932,7 +781,6 @@ pub mod adapter {
     }
 }
 
-/// The forward-pass builder over the `W` interface (see [`attention`] / [`recurrent`] / [`hybrid`]).
 pub struct Pass<W: PassWit> {
     wit: W,
     inner: RefCell<ForwardInner>,
@@ -948,16 +796,10 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
-    /// The float ports bound by [`Pass::input`], each with its channel.
-    /// The prologue reads every one so the program declares it (the host
-    /// feeds a port off the instance's own channel arena).
     port_inputs: Vec<(String, DslChannel)>,
-    /// The latents port's rows, stated to the builder outright: a float
-    /// lane has no token CSR to size its read-out from.
     latent_rows: Option<u32>,
 }
 
-/// A [`KvGeometry`] with claimed ports and resolved WIT handles, held until state-binding.
 struct StagedKv {
     ws: Rc<KvWorkingSet>,
     readable: PageDeclaration,
@@ -971,7 +813,6 @@ struct StagedKv {
     mask: Option<Rc<wit_channel::Channel>>,
 }
 
-/// The attention geometry of one fire — mirrors WIT `kv-geometry` field-for-field.
 pub struct KvGeometry<'a, R, W> {
     pub readable_pages: R,
     pub writable_pages: W,
@@ -981,31 +822,23 @@ pub struct KvGeometry<'a, R, W> {
     pub w_slot: &'a Channel,
     pub w_off: &'a Channel,
     pub positions: &'a Channel,
-    /// `None` omits ETA's AttnMask port; `Some` binds that channel to it.
     pub mask: Option<&'a Channel>,
 }
 
-/// Where the bound recurrent state's folded boundary lands — mirrors WIT `rs-geometry`.
 pub struct RsGeometry<'a, B> {
-    /// Per-request advance of the folded boundary, clamped to `[buffer |
-    /// this fire's tokens]`. `None` means fold-everything.
     pub fold_len: Option<&'a Channel>,
-    /// Capacity grant, not an address — a guest copy could only agree or be refused.
     pub buffer: B,
 }
 
-/// A KV working set and the geometry it's read/written through — mirrors WIT `kv-binding`.
 pub struct KvBinding<'a, R, W> {
     pub working_set: &'a WorkingSet,
     pub geometry: KvGeometry<'a, R, W>,
 }
 
 thread_local! {
-    /// The `fold-len` of a pass that folds unconditionally: `u32::MAX`.
     static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
 }
 
-/// [`RsGeometry`] with its port claimed and channel resolved. See [`StagedKv`].
 struct StagedRs {
     working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     fold_len: Rc<wit_channel::Channel>,
@@ -1067,8 +900,6 @@ mod page_declaration_tests {
 }
 
 impl<W: PassWit> Pass<W> {
-    /// Does this pass bind a dense `AttnMask` channel? [`run_ahead`] gives
-    /// such a pass one slot per frame.
     fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
@@ -1098,9 +929,6 @@ impl<W: PassWit> Pass<W> {
         }
     }
 
-    /// Which of the family's declared readings this pass runs
-    /// (`model::readings()`): `"text"`, `"denoise"`, `"vae.decode"`, ...
-    /// Optional when the model declares at most one. Before the program.
     pub fn reading(&self, name: &str) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -1108,12 +936,6 @@ impl<W: PassWit> Pass<W> {
         self.wit.reading(name)
     }
 
-    /// Bind `ch` to the reading's float port `port` (`reading-fact.ports`),
-    /// read at every submit from the channel's committed cell. The host
-    /// checks the channel's shape against the port; this side makes sure
-    /// the program declares the channel (a prologue read) and, for a row
-    /// port (latents, or a context lane's rows), sizes the read-out
-    /// (`velocity()` / `hidden()`) to its rows.
     pub fn input(&self, port: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
@@ -1126,9 +948,6 @@ impl<W: PassWit> Pass<W> {
         }
         let wit = ch.wit();
         self.wit.input(port, wit.as_ref())?;
-        // A ROW port — latents, or the context rows a caption/context lane
-        // is made of — states the lane's row count; the two never disagree
-        // on one lane, so whichever binds sizes the read-out.
         let row_port = crate::model::readings().iter().any(|reading| {
             reading.ports.iter().any(|fact| {
                 fact.name == port
@@ -1146,8 +965,6 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    /// Which lane stream this pass's rows are (design D2). Default `Text`;
-    /// a reading with several streams takes one pass per stream.
     pub fn stream(&self, stream: LaneStream) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -1155,8 +972,6 @@ impl<W: PassWit> Pass<W> {
         self.wit.stream(stream)
     }
 
-    /// Put this pass's lanes in attention group `id` within a frame, so
-    /// the passes of one request attend each other's rows.
     pub fn group(&self, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -1164,11 +979,6 @@ impl<W: PassWit> Pass<W> {
         self.wit.group(id)
     }
 
-    /// Name another lane of this pass's own attention group as its peer, by
-    /// ordinal in the group's packed order, so the epilogue can read that
-    /// lane's prediction with `intrinsics::peer_velocity(width)`. The
-    /// guidance verb: `u + s(c - u)` is two lanes of one fire, and this is
-    /// how one of them names the other. Call `group` first.
     pub fn peer(&self, ordinal: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -1193,7 +1003,6 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    /// Bind token ids and CSR row indptr. Both descriptor inputs are channels.
     pub fn embed(&self, tokens: &Channel, indptr: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
         let token_wit = tokens.wit();
@@ -1206,8 +1015,6 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    /// Claim the KV geometry ports and resolve its channels. After the
-    /// program is attached this is a rebind — only WIT-side handles refresh.
     fn stage_kv<R, Wr>(
         &self,
         ws: &WorkingSet,
@@ -1275,8 +1082,6 @@ impl<W: PassWit> Pass<W> {
         Ok(staged)
     }
 
-    /// Claim the fold-len port and resolve the recurrent working sets, in
-    /// resolved request order. See [`Pass::stage_kv`] for the rebind rule.
     fn stage_rs<B>(
         &self,
         working_sets: &[RsWorkingSet],
@@ -1285,9 +1090,6 @@ impl<W: PassWit> Pass<W> {
     where
         B: RangeBounds<u32>,
     {
-        // No count check here: the host owns that verdict. An empty set is
-        // the attention case of a hybrid pass, accepted on an attention model
-        // and refused by name on a folding one (`validate_count`).
         let buffer = PageDeclaration::from_range(geom.buffer)?;
         let staged = match geom.fold_len {
             Some(fold_len) => {
@@ -1300,8 +1102,6 @@ impl<W: PassWit> Pass<W> {
                 }
                 fold_len.wit()
             }
-            // Minted once per guest thread so a rebind doesn't leak a
-            // channel; no port claimed since folding everything computes nothing.
             None => FOLD_ALL.with(Channel::wit),
         };
         let working_sets: Vec<Rc<crate::working_set::RsWorkingSet>> =
@@ -1314,7 +1114,6 @@ impl<W: PassWit> Pass<W> {
         })
     }
 
-    /// Bind readout indexes through a channel, separately from embedding.
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
@@ -1326,30 +1125,14 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    /// Run only the first `max_layers` transformer layers for this pass's
-    /// fires and take the head there (the layerskip-draft / logit-lens
-    /// class). Call before `program`.
     pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         self.wit.set_max_layers(max_layers)
     }
 
-    /// **These rows are a block drafter's proposal, not the sequence's own.**
-    /// A block drafter proposes many tokens in one pass over a block whose
-    /// first row is the correction the target just made and whose rest is
-    /// the model's mask token; the trunk must not run over them, and a plan
-    /// carrying such a drafter guards itself on this. Call before `program`.
-    ///
-    /// It cannot be inferred from what the pass reads, the way drafting is:
-    /// what makes a fire a draft is the anchor chosen from the accepted
-    /// prefix, which only this guest knows.
     pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
         self.wit.set_drafting_block(on)
     }
 
-    /// Attach a PEFT adapter at `site`: `f` receives input `x` and base
-    /// output `y`, returns the corrected [`adapter`] expression. Lowers
-    /// LoRA, IA3, and DoRA forms into per-layer prologue sinks. One adapter
-    /// per site per pass.
     pub fn adapter(
         &self,
         site: adapter::Site,
@@ -1357,14 +1140,13 @@ impl<W: PassWit> Pass<W> {
     ) -> Result<(), String> {
         use adapter::ExprKind as K;
         let expr = f(adapter::Expr::x(), adapter::Expr::y());
-        // DoRA lowers to the low-rank sink then the scale sink on the same site.
         if let K::Scale(l, inner) = &expr.kind
             && let K::Add(lhs, rhs) = &inner.kind
         {
             let delta = match (&lhs.kind, &rhs.kind) {
                 (K::Y, _) => &rhs.kind,
                 (_, K::Y) => &lhs.kind,
-                _ => &inner.kind, // falls to the refusal below
+                _ => &inner.kind,
             };
             if let K::Mm(b, mid) = delta
                 && let K::Mm(a, x) = &mid.kind
@@ -1389,7 +1171,6 @@ impl<W: PassWit> Pass<W> {
                 return Ok(());
             }
         }
-        // The scale form (IA3): scale(y, l).
         if let K::Scale(l, inner) = &expr.kind
             && matches!(inner.kind, K::Y)
         {
@@ -1430,7 +1211,6 @@ impl<W: PassWit> Pass<W> {
             _ => return Err("adapter: the delta must be mm(b, mm(a, x))".to_string()),
         };
         {
-            // One pair per site: each call emits its own lora sink.
             let mut inner = self.inner.borrow_mut();
             if inner.adapter_lowrank_sites & site.bit() != 0 {
                 return Err(format!(
@@ -1448,7 +1228,6 @@ impl<W: PassWit> Pass<W> {
     pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
     }
-    /// Attach the `epilogue` stage (sampling programs; after the forward).
     pub fn epilogue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Epilogue, body);
     }
@@ -1466,9 +1245,6 @@ impl<W: PassWit> Pass<W> {
         }
     }
 
-    /// Enqueue this pass as a single-slot frame on `on`: slot 0 is this
-    /// pass, the rest pad to no-ops. For a one-shot fire only — a decode
-    /// loop should use [`run_ahead`] or [`submit_frame`] instead.
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
         submit_frame(on, &[Some(self)])
     }
@@ -1485,11 +1261,6 @@ impl<W: PassWit> Pass<W> {
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
-        // Every port-fed channel is read in the prologue, so the program
-        // declares it whether or not a stage of the author's touches it: a
-        // read is the one effect with no consequence (nothing is consumed,
-        // nothing written), and it is what makes a seeded control channel
-        // a latest-value cell the host may `set`.
         let port_channels: Vec<DslChannel> =
             inner.port_inputs.iter().map(|(_, ch)| ch.clone()).collect();
         let author_prologue = inner
@@ -1535,8 +1306,6 @@ impl<W: PassWit> Default for Pass<W> {
     }
 }
 
-/// Waves per frame (k) for this deployment (cached; fixed at runtime
-/// start). Guests must be output-correct for any k.
 pub fn frame_size() -> usize {
     thread_local! {
         static FRAME_SIZE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
@@ -1544,8 +1313,6 @@ pub fn frame_size() -> usize {
     FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
 }
 
-/// How long a pipeline may hold a frame's wait-set before the runtime stops
-/// waiting (cached); not fatal to overrun, but call `Pipeline::park` around long work.
 pub fn submit_deadline() -> std::time::Duration {
     thread_local! {
         static DEADLINE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
@@ -1555,14 +1322,10 @@ pub fn submit_deadline() -> std::time::Duration {
     )
 }
 
-/// Host-reader channel capacity, in cells, that sustains the runtime's
-/// run-ahead for one lane; not cached, unlike [`frame_size`].
 pub fn channel_capacity() -> usize {
     (crate::model::channel_capacity() as usize).max(2)
 }
 
-/// Tokens per KV page (cached); prefer [`WorkingSet::page_size`] when a
-/// working set is in hand.
 pub fn kv_page_size() -> u32 {
     thread_local! {
         static PAGE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
@@ -1570,8 +1333,6 @@ pub fn kv_page_size() -> u32 {
     PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
 }
 
-/// Max embed tokens in a single pass (cached, guest-side prefill chunk
-/// budget); split a longer prompt with [`prefill_chunks`].
 pub fn max_embed_length() -> usize {
     thread_local! {
         static MAX_EMBED: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
@@ -1579,20 +1340,10 @@ pub fn max_embed_length() -> usize {
     MAX_EMBED.with(|c| *c.get_or_init(|| crate::model::max_embed_length().max(1) as usize))
 }
 
-/// The prefill chunk the scheduler would like right now, in tokens: the
-/// forward token budget shared among the live processes, in whole KV pages
-/// (`model.prefill-chunk-hint`). Read per call — it moves as processes come
-/// and go. A hint: the runtime never splits a fire, and a program is free to
-/// chunk differently.
 pub fn prefill_chunk_hint() -> usize {
     (crate::model::prefill_chunk_hint().max(1) as usize).min(max_embed_length())
 }
 
-/// The `[start, end)` spans a prompt of `n` tokens must be prefilled in,
-/// respecting [`max_embed_length`]. `cap` overrides the limit; `None` takes
-/// [`prefill_chunk_hint`], so a prompt prefilled beside other live processes
-/// is cut into chunks that leave the step room for their decodes, and a
-/// prompt prefilled alone takes the whole budget.
 pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
     let cap = cap
         .unwrap_or_else(|| prefill_chunk_hint() as u32)
@@ -1601,7 +1352,6 @@ pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
     even_spans(n, cap)
 }
 
-/// Arithmetic of [`prefill_chunks`], split out to test off-device.
 fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
     if n == 0 {
         return Vec::new();
@@ -1620,8 +1370,6 @@ fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
     out
 }
 
-/// Submit ONE FRAME on `on`: up to `frame_size()` slots, slot i executing
-/// in wave i; trailing slots pad with no-ops. First submit attaches the program.
 pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Result<(), String> {
     let k = frame_size();
     if slots.len() > k {
@@ -1641,8 +1389,6 @@ pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Re
     W::submit(&on.wit, &borrows)
 }
 
-/// Keeps the runtime's run-ahead window full while `on_token` consumes
-/// results, until `budget` fires submit or `on_token` breaks. Returns the run count.
 pub async fn run_ahead<W: PassWit>(
     on: &Pipeline,
     pass: &Pass<W>,
@@ -1654,14 +1400,6 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    // Live slots per frame. A pass that binds a dense device mask takes one
-    // (see `Pass::binds_device_mask`). So does a pass on a recurrent or
-    // hybrid model: the frame's waves then carry the same sequence's state
-    // one into the next, and a frame of one live slot measured faster than a
-    // full one on Qwen3.5-0.8B at 16 lanes (627 vs 598 tok/s, the two shapes
-    // alternated over five passes on one binary) — the same fires stay in
-    // flight, spread over twice the frames. A dense attention pass fills the
-    // frame.
     let r = if pass.binds_device_mask()
         || crate::model::pass_kind() != crate::model::ForwardKind::Attention
     {
@@ -1669,17 +1407,12 @@ pub async fn run_ahead<W: PassWit>(
     } else {
         frame_size()
     };
-    // THE WINDOW IS THE RUNTIME'S NUMBER, NOT RECOVERED FROM THE RING. The
-    // runtime derives the ring size and the window from one source and
-    // publishes both; a guest that re-derived one from the other believed a
-    // number the runtime never stated. In frames of `r` live slots.
     let window_fires = crate::model::run_ahead_window() as usize;
     let window_frames = (window_fires / r.max(1)).max(1);
 
     let mut submitted = 0usize;
     let mut consumed = 0usize;
 
-    // One frame of up to `r` live slots, never past `budget`.
     let submit_one_frame = |submitted: &mut usize| -> Result<(), String> {
         let live = r.min(budget - *submitted);
         if live == 0 {
@@ -1698,25 +1431,20 @@ pub async fn run_ahead<W: PassWit>(
         submit_one_frame(&mut submitted)?;
     }
 
-    // Close must fire the instant this lane stops submitting, or other lanes
-    // hold their seal waiting on it. Safe with fires in flight — close never waits.
     let mut ended = false;
 
-    // (a) priming loop already spent the budget; close before the first take.
     if submitted >= budget && !ended {
         on.close();
         ended = true;
     }
     while consumed < submitted {
         if on_token().await? == ControlFlow::Break(()) {
-            // (b) an early stop also ends the stream; close reclaims the rest.
             if !ended {
                 on.close();
             }
             return Ok(consumed + 1);
         }
         consumed += 1;
-        // Refill a whole frame at a time — a partial frame can't be topped up later.
         if submitted < budget && submitted - consumed <= (window_frames - 1) * r {
             submit_one_frame(&mut submitted)?;
         }
@@ -1725,20 +1453,12 @@ pub async fn run_ahead<W: PassWit>(
             ended = true;
         }
     }
-    // (c) a zero-width lane never submits, so the loop can exit with
-    //     `submitted < budget` without (a) or the in-loop check firing.
     if !ended {
         on.close();
     }
     Ok(consumed)
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline
-// ---------------------------------------------------------------------------
-
-/// A run-ahead ordering domain — every command on it linearizes in
-/// submission order. Concurrent streams need separate pipelines.
 pub struct Pipeline {
     wit: wit_pipeline::Pipeline,
 }
@@ -1750,17 +1470,11 @@ impl Pipeline {
         }
     }
 
-    /// End the stream and release its scheduler wait-set immediately.
-    /// Already-submitted fires still drain and remain take-able.
     pub fn close(&self) {
         self.wit.close();
     }
 
-    /// Leave the frame wait-set until this pipeline submits again — the way
-    /// to go idle without running down `submit_deadline`. Unlike `close`,
-    /// the pipeline stays usable; the next `submit` rejoins automatically.
     pub fn park(&self) {
-        // Every forward interface declares the same `park`, one runtime function.
         wit_attention::park(&self.wit);
     }
 }
@@ -1771,21 +1485,16 @@ impl Default for Pipeline {
     }
 }
 
-/// The kind-independent half of every pass prelude. No top-level
-/// `eta::prelude`: importing a pass type requires naming its kind.
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, LaneStream, PageGrant, Pipeline, RsGeometry, RsWorkingSet,
         TOKEN_PAD, WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length,
         prefill_chunk_hint, prefill_chunks,
     };
-    /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.
     pub use crate::{Context, Result, model};
-    /// Only `Stage`; dtypes are spelled `dtype::f32` and friends.
     pub use eta_dsl::Stage;
     pub use eta_dsl::dtype;
     pub use eta_dsl::intrinsics;
-    /// Arithmetic intrinsics are absent — `+ - * / %` and unary `-` are their spelling.
     pub use eta_dsl::value::{
         Tensor, abs, and, broadcast, cast, causal_mask, cos, cummass_le, cumprod, cumsum, entropy,
         entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, indptr,
@@ -1798,23 +1507,14 @@ pub mod shared_prelude {
     pub use std::ops::ControlFlow;
 }
 
-// ---------------------------------------------------------------------------
-// The three author-facing pass modules
-// ---------------------------------------------------------------------------
-
-/// Attention taps, legal only where attention layers exist.
 impl Pass<wit_attention::ForwardPass> {
-    /// Attach the `on_attn_proj` stage (per layer, before attention).
     pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttnProj, body);
     }
-    /// Attach the `on_attn` stage (per layer, after attention).
     pub fn on_attn(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttn, body);
     }
 
-    /// `pie:inferlet/forward.attention` — bind the KV working set and all of
-    /// its geometry channels. See [`KvGeometry`]. REQUIRED.
     pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
     where
         R: RangeBounds<u32>,
@@ -1838,32 +1538,23 @@ impl Pass<wit_attention::ForwardPass> {
         )
     }
 
-    /// `pie:inferlet/forward.media` — carries a media span's payload,
-    /// order-matched to the placeholder token runs already in the sequence
-    /// (see `img.tokens()`). The hybrid pass carries the same verb.
     pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
         wit_attention::ForwardPass::media(&self.wit, spans)
     }
 }
 
 impl Pass<wit_hybrid::ForwardPass> {
-    /// `pie:inferlet/forward-hybrid.media` — the attention pass's `media`,
-    /// same span type, for a tower over a hybrid trunk.
     pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
         wit_hybrid::ForwardPass::media(&self.wit, spans)
     }
 
-    /// Attach the `on_attn_proj` stage (per attention layer, before attention).
     pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttnProj, body);
     }
-    /// Attach the `on_attn` stage (per attention layer, after attention).
     pub fn on_attn(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttn, body);
     }
 
-    /// `pie:inferlet/forward-hybrid.attention` — bind both halves of state in
-    /// one call; `kv` is [`Option`] for a recurrent-only fire. Rebinds on recall.
     pub fn attention<R, W, B>(
         &self,
         kv: Option<KvBinding<'_, R, W>>,
@@ -1907,19 +1598,14 @@ impl Pass<wit_hybrid::ForwardPass> {
     }
 }
 
-/// The diffusion pass: the attention pass's surface plus the reading.
 impl Pass<wit_diffusion::ForwardPass> {
-    /// Attach the `on_attn_proj` stage (per layer, before attention).
     pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttnProj, body);
     }
-    /// Attach the `on_attn` stage (per layer, after attention).
     pub fn on_attn(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttn, body);
     }
 
-    /// `pie:inferlet/forward-diffusion.attention` — bind the KV working set
-    /// and its geometry. On a denoise pass the geometry is the canvas's. REQUIRED.
     pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
     where
         R: RangeBounds<u32>,
@@ -1943,37 +1629,24 @@ impl Pass<wit_diffusion::ForwardPass> {
         )
     }
 
-    /// `pie:inferlet/forward-diffusion.canvas` — which reading this pass
-    /// runs. REQUIRED, once, before the first submit.
     pub fn canvas(&self, mode: wit_diffusion::Mode) -> Result<(), String> {
         wit_diffusion::ForwardPass::canvas(&self.wit, mode)
     }
 
-    /// `pie:inferlet/forward-diffusion.self-conditioning` — the previous
-    /// step's distribution as taps, `model::canvas().self_cond_taps` per
-    /// canvas row (`top_k` of the temperature-scaled softmax is the
-    /// reference's reading), staged for this pass's next submit. Row major:
-    /// `rows.len() == weights.len() == length * taps`.
     pub fn self_conditioning(&self, rows: &[u32], weights: &[f32]) -> Result<(), String> {
         wit_diffusion::ForwardPass::self_conditioning(&self.wit, rows, weights)
     }
 
-    /// `pie:inferlet/forward-diffusion.self-conditioning-from`: the taps read
-    /// off two of this pass's channels at every submit (ids `[length, taps]`
-    /// u32, weights `[length, taps]` f32) — a persistent binding.
     pub fn self_conditioning_from(&self, rows: &Channel, weights: &Channel) -> Result<(), String> {
         wit_diffusion::ForwardPass::self_conditioning_from(&self.wit, &rows.wit(), &weights.wit())
     }
 
-    /// `pie:inferlet/forward-diffusion.media` — the attention pass's `media`.
     pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
         wit_diffusion::ForwardPass::media(&self.wit, spans)
     }
 }
 
 impl Pass<wit_recurrent::ForwardPass> {
-    /// `pie:inferlet/forward-recurrent.attention` — bind the recurrent state:
-    /// one working set per request, plus where its folded boundary lands.
     pub fn attention<B>(&self, rs: &[RsWorkingSet], geom: RsGeometry<'_, B>) -> Result<(), String>
     where
         B: RangeBounds<u32>,
@@ -1992,36 +1665,21 @@ impl Pass<wit_recurrent::ForwardPass> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The four author-facing pass aliases
-// ---------------------------------------------------------------------------
-// One alias per `pie:inferlet` forward interface; distinct types sharing no impl.
-
-/// `pie:inferlet/forward` — paged, per-token, reversibly discardable KV only.
-/// Valid when `model.pass_kind()` is `ForwardKind::Attention`.
 pub mod attention {
-    /// An attention-only forward pass.
     pub type ForwardPass = super::Pass<super::wit_attention::ForwardPass>;
     pub use super::{run_ahead, submit_frame};
 
-    /// Glob-import surface for attention-only inferlet authors.
     pub mod prelude {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::eta::shared_prelude::*;
     }
 }
 
-/// `pie:inferlet/forward-diffusion` — paged KV plus a canvas the model
-/// denoises in place. Valid when `model.pass_kind()` is `ForwardKind::Diffusion`.
 pub mod diffusion {
-    /// A diffusion forward pass; `canvas(Mode)` states its reading.
     pub type ForwardPass = super::Pass<super::wit_diffusion::ForwardPass>;
-    /// `encode` (causal, writes the sequence) or `denoise` (bidirectional
-    /// over the canvas, scratch KV).
     pub use super::wit_diffusion::Mode;
     pub use super::{run_ahead, submit_frame};
 
-    /// Glob-import surface for diffusion inferlet authors.
     pub mod prelude {
         pub use super::{
             ForwardPass, Mode, entropy_bound_accept, linear_temperature, run_ahead,
@@ -2034,37 +1692,19 @@ pub mod diffusion {
         Tensor, and, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set, sort_desc,
     };
 
-    /// The reference schedule: `t_min + (t_max - t_min) * remaining / max`,
-    /// with `remaining` counting DOWN from `max` on the first step to 1 on
-    /// the last. Host arithmetic; the value reaches the program through a
-    /// control channel the host `set`s before each submit.
     pub fn linear_temperature(remaining: u32, max_steps: u32, t_max: f32, t_min: f32) -> f32 {
         t_min + (t_max - t_min) * (remaining as f32 / max_steps.max(1) as f32)
     }
 
-    /// The entropy-bound acceptance rule over one canvas: accept the
-    /// lowest-entropy positions while `sum(H) - max(H) <= bound` over the
-    /// accepted set (Ben-Hamu et al., 2505.24857). `entropy` is `[n]` f32,
-    /// one row per canvas position; the answer is `[n]` bool.
-    ///
-    /// Spelled with a descending sort of the negated entropies because the
-    /// DSL sorts one way; in ascending order the running maximum is the
-    /// element itself, which is what makes the bound a prefix test.
     pub fn entropy_bound_accept(entropy: &Tensor, bound: f32) -> Tensor {
         let n = entropy.shape().dims()[0];
         let (neg_sorted, order) = sort_desc(-entropy);
         let sorted = -&neg_sorted;
         let below = le(&(&cumsum(&sorted) - &sorted), bound);
-        // Back to canvas order: a false base, the sorted verdicts scattered
-        // through the sort's own permutation.
         let none = lt(iota(n), 0u32);
         scatter_set(&none, &order, &below)
     }
 
-    /// The reference stopping rule for one canvas: the argmax canvas did not
-    /// move since the previous step AND the mean per-position entropy is
-    /// under `threshold`. `argmax`/`previous` are `[n]` i32, `entropy` `[n]`
-    /// f32; the answer is a bool scalar.
     pub fn stable_and_confident(
         argmax: &Tensor,
         previous: &Tensor,
@@ -2079,28 +1719,20 @@ pub mod diffusion {
     }
 }
 
-/// `pie:inferlet/forward-recurrent` — irreversibly folded recurrent state only.
-/// `on_attn_proj` / `on_attn` don't exist here — no attention layer to fire on.
 pub mod recurrent {
-    /// A recurrent-only forward pass.
     pub type ForwardPass = super::Pass<super::wit_recurrent::ForwardPass>;
     pub use super::{run_ahead, submit_frame};
 
-    /// Glob-import surface for recurrent-only inferlet authors.
     pub mod prelude {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::eta::shared_prelude::*;
     }
 }
 
-/// `pie:inferlet/forward-hybrid` — attention layers and recurrent layers in
-/// one forward (Qwen3.5 GDN, Nemotron-H Mamba2).
 pub mod hybrid {
-    /// A hybrid forward pass.
     pub type ForwardPass = super::Pass<super::wit_hybrid::ForwardPass>;
     pub use super::{run_ahead, submit_frame};
 
-    /// Glob-import surface for hybrid inferlet authors.
     pub mod prelude {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::eta::shared_prelude::*;

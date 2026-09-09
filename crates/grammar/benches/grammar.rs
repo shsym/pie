@@ -1,12 +1,3 @@
-//! Single-request grammar benchmarks.
-//!
-//! Run:
-//!   cargo bench -p pie-grammar --bench grammar
-//!   PIE_GRAMMAR_BENCH_VOCAB=151936 cargo bench -p pie-grammar --bench grammar
-//!
-//! These benchmarks cover the native grammar crate. WIT list transfer and
-//! sampler binding costs belong in an engine-level benchmark.
-
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;

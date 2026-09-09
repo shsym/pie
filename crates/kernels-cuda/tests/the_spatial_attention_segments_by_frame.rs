@@ -1,17 +1,3 @@
-//! **`spatial::attention` UNDER `Segment::Frames(n)` ATTENDS THE RUN OF
-//! FRAMES ITS QUERY SITS IN AND NOTHING ELSE** — Wan 2.2's mid block, which
-//! is one 1024-wide head per FRAME rather than per clip.
-//!
-//! Two clips of five and three frames, `Frames(1)` and `Frames(2)`, at the
-//! 1024 channels Wan's mid block is wide: every query's softmax runs over
-//! its own run of frames (a run short at the end when the frame count does
-//! not divide), against an f64 host reference to bf16 tolerance. And the
-//! per-frame answer must differ from the whole-clip one by far more than
-//! that tolerance — a kernel that quietly kept attending the whole clip
-//! would otherwise pass on the numbers alone.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_spatial_attention_segments_by_frame`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -22,8 +8,6 @@ use dtype::Dtype;
 use kernels_cuda::spatial::{Segment, attention};
 use kernels_cuda::tensor::Tensor;
 
-/// The reference: per clip, per BLOCK of `seg` frames (0 = the whole clip),
-/// `softmax(q kᵀ · scale) v` in f64.
 fn attention_ref(
     q: &[f32],
     k: &[f32],
@@ -70,12 +54,8 @@ fn attention_ref(
     y
 }
 
-/// Wan 2.2's mid-block width.
 const C: usize = 1024;
 
-/// Five frames and three, over a 2x3 plane: `Frames(2)` leaves a one-frame
-/// run at the end of the first clip and the second, so the short tail is
-/// exercised on both sides of a clip boundary.
 const BOXES: [Box3; 2] = [Box3::new(5, 2, 3), Box3::new(3, 2, 3)];
 
 fn run(gpu: &mut Gpu, at: (u64, u64, u64, u64, u64), rows: usize, segment: Segment, scale: f32) {
@@ -99,10 +79,7 @@ fn run(gpu: &mut Gpu, at: (u64, u64, u64, u64, u64), rows: usize, segment: Segme
 #[test]
 fn the_attention_blocks_per_frame_run_rather_than_per_clip() {
     let (grid, live) = table(&BOXES);
-    // Three padded rows past the last clip, as a bucketed fire leaves them.
     let rows = live + 3;
-    // A sharper softmax than the head's own, so a key from the wrong frame
-    // moves the answer rather than being averaged away.
     let scale = (C as f32).sqrt().recip() * 4.0;
 
     let mut lcg = Lcg::seeded(0x5e6);
@@ -151,9 +128,6 @@ fn the_attention_blocks_per_frame_run_rather_than_per_clip() {
         answers.push(got);
     }
 
-    // The segmentation MATTERS: per-frame, per-two-frames and whole-clip are
-    // three different answers on the same rows, each far outside the bf16
-    // tolerance the assertions above allow.
     for (a, b) in [(0usize, 1usize), (1, 2), (0, 2)] {
         let moved = answers[a]
             .iter()

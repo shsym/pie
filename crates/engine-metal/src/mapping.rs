@@ -1,18 +1,8 @@
-//! The artifact, mapped once and bound without a copy: `newBufferWithBytesNoCopy`
-//! hands Metal the mapping's own pages, faulted from the file exactly once.
-//!
-//! A reservation wires whole on first GPU touch, so this bounds no memory
-//! and must never carry the streamed path; [`cut`] windows past
-//! `maxBufferLength` around the planes a load binds, and each buffer's
-//! `Arc<Mapping>` outlives it while named.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Fault, Result};
 
-/// The host's page size. Probed rather than assumed: 16 KiB on Apple
-/// silicon, 4 KiB on an Intel Mac and under Rosetta.
 #[must_use]
 pub fn page() -> usize {
     // SAFETY: `sysconf` of a defined name, reading no memory.
@@ -24,13 +14,9 @@ pub fn page() -> usize {
     }
 }
 
-/// One artifact file, mapped read-only, whole. Held behind an [`Arc`] by
-/// every [`Buffer`](crate::device::Buffer) minted over it.
 pub struct Mapping {
     at: std::ptr::NonNull<u8>,
-    /// Address space spanned: `round_up(len, page())`, the length Metal is told.
     span: usize,
-    /// The artifact's true byte count, what every caller above is bounded to.
     len: u64,
     file: std::fs::File,
     path: PathBuf,
@@ -44,8 +30,6 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
-    /// Map `path` read-only, whole, and keep its descriptor. Errors with
-    /// [`Fault::Mapped`] naming the step that refused.
     pub fn of(path: impl AsRef<Path>) -> Result<Arc<Mapping>> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).map_err(|why| Fault::Mapped {
@@ -56,9 +40,6 @@ impl Mapping {
         Mapping::of_file(file, path.to_path_buf())
     }
 
-    /// Map an already-open artifact, whole. `named` is what refusals and
-    /// `Debug` will call this; it is never opened, so a caller holding a
-    /// descriptor to an unlinked file may say whatever identifies it.
     pub fn of_file(file: std::fs::File, named: PathBuf) -> Result<Arc<Mapping>> {
         let what = || named.display().to_string();
         let len = file
@@ -69,8 +50,6 @@ impl Mapping {
                 why: why.to_string(),
             })?
             .len();
-        // `mmap` will not take a zero length, and a zero-byte checkpoint is
-        // broken, not legal.
         if len == 0 {
             return Err(Fault::Mapped {
                 step: "size",
@@ -120,53 +99,40 @@ impl Mapping {
         }))
     }
 
-    /// The file this is a mapping of — a seat copy `pread`s through it.
     #[must_use]
     pub fn file(&self) -> &std::fs::File {
         &self.file
     }
 
-    /// The artifact's true byte count, which every caller above is bounded to.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.len
     }
 
-    /// Always `false` ([`Mapping::of`] refuses an empty artifact); exists
-    /// for the lint pairing it with [`Mapping::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Address space the mapping spans, page-aligned — no caller above may address it.
     #[must_use]
     pub fn span(&self) -> usize {
         self.span
     }
 
-    /// The mapping's page-aligned base, for the bind and for nothing else.
-    /// Read by the Apple-only `newBufferWithBytesNoCopy` arm, which is why a
-    /// non-Apple dead-code sweep sees no caller.
     pub(crate) fn base(&self) -> std::ptr::NonNull<u8> {
         self.at
     }
 
-    /// What was mapped, as the caller named it.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The backing file's size — equal to [`len`](Mapping::len) when this
-    /// provably windows real storage.
     #[must_use]
     pub fn backing(&self) -> Option<u64> {
         self.file.metadata().ok().map(|it| it.len())
     }
 
-    /// How many names the backing file has — at least one, unlike a staged
-    /// (unlinked) copy, whose link count is `0`.
     #[must_use]
     pub fn links(&self) -> Option<u64> {
         use std::os::unix::fs::MetadataExt;
@@ -174,23 +140,14 @@ impl Mapping {
     }
 }
 
-/// One page-aligned window of a [`Mapping`], as one `MTLBuffer` will see it
-/// — the unit [`cut`] answers in and
-/// [`Buffer::window`](crate::device::Buffer::window) mints. Must be passed
-/// back beside the same `Arc<Mapping>` it was cut from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cut {
-    /// Where this window starts inside the mapping — page-aligned.
     base: usize,
-    /// How many bytes Metal is told, a page multiple never above `ceiling`.
     span: usize,
-    /// Bytes of the artifact this window addresses — `span`, except the
-    /// last chunk's zero-fill tail.
     bytes: u64,
 }
 
 impl Cut {
-    /// The whole mapping as one window, for an artifact under the ceiling.
     #[must_use]
     pub fn whole(map: &Mapping) -> Cut {
         Cut {
@@ -200,44 +157,35 @@ impl Cut {
         }
     }
 
-    /// Where the window starts inside the mapping, page-aligned.
     #[must_use]
     pub fn base(&self) -> usize {
         self.base
     }
 
-    /// The page-aligned length Metal is told.
     #[must_use]
     pub fn span(&self) -> usize {
         self.span
     }
 
-    /// The TRUE artifact bytes this window addresses.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
-    /// Whether a blob at `offset` of `length` bytes lies wholly inside this window.
     #[must_use]
     pub fn holds(&self, offset: u64, length: u64) -> bool {
         let base = self.base as u64;
         offset >= base && offset.saturating_add(length) <= base.saturating_add(self.bytes)
     }
 
-    /// Where a blob at `offset` sits within this window, for `Handles::bind`.
     #[must_use]
     pub fn view(&self, offset: u64) -> Option<u64> {
         offset.checked_sub(self.base as u64)
     }
 }
 
-/// How far apart two bound planes may be and still share one window — the
-/// writer's own padding (`pie model import` aligns at 2 MiB), never a band.
 const SLACK: u64 = 8 << 20;
 
-/// The device's `maxBufferLength`, clamped down by `diagnostics =
-/// "window-ceiling=<bytes>"` when that states a smaller one.
 #[must_use]
 pub fn ceiling(device: u64) -> u64 {
     crate::diag::on()
@@ -245,15 +193,6 @@ pub fn ceiling(device: u64) -> u64 {
         .map_or(device, |stated| stated.min(device))
 }
 
-/// Cut a mapping into windows, none larger than `ceiling`, that cover the
-/// planes a load will bind — `bound` as `(name, offset, length)` — rather
-/// than the whole file, since a window wires whole.
-///
-/// # Errors
-///
-/// [`Fault::Mapped`] at step `cut`, naming the plane that leaves the
-/// artifact or alone exceeds the ceiling, or (nameless) for a sub-page
-/// `ceiling` or an oversized mapping with no bound plane at all.
 pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Vec<Cut>> {
     let page = page();
     let what = || map.path().display().to_string();
@@ -262,8 +201,6 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
         what: what(),
         why,
     };
-    // Floored once, here, so no window's page-multiple length can round
-    // back above the device's own number.
     let ceiling = usize::try_from(ceiling).unwrap_or(usize::MAX) / page * page;
     if ceiling == 0 {
         return Err(refuse(format!(
@@ -272,7 +209,6 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
     }
     let span = map.span();
     let len = map.len();
-    // The whole file fits one reservation; the plane list goes unread.
     if span <= ceiling {
         return Ok(vec![Cut::whole(map)]);
     }
@@ -295,7 +231,6 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
         bytes: (len - base as u64).min((end - base) as u64),
     };
     let mut cuts: Vec<Cut> = Vec::new();
-    // The window being built: page-aligned base, and page above its last plane.
     let mut open: Option<(usize, usize)> = None;
     for (name, offset, length) in sorted {
         let end = offset
@@ -317,7 +252,6 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
             )));
         }
         match open {
-            // Extend when only the writer's padding lies between, and it still fits.
             Some((base, cover))
                 if lo.saturating_sub(cover) as u64 <= SLACK && hi - base <= ceiling =>
             {
@@ -339,8 +273,6 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
 impl std::ops::Deref for Mapping {
     type Target = [u8];
 
-    /// The artifact's bytes at their TRUE length — never the page-rounded
-    /// span, whose tail is zero-fill that belongs to no file.
     fn deref(&self) -> &[u8] {
         // SAFETY: `len` readable bytes inside a mapping of `span >= len`
         // bytes this type owns for its whole life, and which nothing may
@@ -356,7 +288,6 @@ impl std::ops::Deref for Mapping {
 
 impl std::fmt::Debug for Mapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The BYTES are never printed: this is a whole model.
         f.debug_struct("Mapping")
             .field("path", &self.path)
             .field("bytes", &self.len)
@@ -380,14 +311,20 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// A temporary file of `bytes` bytes of a known pattern, unlinked by
-    /// the caller.
     fn scratch(name: &str, bytes: usize) -> PathBuf {
         let path = std::env::temp_dir().join(format!("pie-map-{}-{name}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("a scratch artifact");
         let pattern: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8).collect();
         file.write_all(&pattern).expect("the pattern lands");
         path
+    }
+
+    fn mapping_every_case() {
+        an_empty_artifact_is_refused_by_name();
+        a_blob_larger_than_one_buffer_is_refused_by_its_own_name();
+        an_oversized_artifact_with_no_bound_plane_is_refused();
+        a_ceiling_under_one_page_is_refused_before_the_manifest();
+        a_blob_that_leaves_the_artifact_is_refused_by_name();
     }
 
     #[test]
@@ -399,8 +336,6 @@ mod tests {
         assert!(said.contains("holds no bytes"), "the refusal says why: {said}");
     }
 
-    /// A sparse scratch artifact of `bytes` bytes — `ftruncate` and no
-    /// write, so it costs no disk despite exceeding `maxBufferLength`.
     fn sparse(name: &str, bytes: u64) -> PathBuf {
         let path = std::env::temp_dir().join(format!("pie-cut-{}-{name}", std::process::id()));
         let file = std::fs::File::create(&path).expect("a scratch artifact");
@@ -414,9 +349,6 @@ mod tests {
             .collect()
     }
 
-    /// A plane no buffer can hold is refused by name, since a view cannot
-    /// span two reservations.
-    #[test]
     fn a_blob_larger_than_one_buffer_is_refused_by_its_own_name() {
         let page = page();
         let path = sparse("huge-plane", 64 * page as u64);
@@ -440,8 +372,6 @@ mod tests {
         );
     }
 
-    /// An oversized artifact this load binds no plane of is refused.
-    #[test]
     fn an_oversized_artifact_with_no_bound_plane_is_refused() {
         let page = page();
         let path = sparse("nothing-bound", 64 * page as u64);
@@ -454,8 +384,6 @@ mod tests {
         );
     }
 
-    /// A ceiling below one page is refused before a manifest is walked.
-    #[test]
     fn a_ceiling_under_one_page_is_refused_before_the_manifest() {
         let path = scratch("tiny-ceiling", 5000);
         let map = Mapping::of(&path).expect("the artifact maps");
@@ -467,8 +395,6 @@ mod tests {
         );
     }
 
-    /// A blob whose extent leaves the artifact is refused by name.
-    #[test]
     fn a_blob_that_leaves_the_artifact_is_refused_by_name() {
         let page = page();
         let path = sparse("overrun", 64 * page as u64);
@@ -483,12 +409,6 @@ mod tests {
 
 }
 
-/// **PREFAULT THE RESIDENT PLANES** (`prefault`): the artifact is
-/// mapped and bound without a copy, so the device's first touch of a plane
-/// page-faults it in — a random walk over the whole resident tier that the
-/// first fire after boot waits on. Asking the kernel for the pages up front,
-/// sequentially and on several threads, is the same bytes at the disk's
-/// sequential rate instead.
 fn prefault(map: &Mapping, planes: &[(&str, u64, u64)]) {
     let page = page() as u64;
     let base = map.base().as_ptr() as usize as u64;

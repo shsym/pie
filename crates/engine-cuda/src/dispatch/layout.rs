@@ -1,5 +1,3 @@
-//! `Layout`: the embedding table read and the packed-row splits.
-
 use kernels_cuda::layout;
 use model_exec::{DispatchLayout, KernelError};
 use model_ir::Layout;
@@ -13,8 +11,6 @@ impl DispatchLayout for Run<'_> {
 }
 
 impl Run<'_> {
-    /// Arms in `kernels-cuda`'s error vocabulary, lifted by
-    /// [`kernel`](crate::error::kernel) above the match.
     fn layout(&mut self, op: &Layout) -> Result<(), kernels_cuda::Error> {
         match op {
             Layout::Embed {
@@ -23,8 +19,6 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
-                // Affine-quantized table (e.g. qwen4's 8-bit): dequantized
-                // only for the rows this step touches.
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_mlx_affine(
                         self.ctx(),
@@ -37,11 +31,6 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
-                // A table the loader banded holds fewer rows than the
-                // vocabulary the op names: this rank owns a slice, so the
-                // gather bands and the model's `all_reduce` sums the ranks
-                // back into a whole row. Nothing here needs the rank — the
-                // banded entry reads it off the communicator.
                 None if self.tensor(*table).rows < *vocab => layout::embed_vocab_shard(
                     self.ctx(),
                     self.tensor(*ids),
@@ -62,8 +51,6 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
-                // Large table lands as its affine triplet; the gather
-                // dequantizes only the rows touched per token.
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
                         self.ctx(),
@@ -124,8 +111,6 @@ impl Run<'_> {
                 &mut self.tensor(*left),
                 &mut self.tensor(*right),
             ),
-            // Interpolating gather: the resampled table, vs the
-            // native-grid embed arm above.
             Layout::EmbedWeighted {
                 ids,
                 weights,
@@ -146,16 +131,12 @@ impl Run<'_> {
                 *side,
                 &mut self.tensor(*y),
             ),
-            // side² rows concatenated rather than averaged; the one op here
-            // whose destination is wider than its source.
             Layout::MergeRows { x, side, y } => kernels_cuda::layout_fold::merge_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
                 &mut self.tensor(*y),
             ),
-            // Embed merge with a drop sentinel: the shell admits -1 in
-            // patch_routes only for a plan that names this op.
             Layout::ScatterLiveRows {
                 src,
                 routes,
@@ -165,13 +146,8 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
-                // Routes are absolute fire rows; a window-cut `y` would
-                // double-count the region's offset.
                 &mut self.fire_wide(*y),
             ),
-            // src resolves at the patch window, y at the token window — the
-            // one node whose operands come from two seriations. routes are
-            // already validated host-side (Fault::PatchRoute).
             Layout::ScatterRows {
                 src,
                 routes,
@@ -181,21 +157,14 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
-                // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
-            // The packed rectangle stands at the selection's own window (the
-            // rows its lanes stand at, `model_exec::fire::packing`), so the
-            // permutation and the packed side cut like any row value while
-            // the fire-aligned side is whole: `perm`'s values are absolute.
             Layout::PackRows { x, perm, y } => layout::pack_rows(
                 self.ctx(),
                 self.fire_wide(*x),
                 self.tensor(*perm),
                 &mut self.tensor(*y),
             ),
-            // The launch is over the packed rows (`x`'s window); the scatter
-            // target is the whole rectangle at its base.
             Layout::UnpackRows { x, perm, y } => {
                 let packed = self.tensor(*x);
                 let whole = self.fire_wide(*y);
@@ -206,8 +175,6 @@ impl Run<'_> {
                     &mut kernels_cuda::Tensor::new(whole.ptr, packed.rows, whole.width, whole.dtype),
                 )
             }
-            // TopK and Argmax were refusals on the imagegen branch and are
-            // served upstream; the kernels landed with the block drafters.
             Layout::TopK {
                 x,
                 k,

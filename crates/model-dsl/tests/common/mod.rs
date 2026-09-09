@@ -1,8 +1,3 @@
-//! What the generative-vocabulary tests in this directory share: a fact
-//! vocabulary of stream bits, and one small two-stream text that reads its
-//! queries off the audio lanes and its keys off the video lanes — the
-//! cross-attention shape D2 is designed around, in six nodes.
-
 #![allow(dead_code)]
 
 use model_dsl::{
@@ -10,10 +5,8 @@ use model_dsl::{
     Value, Weight, ops, seam,
 };
 
-/// The stream bits, one-hot from bit 0: `Stream::code()` is the bit.
 pub const STREAM_BASE: u8 = 0;
 
-/// A fact vocabulary of nothing but the stream a lane carries.
 pub struct StreamFacts {
     pub stream: Stream,
 }
@@ -33,22 +26,16 @@ impl Classify for StreamFacts {
     }
 }
 
-/// The audio rows' width, the video rows' width, and the shared head shape.
 pub const AUDIO_WIDTH: u32 = 32;
 pub const VIDEO_WIDTH: u32 = 48;
 pub const HEAD_DIM: u32 = 16;
 pub const HEADS: u64 = 4;
 
-/// Audio queries over video keys: `q` off the audio arm, `k`/`v` off the
-/// video arm, each packed by its own permutation, one ragged attention
-/// under the `Or` of the two, the answer unpacked back onto the audio rows
-/// and returned as the plan's velocity.
 pub struct CrossAttention;
 
 impl ForwardHybrid for CrossAttention {
     type Facts = StreamFacts;
 
-    /// A denoiser keeps nothing between fires: no kv space at all.
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }

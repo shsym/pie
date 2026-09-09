@@ -1,8 +1,3 @@
-//! `residual_add_rmsnorm` leaves the stream bit-equal to `residual_add`, and
-//! the normed row within a bf16 ulp of `rmsnorm_plus_one`'s — the moment sum
-//! is taken eight elements per thread, so its f32 rounding can differ by one
-//! step from the row-strided walk — with and without a staged window.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -40,7 +35,6 @@ fn check(window: Option<(u32, u32, u32)>) {
         let win_at = gpu.up(&[live, base, 0u32, 0u32]);
         ctx.arm_stage(win_at);
     }
-    // Armed, every handle is a plane base standing `rows` (the bucket) tall.
     let staged = |at: u64| Tensor::new(at, rows, hidden as u32, Dtype::Bf16);
     let mut y = staged(y_fused);
     let mut out = staged(out_fused);
@@ -71,12 +65,16 @@ fn check(window: Option<(u32, u32, u32)>) {
     }
 }
 
+fn the_fused_residual_norm_lands_what_the_two_launches_land_every_case() {
+    the_pair_lands_the_two_launches_bits();
+    the_pair_retires_a_buckets_padded_rows_off_the_staged_window();
+}
+
 #[test]
 fn the_pair_lands_the_two_launches_bits() {
     check(None);
 }
 
-#[test]
 fn the_pair_retires_a_buckets_padded_rows_off_the_staged_window() {
     check(Some((4, 2, 1)));
 }

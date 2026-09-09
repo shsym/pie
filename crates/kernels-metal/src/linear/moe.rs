@@ -1,8 +1,3 @@
-//! `Moe`: routers, routed matmuls, and the folds that bring the fan-out
-//! back. One entry per IR variant. Both quantized bank forms reach the
-//! routed matmul; the entry picks between them off the [`Bank`] the driver
-//! resolved (an mxfp4 bank has no zero points, an affine one does).
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -19,51 +14,25 @@ const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
 const MXFP4_BLOCK: u32 = 32;
 
-/// The softmax router's normalization mode: over all experts, not the
-/// selected k.
 const SOFTMAX_OVER_SELECTED: u32 = 0;
 
-/// The file the sort, the gather and the scatter live in.
 const ROUTE_FILE: &str = "linear/moe_route.metal";
 
-/// The file the routed tiled points live in.
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 
-// No `QMM_GROUP` here. It used to state `[32, 2, 2]` as the tiled point's
-// threadgroup, and it was BOTH unused and stale: the shader derives its own
-// `qmm_tgp()` from the row tile now (`quant_qmm_t.metal`, whose comment says
-// the flat literal "was correct for exactly the rungs that predate the 8"),
-// and the launch takes its grid from `quant::qmm_grid`. A constant that
-// documents an obsolete shape is worse than no constant.
-
-/// The contraction step the tiled points walk.
 const QMM_BK: u32 = 32;
 
-/// The three row tiles a routed GEMM is compiled for, narrow first.
 const MOE_TILE_ROWS: [u32; 4] = [8, 16, 32, 64];
 
-/// The column tiles it is compiled for, narrow first.
 const MOE_TILE_COLS: [u32; 3] = [16, 32, 64];
 
-/// When sorting the rows by expert pays for itself: trades a partly-full
-/// tile's wasted arithmetic for reading each expert's weights once instead
-/// of once per pair. `min_per_expert` is a measured threshold, not
-/// modeled.
 #[must_use]
 pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
     experts > 0 && u64::from(pairs) >= u64::from(experts) * u64::from(min_per_expert)
 }
 
-/// Rows each expert's run is padded to, for a batch of `pairs` — 1 when the
-/// mixture does not batch at all. Priced off rows per expert and measured
-/// end-to-end (thresholds live in `DeviceTuning`); a wider tile costs
-/// nothing extra since [`sorted_rows`] is pessimistic and tiles past the
-/// routing decline rather than doing extra arithmetic.
 #[must_use]
 pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
-    // Two doors into the sorted arm: enough pairs per expert, or — for a
-    // fire whose few rows share their experts, a verify block — enough
-    // pairs in all (`moe_batch_min_pairs`, 0 keeps this door shut).
     let by_pairs = tuning.moe_batch_min_pairs > 0 && pairs >= tuning.moe_batch_min_pairs;
     if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) && !by_pairs {
         return 1;
@@ -77,15 +46,10 @@ pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 
     } else if per >= 1 {
         MOE_TILE_ROWS[1]
     } else {
-        // Fewer pairs than experts: the touched experts hold a few rows each,
-        // and the 8-row tile pads them least.
         MOE_TILE_ROWS[0]
     }
 }
 
-/// How many sorted rows a batch of `pairs` can produce. The worst case, not
-/// the actual: every touched expert can waste `tile - 1` rows, and at most
-/// `min(pairs, experts)` are touched.
 #[must_use]
 pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
     let tile = tile_rows(pairs, experts, tuning);
@@ -97,8 +61,6 @@ pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u3
     bound.div_ceil(tile) * tile
 }
 
-/// The widest column tile that divides the output, or `None` when no stamped
-/// one does. Wider is strictly fewer dequantizations of each weight tile.
 #[must_use]
 pub fn tile_cols(out_width: u32) -> Option<u32> {
     MOE_TILE_COLS
@@ -113,7 +75,6 @@ fn router_lanes(op: &'static str, experts: u32) -> Result<u32, Error> {
     Ok(experts.min(1024).div_ceil(32) * 32)
 }
 
-/// One thread per element, one threadgroup row per token row.
 fn route_rows(op: &'static str, width: u32, rows: u32) -> Result<Grid, Error> {
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
@@ -133,8 +94,6 @@ fn ranked_planes(op: &'static str, logits: Tensor, top_k: u32, routes: Tensor, w
     );
 }
 
-/// The staged routers' shared shape: one lane block per token row, the
-/// fan-out held in a threadgroup array — hence the caps.
 fn ranked(
     op: &'static str,
     logits: Tensor,
@@ -197,7 +156,7 @@ pub fn topk_softmax(
             logits.arg(),
             routes.arg_mut(),
             weights.arg_mut(),
-            ctx.absent()?, // the bias seat the softplus router fills
+            ctx.absent()?,
             experts.arg(),
             top_k.arg(),
             SOFTMAX_OVER_SELECTED.arg(),
@@ -206,8 +165,6 @@ pub fn topk_softmax(
     )
 }
 
-/// The same router, times the learned per-expert gain. No new kernel: buffer
-/// 3, which [`topk_softmax`] binds absent, is the gain plane here.
 pub fn topk_softmax_scaled(
     ctx: &Ctx<'_>,
     logits: Tensor,
@@ -272,8 +229,6 @@ pub fn topk_sigmoid(
     )
 }
 
-/// [`topk_sigmoid`] under a per-expert correction bias (`noaux_tc`): the bias
-/// ranks the pick, the weights stay the unbiased sigmoid.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_sigmoid_biased(
     ctx: &Ctx<'_>,
@@ -309,8 +264,6 @@ pub fn topk_sigmoid_biased(
     )
 }
 
-/// Sigmoid routing with a per-expert correction bias; weights pass through
-/// sqrt-softplus.
 #[allow(clippy::too_many_arguments)]
 pub fn topk_sqrt_softplus(
     ctx: &Ctx<'_>,
@@ -346,9 +299,6 @@ pub fn topk_sqrt_softplus(
     )
 }
 
-/// **A ROUTE PREDICTION** (`linear.moe_predict_route`): [`topk_sqrt_softplus`]'s
-/// ranking under the point the segment cut does not fall after. Unscaled,
-/// unnormalized — the weights are nobody's.
 pub fn predict_route(
     ctx: &Ctx<'_>,
     logits: Tensor,
@@ -381,11 +331,6 @@ pub fn predict_route(
     )
 }
 
-/// The hash router: layers `0..num_hash_layers` route by a per-token
-/// lookup, not a learned gate over logits. `tid2eid` is `[vocab, top_k]`
-/// i64, naming `top_k` expert ids at uniform weight `1/top_k` per token id;
-/// this gathers that row into the same layout [`topk_softmax`] writes, so
-/// the output is drop-in for the same sorted-MoE path.
 #[allow(clippy::too_many_arguments)]
 pub fn hash_route(
     ctx: &Ctx<'_>,
@@ -404,10 +349,6 @@ pub fn hash_route(
         matches!(ids.dtype, Dtype::U32 | Dtype::I32),
         "`{OP}` gathers by a 32-bit token id column"
     );
-    // **THE WEIGHTS ARE THE GATE'S.** The official `Gate.forward` scores
-    // every layer with `sqrt(softplus(x · W))` and, on a hash layer, only
-    // replaces the top-k CHOICE with the table's; the chosen experts'
-    // weights are still gathered off the scores, renormalized and scaled.
     dtype_dispatch!(OP, logits.dtype, { Bf16 => () });
     debug_assert_eq!(
         logits.rows, routes.rows,
@@ -422,7 +363,6 @@ pub fn hash_route(
         tid2eid.width, top_k,
         "the hash table names `top_k` experts per token id"
     );
-    // Same shape/element as a softmax router's output.
     ranked_planes(OP, routes, top_k, routes, weights);
     debug_assert_eq!(
         ids.rows, routes.rows,
@@ -431,7 +371,6 @@ pub fn hash_route(
     let top_k = nonzero(OP, "the fan-out this router states", top_k)?;
     nonzero(OP, "the vocabulary this table spans", vocab)?;
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
-    // One thread per token row: the row's `top_k` weights normalize together.
     ctx.fire(
         Fire::at(ROUTE_FILE, "hash_route_gather").apply(Grid::of(
             [routes.rows, 1, 1],
@@ -453,7 +392,6 @@ pub fn hash_route(
     )
 }
 
-/// **THE STATIC ROUTES OF A GROUPED PROJECTION**: `routes[n, g] = g`.
 pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.group_routes";
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` lands i32 routes");
@@ -465,15 +403,6 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
     )
 }
 
-/// **THE BLOCK-DIAGONAL PROJECTION** (`linear.matmul_grouped`): `x` is
-/// `[tokens, G·K]`, the plane `[G·N, K]`, and `y` `[tokens, G·N]`.
-///
-/// **NO NEW POINT.** Read with `G` rows per token, `[tokens, G·K]` is
-/// `[tokens·G, K]` byte for byte, `[G·N, K]` is a `G`-expert bank of `[N, K]`,
-/// and `[tokens, G·N]` is `[tokens·G, N]` — so this is exactly the routed
-/// select over the by-route activation (`x.rows == tokens · top_k`, one
-/// `K`-wide slice per slot) with [`group_routes`]' `g` in slot `g`, and the
-/// three rectangles are restated and handed to it.
 pub fn matmul_grouped(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -509,17 +438,12 @@ pub fn matmul_grouped(
     }
 }
 
-/// The plane a grouped projection reads: a split-plane quantized bank, or one
-/// dense rectangle — resolved by the caller, because a bank's weight never
-/// answers as one dense handle.
 #[derive(Clone, Copy)]
 pub enum GroupedPlane {
     Bank(Bank),
     Dense(Tensor),
 }
 
-/// The routed fan a selected matmul walks: `tokens x top_k` result rows, the
-/// activation read either once per token or once per route.
 struct Selected {
     tokens: u32,
 
@@ -605,8 +529,6 @@ fn routed_qmv_grid(
     Ok([x, out_width.div_ceil(4), top_k])
 }
 
-/// Grouped matmul over a dense bank: each routed row multiplies the expert
-/// its route selects.
 pub fn matmul_select(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -634,17 +556,10 @@ pub fn matmul_select(
     )
 }
 
-/// The routed qmv point one bank arrives at. The discriminator is whether the
-/// bank carries a biases plane, not the group size: mxfp4's e8m0 scale is the
-/// whole dequantization, while affine's bf16 factor needs the zero points
-/// too. Group size is then checked against the chosen point rather than used
-/// to pick it.
 fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static str, Error> {
     match (bank.affine(), bank.group, bank.bits) {
         (true, 64, 4) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
         (true, 64, 4) => Ok("affine_qmv_routed_bfloat16_gs_64_b_4"),
-        // 2-bit routed decode: `AffineU2` is instantiated at all three groups
-        // 2-bit checkpoints carry (group 32, 64, 128).
         (true, 64, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_2"),
         (true, 64, 2) => Ok("affine_qmv_routed_bfloat16_gs_64_b_2"),
         (true, 32, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_32_b_2"),
@@ -665,8 +580,6 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
     }
 }
 
-/// What both routed arms share: the planes agree with the codec the point
-/// was picked for, and K is a whole number of groups.
 fn routed_bank(op: &'static str, x: Tensor, bank: Bank) -> Result<(), Error> {
     if bank.affine() {
         debug_assert_eq!(
@@ -691,9 +604,6 @@ fn routed_bank(op: &'static str, x: Tensor, bank: Bank) -> Result<(), Error> {
     Ok(())
 }
 
-/// Grouped matmul over a quantized bank, with a per-expert bias: each routed
-/// row multiplies the expert its route selects. The driver resolves the bank
-/// weight to its planes before calling.
 pub fn matmul_select_bias(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -730,9 +640,6 @@ pub fn matmul_select_bias(
     )
 }
 
-/// Grouped matmul over a quantized bank with nothing added — the bias-free
-/// twin of [`matmul_select_bias`], for the rows-cut expert down-projection,
-/// whose routed bias lands after the reduce through [`bias_sum`] instead.
 pub fn matmul_select_quant(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -758,7 +665,7 @@ pub fn matmul_select_quant(
             y.arg_mut(),
             stated(OP, x.width)?.arg(),
             stated(OP, y.width)?.arg(),
-            ctx.absent()?, // the expert bias seat; this entry is the one that adds none
+            ctx.absent()?,
             routes.arg(),
             stated(OP, fan.x_slot_stride)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
@@ -767,42 +674,21 @@ pub fn matmul_select_quant(
     )
 }
 
-/// The device planes the sorted arm works in, beside the operands the op
-/// named. Every field is scratch (dead once [`matmul_select_batched`]
-/// returns), sized off `n_pairs`, `n_experts` and [`sorted_rows`]; the caller
-/// allocates it since `kernels-metal` allocates nothing itself.
 #[derive(Clone, Copy, Debug)]
 pub struct RoutedScratch {
-    /// `i32`, [`sorted_rows`] long: the pair index each sorted row came from,
-    /// or −1 for a row the padding invented.
     pub perm: Tensor,
 
-    /// `i32`, [`sorted_rows`] long: which expert each sorted row belongs to.
     pub row_expert: Tensor,
 
-    /// `i32`, one per tile of the sorted stack: the expert that tile serves,
-    /// or −1 for a tile past the routing (a declined tile returns before
-    /// reading a weight, making the padding free).
     pub tile_expert: Tensor,
 
-    /// `i32`, `n_pairs` long: where each pair landed (the inverse
-    /// permutation, produced free by the sort).
     pub inv: Tensor,
 
-    /// The activation gathered into expert-major order: `sorted_rows x K`.
     pub x: Tensor,
 
-    /// The routed product in that same order: `sorted_rows x N`.
     pub y: Tensor,
 }
 
-/// The routed tiled point one bank and one tile arrive at, or `None` when the
-/// shader stamps none for that combination. Four families are stamped; the
-/// fifth (`affine_qmm_t_routed` with a per-expert bias) is absent on purpose
-/// since that family carries no bias seat, so a biased affine bank falls
-/// through to the matvec arm instead. Both mxfp4 bias forms are stamped
-/// (biased and unbiased), since a mixture may bias some expert projections
-/// and not others.
 fn batched_point(
     op: &'static str,
     bank: Bank,
@@ -813,15 +699,10 @@ fn batched_point(
 ) -> Result<Option<crate::linear::quant::Point>, Error> {
     let (bm, bn) = (stated(op, bm)?, stated(op, bn)?);
     match (bank.affine(), bank.group, bank.bits, biased) {
-        // The FP16 staged-weight arm: the loader dequantizes straight to
-        // `half` for pre-Apple9 silicon. Stamped in source, so no jit stamp.
         (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::quant::Point {
             entry: crate::linear::quant::routed_fp16_point(op, bm, bn)?,
             stamp: "",
         })),
-        // An unstamped width declines (`Ok(None)`) rather than faulting, so
-        // the caller falls through to the matvec arm, which serves every
-        // width.
         (true, group, bits, false) if crate::linear::quant::qmm_stamps_width(bits) => {
             Ok(Some(crate::linear::quant::qmm_point(
                 op,
@@ -846,13 +727,6 @@ fn batched_point(
     }
 }
 
-/// The sorted, batched routed matmul: one GEMM over runs of equal expert,
-/// vs. the matvec arm's one simdgroup per (row, four columns). `route_sort`
-/// lays each expert's run out on a tile boundary and writes the
-/// permutation and its inverse; the gather then makes each run's rows
-/// contiguous so the GEMM reads each expert's weight slice once per run
-/// instead of once per row. `tile_rows = 1` collapses the sort to plain
-/// grouping, so decode and prefill share one dataflow.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_select_batched(
     ctx: &Ctx<'_>,
@@ -881,8 +755,6 @@ pub fn matmul_select_batched(
         return Ok(false);
     }
     let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
-    // Only the fp16 affine-4/64 family is stamped at the 8-row rung; the
-    // others take the 16-row tile they always took.
     if tile == MOE_TILE_ROWS[0] && !(fp16 && bank.affine() && bank.bits == 4 && bank.group == 64) {
         tile = MOE_TILE_ROWS[1];
     }
@@ -890,7 +762,6 @@ pub fn matmul_select_batched(
         return Ok(false);
     };
     let padded = {
-        // `sorted_rows` at THIS tile (it may have been widened just above).
         let touched = pairs.min(experts);
         let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
         bound.div_ceil(tile) * tile
@@ -900,8 +771,6 @@ pub fn matmul_select_batched(
         "`{op}`'s sorted stack is `sorted_rows` deep"
     );
 
-    // Fan-out 1 means the activation is already one row per route (pair
-    // index == row); `selected` signals that via a nonzero slot stride.
     let gather_fan = if fan.x_slot_stride == 0 { fan.top_k } else { 1 };
     let sort = [
         routes.arg(),
@@ -947,8 +816,6 @@ pub fn matmul_select_batched(
         stated(op, x.width)?.arg(),
         stated(op, y.width)?.arg(),
     ];
-    // Buffers 7..12 are unbound seats in this family; `tile_expert` is
-    // read at index 12.
     args.push(match bias {
         Some(bias) => bias.arg(),
         None => ctx.absent()?,
@@ -988,8 +855,6 @@ pub fn matmul_select_batched(
     Ok(true)
 }
 
-/// The zero-point seat, bound or null. Both templates hold the seat (mxfp4's
-/// `dot` never reads it), so an absent plane is just a null binding.
 fn zero_points(ctx: &Ctx<'_>, bank: Bank) -> Result<crate::encode::ArgValue, Error> {
     match bank.biases {
         Some(biases) => Ok(biases.arg()),
@@ -997,7 +862,6 @@ fn zero_points(ctx: &Ctx<'_>, bank: Bank) -> Result<crate::encode::ArgValue, Err
     }
 }
 
-/// Folds the `top_k` routed rows back to one row per token, weighted.
 pub fn weighted_sum(
     ctx: &Ctx<'_>,
     routed: Tensor,
@@ -1039,12 +903,6 @@ pub fn weighted_sum(
     )
 }
 
-/// The routed bias mixture, said once on an already-folded activation:
-/// `y[t] = x[t] + Σ_k weights[t, k] · bias[routes[t, k]]`. Its own entry
-/// rather than a seat inside the routed matmul because the expert
-/// down-projection is rows-cut under tp: each rank's matmul is a partial
-/// product, and folding the (replicated) bias in there would sum it tp
-/// times. Stating it after the all_reduce lands it exactly once.
 pub fn bias_sum(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -1093,7 +951,6 @@ pub fn bias_sum(
     )
 }
 
-/// `y = routed + sigmoid(gate) * shared`, per element.
 pub fn sigmoid_gate_add(
     ctx: &Ctx<'_>,
     routed: Tensor,
@@ -1133,11 +990,6 @@ pub fn sigmoid_gate_add(
 mod tests {
     use super::*;
     
-    
-    
-
-    /// An mxfp4 bank with no bias plane must still reach a tiled point (not
-    /// just the biased form).
     #[test]
     fn an_mxfp4_bank_reaches_a_tiled_point_with_or_without_a_bias() {
         let bank = Bank {

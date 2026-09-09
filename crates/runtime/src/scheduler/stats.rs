@@ -1,19 +1,6 @@
-//! `SchedulerStats` — the per-engine, lock-free telemetry snapshot. Updated
-//! atomically after each fire by the single scheduler thread; read (Relaxed)
-//! by [`aggregate`]. Self-contained: no dependency on the
-//! scheduler batch/request types — pure counters + histograms + the fire/engine
-//! probe sub-structs (`crate::scheduler::probe`).
-
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-// =============================================================================
-// SchedulerStats (lock-free snapshot for monitoring)
-// =============================================================================
-
-/// Inter-batch bubble histogram: exclusive upper bounds (µs) per bucket. A
-/// boundary is pinned at 100 (the masterplan p50 gate) so "p50 < 100 µs" reads as
-/// "the p50 bucket's upper bound ≤ 100". `u64::MAX` is the overflow catch-all.
 pub const BUBBLE_HIST_UPPER_US: [u64; 16] = [
     1,
     2,
@@ -33,55 +20,20 @@ pub const BUBBLE_HIST_UPPER_US: [u64; 16] = [
     u64::MAX,
 ];
 
-/// Cumulative stats exposed for monitoring. Updated atomically after each batch.
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
-    // ── Always-on counters (no Instant::now needed). ────────────────────────
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
-    /// Total request count across all batches (sum of batch sizes).
-    /// Divide by `total_batches` for mean batch size in requests.
     pub total_requests_processed: AtomicU64,
-    /// Largest forward request count ever fired by this scheduler.
     pub max_forward_requests_observed: AtomicU64,
-    /// Coarse histogram of batch sizes. Buckets:
-    /// [0]=1, [1]=2-3, [2]=4-7, [3]=8-15, [4]=16-31,
-    /// [5]=32-63, [6]=64-127, [7]=128+.
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    /// Inter-batch bubble histogram (always-on, HOST PROXY), bucketed by
-    /// [`BUBBLE_HIST_UPPER_US`].
-    ///
-    /// **ONE COUNT PER STARVATION, NOT PER FIRE** — and the difference is not
-    /// pedantic. [`crate::scheduler::frame::FramePolicy`] records here only
-    /// when a frame is posted with nothing executing; a boundary the run-ahead
-    /// window covered adds no entry at all, zero or otherwise. So the p50 is a
-    /// median over the gaps that HAPPENED and says nothing about how often
-    /// they happen, and two arms with different starvation RATES are not
-    /// comparable through it: a fully pipelined lane whose only gaps are the
-    /// first and last of a launch reads a high p50 off two samples, while a
-    /// lockstep lane that starves on every single token reads a low one off
-    /// hundreds. Palo D0 lost time to exactly that reading (build log 19's
-    /// "bubble p50 rises 8×"). The figure to compare is
-    /// `fire.quorum.device_idle_us / total_tokens`, with
-    /// `device_idle_gaps` beside it as the rate.
-    ///
-    /// The host stamp includes scheduler wake/submit overhead, so each sample
-    /// is a conservative upper bound on the gap it measures.
     pub bubble_us_hist: [AtomicU64; BUBBLE_HIST_UPPER_US.len()],
-    // ── Fire-domain probes (gated behind `profile-fire` feature). ───────────
-    //
-    // Hierarchy + invariants documented in `crate::scheduler::probe`. Writers
-    // use the `probe_fire!` macro from that module so the fetch_add
-    // disappears when the feature is off. The struct itself is always
-    // defined so callers and readers compile uniformly.
     pub fire: crate::scheduler::probe::FireProbes,
 }
 
 impl SchedulerStats {
-    /// Record one fire's inter-batch bubble (µs) into the host-proxy
-    /// histogram. Called only from the single per-engine scheduler thread.
     pub fn record_bubble_us(&self, us: u64) {
         self.bubble_us_hist[Self::bubble_bucket(us)].fetch_add(1, Relaxed);
     }
@@ -95,10 +47,6 @@ impl SchedulerStats {
     }
 }
 
-/// Fold a completed batch's always-on counters into the shared stats.
-/// `latency` is the off-thread forward (GPU) wait —
-/// the dominant component of the batch's wall time under the overlapped
-/// fire (the host build/enqueue overlaps the prior in-flight batch).
 pub(crate) fn record_fire_stats(
     stats: &SchedulerStats,
     latency: Duration,
@@ -136,54 +84,35 @@ pub(crate) fn record_fire_stats(
     });
 }
 
-// AggregateStats: cross-engine stats, aggregated over per-worker stats.
-
 use std::sync::Arc;
 
-/// Aggregated scheduler stats across every engine (was `InferenceStats`).
-///
-/// Always-on counters live at the top; per-domain probe averages
-/// (currently just `fire`) are nested so the shape mirrors the probe
-/// hierarchy in `crate::scheduler::probe`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct AggregateStats {
     pub total_batches: u64,
     pub total_tokens_processed: u64,
     pub total_requests_processed: u64,
     pub max_forward_requests_observed: u64,
-    /// Histogram buckets (1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+).
     pub batch_size_hist: [u64; 8],
     pub last_batch_latency_us: u64,
     pub cumulative_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
 
-    /// Fire-domain probe averages. Values are 0 when built without
-    /// `profile-fire`. Mirrors `crate::scheduler::probe::FireProbes`.
     pub fire: FireStats,
 
-    /// The guest thread's own submit cost, phase by phase. Zero
-    /// without `profile-fire`, and process-global rather than per-engine
-    /// because a submit runs on the guest's task.
     pub host_submit: HostSubmitStats,
 
-    /// Inter-batch bubble histogram: host proxy (device-idle stamped at the
-    /// Rust enqueue point, so it over-counts by the submit/handshake
-    /// delay). See [`Self::bubble_p50`] and [`SchedulerStats::bubble_us_hist`].
     pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
 }
 
 impl AggregateStats {
-    /// Inter-batch bubble p50 (µs) from the scheduler's host-side histogram.
     pub fn bubble_p50(&self) -> u64 {
         self.bubble_percentile(0.50)
     }
 
-    /// Inter-batch bubble p99 (µs).
     pub fn bubble_p99(&self) -> u64 {
         self.bubble_percentile(0.99)
     }
 
-    /// Alias retained for callers that explicitly request the host proxy.
     pub fn bubble_p50_proxy(&self) -> u64 {
         Self::hist_percentile(&self.bubble_us_hist, 0.50)
     }
@@ -192,8 +121,6 @@ impl AggregateStats {
         Self::hist_percentile(&self.bubble_us_hist, q)
     }
 
-    /// The upper bound of the bucket containing the `q`-quantile of `hist`
-    /// (0 if the histogram is empty).
     fn hist_percentile(hist: &[u64; BUBBLE_HIST_UPPER_US.len()], q: f64) -> u64 {
         let total: u64 = hist.iter().sum();
         if total == 0 {
@@ -226,66 +153,36 @@ pub struct FireStats {
     pub quorum: QuorumStats,
 }
 
-/// Quorum-rule probe averages/counters. The wave counters (`wave_*`)
-/// populate in every build; legacy straggler counters stay zero under
-/// strict wait-all; the latency probes still require `profile-fire`.
-/// Mirrors `crate::scheduler::probe::QuorumProbes`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct QuorumStats {
-    /// Mean device idle between a batch retiring and the next launching (F1).
     pub avg_inter_batch_bubble_us: u64,
     pub inter_batch_bubble_us_sum: u64,
-    /// Mean last-ready → enqueue latency (F1 quorum completion).
     pub avg_quorum_latency_us: u64,
     pub quorum_latency_us_sum: u64,
-    /// Idle-escape (F2) fire count; divide by `total_batches` for escape rate.
     pub escape_fires: u64,
-    /// Depth-2 submit-ahead (G3 bubble) fire count; divide by `total_batches`
-    /// for the submit-ahead rate (steady-state decode-fleet bubble-filler).
     pub submit_ahead_fires: u64,
-    /// Legacy field: strict wait-all never fires narrow.
     pub straggler_fires: u64,
-    /// Legacy field: strict wait-all never demotes pipelines.
     pub straggler_demotions: u64,
-    /// Dummy-run / readiness-miss count; a healthy fleet holds it under 1%.
     pub readiness_miss: u64,
-    /// Wait-for-all wave: mean active_pipelines (wait-set size) sampled
-    /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
-    /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
     pub avg_active_pipelines_at_fire: u64,
-    /// Mean absentees per wave fire; strict wait-all keeps this at zero.
     pub avg_missing_at_fire: u64,
-    /// Cumulative numerator for `avg_active_pipelines_at_fire`.
     pub wave_active_sum: u64,
-    /// Cumulative numerator for `avg_missing_at_fire`.
     pub wave_missing_sum: u64,
-    /// Count of WaitAll wave fires (denominator for the two averages above).
     pub wave_fires: u64,
-    /// Sealed partitions, and the subset sealed while a frame was executing.
-    /// `seal_while_executing / seal_events` is chain engagement — see
-    /// [`crate::scheduler::probe::QuorumProbes`].
     pub seal_events: u64,
     pub seal_while_executing: u64,
-    /// Whole-sealed-queue holds caused by a blocked front frame.
     pub dispatch_blocked_holds: u64,
-    /// Device idle measured at frame post: total microseconds and the number
-    /// of gaps. See [`crate::scheduler::probe::QuorumProbes`].
     pub device_idle_us: u64,
     pub device_idle_gaps: u64,
-    /// Dispatch passes that skipped the frame policy with the device idle.
     pub idle_break_control: u64,
     pub idle_break_depth: u64,
-    /// Device-idle park time, split by whether a control op held launches.
     pub idle_park_control_us: u64,
     pub idle_park_other_us: u64,
-    /// Scheduler-thread serial cost of ingesting arrivals, and the count.
     pub accept_us: u64,
     pub accept_calls: u64,
-    /// Guest turnaround across every sealed lane: sum, max, count.
     pub turnaround_sum_us: u64,
     pub turnaround_max_us: u64,
     pub turnaround_n: u64,
-    /// Engine-lane busy time split by op kind.
     pub lane_launch_us: u64,
     pub lane_launch_n: u64,
     pub lane_prefill_us: u64,
@@ -317,9 +214,6 @@ pub struct ExecuteStats {
     pub engine_fire_us_sum: u64,
 }
 
-/// Guest-thread submit phases. Mirrors
-/// [`crate::scheduler::probe::HostSubmitProbes`]; every field is a cumulative
-/// sum in microseconds beside the count that divides it.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct HostSubmitStats {
     pub submits: u64,
@@ -341,10 +235,6 @@ pub struct PostDispatchStats {
     pub stats_update_us_sum: u64,
 }
 
-/// Aggregate stats across every per-engine `SchedulerStats` (was
-/// `InferenceService::aggregate_stats`; now a plain function over the
-/// registry's `Vec<Arc<SchedulerStats>>` — the atomics are lock-free, so no
-/// actor round-trip is needed).
 pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateStats {
     let mut total_batches = 0u64;
     let mut total_tokens = 0u64;
@@ -354,7 +244,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
     let mut last_latency = 0u64;
     let mut cumulative_latency = 0u64;
-    // Per-engine sums of probe atomics, in AggregateStats.fire's shape.
     let mut fire_inter = 0u64;
     let mut fire_post_dispatch_to_fire = 0u64;
     let mut fire_recv_block_wait = 0u64;
@@ -455,8 +344,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     }
 
     let avg = |value: u64| value.checked_div(total_batches).unwrap_or(0);
-    // Inter-fire is sampled starting at the 2nd batch (no prior to diff
-    // against for the 1st), so divide by max(total_batches-1, 1).
     let avg_pair = |value: u64| {
         if total_batches > 1 {
             value / (total_batches - 1)
@@ -474,7 +361,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         cumulative_batch_latency_us: cumulative_latency,
         avg_batch_latency_us: avg(cumulative_latency),
         host_submit: {
-            // Process-global, so read here rather than summed per-engine.
             let h = crate::scheduler::probe::host_submit();
             HostSubmitStats {
                 submits: h.submits.load(Relaxed),

@@ -1,5 +1,3 @@
-//! `Collective`: the cross-rank reductions and gathers.
-
 use kernels_cuda::collective;
 use model_exec::{DispatchCollective, KernelError};
 use model_ir::Collective;
@@ -13,7 +11,6 @@ impl DispatchCollective for Run<'_> {
 }
 
 impl Run<'_> {
-    /// Returns `kernels_cuda::Error`, lifted by [`kernel`](crate::error::kernel) in `dispatch` above.
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_cuda::Error> {
         match op {
             Collective::AllReduce { buf, buf_out: _ } => {

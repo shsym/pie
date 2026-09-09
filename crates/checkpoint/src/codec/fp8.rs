@@ -1,14 +1,5 @@
-//! OCP FP8 E4M3: one byte, four exponent bits, three mantissa bits. Decode
-//! and encode are kept in one file since a round-trip that doesn't close is
-//! the bug this arrangement is meant to make visible.
 use super::e8m0::exp2i;
 
-/// One `f64` per `Fp8E4M3` byte: sign, four exponent bits, three mantissa
-/// bits, bias 7.
-///
-/// OCP `E4M3` with no infinity: the all-ones exponent carries ordinary
-/// values up to 448 and only `S.1111.111` is NaN. A subnormal is
-/// `mantissa/8 * 2^-6`.
 pub fn decode_fp8_e4m3_elements(bytes: &[u8]) -> Vec<f64> {
     bytes
         .iter()
@@ -29,8 +20,6 @@ pub fn decode_fp8_e4m3_elements(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
-/// One E4M3 byte as the `f32` it denotes, `__nv_cvt_fp8_to_halfraw` widened:
-/// 1-4-3, bias 7, no infinities, `S.1111.111` the one NaN.
 pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0 };
     let exp = (byte >> 3) & 0xF;
@@ -39,7 +28,6 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         return f32::NAN;
     }
     let value = if exp == 0 {
-        // Subnormal: units of 2^-9.
         mant * exp2i(-9)
     } else {
         (1.0 + mant / 8.0) * exp2i(i32::from(exp) - 7)
@@ -47,9 +35,6 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     sign * value
 }
 
-/// `__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)`: round to nearest
-/// even, saturate finite overflow — and infinity — to ±448, NaN to the
-/// scheme's NaN byte with the sign kept.
 pub fn f32_to_fp8_e4m3(x: f32) -> u8 {
     let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
     if x.is_nan() {
@@ -57,15 +42,9 @@ pub fn f32_to_fp8_e4m3(x: f32) -> u8 {
     }
     let a = x.abs();
     if a >= 448.0 {
-        // Everything past the last code rounds or saturates onto it: the
-        // next magnitude up the grid is the NaN slot, which SATFINITE never
-        // produces.
         return sign | 0x7E;
     }
     if a < 0.015625 {
-        // Subnormal: quantize in units of 2^-9. The multiply is by a power
-        // of two, so it is exact and the tie is the true tie; 8 rolls over
-        // into exactly the first normal code.
         let q = (a * 512.0).round_ties_even() as u32;
         return sign | q as u8;
     }
@@ -79,4 +58,3 @@ pub fn f32_to_fp8_e4m3(x: f32) -> u8 {
     }
     sign | (((e + 7) as u8) << 3) | (q as u8 - 8)
 }
-

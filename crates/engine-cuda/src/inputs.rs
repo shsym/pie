@@ -1,5 +1,3 @@
-//! Resident fire inputs: one allocation, carved once at load and overwritten every fire. Addresses are pointer-stable because a captured graph bakes them in and is never re-captured.
-
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_padding};
 use model_compiler::Budget;
@@ -13,24 +11,19 @@ use crate::error::Result;
 use crate::store::SpaceSeat;
 use crate::store::kv::{Facts, Geometry, Paging, SpaceFacts};
 
-/// Int side of one plan grant: where a built schedule's offset table is staged. Builders refuse at build time (naming bytes asked vs. left) when a schedule does not fit.
 const GRANT_INT_BYTES: u64 = 8 << 20;
 
-/// Floor for the float side: split-kv partial outputs and log-sum-exps. A graph-shaped prefill schedule may want more; see [`graph_float_bytes`].
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
-/// Float workspace one graph-shaped prefill schedule can ask for. A short grant does not fail the build — it declines graph capture and falls back to an unshaped schedule.
 fn graph_float_bytes(facts: &SpaceFacts, sms: u32) -> u64 {
     let padded = u64::from(2 * sms.max(1)) / u64::from(facts.kv_heads.max(1)).max(1);
     let tile = if facts.head_dim >= 256 { 64 } else { 128 };
     let heads = u64::from(facts.q_heads);
-    // `tmp_v`: partials; `tmp_s`: their log-sum-exps. Both f32, 16-byte aligned.
     let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
     let s = heads * padded * tile * 4;
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// Float workspace one graph-shaped FA2 prefill schedule can ask for at the bucket ceiling — covers the tile-count term [`graph_float_bytes`] misses, computed at the widest bucket and `Budget::max_lanes`.
 fn prefill_float_bytes(facts: &SpaceFacts, rows: u32, lanes: u32, device: &Device) -> u64 {
     let (tile, padded) = prefill_graph_padding(
         rows,
@@ -42,23 +35,19 @@ fn prefill_float_bytes(facts: &SpaceFacts, rows: u32, lanes: u32, device: &Devic
     );
     let heads = u64::from(facts.q_heads);
     let tile = u64::from(tile);
-    // `sched_prefill::layout`'s `tmp_v` and `tmp_s`, exactly.
     let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
     let s = heads * padded * tile * 4;
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// Float workspace one graph-shaped decode schedule can ask for at the lane ceiling; the occupancy term is covered by the prefill formula, but the lane term is not, so the caller takes the max of both.
 fn decode_float_bytes(facts: &SpaceFacts, lanes: u32) -> u64 {
     let padded = u64::from(lanes.max(1));
     let heads = u64::from(facts.q_heads);
-    // `tmp_v` and `tmp_s`, on `sched_decode::layout`'s own terms.
     let v = heads * padded * u64::from(facts.head_dim) * 4;
     let s = heads * padded * 4;
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// Float workspace one latent (mla) schedule can ask for. `plan_mla` sizes split-kv partials off the cluster grid, not a query rectangle; `rows` bounds to `2*SMs*64` regardless of cluster size since it cancels out.
 fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
     let rows = 2 * u64::from(sms.max(1)) * 64;
     let partial_o = (rows * 2 * u64::from(rank)).next_multiple_of(16);
@@ -66,22 +55,17 @@ fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
     (partial_o + partial_lse).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
-/// The alignment every carved region starts on.
 const ALIGN: u64 = 256;
 
-/// How long [`Inputs::claim`] spins before it says the ring is oversubscribed. A correctly sized ring never reaches it.
 const CLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// One plan value's grant, as offsets — turned into a [`Workspace`] once the store is allocated and its base address is known.
 #[derive(Clone, Debug)]
 struct Grant {
-    /// One int carving per run of the region that builds this schedule, in run order.
     int_at: Vec<u64>,
     float_at: u64,
     float_bytes: u64,
 }
 
-/// One kv space's six vectors, as offsets into the store.
 #[derive(Debug, Clone, Copy)]
 struct SpaceAt {
     indptr: u64,
@@ -92,60 +76,37 @@ struct SpaceAt {
     write_offset: u64,
 }
 
-/// The handles one fire's inputs resolve to.
 #[derive(Debug, Clone)]
 pub struct Handles {
     pub tokens: Tensor,
     pub positions: Tensor,
-    /// Where the packed per-window boundary vectors landed — [`Windows::bind`](crate::window::Windows::bind) cuts them apart.
     pub windows: u64,
-    /// Un-rebased qo prefix sums, `[lanes + 1]` `i32`. A base, not a `Tensor`, since a body bakes the pointer. `None` unless bodied.
     pub qo_absolute: Option<u64>,
-    /// `None` when this fire staged no live words.
     pub live_rows: Option<u64>,
     pub spaces: Vec<SpaceHandles>,
-    /// `[lanes]`: which recurrent bank each lane owns.
     pub slot_ids: Tensor,
     pub row_valid: Tensor,
-    /// One adapter id per token row. `None` when no lane carried one.
     pub adapter_routes: Option<Tensor>,
-    /// `[readouts]` `i32`: which token row each readout row gathers, in
-    /// fire order — what puts the trunk head on the rows a reader takes
-    /// (`RuntimeInput::ReadoutRows`).
     pub readout_rows: Tensor,
-    /// Packed `u8` (query, key) bits, fire-wide. `None` when no lane carried a mask, so a masked consumer answers `attn::masked`'s own refusal rather than reading zeros.
     pub mask: Option<Tensor>,
-    /// Each lane's ABSOLUTE byte offset into [`mask`](Handles::mask).
     pub mask_indptr: Option<Tensor>,
-    /// `GeomKind::GroupOfLane`, `[lanes]` at the lane tables' reach. `None`
-    /// for a fire that staged none (a plan reading no packing table).
     pub group_of_lane: Option<Tensor>,
-    /// One entry per selection the load carved, in the load's order.
     pub packings: Vec<PackingHandles>,
-    /// `GeomKind::RequestOfToken`: `[rows]` i32, the fire lane of every row (lane 0 past the live rows).
     pub lane_of_row: Tensor,
 }
 
-/// Numbers per multimodal position: `(t, h, w)`. `RuntimeInput::PatchPositions` and `RuntimeInput::MropePositions` are the same triple over two rectangles.
 const AXES: u64 = 3;
 
-/// The second row axis's reservation, or `None` for a load whose plan states no patch row.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSeat {
-    /// Most patch rows one fire may carry (`PatchLadder::max_patches`).
     pub rows: u64,
-    /// One patch row's width in bytes: `C·T·P²` elements of the plan's dtype.
     pub row_bytes: u64,
-    /// Most images one fire may carry (`PatchLadder::max_images`).
     pub images: u64,
     pub dtype: Dtype,
-    /// Position-gather width: 1 (native grid), 4 (bilinear), 16 (bicubic), or 0 for no position gather.
     pub embed_taps: u64,
-    /// Whether the plan also declares `RuntimeInput::PatchEmbedWeights`.
     pub embed_weights: bool,
 }
 
-/// Where the patch vectors sit in the device store.
 #[derive(Debug, Clone, Copy)]
 struct PatchAt {
     payload: u64,
@@ -157,50 +118,36 @@ struct PatchAt {
     seat: PatchSeat,
 }
 
-/// The three seats one fire's images resolve to.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchHandles {
-    /// `[patch rows, C·T·P²]`, the plan's element.
     pub patches: Tensor,
     pub segments: Tensor,
-    /// One destination token row per patch row.
     pub routes: Tensor,
-    /// `[patch rows, 3]` — one `(t, h, w)` per patch row.
     pub positions: Tensor,
-    /// Rows of the learned position table each patch reads. `None` for a plan that declares no position gather.
     pub embed_rows: Option<Tensor>,
-    /// `None` for a native-grid plan.
     pub embed_weights: Option<Tensor>,
 }
 
-/// One float port the plan reads (design D3), as the load carves it: a
-/// `[max_tokens, width]` rectangle on the token axis, or `[max_lanes,
-/// width]` for a lane vector, in the element the plan's reader states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortSeat {
     pub kind: engine::fire::PortKind,
-    /// The family's index for a port of this kind.
     pub port: u8,
-    /// Elements per row (`width`, or `axes` for the positions port).
     pub width: u32,
     pub dtype: Dtype,
 }
 
 impl PortSeat {
-    /// Is this a per-lane rectangle rather than a per-row one?
     #[must_use]
     pub fn per_lane(&self) -> bool {
         self.kind == engine::fire::PortKind::LaneVector
     }
 
-    /// One row's bytes.
     #[must_use]
     pub fn row_bytes(&self) -> u64 {
         u64::from(self.width) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
     }
 }
 
-/// Where one port's rectangle sits in the store.
 #[derive(Debug, Clone, Copy)]
 struct PortAt {
     seat: PortSeat,
@@ -208,10 +155,6 @@ struct PortAt {
     bytes: u64,
 }
 
-/// One selection's packing tables (design D2), host side, as one fire
-/// stages them: the two CSRs, the reference tails, and the two row tables —
-/// every one at the length `prepare` built it, padded by `write_host` to
-/// the lane ceiling / carve rows.
 #[derive(Debug, Clone, Copy)]
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
@@ -221,8 +164,6 @@ pub struct PackingFire<'a> {
     pub permutation: &'a [i32],
 }
 
-/// One selection's packing tables, on the device: `i32` columns at the
-/// addresses the load carved.
 #[derive(Debug, Clone, Copy)]
 pub struct PackingHandles {
     pub group_indptr: Tensor,
@@ -232,7 +173,6 @@ pub struct PackingHandles {
     pub permutation: Tensor,
 }
 
-/// Where one selection's five tables sit in the staged prefix.
 #[derive(Debug, Clone, Copy)]
 struct PackingAt {
     group_indptr: u64,
@@ -242,7 +182,6 @@ struct PackingAt {
     permutation: u64,
 }
 
-/// One kv space's device seats.
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceHandles {
     pub indptr: Tensor,
@@ -253,52 +192,32 @@ pub struct SpaceHandles {
     pub write_offset: Tensor,
 }
 
-/// What one fire wants written, host side.
 #[derive(Debug, Clone)]
 pub struct Fire<'a> {
     pub tokens: &'a [i32],
-    /// Absolute positions, in fire row order.
     pub positions: &'a [i32],
-    /// Every window's rebased boundaries, at its slot's offset in the blob's fixed-width carve ([`Windows::packed`](crate::window::Windows::packed)).
     pub windows: &'a [i32],
-    /// The other reading of [`windows`](Fire::windows): `[lanes + 1]` absolute qo boundaries. Empty for a fire that stages none.
     pub qo_absolute: &'a [i32],
-    /// Live-rows seat words, one per (region, run). Empty for a fire that stages none.
     pub live: &'a [u32],
-    /// Which recurrent bank each lane owns, in fire lane order.
     pub slot_ids: &'a [i32],
-    /// Which adapter each token row routes to, or `None` if none carried one. Tail value `-1` means the base model.
     pub adapter_routes: Option<&'a [i32]>,
-    /// The token row each readout row gathers, in fire order. A bodied
-    /// fire pads to the key's readout ceiling with zeros, so a replay's
-    /// carved grid reads a live row rather than off the plane.
     pub readout_rows: &'a [i32],
-    /// One geometry per kv space. A bodied fire pads page CSR and per-lane vectors to the key's ladder reach so lanes past live ones read empty.
     pub spaces: &'a [Geometry],
-    /// This fire's expanded lane masks, or `None` when no lane carried one.
     pub mask: Option<&'a crate::mask::Staged>,
-    /// How many of [`tokens`](Fire::tokens) are this fire's own — the rest is carve padding — or `0` for "all of them".
     pub live_rows: u32,
-    /// `[rows]`: the fire lane of every row, `0` over the carve's padding — `GeomKind::RequestOfToken`, staged by every fire.
     pub lane_of_row: &'a [i32],
-    /// How many lanes every per-lane table is staged at: the fire's own count, or the key's lane ceiling for a bodied fire (whose body reads the tables at that reach). A plan with kv spaces carries the same reach on its padded geometries; a kv-less plan carries it here alone.
     pub lane_reach: u32,
-    /// `[fire lanes]` group ids; empty for a plan that reads no packing table.
     pub group_of_lane: &'a [i32],
-    /// One per selection the load carved, in the load's order; empty stages none.
     pub packings: &'a [PackingFire<'a>],
 }
 
-/// Free set of a staging ring, as one word. Claim is compare-exchange on the lowest set bit; release is `fetch_or`, legal from the CUDA driver's callback thread (where a mutex or CUDA call would be a hazard).
 #[derive(Debug)]
 pub struct Free {
-    /// Bit `i` set means slot `i` is claimable.
     bits: AtomicU64,
     depth: u32,
 }
 
 impl Free {
-    /// A set of `depth` claimable slots. Shared with [`crate::settle::Settlement`], which recycles one event per in-flight step from the same callback thread.
     #[must_use]
     pub fn of(depth: usize) -> Arc<Free> {
         debug_assert!(depth <= 64, "the free set is one word");
@@ -313,7 +232,6 @@ impl Free {
         })
     }
 
-    /// Take the lowest free slot, or `None` when every one is in flight.
     #[must_use]
     pub fn take(&self) -> Option<u32> {
         let mut seen = self.bits.load(Ordering::Acquire);
@@ -334,19 +252,16 @@ impl Free {
         }
     }
 
-    /// Give one back. Called from the driver's callback thread.
     pub fn give(&self, at: u32) {
         self.bits.fetch_or(1u64 << at, Ordering::Release);
     }
 
-    /// How many slots are claimed right now — the steps the device may still be reading staging for.
     #[must_use]
     pub fn in_flight(&self) -> u32 {
         self.depth - self.bits.load(Ordering::Acquire).count_ones()
     }
 }
 
-/// One claimed staging slot; dropping it releases the slot. Held from [`Inputs::claim`] in `prepare` until the step's settlement callback drops it, or until an aborted, never-enqueued frame drops it directly.
 #[derive(Debug)]
 pub struct SlotGuard {
     free: Arc<Free>,
@@ -354,7 +269,6 @@ pub struct SlotGuard {
 }
 
 impl SlotGuard {
-    /// Which slot this is.
     #[must_use]
     pub fn at(&self) -> u32 {
         self.at
@@ -367,35 +281,21 @@ impl Drop for SlotGuard {
     }
 }
 
-/// What one fire's host staging came to — the lengths the copies and the handles are cut at. Written by [`Inputs::write_host`], read by [`Inputs::commit`]; the bytes live in the claimed slot's pinned memory.
 #[derive(Debug, Clone)]
 pub struct Staged {
-    /// Rows written — the fire's own row count, or the bucket ceiling for a bodied fire.
     rows: u32,
     lanes: u32,
     windows: usize,
     qo_absolute: Option<usize>,
-    /// `None` until a caller fills [`Fire::live`].
     live: Option<usize>,
     adapter_rows: Option<u32>,
-    /// Readout rows written — the fire's own count, or the key's ceiling
-    /// for a bodied fire.
     readouts: u32,
     mask_bytes: Option<u32>,
-    /// Per kv space, how many page ids its `indices` vector carries.
     space_indices: Vec<u32>,
-    /// Lanes the per-space lane tables were staged at: [`lanes`](Staged::lanes) normally, or the bucket's lane ceiling for a bodied fire.
     space_lanes: u32,
-    /// Whether the group table and the packings were staged this fire.
     packed: bool,
 }
 
-/// One decode token to lift off a device-only ring instead of the host
-/// round-trip: overwrite the staged token slab, on the stream after the H2D
-/// stage, with the value the previous fire's epilogue wrote to the ring's
-/// device cells. `dst_off` is the byte offset into the token slab; `src` the
-/// device cell address; `bytes` the cell's native width. Empty unless
-/// run-ahead is on, the default (see [`crate::program::Session::token_device_source`]).
 #[derive(Clone, Copy, Debug)]
 pub struct TokenInject {
     pub dst_off: u64,
@@ -403,72 +303,46 @@ pub struct TokenInject {
     pub bytes: usize,
 }
 
-/// The resident inputs, carved once.
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
-    /// Pinned mirror of the store's staged prefix, one per in-flight step.
     staging: Vec<Pinned>,
-    /// Claimable slots, shared with every live [`SlotGuard`].
     free: Arc<Free>,
-    /// Bytes of [`Inputs::store`] a fire stages, before the plan grants.
     stage_bytes: u64,
     tokens: u64,
     positions: u64,
     windows: u64,
     window_ints: u64,
-    /// One fixed-width slot per distinct window ([`crate::window::Slots`]).
     window_slots: crate::window::Slots,
-    /// Fire-wide qo vector, `lanes + 1` `i32`. Carved by every load; written only by a bodied fire.
     qo_absolute: u64,
     qo_absolute_ints: u64,
-    /// `regions * max_runs * 4`, a `[rows, row_offset, lanes, lane_offset]` quad per seat.
     live_rows: u64,
     live_ints: u64,
     row_valid: u64,
     slot_ids: u64,
     adapter_routes: u64,
-    /// `[readouts]` `i32`, carved at the token ceiling: a readout names a
-    /// row the lane has, so a fire may read every row it carries.
     readout_rows: u64,
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
-    /// Carved past the staged prefix: device bytes, no pinned mirror. `None` for a plan that states no patch row.
     patch: Option<PatchAt>,
-    /// `RuntimeInput::MropePositions`, or `None` for texts that rotate by a scalar. Below the staged prefix and on no ring, like [`Inputs::patch`].
     mrope: Option<u64>,
-    /// Bytes [`Inputs::mrope`] holds — the row ceiling tripled, or zero.
     mrope_bytes: u64,
-    /// The self-conditioning taps' seat: ids then weights, each
-    /// [`Inputs::self_cond_bytes`] long; `None` for a plan that reads none.
     self_cond: Option<u64>,
     self_cond_taps: u64,
     self_cond_bytes: u64,
-    /// The float ports' rectangles, below the line like the patch seat.
     ports: Vec<PortAt>,
-    /// `GeomKind::RequestOfToken`, in the staged prefix, `[max_tokens]` i32.
     lane_of_row: u64,
-    /// `GeomKind::GroupOfLane`, in the staged prefix, `[max_lanes]` i32.
     group_of_lane: u64,
-    /// One packing per selection the plan reads, in the staged prefix.
     packings: Vec<PackingAt>,
     spaces: Vec<SpaceAt>,
-    /// Lane ceiling every per-lane table was carved at (`Budget::max_lanes`).
     max_lanes: u32,
-    /// Row ceiling every row-shaped table was carved at (`Budget::max_tokens`).
     max_rows: u32,
-    /// One grant per (run, plan value), flat at `run * plan_values + value`. Needs no ring: source and destination are on the same stream within one `enqueue`, so in-flight frames cannot collide.
     plans: Vec<Option<Workspace>>,
-    /// How many plan values one run's slice of [`plans`](Inputs::plans) holds.
     plan_values: usize,
 }
 
 impl Inputs {
-    /// Reserve the vectors a deployment's ceilings admit.
-    /// The device carve is one pointer-stable region (captured-graph
-    /// addresses fixed at bake); the host side is a `runahead.staging_depth()`-deep pinned ring, so `write_host` may write frame W+1 while frame W's copies are in flight.
-    /// # Errors: [`Fault::Device`](crate::Fault::Device) for the device allocation or any of the ring's pinned ones.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         budget: &Budget,
@@ -479,7 +353,6 @@ impl Inputs {
         regions: usize,
         runs: u32,
         gathered: usize,
-        // Device facts the plan builders take: `num_sm` sizes the grants below; `cc_major` lets the prefill grant ask the planner for its tile rather than bound it by hand (`prefill_float_bytes`).
         device: Device,
         runahead: engine::runahead::Runahead,
         patch: Option<PatchSeat>,
@@ -492,7 +365,6 @@ impl Inputs {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        // A window is one contiguous run of classes: at most `k(k+1)/2` for `k` classes, plus one shared empty window. Reserved unconditionally since addresses are recorded into a never-re-captured graph; slots are fixed-width.
         let window_slots =
             crate::window::Slots::new(classes, lanes, runs, gathered, rows, spaces, pages);
         let window_ints = window_slots.words();
@@ -506,21 +378,15 @@ impl Inputs {
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
         let windows = take(window_ints * 4);
-        // Same boundaries, un-rebased: `[lanes + 1]` i32 fire-wide qo prefix sums, so a consumer can take this vector whole. Carved unconditionally; only a bodied fire writes it.
         let qo_absolute_ints = lanes + 1;
         let qo_absolute = take(qo_absolute_ints * 4);
-        // Live-rows seat: `Ctx::arm_stage` reads this per region so a graph replay serves the right row count from memory instead of a baked node parameter. Carved unconditionally; only a bodied fire writes it.
         let live_seat = crate::window::Seat::new(regions as u64, u64::from(runs.max(1)));
         let live_ints = live_seat.words();
         let live_rows = take(live_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);
-        // Reserved unconditionally: a conditional carve would make the store's layout depend on the plan.
         let adapter_routes = take(rows * 4);
-        // Same reason as the adapter routes: carved unconditionally so the
-        // store's layout does not follow the plan.
         let readout_rows = take(rows * 4);
-        // Masked axis's two vectors. `context` is what a slot can hold, so `rows * context` bounds every (query, key) cell a fire can present; `+ lanes` is one byte-alignment pad per lane. A plan with no `attention.masked` arm carves none: at 65536 rows the slab (and its nine pinned mirrors) would be gigabytes nobody reads.
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_bytes = if masked {
             (rows * context).div_ceil(8) + lanes
@@ -539,7 +405,6 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
-        // The row-to-lane map every fire stages (a modulation vector's broadcast reads it), then the D2 packing tables riding the staged prefix like the geometry vectors: the group table once, five tables per selection the plan reads.
         let lane_of_row = take(rows * 4);
         let group_of_lane = take(lanes * 4);
         let packings: Vec<PackingAt> = (0..selections)
@@ -551,9 +416,7 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
-        // Where the staged prefix ends: above is written by a fire and copied by `commit`; below is granted to schedule builders staging directly onto the stream. `take(0)` reads the cursor without moving it.
         let stage_bytes = take(0);
-        // The float ports (D3), below the line: device rectangles a fire fills device-to-device from channel cells, one per declared port at the row (or lane) ceiling.
         let ports: Vec<PortAt> = ports
             .iter()
             .map(|seat| {
@@ -565,14 +428,11 @@ impl Inputs {
                 }
             })
             .collect();
-        // Patch regions, below the line: device bytes, no pinned mirror. A text-only load's carve is unaffected; `PatchSeat`'s `None` costs not even an offset.
         let patch = patch.map(|seat| PatchAt {
             payload: take(seat.rows * seat.row_bytes),
             segments: take((seat.images + 1) * 4),
             routes: take(seat.rows * 4),
-            // Tower's own rotation stream, `[patch rows, 3]` i32.
             positions: take(seat.rows * AXES * 4),
-            // Position gather's two streams, sized by the plan's tap count: 0 taps carves nothing; a native-grid plan carves ids at one tap and no weights.
             embed_rows: take(seat.rows * seat.embed_taps * 4),
             embed_weights: if seat.embed_weights {
                 take(seat.rows * seat.embed_taps * 4)
@@ -581,11 +441,8 @@ impl Inputs {
             },
             seat,
         });
-        // Trunk's triple-wide token stream, below the line like patch, reserved only when the plan names it. `[max_tokens, 3]` i32, not paid at all by a scalar-rotate text.
         let mrope = mrope.then(|| take(rows * AXES * 4));
-        // The denoiser's taps: `[max_tokens, taps]` i32 ids and f32 weights, reserved only when the plan reads them.
         let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
-        // One grant per plan value: the float side is the requirement of the builder that will actually run, or the flat floor, whichever is larger — computed, not guessed, since a short grant declines to capture instead of failing.
         let runs = runs.max(1);
         let grants: Vec<Option<Grant>> = facts
             .plans
@@ -593,7 +450,6 @@ impl Inputs {
             .map(|seat| {
                 seat.map(|seat| {
                     let floats = match seat.kind {
-                        // Occupancy term vs. ceiling term; larger wins.
                         StructKind::AttnPrefillPlan => graph_float_bytes(&seat.reading, device.num_sm)
                             .max(prefill_float_bytes(
                                 &seat.reading,
@@ -601,11 +457,9 @@ impl Inputs {
                                 budget.max_lanes,
                                 &device,
                             )),
-                        // `sched_sm90` allocates no floats (`Built::float_bytes` is zero), so only its int ask grows, covered by the flat `GRANT_INT_BYTES`.
                         StructKind::AttnPrefillPlanSm90 => {
                             graph_float_bytes(&seat.reading, device.num_sm)
                         }
-                        // Prefill bound covers decode's occupancy term (same q_heads/head_dim); the lane term is separate, since a graph-shaped decode also pads to `max_lanes`.
                         StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
                             .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
                         StructKind::MlaPlan => {
@@ -625,7 +479,6 @@ impl Inputs {
 
         let store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
         let base = store.ptr();
-        // Ring is the host half only: one pinned mirror of the staged prefix per slot. Pinned, not pageable, so the H2D copy is asynchronous.
         let depth = runahead.staging_depth();
         let slot_bytes = usize::try_from(stage_bytes).unwrap_or(usize::MAX);
         let mut staging = Vec::with_capacity(depth);
@@ -682,20 +535,17 @@ impl Inputs {
         })
     }
 
-    /// One plan value's builder grant, by value id and run. `None` for a run past what this load reserved, same as a non-plan value.
     #[must_use]
     pub fn grant(&self, plan: u32, run: u32) -> Option<Workspace> {
         let at = run as usize * self.plan_values + plan as usize;
         self.plans.get(at).copied().flatten()
     }
 
-    /// Every byte the inputs hold.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes() as u64
     }
 
-    /// Claim a staging slot — the fire path's one resource acquisition. Spins rather than parks: a slot releases in microseconds from the settlement callback, and a condvar would put a mutex on the driver's callback thread. # Errors: [`Fault::Ceiling`](crate::Fault::Ceiling) naming the ring, for a caller holding every slot past [`CLAIM_DEADLINE`].
     pub fn claim(&self) -> Result<SlotGuard> {
         if let Some(at) = self.free.take() {
             return Ok(SlotGuard {
@@ -723,25 +573,21 @@ impl Inputs {
         }
     }
 
-    /// How many staging slots are claimed right now.
     #[must_use]
     pub fn in_flight(&self) -> u32 {
         self.free.in_flight()
     }
 
-    /// The window blob's carve, for `Windows::of`/`Windows::packed` to lay every slot out where this reserve put it.
     #[must_use]
     pub fn window_slots(&self) -> crate::window::Slots {
         self.window_slots
     }
 
-    /// Write one fire's vectors into a claimed slot — host only, no stream. Every ceiling this staging enforces is enforced here. # Errors: [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved ceilings.
     pub fn write_host(&self, slot: &SlotGuard, fire: &Fire<'_>) -> Result<Staged> {
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32;
         let host = &self.staging[slot.at() as usize];
 
-        // A bodied fire pads its token, position and rotation vectors out to the bucket its launches are gridded at; refuse a padding past what `reserve` carved, which would write over the region behind it.
         if rows > self.max_rows {
             return Err(crate::error::Fault::Ceiling {
                 what: "staged token rows",
@@ -771,7 +617,6 @@ impl Inputs {
                 have: self.live_ints,
             });
         }
-        // Lane count is read off the spaces since every space of one fire must agree.
         let mut spelled: Option<usize> = None;
         for geometry in fire.spaces {
             let count = geometry.indptr.len().saturating_sub(1);
@@ -792,7 +637,6 @@ impl Inputs {
             }
             spelled = Some(count);
         }
-        // The reach every per-lane table is staged at: the widest of the fire's lanes, the kv geometries' (padded to the key's ceiling for a bodied fire), and the reach the fire states — which is how a kv-less plan's bodied fire pads its packing and slot tables to the ceiling its body reads them at, rather than leaving the tail as the last fire's entries.
         let space_lanes = spelled
             .map_or(lanes, |count| count as u32)
             .max(lanes)
@@ -814,7 +658,6 @@ impl Inputs {
             });
         }
 
-        // `put` refuses a region past the slot mirror — the same ceiling the device carve would enforce, caught one phase earlier.
         let put = |offset: u64, bytes: &[u8], what: &'static str| -> Result<()> {
             if host.write(usize::try_from(offset).unwrap_or(usize::MAX), bytes) {
                 return Ok(());
@@ -829,7 +672,6 @@ impl Inputs {
         put(self.tokens, bytes_of(fire.tokens), "staged tokens")?;
         put(self.positions, bytes_of(fire.positions), "staged positions")?;
         put(self.windows, bytes_of(fire.windows), "staged window boundaries")?;
-        // row_valid is all-1 over `live` rows (this fire's own) and 0 over the carve's padding, telling the writers which of a bucket's rows are real. A fire that padded nothing states `live == rows`.
         let live = if fire.live_rows == 0 {
             rows
         } else {
@@ -850,7 +692,6 @@ impl Inputs {
         }
         put(self.lane_of_row, bytes_of(fire.lane_of_row), "staged lane of row")?;
         put(self.slot_ids, bytes_of(fire.slot_ids), "staged slot ids")?;
-        // Lanes a ceiling plan names but this fire did not bring are padded with `-1`: without it the device tail is whatever the last fire left, and `attn/ssm.cuh`'s `if (slot < 0) return` cannot refuse valid-looking stale ids.
         if space_lanes > lanes {
             let inert = vec![-1i32; (space_lanes - lanes) as usize];
             put(
@@ -860,7 +701,6 @@ impl Inputs {
             )?;
         }
 
-        // Empty `Fire::qo_absolute` writes/copies/publishes nothing.
         let qo_absolute = if fire.qo_absolute.is_empty() {
             None
         } else {
@@ -868,7 +708,6 @@ impl Inputs {
             Some(fire.qo_absolute.len())
         };
 
-        // Empty `Fire::live` writes nothing and costs no H2D or launch argument; the device carve exists either way.
         let live = if fire.live.is_empty() {
             None
         } else {
@@ -876,7 +715,6 @@ impl Inputs {
             Some(fire.live.len())
         };
 
-        // A fire no lane routed writes nothing here and binds no seat.
         let adapter_rows = match fire.adapter_routes {
             None => None,
             Some(routes) => {
@@ -891,7 +729,6 @@ impl Inputs {
             "staged readout rows",
         )?;
 
-        // A fire no lane masked writes nothing and binds no seat, so a masked consumer sees `attn::masked`'s refusal rather than reading a zeroed (all-masked-out) slab.
         let mask_bytes = match fire.mask {
             None => None,
             Some(staged) => {
@@ -901,7 +738,6 @@ impl Inputs {
             }
         };
 
-        // The packing tables, padded to the same reaches the lane and row tables were: a group past the fire's repeats the last bound (an empty segment), a row past the fire's names no row (`-1`).
         let packed = !fire.group_of_lane.is_empty();
         if packed {
             if fire.packings.len() != self.packings.len() {
@@ -972,9 +808,6 @@ impl Inputs {
         })
     }
 
-    /// One float port's device rectangle, `rows` tall (the caller states the
-    /// carve: the fire's rows or lanes, or a body's bucket), or `None` for a
-    /// port this load carved none of.
     #[must_use]
     pub fn port(&self, kind: engine::fire::PortKind, port: u8, rows: u32) -> Option<Tensor> {
         let at = self
@@ -990,13 +823,11 @@ impl Inputs {
         ))
     }
 
-    /// Every port the load carved.
     #[must_use]
     pub fn ports(&self) -> Vec<PortSeat> {
         self.ports.iter().map(|at| at.seat).collect()
     }
 
-    /// Second row axis's H2D, inside the enqueue and outside the ring. Pageable is safe without a slot: the driver copies the source before the call returns. # Errors: [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved patch rectangle, [`Fault::Device`](crate::Fault::Device) for the copies.
     pub fn stage_patches(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -1065,14 +896,12 @@ impl Inputs {
             patches: Tensor::new(base + at.payload, rows, width, at.seat.dtype),
             segments: i32s(base + at.segments, segments.len() as u32),
             routes: i32s(base + at.routes, routes.len() as u32),
-            // `[patch rows, 3]`: `rope_mrope` refuses anything not three wide.
             positions: Tensor::new(
                 base + at.positions,
                 (positions.len() / AXES as usize) as u32,
                 AXES as u32,
                 Dtype::I32,
             ),
-            // `[patch rows, taps]`: `embed_weighted` reads the tap count off this width.
             embed_rows: (!embed_rows.is_empty()).then(|| {
                 let taps = at.seat.embed_taps.max(1) as u32;
                 Tensor::new(
@@ -1094,7 +923,6 @@ impl Inputs {
         })
     }
 
-    /// Trunk's triple-wide position stream, staged where the patch vectors are. `[rows, 3]` i32, one `(t, h, w)` per token row — every row, since a text lane's `(p, p, p)` is scalar rope, not an absence. # Errors: [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved stream (the row ceiling's, tripled) or none reserved, [`Fault::Device`](crate::Fault::Device) for the copy.
     pub fn stage_mrope_positions(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -1126,8 +954,6 @@ impl Inputs {
         ))
     }
 
-    /// Stage a fire's self-conditioning taps: `rows` ids and `weights`, each
-    /// `[token rows, taps]` row major, into the seat the load reserved.
     pub fn stage_self_cond(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -1184,9 +1010,7 @@ impl Inputs {
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
-        // What the lane tables were written at (see `Staged::space_lanes`).
         let space_lanes = *space_lanes;
-        // Offsets taken as values before the split borrow below.
         let base = self.store.ptr();
         let (at_tokens, at_positions, at_windows) = (self.tokens, self.positions, self.windows);
         let at_qo_absolute = self.qo_absolute;
@@ -1199,13 +1023,11 @@ impl Inputs {
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
-        // Split borrow: the ring is read, the device store is written.
         let Inputs {
             store, staging, ..
         } = self;
         let host = staging[slot.at() as usize].host();
 
-        // The spans, gathered and issued as ONE batched copy at the end (source is this slot's pinned allocation, alive until the `SlotGuard` drops; destination spans are checked by `Buffer::stage_batch_from`).
         let mut spans: Vec<(u64, *const u8, usize)> = Vec::with_capacity(24);
         let mut copy = |offset: u64, len: usize| -> Result<()> {
             spans.push((offset, host.wrapping_add(offset as usize), len));
@@ -1215,7 +1037,6 @@ impl Inputs {
         copy(at_tokens, rows as usize * 4)?;
         copy(at_positions, rows as usize * 4)?;
         copy(at_windows, windows * 4)?;
-        // Copied only if the fire wrote one.
         if let Some(bounds) = qo_absolute {
             copy(at_qo_absolute, *bounds * 4)?;
         }
@@ -1225,7 +1046,6 @@ impl Inputs {
         copy(at_row_valid, rows as usize)?;
         copy(at_lane_of_row, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
-        // Copied at `space_lanes`, with every other per-lane table: the host vector was `-1`-padded to that reach (see `write_host`).
         copy(at_slot_ids, space_lanes as usize * 4)?;
         if let Some(routes) = adapter_rows {
             copy(at_routes, *routes as usize * 4)?;
@@ -1254,7 +1074,6 @@ impl Inputs {
         }
         let mut spaces = Vec::with_capacity(places.len());
         for (at, indices) in places.iter().zip(space_indices) {
-            // Lane tables copy at `space_lanes`, not `lanes` — leaving the padded tail as a previous fire's bytes would defeat the padding.
             copy(at.indptr, (space_lanes as usize + 1) * 4)?;
             copy(at.indices, *indices as usize * 4)?;
             copy(at.last_page_len, space_lanes as usize * 4)?;
@@ -1274,13 +1093,6 @@ impl Inputs {
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
 
-        // Device-injected decode tokens: overwrite the token cell with the
-        // value the previous fire's epilogue left on the device-only ring.
-        // MUST run after the batched H2D above (which staged the placeholder
-        // into the same slab) so the injection is the last write to the cell.
-        // The token is already on-device; this drops the round-trip's
-        // dependence on the host having read it, and is byte-identical to the
-        // host path when the sources agree.
         for inject in token_injects {
             crate::device::copy_d2d(
                 stream,
@@ -1297,12 +1109,10 @@ impl Inputs {
             qo_absolute: qo_absolute.map(|_| base + at_qo_absolute),
             live_rows: live.map(|_| base + at_live),
             spaces,
-            // The handle says what was written, at `space_lanes`.
             slot_ids: i32s(base + at_slot_ids, space_lanes),
             adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
             readout_rows: i32s(base + at_readouts, readouts),
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
-            // Handed over whole: entries are bits, not fire rows, so `Run::cut` excludes it, like the page-id list.
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
@@ -1311,7 +1121,6 @@ impl Inputs {
         })
     }
 
-    /// The pool seats one fire lends its cache table.
     #[must_use]
     pub fn seats(&self, handles: &Handles, pages: u32, rows: u32, lanes: u32) -> crate::store::Seats {
         crate::store::Seats {
@@ -1329,7 +1138,6 @@ impl Inputs {
                 })
                 .collect(),
             slot_ids: handles.slot_ids,
-            // Plain fold is the default: RS seats aren't staged inputs — the fold predicate lives on the device (`channel::mask_from_commit`); a fire with a recurrent verb calls `Seats::rs` instead.
             write_state: true,
             write_state_mask: Tensor::ABSENT,
             commit_len: Tensor::ABSENT,
@@ -1338,12 +1146,10 @@ impl Inputs {
     }
 }
 
-/// One `i32` column, `n` rows tall.
 fn i32s(ptr: u64, rows: u32) -> Tensor {
     Tensor::new(ptr, rows, 1, Dtype::I32)
 }
 
-/// A vector of `i32` as the bytes a copy takes. Little-endian — every device this ships on is, and so is the fire descriptor's layout.
 fn bytes_of(values: &[i32]) -> &[u8] {
     // SAFETY: `i32` is `Copy` with no padding/niche, so all `4 * len` bytes are initialized. Result borrows the input, read-only, for one enqueue.
     unsafe {
@@ -1351,7 +1157,6 @@ fn bytes_of(values: &[i32]) -> &[u8] {
     }
 }
 
-/// [`bytes_of`] for the one geometry stream that is not an index: the interpolation weights, which are `f32` (preprocessor arithmetic).
 fn f32_bytes_of(values: &[f32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `f32` is `Copy`, no padding or niche.
     unsafe {
@@ -1359,7 +1164,6 @@ fn f32_bytes_of(values: &[f32]) -> &[u8] {
     }
 }
 
-/// [`bytes_of`] for the live-rows seat: `u32` because a row count is unsigned and the device guard reads it as one.
 fn u32_bytes_of(values: &[u32]) -> &[u8] {
     // SAFETY: as [`bytes_of`] — `u32` is `Copy`, no padding or niche.
     unsafe {

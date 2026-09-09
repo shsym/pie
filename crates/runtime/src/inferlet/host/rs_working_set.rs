@@ -1,10 +1,3 @@
-//! `pie:inferlet/working-set` — RS working-set host resource.
-//!
-//! The WASM resource type is [`crate::store::rs::working_set::RsWorkingSet`],
-//! a thin handle (model, engine, RsWorkingSetId, cached geometry); every
-//! substantive operation delegates to the per-(model, engine) [`RsStore`]
-//! resolved through `store::registry`.
-
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -19,9 +12,6 @@ use crate::store::rs::working_set::RsWorkingSet;
 type WitRange = pie::inferlet::working_set::PageRange;
 
 impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
-    /// Fresh, empty RS working set bound to the single bound model (model 0),
-    /// engine 0. Geometry comes from the model's RS caps (0/0/1 for
-    /// pure-attention models).
     async fn new(&mut self) -> Result<Resource<RsWorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let model = 0;
@@ -51,7 +41,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         n: u32,
     ) -> Result<Result<WitRange, String>> {
-        // Strict admission: RS buffer slots are scarce pooled resources.
         crate::inferlet::process::ensure_bind_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
@@ -122,10 +111,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // no drain: RS mappings publish at prepare, in submission order, so
-        // the committed mapping already carries every fire submitted on
-        // `on` before this call; a later CoW copy is issued behind the
-        // fires that wrote the parent.
         let (failure, scope) = {
             let pipeline = self.ctx().table.get(&on)?;
             (pipeline.failure.clone(), pipeline.scope.clone())
@@ -148,8 +133,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         let forked = stores.rs.lock().unwrap().fork(ws.id);
         match forked {
             Ok(id) => {
-                // a distinct working-set id gets its own fresh lifecycle,
-                // never a clone of the parent's.
                 let child = RsWorkingSet::new(ws.model, ws.engine, id, ws.geom);
                 self.register_rs_working_set(ws.model, ws.engine, id);
                 Ok(Ok(self.ctx().table.push(child)?))
@@ -160,9 +143,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
 
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // `release` performs the `release_working_set`/`retire_idle`
-        // sequence and marks the shared lifecycle done, so `ws`'s own drop
-        // is a no-op.
         let ws = self.ctx().table.delete(this)?;
         self.unregister_rs_working_set(ws.model, ws.engine, ws.id);
         ws.release();

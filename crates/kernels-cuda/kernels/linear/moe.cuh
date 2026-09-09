@@ -91,9 +91,6 @@ __device__ inline void block_argmax(
 
 }
 
-// `per_expert_scale` is gemma 4's learned per-expert gain, applied to the
-// selected weights after the softmax and gathered by the ids this body just
-// chose. `nullptr` on every other family, which is the whole of the branch.
 template <class T, bool FusedGemv>
 __device__ __forceinline__ void moe_topk_softmax_body(
     const T* __restrict__ logits,
@@ -106,18 +103,9 @@ __device__ __forceinline__ void moe_topk_softmax_body(
     const T* __restrict__ per_expert_scale = nullptr)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): this grid is one
-    // block per TOKEN row, so a replay whose grid was carved at a bucket
-    // retires its padded rows here, off a word the fire staged and not a
-    // parameter the recording baked. A router's grid counts rows and nothing
-    // else, so the seat's lane pair is not read at all.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // The seat's second word says WHERE those rows are. Armed, the logits
-    // this block scores and the routes and weights it lands are planes of the
-    // one token axis, handed at their own base, and this block owns plane row
-    // `win[1] + n`; null, they arrived pre-shifted and `n` is the row already.
-    // All three shift together -- a router that scored one token's logits and
-    // wrote another token's routes would be wrong in silence.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row =
@@ -230,9 +218,6 @@ __global__ void moe_topk_softmax(
                                 num_experts, K, hidden, win);
 }
 
-// **ADDITIVE, FOR GEMMA 4's MIXTURE.** The same softmax-then-renormalize the
-// point above takes -- which is a softmax over the SELECTED k -- and then the
-// learned gain of the expert each slot chose.
 template <class T>
 __global__ void moe_topk_softmax_scaled(
     const T* __restrict__ logits,
@@ -437,13 +422,6 @@ __global__ void moe_topk_sigmoid_bias(
     }
 }
 
-// Sigmoid routing with `S` sink experts riding the row after the `E` routed
-// logits (Inkling's shared experts): the choice is top-`K` of sigmoid + bias
-// over the routed `E` alone; the weights are every chosen score and every
-// sink score over their common sum, times `scaling` and `global_scale[0]`
-// when one is bound. Routes land `[K picks | E, E+1, .. E+S-1]`, `K + S`
-// wide, so a select over a bank of `E + S` experts serves the sinks as
-// fixed routes.
 template <class T>
 __global__ void moe_topk_sigmoid_sink(
     const T* __restrict__ logits,
@@ -525,16 +503,9 @@ __global__ void moe_topk_sigmoid(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat, the ranked router's copy of the softmax
-    // router's: one block per token row, so the padded rows of a grid carved
-    // at a bucket retire here off the fire's own staged word. The lane pair
-    // is nothing to a grid that counts rows.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where the live rows start: logits in, routes and
-    // weights out, three planes of one token axis handed at their bases, this
-    // block owning plane row `win[1] + n`. Null, they came pre-shifted and
-    // `n` is the row. `correction_bias` is the expert bank, addressed by
-    // expert and never by row, so it does not move.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row = logits + static_cast<long long>(plane_row) * E;
@@ -606,16 +577,9 @@ __global__ void moe_topk_sqrt_softplus(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat, the ranked router's copy of the softmax
-    // router's: one block per token row, so the padded rows of a grid carved
-    // at a bucket retire here off the fire's own staged word. The lane pair
-    // is nothing to a grid that counts rows.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where the live rows start: logits in, routes and
-    // weights out, three planes of one token axis handed at their bases, this
-    // block owning plane row `win[1] + n`. Null, they came pre-shifted and
-    // `n` is the row. `correction_bias` is the expert bank, addressed by
-    // expert and never by row, so it does not move.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row = logits + static_cast<long long>(plane_row) * E;
@@ -854,20 +818,6 @@ __global__ void moe_matmul_select_wmma_by_route(
                                    top_k, K, N, expert_stride);
 }
 
-// **WHERE ONE EXPERT'S WEIGHTS ARE** (alto design §7, wave D2).
-//
-// `expert_table` is the bank's device-resident indirection table: entry `e`
-// is the base address of expert `e`'s slot, wherever it lives — inside the
-// device slab if it is resident, or in pinned host memory over UVA if it is
-// not. It is DATA (article 5), so promoting an expert changes an entry and
-// never an address a captured graph holds.
-//
-// `nullptr` is the fully-resident load, and it is not a slow arm of a fast
-// one: the table is not read at all, the arithmetic is the
-// `weight_base + expert * expert_stride` this kernel always did, and the
-// generated code for that arm is what it was before D2 existed. That is
-// dev's `place_all()` degeneration, spelled as a branch on a pointer the
-// whole grid loads uniformly.
 template <class T>
 __device__ __forceinline__ const T* moe_expert_base(
     const T* __restrict__ weight_base,
@@ -880,15 +830,6 @@ __device__ __forceinline__ const T* moe_expert_base(
         : weight_base + static_cast<long long>(expert) * expert_stride;
 }
 
-// **THE ONE STATISTIC THE FIRE PATH PUBLISHES** (article 3, applied to
-// weights). One `atomicAdd` per routed expert per fire, into a device buffer
-// at a fixed address; the host reads it between fires and promotes. No
-// callback, no sync, and no host decision on the fire path — the count is
-// device data that the settle-side readback carries out, exactly as the
-// channel plane carries a commit word out.
-//
-// `nullptr` — the fully-resident load — costs the same uniform branch the
-// table does and nothing else.
 __device__ __forceinline__ void moe_note_expert(
     unsigned int* __restrict__ expert_hits, int expert)
 {
@@ -909,14 +850,7 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const u32* __restrict__ win)
 {
     const int route = blockIdx.y;
-    // **THE SEAT IS IN TOKEN ROWS AND THIS AXIS IS IN ROUTES**, and the
-    // conversion between them is the fan-out. The seat's pair belongs to the
-    // REGION, whose row space is the token space -- the one `moe_weighted_sum`
-    // folds this rectangle back onto, indexing its routed source at
-    // `plane_row * top_k + k` -- so a window of `win[0]` token rows starting
-    // at `win[1]` is a run of `win[0] * top_k` routes starting at route
-    // `win[1] * top_k`. Multiply once and every plane below reads a route
-    // ordinal that is the PLANE's, not the launch's.
+
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
     const int plane_route = win != nullptr
         ? route + static_cast<int>(win[1]) * top_k
@@ -924,9 +858,7 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const int row = blockIdx.x * kWarps + threadIdx.y;
     if (row >= N) return;
     const int lane = threadIdx.x;
-    // `topk_idx` is the `[tokens, top_k]` route plane laid out route-major, so
-    // the route ordinal indexes it whole; `out` is one row per route and takes
-    // the same ordinal.
+
     const int expert = topk_idx[plane_route];
 
     if (expert < 0) {
@@ -935,18 +867,13 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
         }
         return;
     }
-    // One thread of one block per route does the counting: `blockIdx.x == 0`
-    // picks the block that owns the first row tile and `threadIdx` picks its
-    // first thread, so the count is per (route, fire) and not per block.
+
     if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
         moe_note_expert(expert_hits, expert);
     }
     const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride)
         + (long long)row * K;
-    // And the activation follows the same ordinal into whichever space it
-    // was cut in: `route / top_k` is the plane's TOKEN row on the up leg,
-    // where `x` holds one row per token, and the route ordinal itself on the
-    // down leg, where it holds one per route.
+
     const T* x =
         act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K;
 
@@ -1394,20 +1321,13 @@ __global__ void moe_weighted_sum(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // The seat's second word says WHERE those rows are. Armed, the pointers
-    // are the plane's own base and this block owns plane row `win[1] + n`;
-    // null, they arrived pre-shifted and `n` is the row already.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= hidden) return;
-    // `src` and `weights` are `top_k` rows per token and `out` is one: three
-    // planes of the SAME token axis, so all three shift by the one start. A
-    // fold that shifted the answer but not the routes it sums would take
-    // another row's routes, so they move together or not at all.
+
     const long long base = static_cast<long long>(plane_row) * top_k;
     float acc = 0.f;
     #pragma unroll
@@ -1431,19 +1351,13 @@ __global__ void moe_bias_sum(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, and with them the
-    // tail's route ids, which a retired row never dereferences.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // The seat's second word says WHERE those rows are. Armed, the pointers
-    // are the plane's own base and this block owns plane row `win[1] + n`;
-    // null, they arrived pre-shifted and `n` is the row already.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= hidden) return;
-    // `x`, `out`, `topk_idx` and `weights` are all planes of the token axis
-    // the guard counts, so all four take the shifted row together; `bias` is
-    // the expert bank, addressed by the route id, and never moves.
+
     const long long base = static_cast<long long>(plane_row) * top_k;
     const long long i = static_cast<long long>(plane_row) * hidden + h;
     float acc = Elem<T>::to_f32(x[i]);
@@ -1635,20 +1549,6 @@ __global__ void reorder_moe_aligned_output(
 }
 
 
-/// The batched GEMM's three pointer arrays for ONE grouped MoE leg.
-///
-/// `build_moe_ptrs_aligned` is the fused twin: it lays out the gate/up and
-/// down legs together because the fused MLP shares one alignment between
-/// them. A leg fired on its own — which is how the IR spells a routed
-/// select — shares nothing, so it wants only its own triple.
-///
-/// A block the alignment left unused answers `expert_ids[b] < 0`. It still
-/// needs a readable weight base, so it borrows expert 0's; the rows under
-/// it are the zeros `gather_moe_aligned_inputs` wrote for the padding, so
-/// it lands zeros in a region `reorder_moe_aligned_output` never reads
-/// back. Launching the padded block count rather than the live one is what
-/// keeps the batch size off the host: cuBLAS takes `batchCount` by value,
-/// and reading the live count would be the D2H this pipeline does not do.
 template <class T>
 __global__ void build_moe_leg_ptrs(
     const i32* __restrict__ expert_ids,

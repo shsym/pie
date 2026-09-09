@@ -1,5 +1,3 @@
-//! Tokenizer-bound grammar compilation and caching.
-
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,11 +56,6 @@ enum CacheKey {
     BuiltinJson,
 }
 
-/// Single-tokenizer grammar compiler with a typed LRU cache.
-///
-/// Cache hits bypass frontend parsing as well as DFA and token-mask compilation.
-/// Misses compile outside the cache lock so an unrelated cold grammar does not
-/// block cache hits from other requests.
 pub struct GrammarCompiler {
     tokenizer: Arc<Tokenizer>,
     limits: GrammarLimits,

@@ -1,7 +1,3 @@
-//! Writing a `pie.serving/1` artifact from objects in hand or streamed:
-//! objects in caller order, a [`Stamp`] under [`serving::PROFILE`], and block
-//! digests on every blob. Deleting the stamp leaves an ordinary checkpoint.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -12,19 +8,12 @@ use crate::error::Error;
 use crate::serving::{self, Stamp};
 use crate::term::blob_planes;
 
-/// The placement alignment this build writes at: payloads are read into
-/// page-locked memory on huge-page boundaries.
 pub const SERVING_ALIGN: u64 = 2 << 20;
 
-/// Free space a write must leave behind after the artifact fits.
 pub const MARGIN: u64 = 256 << 20;
 
-/// Where one plane's bytes come from.
 pub enum Payload<'a> {
-    /// The bytes, in hand. Shares a blob with any identical object already
-    /// written.
     Whole(&'a [u8]),
-    /// The plane's size. The bytes arrive through [`write`]'s `fill`.
     Streamed(u64),
 }
 
@@ -38,21 +27,16 @@ impl Payload<'_> {
     }
 }
 
-/// One object of a serving artifact: its type, its layout, and one payload
-/// per plane in canonical order.
 pub struct Object<'a> {
     pub name: &'a str,
     pub shape: Vec<u64>,
     pub term: Option<Term>,
-    /// A named layout, or `None` for the canonical one.
     pub layout: Option<String>,
     pub attributes: Option<Value>,
-    /// One per plane of the type (one for a leaf or a named layout).
     pub planes: Vec<Payload<'a>>,
 }
 
 impl<'a> Object<'a> {
-    /// A leaf object of `bytes`.
     #[must_use]
     pub fn leaf(name: &'a str, shape: Vec<u64>, leaf: ztensor::Leaf, bytes: &'a [u8]) -> Object<'a> {
         Object {
@@ -66,13 +50,6 @@ impl<'a> Object<'a> {
     }
 }
 
-/// Write the serving artifact at `path`, atomically.
-///
-/// `objects` are written in the order given, except metadata objects
-/// (`__meta__/…`) go first regardless of position. `fill` delivers every
-/// [`Payload::Streamed`] plane's bytes, once per plane, in canonical order,
-/// and must deliver exactly [`Payload::len`] bytes. An object may not mix
-/// the two kinds.
 pub fn write(
     path: &Path,
     stamp: &Stamp,
@@ -141,7 +118,6 @@ fn emit(
         .map_err(|why| Error::Checkpoint(format!("syncing {}: {why}", target.display())))
 }
 
-/// Where a streamed plane's bytes go.
 pub struct Chunks<'w> {
     writer: &'w mut ztensor::Writer,
     sink: &'w mut ztensor::Sink,
@@ -162,7 +138,6 @@ impl Chunks<'_> {
     }
 }
 
-/// Where an object's planes lie, checked against its payloads.
 fn laid(object: &Object<'_>) -> Result<Vec<(u64, u64)>, Error> {
     let bad = |detail: String| Error::Checkpoint(format!("serving object {:?} {detail}", object.name));
     if object.planes.is_empty() {
@@ -238,9 +213,6 @@ fn add(
                 Payload::Streamed(_) => unreachable!("counted above"),
             })
             .collect();
-        // The container lays planes out only under the canonical layout; a
-        // named layout takes the blob whole, so the tiled planes are laid
-        // here and a gguf array is its one plane already.
         let blob: Vec<u8> = match (&object.layout, whole.as_slice()) {
             (None, _) => {
                 return writer
@@ -364,4 +336,3 @@ fn check_tiling(temp: &Path, path: &Path) -> Result<(), Error> {
     }
     Ok(())
 }
-

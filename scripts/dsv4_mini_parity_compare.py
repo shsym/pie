@@ -14,7 +14,6 @@ import os
 
 import numpy as np
 
-
 def load(dir_, name, tag, arm, vocab):
     path = os.path.join(dir_, f"{name}.{tag}.{arm}.f32")
     if not os.path.exists(path):
@@ -22,11 +21,9 @@ def load(dir_, name, tag, arm, vocab):
     a = np.fromfile(path, dtype=np.float32)
     return a.reshape(-1, vocab)
 
-
 def logsoftmax(x):
     m = x.max(-1, keepdims=True)
     return x - m - np.log(np.exp(x - m).sum(-1, keepdims=True))
-
 
 def compare(a, b, label):
     n = min(a.shape[0], b.shape[0])
@@ -36,7 +33,6 @@ def compare(a, b, label):
     la, lb = logsoftmax(a), logsoftmax(b)
     kl = (np.exp(lb) * (lb - la)).sum(-1)
     maxd = np.abs(a - b).max(-1)
-    # b's own margin between its top two, where the two dumps disagree
     top2 = np.sort(b, axis=-1)[:, -2:]
     margin = top2[:, 1] - top2[:, 0]
     flips = np.nonzero(~agree)[0]
@@ -48,7 +44,6 @@ def compare(a, b, label):
         line += f"  flips won by >1 logit in b: {len(big)}"
     print(line)
     return agree.sum(), n
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,7 +74,6 @@ def main():
                 tot[0] += g
                 tot[1] += n
     print(f"teacher-forced argmax agreement over the battery: {tot[0]}/{tot[1]}")
-
 
 if __name__ == "__main__":
     main()

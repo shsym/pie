@@ -1,23 +1,3 @@
-//! **PACKING ROWS BY GROUP AND UNPACKING THEM AGAIN CHANGES THE ORDER AND
-//! NOTHING ELSE: THE ROW SPACE, WIDTH AND ELEMENT ARE THE INPUT'S.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_row_permutation_keeps_the_row_space
-//! ```
-//!
-//! `layout.pack_rows` gathers by `RuntimeInput::RowPermutation` and
-//! `layout.unpack_rows` scatters by the same vector (D2). Neither is a
-//! reshape — the IR has none — so:
-//!
-//! ```text
-//! (a) both answer exactly `x`'s type, on `Dim::Tokens`
-//! (b) the permutation is `[Tokens]` i32, one per arm's selection, and the
-//!     two ops of one arm read the same value
-//! (c) both are fresh rectangles (no alias): a gather cannot run in place
-//! (d) an rmsnorm-shaped chain around them types as before, so the packing
-//!     is transparent to the ops on either side
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, ops, seam,
     trace_hybrid,
@@ -78,7 +58,6 @@ fn pack_and_unpack_keep_the_row_space() {
     let pack = pack.expect("the gather is one node");
     let unpack = unpack.expect("the scatter is one node");
 
-    // (a)
     assert_eq!(ty(pack.0), want);
     assert_eq!(ty(pack.2), want, "the packed rectangle is the input's type");
     assert_eq!(ty(unpack.2), want, "and so is the unpacked one");
@@ -88,7 +67,6 @@ fn pack_and_unpack_keep_the_row_space() {
         "(d) the norm between them answered the same type"
     );
 
-    // (b)
     assert_eq!(pack.1, unpack.1, "one permutation serves both directions");
     assert_eq!(
         trace.values[pack.1.0 as usize].def,
@@ -105,7 +83,6 @@ fn pack_and_unpack_keep_the_row_space() {
         }
     );
 
-    // (c)
     for node in &trace.nodes {
         if matches!(
             node.op,

@@ -51,11 +51,6 @@ instantiate_silu_mul_strided(bfloat16, bfloat)
 
 instantiate_silu_mul(bfloat16, bfloat)
 
-// `mlp_packed.metal`'s `packed_swiglu_clamp`, with the two halves arriving as
-// two buffers instead of as the two halves of one `2*intermediate` row. Same
-// clamps, same silu, same product — an artifact whose gate and up carry
-// different quantization points cannot state the packed row, and this is what
-// it fires instead.
 template <typename T>
 [[kernel]] void swiglu_clamp(
     const device T* gate        [[buffer(0)]],
@@ -101,9 +96,6 @@ template <typename T>
 
 instantiate_geglu_tanh(bfloat16, bfloat)
 
-// The ungated map: a tower MLP (multimodal §6.2) applies gelu_tanh to one
-// projection and multiplies nothing — the same activation as geglu_tanh
-// with the `up` operand absent, not an `up` of ones.
 template <typename T>
 [[kernel]] void mlp_gelu_tanh(
     const device T* x         [[buffer(0)]],

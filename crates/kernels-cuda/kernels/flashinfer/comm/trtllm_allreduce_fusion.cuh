@@ -8,32 +8,12 @@
 #endif
 
 #include <cuda/std/optional>
-// PIE: REMOVED -- `#include <tuple>`, and REPLACED by `<array>` on the line below, which
-// is an EDIT rather than a plain removal. No `std::tuple` is named anywhere in this file.
-// What upstream actually took from that directive is `std::array`, transitively:
-// libstdc++'s `<tuple>` includes `<array>` for the `tuple_size`/`tuple_element`
-// specialisations, and `allreduce_fusion_kernel_twoshot_sync`'s parameter list below is
-// `std::array<int, NRanks>` twice. `csrc/shim` answers a directive by the literal string
-// in it and carries no `tuple`, so the transitive route does not exist here and the
-// header that carries the name is named directly. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
+
 #include <array>
 #include <type_traits>
 
-// PIE: REMOVED -- `#include "../exception.h"`. That file is deleted from this tree
-// (host C++: `flashinfer::Error` derives from `std::exception` and every macro in it
-// builds its message in a `std::ostringstream`), and `utils.cuh` records the same
-// removal at its own include site. Its `FLASHINFER_CHECK` and `FLASHINFER_ERROR` were
-// expanded ONLY inside `allreduce_fusion_kernel_launcher` and `allreduce_fusion_op`,
-// both host functions removed at the bottom of this file, so this deletion changes what
-// NVRTC sees by nothing at all. This marker is one a strip does NOT undo.
 #include "../fp4_layout.cuh"
-// PIE: REMOVED -- `#include "../logging.h"`. 100% host C++ and not even portable host
-// C++: it is six `#define`s over `spdlog::` free functions plus a `set_log_level` built
-// on `std::make_shared<spdlog::sinks::stdout_color_sink_mt>`, and `spdlog` is a
-// third-party library this repository does not carry at all. Nothing in this file
-// expands a `FLASHINFER_LOG_*` macro. This marker is one a strip does NOT undo; see
-// MODIFICATIONS.
+
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 
@@ -51,10 +31,10 @@ static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
-}  // namespace details
+}
 
 namespace maths {
-// // ============================== Cast ==============================
+
 template <typename T_OUT, typename T_IN>
 __device__ inline T_OUT cuda_cast(T_IN val) {
   return val;
@@ -90,48 +70,6 @@ __device__ inline half2 cuda_cast<half2, half>(half val) {
   return __half2half2(val);
 }
 
-// PIE: REMOVED -- `cuda_cast<int8_t, half>` and `cuda_cast<int16_t, half2>`,
-// and with them the other four members of the integer<->half-precision cast
-// family marked below. **This is the first removal in this tree that takes
-// DEVICE text**, so it needs the whole argument rather than a line, and
-// MODIFICATIONS carries it under a heading of its own.
-//
-// What they are: `cuda_cast` specialisations that convert between `int8_t`/
-// `int16_t` and `half`/`half2`/`__nv_bfloat16`/`__nv_bfloat162`. TensorRT-LLM's
-// SmoothQuant heritage, carried into this header with the rest of
-// `namespace maths`.
-//
-// **Nothing in this file calls any of them.** Measured: the only consumers of
-// `maths::` anywhere in this header are four lines inside
-// `utils::cvt_warp_fp16_to_fp4`, and all four name `cuda_abs` and `cuda_max`.
-// Every reference to the six removed specialisations is one of them calling
-// another -- `cuda_cast<int16_t, half2>` calls `cuda_cast<int8_t, half>`,
-// `cuda_cast<__nv_bfloat162, int16_t>` calls `cuda_cast<__nv_bfloat16>(int8_t)`,
-// `cuda_cast<int16_t, __nv_bfloat162>` calls `bf1622int16`. The family is a
-// closed component of the call graph with no edge into it.
-//
-// **Why they cannot stay.** Every one of them needs an IMPLICIT conversion
-// between a built-in integer or floating type and the half-precision type --
-// `make_half2(int8[0], int8[1])`, `return static_cast<float>(val);` from a
-// function returning `__nv_bfloat16`, `static_cast<short>(val.x)` on a
-// `__nv_bfloat16`. NVIDIA's `__half` and `__nv_bfloat16` are classes with a
-// converting constructor per arithmetic type and they compile. Ours are
-// `pie_cuda_driver::kernels::device::f16` and `::bf16`, whose every
-// constructor and conversion operator is `explicit` ON PURPOSE:
-// `pie_device.cuh:71-83` states the rule (`bf16 b = 5;` and `bf16 b = 1.0f;`
-// stay refused) and MODIFICATIONS' "THE EDIT THAT IS NOT A REMOVAL" is a
-// second, independent record of that explicitness being load-bearing --
-// `xqa/mha.cuh:1455` had to change because of it.
-//
-// So the choice was: relax the prelude's canonical device types for six dead
-// functions, or remove the six. Relaxing would reach every FA2 and XQA
-// instantiation in the crate and turn a class of narrowing bugs from compile
-// errors into silent conversions. `csrc/shim/README.md`'s rule points the
-// same way -- "an untested conversion is a wrong answer that compiles".
-//
-// What a rebase does: put all six back and they will not compile until the
-// prelude is widened. That is the correct failure. This marker is one a strip
-// does NOT undo; see MODIFICATIONS.
 template <>
 __device__ inline int8_t cuda_cast<int8_t, float>(float val) {
   union {
@@ -155,10 +93,6 @@ __device__ inline int16_t cuda_cast<int16_t, float2>(float2 val) {
   return int16;
 }
 
-// PIE: REMOVED -- `cuda_cast<half2, int16_t>`. Part of the integer<->half-precision `cuda_cast`
-// family; the whole family's removal is argued at the FIRST marker of this
-// kind above (the `cuda_cast<int8_t, half>` one). Nothing in this file calls
-// it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 template <>
 __device__ inline float2 cuda_cast<float2, int16_t>(int16_t val) {
   union {
@@ -170,11 +104,6 @@ __device__ inline float2 cuda_cast<float2, int16_t>(int16_t val) {
   return make_float2(int8[0], int8[1]);
 }
 
-// PIE: REMOVED -- `cuda_cast<__nv_bfloat16>(int32_t)`, `cuda_cast<__nv_bfloat16>(int8_t)`
-// and `cuda_cast<int8_t>(__nv_bfloat16)`. Part of the integer<->half-precision `cuda_cast`
-// family; the whole family's removal is argued at the FIRST marker of this
-// kind above (the `cuda_cast<int8_t, half>` one). Nothing in this file calls
-// it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 template <>
 __device__ inline float cuda_cast<float, __nv_bfloat16>(__nv_bfloat16 val) {
   return __bfloat162float(val);
@@ -201,10 +130,6 @@ __device__ inline half cuda_cast<half, __nv_bfloat16>(__nv_bfloat16 val) {
   return __float2half(__bfloat162float(val));
 }
 
-// PIE: REMOVED -- `bf1622int16` and `cuda_cast<int16_t, __nv_bfloat162>`. Part of the integer<->half-precision `cuda_cast`
-// family; the whole family's removal is argued at the FIRST marker of this
-// kind above (the `cuda_cast<int8_t, half>` one). Nothing in this file calls
-// it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <>
 __device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, float>(float val) {
@@ -250,17 +175,12 @@ __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float2>(float2 val) {
   return float22bf162(val);
 }
 
-// PIE: REMOVED -- `cuda_cast<__nv_bfloat162, int16_t>`. Part of the integer<->half-precision `cuda_cast`
-// family; the whole family's removal is argued at the FIRST marker of this
-// kind above (the `cuda_cast<int8_t, half>` one). Nothing in this file calls
-// it. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 template <>
 __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val) {
   return float22bf162(__half22float2(val));
 }
 
-// // ============================== Abs ==============================
 template <typename T>
 __device__ inline T cuda_abs(T val) {
   assert(false);
@@ -299,7 +219,6 @@ __device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val) {
 }
 #endif
 
-// // ============================== Max ==============================
 template <typename To, typename Ti>
 __device__ inline To cuda_max(Ti val) {
   return cuda_cast<To>(val);
@@ -326,7 +245,6 @@ __device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
 #endif
 }
 
-// Binary maximum: compute the max of two values.
 template <typename T>
 __device__ inline T cuda_max(T val1, T val2) {
   return (val1 > val2) ? val1 : val2;
@@ -350,14 +268,12 @@ __device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 va
   return __hmax2(val1, val2);
 }
 
-// // ============================== Reciprocal ==============================
-// Fast reciprocal.
 inline __device__ float reciprocal_approximate_ftz(float a) {
   float b;
   asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
   return b;
 }
-}  // namespace maths
+}
 
 namespace utils {
 
@@ -400,49 +316,33 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
-// PIE: REMOVED -- `inline int getSMVersion()` and `inline int getSMRegisters()`.
-// 20 lines of host C++: `cudaGetDevice` and `cudaDeviceGetAttribute` behind
-// `FLASHINFER_CUDA_CALL`, neither with a `__device__` qualifier and neither callable
-// from one. Their only callers were `allreduce_fusion_kernel_launcher` (removed at the
-// bottom of this file), and under the JIT both questions are Rust's:
-// `jit::Ctx::compute_capability_major` answers the first and
-// `kernels_cuda::comm::CLUSTER_SIZE`'s note records why the second is not asked at all.
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 inline __device__ int64_t get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx, int mIdx,
                                                   int kIdx, cuda::std::optional<int> numRows,
                                                   int numCols) {
-  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
-  // batched tensor
-  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
 
   int32_t innerKIdx = (kIdx % 4);
   int64_t innerKStride = 1;
 
   int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-  int64_t innerMStride = 4 * innerKStride;  // 4
+  int64_t innerMStride = 4 * innerKStride;
 
-  // M tile layout [32, 4] is column-major.
   int32_t outerMIdx = (mIdx % 32);
-  int64_t outerMStride = 4 * innerMStride;  // 16
+  int64_t outerMStride = 4 * innerMStride;
 
   int32_t kTileIdx = (kIdx / 4);
-  int64_t kTileStride = 32 * outerMStride;  // 512
+  int64_t kTileStride = 32 * outerMStride;
 
-  // SF vector size 16. We round the "numCols" up to a multiple of 64.
   int factor = details::CVT_FP4_SF_VEC_SIZE * 4;
   int32_t numKTiles = (numCols + factor - 1) / factor;
   int32_t mTileIdx = mIdx / (32 * 4);
   int64_t mTileStride = numKTiles * kTileStride;
 
-  // Each SF block has 128 rows so pad rows to the multiple of 128.
   int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
   int64_t bTileStride = numMTiles * mTileStride;
 
-  // Compute the global offset.
   int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
                      kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
                      innerKIdx * innerKStride;
@@ -459,20 +359,16 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(cuda::std::optional<int> 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
-  // One pair of threads write one SF to global memory.
-  // TODO: stage through smem for packed STG.32
-  // is it better than STG.8 from 4 threads ?
   if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
     if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
-      // SF vector index (16 elements share one SF in the K dimension).
-      // numRows and numCols are unpadded.
+
       int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
       int32_t mIdx = rowIdx;
 
       auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else if (layout == QuantizationSFLayout::LINEAR) {
-      // Linear row-major layout, no padding required.
+
       int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
 
       int32_t numKTiles = numCols / details::CVT_FP4_SF_VEC_SIZE;
@@ -499,9 +395,6 @@ __forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c
   return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
 }
 
-// Convert single float2 pair to e2m1 (2 float32 -> 2 e2m1, returns uint8_t)
-// Optimization: allows pipelined processing to reduce register usage
-// Note: "=r" constraint always allocates 32-bit register regardless of variable type
 inline __device__ uint8_t fp32_pair_to_e2m1(float2 pair) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   uint32_t val32;
@@ -513,60 +406,22 @@ inline __device__ uint8_t fp32_pair_to_e2m1(float2 pair) {
       "}"
       : "=r"(val32)
       : "f"(pair.x), "f"(pair.y));
-  return static_cast<uint8_t>(val32 & 0xFF);  // Extract low 8 bits
+  return static_cast<uint8_t>(val32 & 0xFF);
 #else
   return 0;
 #endif
 }
 
 #if CUDA_VERSION >= 12080
-// PIE: REMOVED -- both `fp32_vec_to_e2m1` overloads, `float (&)[8]` and
-// `float2 (&)[4]`. 64 lines of DEVICE text, and the second removal of that
-// kind in this file; the `cuda_cast` marker above carries the general
-// argument and MODIFICATIONS the heading. This one is removed for a different
-// reason and it is a decision this repository had already taken.
-//
-// Each overload is two bodies. Above sm_100 it is
-// `cvt.rn.satfinite.e2m1x2.f32` inline PTX; below sm_100 it is four calls to
-// `__nv_cvt_float2_to_fp4x2`, NVIDIA's software emulation of that
-// instruction. `csrc/shim/cuda_fp4.h` answers `<cuda_fp4.h>` here, and it
-// carries the fp4 STORAGE types and the `__NV_E2M1` enumerator and
-// deliberately no conversion at all. Its banner states why, and the sentence
-// is about exactly this situation: *"If a Blackwell path we never instantiate
-// is one day switched on and reaches `__nv_fp4_e2m1(x)`, the build stops on a
-// missing constructor -- which is the correct moment to decide what that
-// conversion should do, on hardware that can be measured."*
-//
-// This is that build stopping. Supplying `__nv_cvt_float2_to_fp4x2` means
-// writing a round-to-nearest-even over the eight E2M1 magnitudes
-// {0, .5, 1, 1.5, 2, 3, 4, 6} with a saturating NaN rule, on a box whose one
-// GPU is an sm_89 L40S that cannot execute the instruction the emulation is
-// emulating -- so nothing here could check it against anything, and a
-// conversion checked against nothing is the failure `csrc/shim/README.md`
-// names in one line: *"an untested conversion is a wrong answer that
-// compiles."*
-//
-// It costs nothing today. **Neither overload has a caller anywhere in this
-// file** -- the FP4 epilogue reaches `fp32_pair_to_e2m1` (which is above and
-// stands, because its sub-sm_100 body is `return 0;` and needs no shim), not
-// `fp32_vec_to_e2m1` -- and `comm::INSTANTIATED` names one pattern,
-// `kARResidualRMSNorm`, whose `GetQuantType` is `kNone`. The whole FP4 arm is
-// unreachable from every instantiation this tree compiles.
-//
-// What a rebase does: put both back, and they compile the moment
-// `csrc/shim/cuda_fp4.h` grows a measured `__nv_cvt_float2_to_fp4x2`. That is
-// the right order. This marker is one a strip does NOT undo; see
-// MODIFICATIONS.
 
-// Quantizes the provided PackedVec into the uint32_t output
+
 template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
                                          uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Pre-compute constant: reciprocal of 6.0 (maximum value of e2m1)
+
   static constexpr float RECIPROCAL_6 = 1.0f / 6.0f;
 
-  // Get absolute maximum values among the local 8 values.
   auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
 
 #pragma unroll
@@ -574,15 +429,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
     localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
   }
 
-  // Get the absolute maximum among all 16 values (two threads).
   localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  // Get the final absolute maximum values.
-  // Optimization: compute vecMax and reuse localMax space (localMax no longer needed)
+
   float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
 
-  // Get the SF (max value of the vector / max value of e2m1).
-  // maximum value of e2m1 = 6.0.
-  // Optimization: compute quantized SF directly, avoid storing intermediate SFValue
   uint8_t fp8SFVal;
   float quantized_sf;
   if constexpr (UE8M0_SF) {
@@ -596,30 +446,24 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 #error "FP8 E8M0 support requires CUDA 12.8 or newer."
 #endif
   } else {
-    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFScaleVal * (vecMax * RECIPROCAL_6));
     fp8SFVal = tmp.__x;
     quantized_sf = static_cast<float>(tmp);
   }
-  // Get the output scale directly (optimization: avoid storing intermediate SFValue)
-  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  // Optimization: mathematically equivalent to SFScaleVal / quantized_sf, but more efficient
-  // (reduces 1 reciprocal call and 1 multiply operation)
+
   float outputScale = quantized_sf != 0 ? SFScaleVal / quantized_sf : 0.0f;
 
   if (SFout) {
-    // Write the SF to global memory (STG.8).
+
     *SFout = fp8SFVal;
   }
 
-  // Convert the input to float and quantize (pipelined to reduce register usage).
-  // Optimization: use single float2 instead of array to reduce register pressure from 32 bytes to 8
-  // bytes
   uint32_t e2m1Vec = 0;
 
 #pragma unroll
   for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    // Reuse single float2 register instead of array
+
     float2 fp2Val;
     if constexpr (std::is_same_v<T, half>) {
       fp2Val = __half22float2(get_vec2_element(vec, i));
@@ -629,12 +473,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
     fp2Val.x *= outputScale;
     fp2Val.y *= outputScale;
 
-    // Convert pair immediately and pack into result
     uint8_t e2m1Pair = fp32_pair_to_e2m1(fp2Val);
     e2m1Vec |= (static_cast<uint32_t>(e2m1Pair) << (i * 8));
   }
 
-  // Write the e2m1 values to global memory.
   return e2m1Vec;
 #else
   return 0;
@@ -643,7 +485,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 
 #endif
 
-}  // namespace utils
+}
 
 template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> vec_add(const vec_t<T, VEC_SIZE>& a,
@@ -661,13 +503,12 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNorm = 1,
   kARResidualRMSNormFP8Quant = 2,
   kARResidualRMSNormFP4Quant = 3,
-  // The difference between these two and the standard version is that the NormOut version outputs
-  // the result of the norm.
+
   kARResidualRMSNormOutFP8Quant = 4,
   kARResidualRMSNormOutFP4Quant = 5,
-  // Per-token-group FP8 quantization with UE8M0 packed scales
+
   kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8,
-  // Same as above but also outputs the norm result
+
   kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9,
 };
 
@@ -675,7 +516,7 @@ enum class QuantType : int {
   kNone = 0,
   kFP8 = 1,
   kFP4 = 2,
-  kPerTokenGroupFP8Packed = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
+  kPerTokenGroupFP8Packed = 3,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -741,8 +582,7 @@ struct AllReduceFusionParams {
   void* scale_out;
   void* rms_gamma;
   float rms_eps;
-  // 0 for standard RMSNorm (out = gamma * x * rsqrt(...)),
-  // 1 for Gemma / Qwen3.5 (out = (1 + gamma) * x * rsqrt(...)).
+
   float weight_bias = 0.f;
   float* scale_factor;
   bool use_oneshot;
@@ -845,8 +685,7 @@ class Barrier {
     __syncthreads();
     if (threadIdx.x < NRanks) {
       m_flag_value = next_flag(m_flag_value);
-      // To avoid the ABA problem, we need to synchronize the correct flag value to all
-      // barrier_flags, even if the corresponding CTA has not been launched.
+
       for (int flag_idx = blockIdx.x; flag_idx < details::kBarrierFlagCount;
            flag_idx += gridDim.x) {
         st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
@@ -901,7 +740,6 @@ class FusedOp {
     }
   }
 
-  // template <typename T>
   __device__ __forceinline__ void update(int access_id) {
     if (m_access_id != access_id) {
       m_access_id = access_id;
@@ -911,7 +749,6 @@ class FusedOp {
     }
   }
 
-  // template <typename T, uint32_t VEC_SIZE>
   __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
       val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
@@ -931,10 +768,10 @@ class FusedOp {
 
 #if CUDA_VERSION >= 12080
     if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      // NOTE(Yingyi): might update later
+
       auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-          cuda::std::nullopt /* batchIdx */, token_id, m_access_id_in_token,
-          cuda::std::nullopt /* numRows */, m_params.hidden_dim,
+          cuda::std::nullopt , token_id, m_access_id_in_token,
+          cuda::std::nullopt , m_params.hidden_dim,
           reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
       reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id] =
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
@@ -950,21 +787,16 @@ class FusedOp {
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
-      // Per-token-group FP8 quantization with UE8M0 packed scales.
+
       constexpr float FP8_E4M3_MAX = 448.0f;
       int group_size = m_params.block_quant_group_size;
       int groups_in_block = blockDim.x * VEC_SIZE / group_size;
       int block_elem_start = threadIdx.x * VEC_SIZE;
 
-      // --- Group absmax reduction ---
-      // use warp-shuffle reduce when group fits cleanly in a warp
-      // (group_size divisible by VEC_SIZE, group_size_in_vecs is power of 2 and <= 32).
-      // otherwise use shared-memory atomicMax
       int group_size_in_vecs = group_size / VEC_SIZE;
       bool use_warp_shuffle = (group_size % VEC_SIZE == 0) && (group_size_in_vecs <= 32) &&
                               (group_size_in_vecs & (group_size_in_vecs - 1)) == 0;
 
-      // per-element group absmax
       float elem_group_absmax[VEC_SIZE];
       extern __shared__ unsigned int smem_group_absmax[];
 
@@ -975,7 +807,7 @@ class FusedOp {
           float v = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
           local_absmax = fmaxf(local_absmax, v);
         }
-        // Butterfly all-reduce within the quantization group using warp shuffles.
+
         for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
           local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
         }
@@ -984,7 +816,7 @@ class FusedOp {
           elem_group_absmax[i] = local_absmax;
         }
       } else {
-        // use shared-memory atomicMax for group max reduction
+
         for (int g = threadIdx.x; g < groups_in_block; g += blockDim.x) {
           smem_group_absmax[g] = 0;
         }
@@ -1005,7 +837,6 @@ class FusedOp {
         }
       }
 
-      // compute UE8M0 scale and quantize to FP8
       auto compute_ue8m0_scale = [](float group_absmax) -> float {
         float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
         unsigned int y_s_bits = __float_as_uint(y_s);
@@ -1026,9 +857,6 @@ class FusedOp {
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
 
-      // write packed UE8M0 scales
-      // For warp-shuffle path: one thread per group (first thread in each group).
-      // For smem path: one thread per group in the block (threadIdx.x < groups_in_block).
       int block_first_elem = (m_access_id_in_token - threadIdx.x) * VEC_SIZE;
       auto write_group_scale = [&](int group_idx_in_row, float group_absmax) {
         float y_s = compute_ue8m0_scale(group_absmax);
@@ -1039,23 +867,16 @@ class FusedOp {
         int pos = group_idx_in_row % 4;
         int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
 
-        // Write valid exponent
         unsigned int bits = __float_as_uint(y_s);
         uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
         reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
 
-        // K-padding: last valid group zeros trailing bytes in its pack
         if (group_idx_in_row == groups_per_row - 1) {
           for (int p = pos + 1; p < 4; p++) {
             reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + p] = 0;
           }
         }
 
-        // MN-padding: on last valid token, first group zeros all packs
-        // for padding tokens (token_num .. tma_aligned_mn - 1).
-        // Skip the last packed column (pk = k_num_packed - 1) because
-        // scale_out storage is (token_num + (k_num_packed-1)*tma_aligned_mn)
-        // elements — the last column only has token_num rows allocated.
         if (token_id == token_num - 1 && group_idx_in_row == 0) {
           for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
             for (int pk = 0; pk < k_num_packed - 1; pk++) {
@@ -1073,7 +894,7 @@ class FusedOp {
           write_group_scale(group_idx_in_row, elem_group_absmax[0]);
         }
       } else {
-        // Loop: groups_in_block may exceed blockDim.x when group_size < VEC_SIZE
+
         for (int local_group = threadIdx.x; local_group < groups_in_block;
              local_group += blockDim.x) {
           float group_absmax = __uint_as_float(smem_group_absmax[local_group]);
@@ -1168,25 +989,21 @@ __device__ bool is_negative_zero(T) {
   return false;
 }
 
-// float specialization
 template <>
 __device__ bool is_negative_zero<float>(float x) {
   return (__float_as_int(x) == 0x80000000);
 }
 
-// double specialization
 template <>
 __device__ bool is_negative_zero<double>(double x) {
   return (__double_as_longlong(x) == 0x8000000000000000ULL);
 }
 
-// __half specialization
 template <>
 __device__ bool is_negative_zero<__half>(__half x) {
   return (__half_as_ushort(x) == 0x8000);
 }
 
-// __nv_bfloat16 specialization
 template <>
 __device__ bool is_negative_zero<__nv_bfloat16>(__nv_bfloat16 x) {
   return (__bfloat16_as_ushort(x) == 0x8000);
@@ -1222,8 +1039,7 @@ template <typename T, uint32_t VEC_SIZE, int NRanks, bool Fp32Acc>
 __device__ __forceinline__ vec_t<T, VEC_SIZE> allreduce_sum(vec_t<T, VEC_SIZE>* vals) {
   if constexpr (Fp32Acc) {
     static_assert(!std::is_same_v<T, float>);
-    // Optimization: process one element at a time to reduce register usage
-    // Instead of storing acc_f32[VEC_SIZE] (32 bytes), process and convert immediately
+
     vec_t<T, VEC_SIZE> acc;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
@@ -1305,13 +1121,13 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     remove_neg_zero<T, VEC_SIZE>(val);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-      // Push data to other ranks
+
       val.store(reinterpret_cast<T*>(comm.data_bufs[r]) +
                 (params.rank * tot_access + idx) * VEC_SIZE);
     }
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    // Clear comm buffer that previous kernel used
+
     clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
   }
 
@@ -1325,7 +1141,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
       done = true;
 #pragma unroll
       for (int r = 0; r < NRanks; ++r) {
-        // LDG.128 from local rank
+
         vals[r].load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
@@ -1408,36 +1224,7 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
 #endif
 }
 
-// PIE: REMOVED -- `get_sm_count`, `launch_oneshot_lamport`,
-// `get_registers_per_thread_oneshot`, `launch_twoshot_sync`,
-// `get_registers_per_thread_twoshot`, `use_oneshot`,
-// `allreduce_fusion_kernel_launcher` and `allreduce_fusion_op`. 296 lines of host C++
-// and the whole of what upstream calls a "launcher": `cudaGetDevice`,
-// `cudaDeviceGetAttribute`, `cudaFuncGetAttributes`, `cudaLaunchConfig_t`,
-// `cudaLaunchAttribute`, `cudaLaunchKernelEx`, `std::min`, five lambdas, twelve
-// `FLASHINFER_CHECK`s and two nested dispatch macros. Not one line carries a
-// `__device__` or `__global__` qualifier.
-//
-// It is the largest removal in this directory and the one that has a NAMED
-// replacement rather than a deleted one: `kernels_cuda::comm` is all of it in Rust.
-// The two `switch`es of `allreduce_fusion_op` are `comm::resolve`; the
-// `#include "kernels.def"` that expanded into `DISPATCH_PATTERN`'s case labels is
-// `comm::INSTANTIATED`; the `case 2/4/8/16` list is `comm::NRANKS`; the three
-// `FLASHINFER_CHECK`s that this file turned into a `throw` are `comm::Decline`
-// variants; and the grid/block arithmetic at `:1660-1685` (upstream numbering) is
-// `comm::fusion_geometry`, whose doc records exactly which two of upstream's
-// decisions it does NOT make and why -- the cluster dimension and the
-// registers-per-thread clamp.
-//
-// **The two `__global__`s this file exists for stand above it, untouched**, and they
-// are what NVRTC is handed: `allreduce_fusion_kernel_oneshot_lamport` and
-// `allreduce_fusion_kernel_twoshot_sync`. That is the whole distinction this removal
-// draws -- upstream's `allreduce_fusion_kernel_launcher` is a HOST function whose name
-// no `nvrtcAddNameExpression` can lower, which is why `comm::Instantiation::\
-// name_expression` names the `__global__` and not the launcher.
-//
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
-}  // namespace trtllm_allreduce_fusion
+}
 
-}  // namespace flashinfer
+}

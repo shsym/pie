@@ -1,10 +1,3 @@
-//! Every entry this milestone adds to `seat::ENTRIES` reads the staged
-//! window: fired at a bucket's grid with `win = [live, base]` armed, it lands
-//! exactly what the same launch lands over the rows `[base, base+live)` taken
-//! as their own rectangle, and writes nothing outside them.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test every_dit_seat_entry_retires_the_staged_windows_padded_rows`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,8 +10,6 @@ use kernels_cuda::jit::Ctx;
 use kernels_cuda::layout;
 use kernels_cuda::tensor::Tensor;
 
-/// The rows the window starts at, the rows it covers, the rows the recording
-/// was carved for, and the rows each plane stands.
 const BASE: u32 = 2;
 const LIVE: u32 = 3;
 const BUCKET: u32 = 5;
@@ -28,12 +19,8 @@ const WIDTH: usize = 64;
 const HEAD_DIM: usize = 32;
 const EPS: f32 = 1e-6;
 
-/// A byte no run writes, so an untouched row is recognisable.
 const SENTINEL: u8 = 0xa5;
 
-/// The two destinations one claim compares: the one a staged replay wrote at
-/// the plane's base, and the one the same launch wrote over the window taken
-/// as its own rectangle.
 #[derive(Clone, Copy)]
 struct Pair {
     staged: u64,
@@ -48,8 +35,6 @@ fn destinations(gpu: &mut Gpu, row_bytes: usize) -> Pair {
     }
 }
 
-/// The two runs agree everywhere, and the rows outside the window are the
-/// sentinel in both.
 fn agree(gpu: &Gpu, pair: Pair, row_bytes: usize, name: &str) {
     let staged: Vec<u8> = gpu.down(pair.staged, PLANES * row_bytes);
     let shifted: Vec<u8> = gpu.down(pair.shifted, PLANES * row_bytes);
@@ -76,14 +61,11 @@ fn agree(gpu: &Gpu, pair: Pair, row_bytes: usize, name: &str) {
     );
 }
 
-/// The window words a replay stages: live rows, row origin, and the two lane
-/// words nothing here reads.
 fn arm(gpu: &mut Gpu, ctx: &Ctx) {
     let at = gpu.up(&[LIVE, BASE, 0u32, 0]);
     ctx.arm_stage(at);
 }
 
-/// A handle on `plane`, `rows` tall, starting `shift` rows in.
 fn view(plane: u64, shift: u32, rows: u32, width: usize, dtype: Dtype, elem: usize) -> Tensor {
     Tensor::new(
         plane + u64::from(shift) * (width * elem) as u64,
@@ -95,6 +77,15 @@ fn view(plane: u64, shift: u32, rows: u32, width: usize, dtype: Dtype, elem: usi
 
 fn bf16(plane: u64, shift: u32, rows: u32, width: usize) -> Tensor {
     view(plane, shift, rows, width, Dtype::Bf16, 2)
+}
+
+fn every_dit_seat_entry_retires_the_staged_windows_padded_rows_every_case() {
+    the_modulations_retire_their_padded_rows();
+    the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs();
+    the_timestep_embedding_retires_its_padded_rows();
+    the_axial_rotation_retires_its_padded_rows();
+    the_row_permutations_retire_their_padded_rows();
+    the_bare_pointwise_ops_retire_their_padded_rows();
 }
 
 #[test]
@@ -144,7 +135,6 @@ fn the_modulations_retire_their_padded_rows() {
     }
 }
 
-#[test]
 fn the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs() {
     let mut lcg = Lcg::seeded(0x5ea72);
     let (r_raw, _) = lcg.row(PLANES * WIDTH);
@@ -184,7 +174,6 @@ fn the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs() {
     agree(&gpu, normed, WIDTH * 2, "the pair's normed row");
 }
 
-#[test]
 fn the_timestep_embedding_retires_its_padded_rows() {
     let mut lcg = Lcg::seeded(0x5ea73);
     let t: Vec<f32> = (0..PLANES).map(|_| lcg.unit() * 4.0 + 5.0).collect();
@@ -214,7 +203,6 @@ fn the_timestep_embedding_retires_its_padded_rows() {
     agree(&gpu, pair, WIDTH * 4, "sinusoid");
 }
 
-#[test]
 fn the_axial_rotation_retires_its_padded_rows() {
     let mut lcg = Lcg::seeded(0x5ea74);
     let (x_raw, _) = lcg.row(PLANES * WIDTH);
@@ -248,14 +236,9 @@ fn the_axial_rotation_retires_its_padded_rows() {
     agree(&gpu, pair, WIDTH * 2, "rope_axes");
 }
 
-#[test]
 fn the_row_permutations_retire_their_padded_rows() {
     let mut lcg = Lcg::seeded(0x5ea75);
     let (x_raw, _) = lcg.row(PLANES * WIDTH);
-    // A permutation that maps the window onto itself, so the rows it names
-    // are the rows the window covers however the map is read; the shifted run
-    // reads the same map with the window's own origin subtracted, since a
-    // permutation's VALUES are absolute rows of the other rectangle.
     let staged_map: Vec<i32> = (0..PLANES)
         .map(|i| {
             let (base, live) = (BASE as usize, LIVE as usize);
@@ -304,7 +287,6 @@ fn the_row_permutations_retire_their_padded_rows() {
     }
 }
 
-#[test]
 fn the_bare_pointwise_ops_retire_their_padded_rows() {
     let mut lcg = Lcg::seeded(0x5ea76);
     let (x_raw, _) = lcg.row(PLANES * WIDTH);

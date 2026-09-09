@@ -1,5 +1,3 @@
-//! Exhaustive generation/reuse and register-then-recheck models.
-
 use super::*;
 use ::loom::sync::Arc;
 use ::loom::sync::atomic::{AtomicBool, AtomicU64 as LAtomicU64, Ordering as O};
@@ -35,4 +33,3 @@ fn recycle(table: &WakerTable, old: WakerSlotId) -> WakerSlotId {
     assert_ne!(old, new, "the recycled slot must have a new generation");
     new
 }
-

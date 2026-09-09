@@ -1,68 +1,41 @@
-//! The DFlash block drafter, in its three shapes: v1 (DFlash), v2 (DFlash2:
-//! dynamic convolutions and a candidate selector), and DSpark (v1's backbone
-//! with a markov readout). Model text any family can carry: a head's own
-//! numbers arrive as a [`Head`], the trunk's as a [`Trunk`].
-
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint_dsl::{Builder, Error, extents};
 use model_dsl::{
     BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam,
 };
 
-/// The trunk numbers the drafter's banks are shaped by.
 #[derive(Clone, Copy, Debug)]
 pub struct Trunk {
     pub hidden: u64,
     pub vocab: u64,
     pub norm_eps: f32,
-    /// Element type for the drafter's projections; a drafter is quantized like the trunk.
     pub weights: Dtype,
-    /// Element type of norms and codebooks.
     pub dense: Dtype,
     pub tp: u32,
 }
 
-/// A DFlash block drafter: its own decoder stack fed by the trunk, running a
-/// whole block of rows in one pass instead of one token at a time.
 pub struct DFlash {
-    /// Trunk layers feeding the fusion, in the order their banks are sliced out of `fc`.
     pub taps: Vec<u32>,
-    /// Per-tap `[hidden, hidden]` slices of the stored `[hidden, taps·hidden]`
-    /// fc bank, summed with residual_add (the IR has no concat).
     pub fc: Vec<Weight>,
-    /// Scales the fused stream before the first block.
     pub hidden_norm: Weight,
     pub hidden_norm_eps: f32,
     pub blocks: Vec<DFlashBlock>,
-    /// Final norm before the readout through the target's `lm_head`.
     pub norm: Weight,
     pub norm_eps: f32,
-    /// Rows one draft pass proposes; the width of the `mtp.drafts` seam.
     pub block: u32,
-    /// Token every block row but the first carries on the way in.
     pub mask_token: u32,
-    /// DFlash2's candidate selector; `None` on a v1 head (readout is per-slot argmax).
     pub selector: Option<Selector>,
-    /// First proposing block row: 1 for DFlash (anchor proposes nothing), 0 for DSpark.
     pub proposals_from: u32,
-    /// The published head this was declared from.
     pub head: &'static Head,
 }
 
-/// DFlash2's candidate selector readout: each mask slot keeps its
-/// `top_k` candidates and a path through them is walked from the anchor.
 pub struct Selector {
-    /// `[rank, hidden]`; `None` for a plain bigram lattice (DSpark) with no hidden term.
     pub hidden_projection: Option<Weight>,
-    /// `[vocab, rank]`, indexed by the predecessor's id.
     pub pred: Weight,
-    /// `[vocab, rank]`, indexed by the candidate's id.
     pub succ: Weight,
     pub top_k: u32,
 }
 
-/// One layer of a [`DFlash`] drafter: a pre-norm decoder block with its own
-/// ungated attention and a sliding window on all but the last.
 pub struct DFlashBlock {
     pub mixer_norm: Weight,
     pub mixer_norm_eps: f32,
@@ -70,35 +43,24 @@ pub struct DFlashBlock {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: DraftMlp,
-    /// Attention window; `None` on the one full-attention layer a v1 head ends with (v2 has none).
     pub window: Option<u32>,
-    /// DFlash2's dynamic convolution around the attention sublayer; `None` on a v1 head.
     pub attn_conv: Option<DynConv>,
-    /// Same, around the MLP sublayer.
     pub mlp_conv: Option<DynConv>,
 }
 
-/// A draft block's gated MLP, routing to no experts.
 pub struct DraftMlp {
     pub gate_up: Weight,
     pub down: Weight,
     pub inter: u32,
 }
 
-/// DFlash2's two-tap grouped dynamic convolution around one sublayer:
-/// coefficients from the normed input convolve it before and its output after.
 pub struct DynConv {
-    /// `[2·taps, hidden]`, row `side·taps + tap`: the stored
-    /// `base_kernel [2, taps, hidden]` read flat.
     pub base: Weight,
-    /// `[2·taps·groups, hidden]`: `kernel_projection.weight`.
     pub proj: Weight,
     pub taps: u32,
-    /// Channels sharing one correction.
     pub group: u32,
 }
 
-/// A [`DFlash`] layer's plain (ungated) attention, with per-head q/k norms.
 pub struct DraftAttn {
     pub q_heads: u32,
     pub kv_heads: u32,
@@ -114,62 +76,44 @@ pub struct DraftAttn {
     pub q_norm_eps: f32,
     pub k_norm: Weight,
     pub k_norm_eps: f32,
-    /// Projection biases, where the head has them (`attn_bias` heads carry q/k/v/o biases).
     pub q_bias: Option<Weight>,
     pub k_bias: Option<Weight>,
     pub v_bias: Option<Weight>,
     pub o_bias: Option<Weight>,
-    /// This layer's kv row, in the trunk's page-id space.
     pub kv: String,
 }
 
-/// A published head's own numbers (its `config.json`); stated by the family
-/// that carries it, never here.
 #[derive(Debug, PartialEq)]
 pub struct Head {
-    /// Trunk layers whose hidden states feed the fusion, in tap order (`dflash_config.target_layer_ids`).
     pub taps: &'static [u32],
-    /// Per layer: a sliding window, or `None` for full attention, bidirectional over the block.
     pub windows: &'static [Option<u32>],
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
     pub inter: u32,
     pub theta: f32,
-    /// Rows one draft pass proposes (`block_size`); the width of the `mtp.drafts` seam.
     pub block: u32,
-    /// `dflash_config.mask_token_id`.
     pub mask_token: u32,
-    /// First proposing block row (DSpark's `logits_start`): 1 or 0.
     pub proposals_from: u32,
-    /// The dynamic convolution around every sublayer, where the head has one.
     pub conv: Option<Conv>,
     pub readout: Readout,
-    /// Whether the head's attention projections carry biases (`attention_bias`).
     pub attn_bias: bool,
 }
 
-/// A [`DynConv`]'s taps and channel-group size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv {
     pub taps: u32,
     pub group: u32,
 }
 
-/// How a head reads its proposals off the shared `lm_head`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readout {
-    /// The per-slot argmax.
     Argmax,
-    /// DFlash2's candidate selector over the slot's `top_k`.
     Selector { rank: u32, top_k: u32 },
-    /// DSpark's markov bigram head; biases only the slot's top-`K`, lossless because the verify decides.
     Markov { rank: u32, top_k: u32 },
 }
 
 impl DFlash {
-    /// Declare the head's planes under `prefix` (`aux` for an `--aux`
-    /// overlay), shaped by the trunk's hidden width and element types.
     #[must_use]
     pub fn declare(head: &'static Head, prefix: &str, trunk: &Trunk) -> DFlash {
         let (hidden, w, dense, tp) = (trunk.hidden, trunk.weights, trunk.dense, trunk.tp);
@@ -293,7 +237,6 @@ impl DFlash {
         }
     }
 
-    /// Register the drafter's kv rows in `space`, the trunk's page-id space.
     pub fn declare_caches(&self, c: &mut HybridSpec, space: KvSpace) {
         for b in &self.blocks {
             let a = &b.attn;
@@ -302,9 +245,6 @@ impl DFlash {
         }
     }
 
-    /// Call after every trunk layer `layer` with its residual stream `y`; at
-    /// a tapped layer folds `y · fcᵢ` into `fused`. The residual stream is one
-    /// aliased buffer, so a tap must fuse the hidden state as it passes.
     pub fn tap(&self, layer: u32, y: &Value, fused: &mut Option<Value>) {
         let Some(at) = self.taps.iter().position(|t| *t == layer) else {
             return;
@@ -316,10 +256,6 @@ impl DFlash {
         });
     }
 
-    /// The drafter's two arms: writes the context into its kv rows, then runs
-    /// the block. `fused` is what [`tap`](DFlash::tap) accumulated; `mask` is
-    /// the guest's mask channel, read by v1's full layer alone. Returns the
-    /// block rows' final hidden for the caller to merge before the readout.
     pub fn arm<F>(
         &self,
         inputs: &Input<F>,
@@ -329,7 +265,6 @@ impl DFlash {
         block_draft: &Predicate,
     ) -> Value {
         let d = self;
-        // written on every trunk fire, not only a drafting one
         let h_ctx = ops::elemwise::rmsnorm_plus_one(fused, &d.hidden_norm, d.hidden_norm_eps);
         let (_, ctx_positions) = inputs.positions().split(block_draft);
         for b in &d.blocks {
@@ -348,20 +283,12 @@ impl DFlash {
             );
         }
 
-        // The block.
         let (input_block, _) = inputs.split(block_draft);
         let (block_positions, _) = inputs.positions().split(block_draft);
         let mut h = h_block.clone();
         for b in &d.blocks {
             let a = &b.attn;
             let hd = a.head_dim;
-            // **THE SCHEDULE IS CARVED FOR THIS BLOCK'S OWN WINDOW.** A
-            // schedule is carved for ONE reading — the window sizes its kv
-            // chunking — so a plan built with `None` and launched with
-            // `Some(w)` is a restated reading its schedule never covered.
-            // v1's windowed layers and every v2 layer state one; the full
-            // -attention layer (v1's last, and every dspark block) states
-            // `None`, which is what the masked arm below reads.
             let plan =
                 ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, b.window);
             let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mixer_norm, b.mixer_norm_eps);
@@ -380,7 +307,6 @@ impl DFlash {
                 &inputs.write_page(&a.kv),
                 &inputs.write_offset(&a.kv),
             );
-            // v1's full-attention layer is bidirectional over the block; the mask is the guest's.
             let o = match b.window {
                 Some(w) => ops::attn::prefill(
                     &q,
@@ -419,8 +345,6 @@ impl DFlash {
         ops::elemwise::rmsnorm_plus_one(&h, &d.norm, d.norm_eps)
     }
 
-    /// Plant proposals at the `mtp.drafts` seam: a v1 head's per-slot argmax,
-    /// or DFlash2's selector walk. `hb` is the hidden [`arm`](DFlash::arm) returned.
     pub fn plant_readout<F>(
         &self,
         logits: &Value,
@@ -459,11 +383,6 @@ impl DFlash {
         seam::at(seam::MTP_DRAFTS, &[&picks]);
     }
 
-    /// Bind the head's `--aux` planes; `norm` reads an RMSNorm weight per the family's rule.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the builder refuses.
     pub fn bind_aux(
         &self,
         b: &mut Builder,
@@ -474,7 +393,6 @@ impl DFlash {
             &self.hidden_norm,
             norm("aux.hidden_norm.weight".to_string()),
         )?;
-        // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is columns `i·hidden .. (i+1)·hidden`.
         let span = extents(&self.fc[0])[1];
         for (i, bank) in self.fc.iter().enumerate() {
             let at = span * i as i64;
@@ -552,13 +470,11 @@ impl DFlash {
 }
 
 impl DraftAttn {
-    /// The kv row's name, owned, for a cache declaration.
     fn attn_kv(&self) -> String {
         self.kv.clone()
     }
 }
 
-/// A projection's bias, where the head has one; passes `x` through otherwise.
 fn biased(x: Value, bias: Option<&Weight>) -> Value {
     match bias {
         Some(b) => ops::elemwise::add_bias(b, &x),
@@ -566,8 +482,6 @@ fn biased(x: Value, bias: Option<&Weight>) -> Value {
     }
 }
 
-/// The input side of a [`DynConv`]: convolve the normed input with side 0;
-/// the coefficients come back for the output side. Passes `x` through where there is no conv.
 fn conv_prepare(x: &Value, conv: Option<&DynConv>) -> (Value, Option<Value>) {
     match conv {
         Some(c) => {
@@ -579,7 +493,6 @@ fn conv_prepare(x: &Value, conv: Option<&DynConv>) -> (Value, Option<Value>) {
     }
 }
 
-/// The output side of a [`DynConv`], with the coefficients its input side projected.
 fn conv_finish(y: &Value, conv: Option<&DynConv>, coeff: Option<&Value>) -> Value {
     match (conv, coeff) {
         (Some(c), Some(coeff)) => ops::attn::block_dyn_conv(y, coeff, &c.base, 1, c.taps, c.group),
@@ -587,7 +500,6 @@ fn conv_finish(y: &Value, conv: Option<&DynConv>, coeff: Option<&Value>) -> Valu
     }
 }
 
-/// The same bytes read as `want`: a stored rank-N kernel as a rank-2 bank.
 fn flat(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));

@@ -1,5 +1,3 @@
-//! Per-op shape/dtype inference for ETA stage bodies.
-
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -8,33 +6,21 @@ use crate::types::{
     Dtype, MAX_RANK, Predicate, Shape, ValueId, ValueType, is_int, is_numeric, supports,
 };
 
-/// An inference failure at `op_index`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyError {
-    /// Position of the offending op in its stage body.
     pub op_index: u32,
-    /// What inference rejected.
     pub kind: BodyErrorKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// What an inference failure was.
 #[non_exhaustive]
 pub enum BodyErrorKind {
-    /// Operand id undefined at this point (out of range / forward ref).
     ValueIdOutOfRange(ValueId),
-    /// Operand shapes an op's rule does not accept.
     ShapeMismatch,
-    /// Elementwise operand shapes that failed to broadcast (carries both).
     ShapeMismatchBin(Shape, Shape),
-    /// Operand dtypes an op's rule does not accept.
     DTypeMismatch,
-    /// A result dtype ETA has no arithmetic for; refused here rather than at
-    /// the encoder, where the only option left is a panic.
     UnsupportedDtype(Dtype),
-    /// Channel index outside the container's declaration table.
     ChannelOutOfRange(u32),
-    /// Name index outside the container's name table.
     NameOutOfRange(u16),
 }
 
@@ -81,20 +67,11 @@ impl fmt::Display for BodyError {
 #[cfg(feature = "std")]
 impl std::error::Error for BodyError {}
 
-/// Context a body types against: the channel element types (in declaration
-/// order, `ACT` already materialized) and the name-table size.
 pub struct BodyCtx<'a> {
-    /// Program-side channel element types, in declaration order.
     pub channel_types: &'a [ValueType],
-    /// Name-table length; a name index at or above it is out of range.
-    /// Wider than the name-index type so a table longer than `u16::MAX` can
-    /// state its real length.
     pub n_names: u32,
 }
 
-/// The per-value type table (index = value id) of one stage body, inferring
-/// in SSA order. Ops defining 0 ids contribute no entries but are still
-/// checked.
 pub fn body_types(ops: &[Op], ctx: &BodyCtx<'_>) -> Result<Vec<ValueType>, BodyError> {
     let mut types: Vec<ValueType> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
@@ -108,7 +85,6 @@ pub fn body_types(ops: &[Op], ctx: &BodyCtx<'_>) -> Result<Vec<ValueType>, BodyE
                 types.push(b);
             }
         }
-        // Every produced dtype must be one ETA computes in.
         for t in &types[produced..] {
             if !supports(t.dtype) {
                 return Err(err(index, BodyErrorKind::UnsupportedDtype(t.dtype)));
@@ -122,7 +98,6 @@ fn err(op_index: u32, kind: BodyErrorKind) -> BodyError {
     BodyError { op_index, kind }
 }
 
-/// Elementwise broadcast of two operand shapes (equal, or one scalar).
 fn broadcast2(a: Shape, b: Shape) -> Option<Shape> {
     if a == b {
         Some(a)
@@ -135,8 +110,6 @@ fn broadcast2(a: Shape, b: Shape) -> Option<Shape> {
     }
 }
 
-/// `src` left-aligned against `target` (trailing axes padded with 1); each
-/// axis equals the target or is 1.
 fn can_broadcast_to(src: Shape, target: Shape) -> bool {
     if src.rank() > target.rank() {
         return false;
@@ -152,7 +125,6 @@ fn can_broadcast_to(src: Shape, target: Shape) -> bool {
     true
 }
 
-/// `idx.dims ++ src.dims[1..]` — the axis-0 gather result / scatter vals shape.
 fn axis0_result(idx: Shape, src: Shape) -> Option<Shape> {
     let mut dims = [0u32; MAX_RANK * 2];
     let n = idx.rank() + src.rank() - 1;
@@ -268,7 +240,6 @@ fn infer(
             );
         }
         Op::Div(a, b) => {
-            // F32 division, or truncating integer division (0 on divide-by-zero).
             let (ta, tb) = (g(a)?, g(b)?);
             if !is_numeric(ta.dtype) || ta.dtype != tb.dtype {
                 return Err(dtype_err());
@@ -500,7 +471,6 @@ fn infer(
                 return Err(dtype_err());
             }
             let expect = axis0_result(ti.shape, tb.shape).ok_or_else(shape_err)?;
-            // vals: exact `idx.dims ++ base.dims[1..]`, or a scalar broadcast.
             if tv.shape != expect && !tv.shape.is_scalar() {
                 return Err(shape_err());
             }

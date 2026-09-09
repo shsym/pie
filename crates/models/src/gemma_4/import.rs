@@ -6,26 +6,14 @@ use checkpoint::contract::TensorType;
 use checkpoint_dsl::{Builder, Error, extents};
 use model_dsl::Platform;
 
-/// Where a safetensors checkpoint puts its trunk: transformers and `mlx_lm`
-/// spell the same tensors under different path prefixes; everything below
-/// `layers.{l}.` is identical either way.
-///
-/// Unlike gemma 3, gemma 4's RMSNorm has no `+1` offset — checkpoint norm
-/// weights are plain multiplicative scales.
 #[derive(Clone, Copy)]
 pub(crate) enum Layout {
-    /// `model.language_model.*` — transformers.
     Transformers,
-    /// `language_model.model.*` — `mlx_lm`.
     Mlx,
-    /// `model.decoder.*` — DiffusionGemma, whose encoder and decoder are
-    /// one trunk stored once under the decoder's name (the encoder side
-    /// holds only its `layer_scalar` copies, identical to the decoder's).
     Diffusion,
 }
 
 impl Layout {
-    /// The trunk prefix, up to and including the trailing dot.
     fn trunk(self) -> &'static str {
         match self {
             Self::Transformers => "model.language_model.",
@@ -46,8 +34,6 @@ impl Layout {
         self.at("embed_tokens.weight")
     }
 
-    /// mlx_lm strips the `model.` prefix here too but does not relocate it,
-    /// unlike the trunk.
     fn vision(self, leaf: &str) -> String {
         match self {
             Self::Transformers => format!("model.vision_tower.{leaf}"),
@@ -56,8 +42,6 @@ impl Layout {
         }
     }
 
-    /// The multimodal embedder's projection, which lives beside the tower and
-    /// not under it.
     fn embed_vision(self) -> &'static str {
         match self {
             Self::Transformers => "model.embed_vision.embedding_projection.weight",
@@ -73,10 +57,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // Try the native contract first: a file this crate's own import
-        // wrote satisfies it directly, with no transform.
-        // Otherwise try each safetensors layout, then GGUF, chosen by
-        // building the contract rather than sniffing a name.
         let mut refusals: Vec<String> = Vec::new();
         for (what, layout) in [
             ("transformers", Layout::Transformers),
@@ -109,8 +89,6 @@ impl Model {
         self.import_from_safetensors(src, platform, Layout::Transformers)
     }
 
-    /// The trunk as a DiffusionGemma checkpoint stores it. The
-    /// self-conditioning block beside it is the diffusion family's to read.
     pub fn import_from_diffusion(
         &self,
         src: &ztensor::Source,
@@ -142,8 +120,6 @@ impl Model {
                     b.read(k_norm, n("self_attn.k_norm.weight"))?;
                     let k = n("self_attn.k_proj.weight");
                     let v = n("self_attn.v_proj.weight");
-                    // `attention_k_eq_v` layers publish no `v_proj`; the
-                    // value leg then reads the key projection's own bytes.
                     let value = if src.get(&v).is_some() { v } else { k.clone() };
                     b.read_concat(qkv, [n("self_attn.q_proj.weight"), k, value])?;
                 }
@@ -159,9 +135,6 @@ impl Model {
             )?;
             b.read(&w.down, n("mlp.down_proj.weight"))?;
 
-            // The routed branch, where the checkpoint ships one. The router
-            // norm's gain is the stored `router.scale * hidden**-0.5`, folded
-            // into the plane rather than the forward.
             if let Some(x) = &w.moe {
                 let root = (self.hidden as f32).powf(-0.5);
                 b.read_expr(&x.router_norm, Expr::src(n("router.scale")).scale(root))?;
@@ -170,12 +143,6 @@ impl Model {
                 b.read(&x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))?;
                 b.read(&x.post_ffw_norm_1, n("post_feedforward_layernorm_1.weight"))?;
                 b.read(&x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))?;
-                // Three spellings of the expert banks: transformers 5 stores
-                // them fused (`experts.gate_up_proj`, `[experts, 2 * inter,
-                // hidden]`, gate first — the declared layout exactly); an
-                // `mlx_lm` quantization of that export keeps the fused shape
-                // under `experts.gate_up_proj.weight` (+ scales, biases);
-                // older exports split them under `switch_glu`.
                 let fused = n("experts.gate_up_proj");
                 let fused_quantized = n("experts.gate_up_proj.weight");
                 if src.get(&fused).is_some() {
@@ -196,17 +163,12 @@ impl Model {
                 }
             }
 
-            // A layer without PLE still owns its own `layer_scalar`; a PLE
-            // stack's is read below instead.
             if let Some(scalar) = &w.scalar {
                 b.read(scalar, n("layer_scalar"))?;
             }
         }
 
         if let Some(ple) = &self.ple {
-            // The leading rows the declaration states: the whole plane for
-            // the full stack, its first `layers * dim` rows for a miniature
-            // cut below the checkpoint's depth.
             let rows = i64::try_from(ple.model_proj.shape[0]).expect("a row count inside i64");
             let name = layout.at("per_layer_model_projection.weight");
             let stored = src.get(&name).and_then(|t| t.shape().first().copied());
@@ -235,10 +197,6 @@ impl Model {
             }
         }
 
-        // Every tower plane is a plain read except the position table:
-        // stored `[2, positions, hidden]`, read as one `[2 * positions,
-        // hidden]` bank (contiguous transmute) for a two-tap
-        // `embed_weighted`.
         if let Some(t) = &self.tower {
             let v = |s: &str| layout.vision(s);
             b.read(&t.patch_embed, v("patch_embedder.input_proj.weight"))?;
@@ -253,7 +211,6 @@ impl Model {
                 })()?,
             )?;
             b.read(&t.projection, layout.embed_vision())?;
-            // Applied as `(h - std_bias) * std_scale`, when the tower states one.
             if let Some(std) = &t.std {
                 b.read(&std.bias, v("std_bias"))?;
                 b.read(&std.scale, v("std_scale"))?;
@@ -279,10 +236,7 @@ impl Model {
                     (&blk.up, n("mlp.up_proj")),
                     (&blk.down, n("mlp.down_proj")),
                 ] {
-                    // The bank always sits under `.linear.`; the clip flag
-                    // only controls whether the four bound scalars are present.
                     b.read(&c.bank, format!("{stem}.linear.weight"))?;
-                    // The four bounds. Stored as rank-0 scalars, read as `[1]`.
                     if let Some(k) = &c.clip {
                         for (weight, suffix) in [
                             (&k.in_lo, "input_min"),
@@ -302,8 +256,6 @@ impl Model {
             }
         }
 
-        // The denoiser's self-conditioning block, beside the trunk under
-        // the same prefix (`model.decoder.self_conditioning.*`).
         if let Some(sc) = &self.self_cond {
             b.read(&sc.pre_norm, layout.at("self_conditioning.pre_norm.weight"))?;
             b.read_concat(
@@ -316,10 +268,7 @@ impl Model {
             b.read(&sc.down, layout.at("self_conditioning.down_proj.weight"))?;
         }
 
-        // The aux draft head: `pie model import --aux` prefixes a second
-        // checkpoint's names with `aux.`.
         if let Some(a) = &self.draft {
-            // `aux.fc.weight` is `[hidden, 2*hidden]`, embedding half first.
             let half = extents(&a.fc_embed)[1];
             b.read_expr(&a.fc_embed, Expr::src("aux.fc.weight").slice(1, 0, half))?;
             b.read_expr(
@@ -355,13 +304,7 @@ impl Model {
             b.read(&a.down, n("mlp.down_proj.weight"))?;
         }
 
-        // Google's assistant, under the same `aux.` prefix, in its own
-        // (transformers) spelling.
         if let Some(a) = &self.assistant {
-            // `pre_projection` is one `[hidden, 2 * trunk]` bank in the
-            // published checkpoint, sliced here; a restatement that split
-            // it first (`scripts/quantize_assistant.py`, whose halves are
-            // quantized on their own) names the halves.
             if src.get("aux.pre_projection_embed.weight").is_some() {
                 b.read(&a.pre_embed, "aux.pre_projection_embed.weight")?;
                 b.read(&a.pre_hidden, "aux.pre_projection_hidden.weight")?;
@@ -404,11 +347,6 @@ impl Model {
             }
         }
 
-        // The block drafter, `--aux`-imported (it is published on its own);
-        // its planes and their spelling are the drafter's (`drafter::dflash`).
-        // Its norms are a Qwen3-style stack's, not gemma's `1 + w`, and the
-        // drafter's text reads them through the `+1` op, so the stored weight
-        // is read down by one — the fold the qwen families measured.
         if let Some(dflash) = &self.dflash {
             dflash.bind_aux(&mut b, src, &|from| Expr::src(from).bias(-1.0))?;
         }
@@ -497,7 +435,6 @@ impl Model {
                 ],
             )?;
             b.read(&w.down, format!("blk.{l}.ffn_down.weight"))?;
-            // A layer without PLE owns its own scalar; a PLE stack's is read below.
             if let Some(scalar) = &w.scalar {
                 b.read(scalar, format!("blk.{l}.layer_scalar"))?;
             }
@@ -525,9 +462,6 @@ impl Model {
     }
 }
 
-/// Re-types a tensor to a stated shape without moving bytes: checks the
-/// element count matches, then transmutes. A source with no stated extents
-/// is passed through unchecked (the plan compiler checks it later).
 fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));

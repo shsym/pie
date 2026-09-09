@@ -1,9 +1,3 @@
-//! FFI — the only surface the other side of the boundary sees: opaque `u64`
-//! slot ids in, `0/1` out, callable from any thread, never unwinds.
-
-// Under `panic = "abort"` a panic in the table takes the caller's process
-// down instead of returning `0`, which its callers (often non-Rust) cannot
-// cope with; `catch_unwind` needs `panic = "unwind"` to do its job.
 #[cfg(panic = "abort")]
 compile_error!(
     "the waker's C ABI contract is `never unwinds, returns 0/1`, which is \
@@ -13,9 +7,6 @@ compile_error!(
 #[cfg(not(loom))]
 use crate::table::{WakeOutcome, WakerTable};
 
-/// Wake the waiter parked on `slot_id`, unconditionally. Returns `1` if a
-/// waker was woken, `0` otherwise (stale id / nobody parked). Callable from
-/// any thread; never unwinds.
 #[cfg(not(loom))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pie_wake(slot_id: u64) -> u8 {
@@ -23,9 +14,6 @@ pub extern "C" fn pie_wake(slot_id: u64) -> u8 {
     matches!(r, Ok(WakeOutcome::Woken)) as u8
 }
 
-/// Epoch-filtered wake: wake the waiter parked on `slot_id` iff the
-/// committed `ring_index` has passed its registered observation. Callable
-/// from any thread; never unwinds.
 #[cfg(not(loom))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pie_wake_past(slot_id: u64, ring_index: u64) -> u8 {

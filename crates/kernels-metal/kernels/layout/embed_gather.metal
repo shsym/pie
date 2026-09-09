@@ -8,23 +8,6 @@ inline uint dequant_code(const device uint32_t* row, int k) {
   return (row[k / per_word] >> ((k % per_word) * bits)) & mask;
 }
 
-/// **THE AFFINE GATHER'S ROW IS CHECKED BEFORE IT IS AN ADDRESS.**
-///
-/// The dequantizing read touches THREE planes off one id — the packed codes,
-/// the group scales and the group biases — so an id past the table's rows is
-/// three out-of-bounds reads, not one, and none of them lands anywhere a
-/// bounds-checked language would catch. `vocab` is the row count the op
-/// states, and an id outside `[0, vocab)` **WRITES ZERO** without reading:
-/// exactly `kernels-cuda`'s `::pie::layout::embed_concat_mlxu4` /
-/// `embed_concat_mlxu8` (`embed_concat.cuh`, `if (id < 0 || id >= vocab) {
-/// y[at] = 0; return; }`), which is the entry BOTH quantized embed points on
-/// the CUDA plane fire — `layout.embed` at one head through
-/// `embed_mlx_affine`, `layout.embed_concat` at sixteen. One semantic for
-/// both, on both planes.
-///
-/// The dense twin one file over stamps two answers because its two ops answer
-/// differently there; here the banked table serves only ops that zero, so the
-/// body carries the one rule.
 template <typename T, int group_size, int bits, bool SCALED>
 METAL_FUNC void embed_gather_body(
     const device uint32_t* w, const device T* scales, const device T* biases,

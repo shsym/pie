@@ -1,6 +1,3 @@
-//! Persistent device arena: assign operand offsets, order the persistent
-//! sources, and validate the resulting layout for overlap and alignment.
-
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{OrOverflow, Result};
@@ -25,7 +22,6 @@ pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<usize>
             buffer.persistent_offset = None;
             continue;
         }
-        // alignment is the max of the device minimum (StorageTarget) and the tensor contract's own request.
         let alignment = u64::from(
             buffer
                 .alignment
@@ -84,21 +80,16 @@ pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
         .or_overflow("alignment overflow")
 }
 
-/// Put `wanted` in the arena's scratch region: the bytes behind the resident tensors, so a transform's operands are somewhere the device can address.
-/// Buffers whose live ranges don't overlap can share bytes, so this is a linear scan over liveness rather than a bump allocator. Anything already resident keeps the offset it has.
 pub(super) fn place_in_scratch(program: &mut LoadPlan, wanted: &[BufferId]) -> Result<usize> {
     let views = view_bases(program);
     let zeroed = filled_buffers(program);
     let mut candidates: Vec<BufferId> = Vec::new();
     for id in wanted {
-        // a view owns no bytes; what has to be placed is the base it windows.
         let id = backing_of(program, &views, *id)?;
         let decl = program.buffer(id)?;
-        // a resident tensor is already addressable.
         if decl.persistent_offset.is_some() || decl.bytes == 0 {
             continue;
         }
-        // a zeroed buffer can't share a reused slot: hoist-bulk-arena-writes lifts every Fill into a prologue, which would erase an earlier user's write.
         if zeroed.contains(&id) {
             continue;
         }
@@ -112,7 +103,6 @@ pub(super) fn place_in_scratch(program: &mut LoadPlan, wanted: &[BufferId]) -> R
 
     let live = live_ranges(program, &views)?;
     let base = persistent_end(program)?;
-    // longest-lived first, then largest: the hardest buffer to fit is placed while the region is empty.
     candidates.sort_by_key(|id| {
         let (start, end) = live.get(id).copied().unwrap_or((0, usize::MAX));
         (
@@ -133,7 +123,6 @@ pub(super) fn place_in_scratch(program: &mut LoadPlan, wanted: &[BufferId]) -> R
         let bytes = decl.bytes;
         let (start, end) = live.get(&id).copied().unwrap_or((0, usize::MAX));
         let mut offset = align_up_u64(base, alignment)?;
-        // slide past every already-placed buffer this one would overlap in bytes and coexist with in time.
         loop {
             let blocker = placed.iter().find(|other| {
                 other.start <= end
@@ -160,7 +149,6 @@ pub(super) fn place_in_scratch(program: &mut LoadPlan, wanted: &[BufferId]) -> R
     Ok(placed.len())
 }
 
-/// Buffers a `Fill` zeroes.
 fn filled_buffers(program: &LoadPlan) -> HashSet<BufferId> {
     program
         .instrs
@@ -172,7 +160,6 @@ fn filled_buffers(program: &LoadPlan) -> HashSet<BufferId> {
         .collect()
 }
 
-/// Every view buffer, and the buffer it is a window on.
 fn view_bases(program: &LoadPlan) -> HashMap<BufferId, BufferId> {
     program
         .instrs
@@ -184,7 +171,6 @@ fn view_bases(program: &LoadPlan) -> HashMap<BufferId, BufferId> {
         .collect()
 }
 
-/// The buffer whose bytes `id` actually is: itself, or the base of the view chain it sits on. Bounded by [`MAX_VIEW_HOPS`]; a non-terminating chain is a malformed plan.
 fn backing_of(
     program: &LoadPlan,
     views: &HashMap<BufferId, BufferId>,
@@ -203,10 +189,8 @@ fn backing_of(
     Ok(id)
 }
 
-/// How deep a chain of views may go before the walk gives up.
 const MAX_VIEW_HOPS: usize = 16;
 
-/// One scratch buffer's window in the arena and in the schedule.
 struct Placement {
     offset: u64,
     end_offset: u64,
@@ -214,7 +198,6 @@ struct Placement {
     end: usize,
 }
 
-/// Where the resident region ends, which is where scratch may begin.
 fn persistent_end(program: &LoadPlan) -> Result<u64> {
     let mut end = 0u64;
     for buffer in &program.buffers {
@@ -229,7 +212,6 @@ fn persistent_end(program: &LoadPlan) -> Result<u64> {
     Ok(end)
 }
 
-/// First and last position in the schedule that names each buffer. A conservative interval, not a liveness analysis: a buffer read at step 3 and again at step 40 is treated as live throughout.
 fn live_ranges(
     program: &LoadPlan,
     views: &HashMap<BufferId, BufferId>,
@@ -261,7 +243,6 @@ fn live_ranges(
             StorageInstr::Finalize { tensor, .. } => touched.push(*tensor),
         }
         for buffer in touched {
-            // recorded against the backing buffer, since that is what occupies bytes.
             let buffer = backing_of(program, views, buffer)?;
             ranges
                 .entry(buffer)

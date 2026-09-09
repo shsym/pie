@@ -1,6 +1,3 @@
-//! Hyper-connections: residual streams expanded, mixed by learned gates,
-//! and folded back layer by layer. Ported from `kernels-cuda`'s `hc.cuh`.
-
 use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated};
@@ -8,18 +5,10 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/hc.metal";
 
-/// The threadgroup the per-row points are stamped for, and the shader's own
-/// `BLOCK` template argument.
 const BLOCK: u32 = 256;
 
-/// The largest stream count the mixers unroll into register (`hc_fold`'s
-/// read-before-write array) and threadgroup gate vectors — the shader's
-/// `HC_MAX_MULT`.
 const MAX_HC_MULT: u32 = 8;
 
-/// The stream fan `M`: how many `hidden`-wide streams the wide row holds.
-/// The variants that state a count beside their rows assert agreement at
-/// their own entries; `fold` states none.
 fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
     if wide == 0 || wide % hidden != 0 {
@@ -44,8 +33,6 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     Ok(fan)
 }
 
-/// One threadgroup per row: `BLOCK` threads apiece, laid on the x axis
-/// (`dispatchThreads` counts threads, not groups).
 fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
     let rows = nonzero(op, "rows", rows)?;
     let lanes = rows
@@ -54,7 +41,6 @@ fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of([lanes, 1, 1], [BLOCK, 1, 1]))
 }
 
-/// Tiles `x` across `streams` residual streams.
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_expand";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "hc_expand_bfloat16" });
@@ -79,8 +65,6 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
     )
 }
 
-/// RMS-normalises the wide stream row and widens it to f32 — the mix
-/// coefficients derived downstream are too sensitive for a bf16 round-trip.
 pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_rmsnorm_f32";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_rmsnorm_f32_bfloat16" });
@@ -100,11 +84,6 @@ pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Resul
     )
 }
 
-/// The per-token mix row: `mixes = normed · hc_fn^T`, `[N, M·H]` against a
-/// `[2M + M², M·H]` plane, all f32.
-///
-/// Not `linear.matmul`: the dense gemm on this plane instantiates bf16 only,
-/// and both operands here are f32. One threadgroup per `(row, column)`.
 pub fn project(
     ctx: &Ctx<'_>,
     normed: Tensor,
@@ -142,8 +121,6 @@ pub fn project(
             ),
         ));
     }
-    // The mix row is as wide as the plane says: `2M + M²` for a layer's
-    // gates, `M` for the trunk collapse.
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
     if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
@@ -157,8 +134,6 @@ pub fn project(
         ));
     }
     let rows = nonzero(OP, "rows", mixes.rows)?;
-    // One threadgroup per (row, column) on one axis: metal position
-    // attributes must all be scalars or all be vectors of one width.
     let lanes = rows
         .checked_mul(mix_hc)
         .and_then(|points| points.checked_mul(BLOCK))
@@ -180,11 +155,6 @@ pub fn project(
     )
 }
 
-/// Splits the mix row, Sinkhorn-normalises the combiner, and collapses the
-/// `M` streams into the layer's input — one threadgroup per token, the gate
-/// matrices landing beside it.
-///
-/// `normed` is the mix row [`project`] lands, `[N, 2M + M²]`.
 #[allow(clippy::too_many_arguments)]
 pub fn gates(
     ctx: &Ctx<'_>,
@@ -218,8 +188,6 @@ pub fn gates(
         post_mix.width == fan && comb_mix.width == fan * fan,
         "the gate matrices are `[N, M]` and `[N, M, M]`"
     );
-    // One threadgroup per (token, 256-wide hidden chunk): the shader's
-    // `HC_GATES_CHUNK`.
     let rows = nonzero(OP, "rows", x.rows)?;
     let chunks = nonzero(OP, "the hidden width", x.width)?.div_ceil(256);
     let lanes = rows
@@ -244,9 +212,6 @@ pub fn gates(
     )
 }
 
-/// Mixes the layer's output back into the streams under the gate matrices —
-/// across the wide row, which is why each thread owns its whole `(n, h)`
-/// column and reads every stream before writing any.
 pub fn fold(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -284,10 +249,6 @@ pub fn fold(
     )
 }
 
-/// **THE TRUNK COLLAPSE**: `y[n, h] = Σᵢ gᵢ · streams[n, i·H + h]` under
-/// `gᵢ = σ(mixes[n, i] · scale[0] + base[i]) + hc_eps` — the `M` streams
-/// folded into the one row the final norm reads (`v4mlx/hc.py::hc_head`).
-/// One threadgroup per token, `hc.cuh`'s `hc_head_postprocess` transcribed.
 #[allow(clippy::too_many_arguments)]
 pub fn collapse(
     ctx: &Ctx<'_>,
@@ -334,11 +295,6 @@ pub fn collapse(
     )
 }
 
-/// The gated-residual flavor (qwen4): a low-rank GEMM chain produces
-/// per-element logits, a sigmoid mixes — no Birkhoff projection or f32 gate
-/// plane. [`reference`] states each op a second time in host f32.
-///
-/// `y[h] = mean_s( σ(gates[s·H + h]) · normed[s·H + h] )`.
 pub fn mix(
     ctx: &Ctx<'_>,
     gates: Tensor,
@@ -375,8 +331,6 @@ pub fn mix(
     )
 }
 
-/// `hyper[s·H + h] += 2·σ(gates[s]/M) · o[h]`, in place on the wide row. The
-/// gate is per stream here and per element in [`mix`].
 pub fn inject(
     ctx: &Ctx<'_>,
     o: Tensor,
@@ -413,9 +367,6 @@ pub fn inject(
     )
 }
 
-/// Per `(row, stream)`, `y = σ(sgn(d)·√max(|d|, 1e-6)) · v` where `d` is the
-/// key·query dot over the stream's `H` values, scaled by `1/√H`. One
-/// threadgroup per `(row, stream)` (group `b` is row `b / M`, stream `b % M`).
 pub fn ple_gate(
     ctx: &Ctx<'_>,
     key: Tensor,
@@ -456,27 +407,17 @@ pub fn ple_gate(
     )
 }
 
-/// The hyper-connection arithmetic, in host f32 — the deviceless mirror the
-/// pins below are written against. Nothing in this crate calls these.
 pub mod reference {
-    /// The pre gate: `σ(logit) + eps`, a width weight in `~0..1`.
     #[must_use]
     pub fn pre_gate(mix: f32, scale: f32, base: f32, eps: f32) -> f32 {
         1.0 / (1.0 + (-(mix * scale + base)).exp()) + eps
     }
 
-    /// The post gate: `alpha · σ(logit)` — the model's `alpha` is 2, so this
-    /// is `2·sigmoid`, not the pre gate with a different epsilon.
     #[must_use]
     pub fn post_gate(mix: f32, scale: f32, base: f32, alpha: f32) -> f32 {
         alpha / (1.0 + (-(mix * scale + base)).exp())
     }
 
-    /// The combiner, from raw `M x M` logits to (approximately) doubly
-    /// stochastic — row-major, `comb[i * m + j]`.
-    ///
-    /// A row softmax seeds it, one column normalization follows, then
-    /// `iters - 1` alternating row/column sweeps run.
     #[must_use]
     pub fn sinkhorn(logits: &[f32], m: usize, iters: u32, eps: f32) -> Vec<f32> {
         let mut comb = vec![0.0f32; m * m];
@@ -515,7 +456,6 @@ pub mod reference {
         }
     }
 
-    /// `hc_gates`' collapse: `x[h] = Σ_i pre[i] · streams[i][h]`.
     #[must_use]
     pub fn collapse(pre: &[f32], streams: &[f32], m: usize, h: usize) -> Vec<f32> {
         (0..h)
@@ -523,7 +463,6 @@ pub mod reference {
             .collect()
     }
 
-    /// `hc_fold`'s algebra: `y[j][h] = post[j]·x[h] + Σ_i comb[i][j]·r[i][h]`.
     #[must_use]
     pub fn fold(x: &[f32], streams: &[f32], post: &[f32], comb: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; m * h];
@@ -539,7 +478,6 @@ pub mod reference {
         out
     }
 
-    /// The weightless RMS norm the wide stream row is widened through.
     #[must_use]
     pub fn rmsnorm(row: &[f32], eps: f32) -> Vec<f32> {
         let mean: f32 = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
@@ -551,10 +489,6 @@ pub mod reference {
         1.0 / (1.0 + (-v).exp())
     }
 
-    // ---- the gated-residual flavor (qwen4) --------------------------------
-
-    /// [`super::mix`]: `y[h] = mean_s( σ(gates[s·H + h]) · normed[s·H + h] )`,
-    /// over one row of `m · h` values.
     #[must_use]
     pub fn mix(gates: &[f32], normed: &[f32], m: usize, h: usize) -> Vec<f32> {
         (0..h)
@@ -567,8 +501,6 @@ pub mod reference {
             .collect()
     }
 
-    /// [`super::inject`]: `hyper[s·H + h] += 2·σ(gates[s]/M) · o[h]`, returning
-    /// the wide row rather than editing it.
     #[must_use]
     pub fn inject(o: &[f32], gates: &[f32], hyper: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = hyper.to_vec();
@@ -581,10 +513,6 @@ pub mod reference {
         out
     }
 
-    /// [`super::ple_gate`]: per stream, the key·query dot over `H` scaled by
-    /// `1/√H`, damped to its signed square root (magnitude clamped at
-    /// `1e-6`), sigmoided, and spent on the value row. `sign(0)` is zero, not
-    /// the clamp floor.
     #[must_use]
     pub fn ple_gate(key: &[f32], query: &[f32], value: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = vec![0.0; m * h];
@@ -607,8 +535,6 @@ pub mod reference {
         out
     }
 
-    /// `elementwise.rmsnorm_grouped_plus_one`: moments per `group`-wide slice,
-    /// gain `weight + 1` off a bank that spans the whole row.
     #[must_use]
     pub fn rmsnorm_grouped_plus_one(row: &[f32], weight: &[f32], group: usize, eps: f32) -> Vec<f32> {
         let mut out = vec![0.0; row.len()];
@@ -622,7 +548,6 @@ pub mod reference {
         out
     }
 
-    /// `elementwise.silu_scaled`: `silu(s·x)`, element for element.
     #[must_use]
     pub fn silu_scaled(x: &[f32], s: f32) -> Vec<f32> {
         x.iter()
@@ -642,8 +567,6 @@ mod tests {
     use crate::probe::Probe;
     use dtype::Dtype;
 
-    /// dsv4's own geometry, shrunk on the row axis only: four streams, a
-    /// hidden width wide enough that the per-row points loop.
     const M: u32 = 4;
     const H: u32 = 512;
     const ROWS: u32 = 3;
@@ -656,10 +579,12 @@ mod tests {
         Tensor::new(buf, rows, width, Dtype::F32)
     }
 
-    // ---- the marshalling pins ---------------------------------------------
+    fn hc_every_case() {
+        a_fan_past_the_unrolled_maximum_is_refused_by_name();
+        a_row_that_is_not_whole_streams_is_refused_by_name();
+        an_unstamped_dtype_is_refused_by_name();
+    }
 
-    /// A fan past the unrolled maximum is a refusal, not a clamp: the
-    /// shader's arrays are `HC_MAX_MULT` long.
     #[test]
     fn a_fan_past_the_unrolled_maximum_is_refused_by_name() {
         let probe = Probe::default();
@@ -675,9 +600,6 @@ mod tests {
         assert!(probe.fires().is_empty(), "a refused entry fired anyway");
     }
 
-    /// A wide row that is not a whole number of hidden-wide streams is the
-    /// other refusal — the fan is derived from the two widths.
-    #[test]
     fn a_row_that_is_not_whole_streams_is_refused_by_name() {
         let probe = Probe::default();
         let err = fold(
@@ -692,9 +614,6 @@ mod tests {
         assert!(matches!(err, Error::Backend { op, .. } if op == "elementwise.hc_fold"));
     }
 
-    /// f16 is not a dtype this plane stamps — the CUDA twin instantiates it,
-    /// this one does not.
-    #[test]
     fn an_unstamped_dtype_is_refused_by_name() {
         let probe = Probe::default();
         let err = expand(
@@ -709,11 +628,5 @@ mod tests {
             Error::DtypeUnsupported { op, dtype } if op == "elementwise.hc_expand" && dtype == Dtype::F16
         ));
     }
-
-    // ---- the arithmetic pins ----------------------------------------------
-
-    // ---- the gated-residual flavor (qwen4) --------------------------------
-
-    // ---- the arithmetic pins ----------------------------------------------
 
 }

@@ -1,8 +1,3 @@
-//! `Fallback::Copy`, on the metal plane, without a device: exercises the
-//! class table (`Windows::of`) that decides whether a copy happens and over
-//! which rows. Does not check that a copy's bytes equal a split's (needs a
-//! device).
-
 use engine_metal::window::{Copies, Windows};
 use model_compiler::{Budget, CompiledModel, DeviceProfile, Fallback, compile};
 use model_exec::fire::{ClassWindow, WindowTable};
@@ -11,11 +6,8 @@ use model_ir::{ClassSet, Platform, Trace};
 
 const SERVED: &str = "qwen35-d0.8b";
 
-/// Tokens per page; small, so a lane's page span exceeds one entry.
 const PAGE: i32 = 4;
 
-/// Must straddle the crossover: `model_compiler::layout` writes `Copy` below
-/// it and `Split` above.
 const LATTICE: [u32; 5] = [16, 64, 256, 1024, 4096];
 
 fn budget() -> Budget {
@@ -34,7 +26,6 @@ fn profile() -> DeviceProfile {
     }
 }
 
-/// The served text, baked for this plane.
 fn baked() -> (Trace, CompiledModel) {
     let trace = models::skus()
         .find(|row| row.name.starts_with(SERVED))
@@ -45,7 +36,6 @@ fn baked() -> (Trace, CompiledModel) {
     (trace, compiled)
 }
 
-/// One row and one lane per class, in the artifact's shipped order.
 fn every_class_once(compiled: &CompiledModel) -> WindowTable {
     let classes = compiled.classes.classes.len();
     let order = compiled
@@ -63,13 +53,10 @@ fn every_class_once(compiled: &CompiledModel) -> WindowTable {
     WindowTable::new(table)
 }
 
-/// This fire's qo boundaries: one row per lane, so the prefix sum counts.
 fn indptr(lanes: usize) -> Vec<i32> {
     (0..=lanes as i32).collect()
 }
 
-/// Lanes own different numbers of pages, so a gathered lane's span of the
-/// page-id list differs from what a slice would give.
 fn geometry(lanes: usize) -> Geometry {
     let mut indptr = vec![0i32];
     let mut indices = Vec::new();
@@ -77,7 +64,6 @@ fn geometry(lanes: usize) -> Geometry {
     let mut kv_len = Vec::new();
     let mut page = 0i32;
     for lane in 0..lanes {
-        // lane l holds l % 3 + 1 pages (one to three).
         let pages = (lane % 3 + 1) as i32;
         for _ in 0..pages {
             indices.push(page);
@@ -97,8 +83,6 @@ fn geometry(lanes: usize) -> Geometry {
     }
 }
 
-/// `positions` is `100 + row` so a permuted vector can't be confused with an
-/// identity one.
 fn ambient(rows: usize) -> (Vec<i32>, Vec<i32>) {
     (
         (0..rows as i32).map(|row| 100 + row).collect(),
@@ -106,10 +90,8 @@ fn ambient(rows: usize) -> (Vec<i32>, Vec<i32>) {
     )
 }
 
-/// The windows this fire cuts, at one arm of the switch.
 fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
     let classes = every_class_once(compiled);
-    // no patch row on this artifact: every Window::patch is (0, 0).
     let no_patches = WindowTable::new(vec![
         ClassWindow::default();
         compiled.classes.classes.len()
@@ -122,9 +104,9 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
         compiled,
         &classes,
         &no_patches,
+        &no_patches,
         &indptr(lanes),
         Copies {
-            // bucket 0 is 16 rows, below the crossover.
             bucket: 0,
             enabled,
             spaces: &spaces,
@@ -137,7 +119,6 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
     .expect("a fire over every class is a fire the artifact promised")
 }
 
-/// Every region index with a `Fallback::Copy` row, and its mask.
 fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
     let mut out: Vec<(u32, ClassSet)> = Vec::new();
     for (at, region) in compiled.template().iter().enumerate() {
@@ -151,6 +132,20 @@ fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
     out
 }
 
+fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
+    the_bake_writes_a_copy_row_below_the_crossover();
+    a_withdrawn_window_splits_when_the_shell_does_not_copy();
+    the_same_window_is_one_encode_when_it_does();
+    the_gathered_window_names_the_rows_the_split_ran_over();
+    the_boundaries_are_rebased_over_the_union_and_not_over_one_run();
+    the_ambient_row_tables_are_permuted_and_not_sliced();
+    the_page_tables_are_re_cut_lane_by_lane_and_not_sliced();
+    the_masked_window_is_refused_by_name_however_the_switch_is_set();
+    only_a_withdrawn_mask_is_ever_in_pieces();
+    the_builder_inherits_its_readers_answer();
+    the_packed_blob_and_the_bind_walk_it_in_one_order();
+}
+
 #[test]
 fn the_bake_writes_a_copy_row_below_the_crossover() {
     let (_, compiled) = baked();
@@ -161,7 +156,6 @@ fn the_bake_writes_a_copy_row_below_the_crossover() {
          of {LATTICE:?}; every claim in this file is about a table that is now \
          empty"
     );
-    // the other half is still written, above the crossover.
     assert!(
         compiled
             .fallback
@@ -172,7 +166,6 @@ fn the_bake_writes_a_copy_row_below_the_crossover() {
     );
 }
 
-#[test]
 fn a_withdrawn_window_splits_when_the_shell_does_not_copy() {
     let (trace, compiled) = baked();
     let split = windows(&trace, &compiled, false);
@@ -185,7 +178,6 @@ fn a_withdrawn_window_splits_when_the_shell_does_not_copy() {
     );
 }
 
-#[test]
 fn the_same_window_is_one_encode_when_it_does() {
     let (trace, compiled) = baked();
     let split = windows(&trace, &compiled, false);
@@ -205,7 +197,6 @@ fn the_same_window_is_one_encode_when_it_does() {
         split.launches()
     );
 
-    // every region the copy gathered ran r > 1 times under the split, once now.
     let mut gathered = 0;
     for at in 0..compiled.template().len() as u32 {
         if copy.runs(at) == split.runs(at) {
@@ -224,7 +215,6 @@ fn the_same_window_is_one_encode_when_it_does() {
     );
 }
 
-#[test]
 fn the_gathered_window_names_the_rows_the_split_ran_over() {
     let (trace, compiled) = baked();
     let split = windows(&trace, &compiled, false);
@@ -234,7 +224,6 @@ fn the_gathered_window_names_the_rows_the_split_ran_over() {
         .find(|&at| copy.runs(at) == 1 && split.runs(at) > 1)
         .expect("some region is copied");
 
-    // the rows the split's r encodes covered, in encode order.
     let mut expected: Vec<i32> = Vec::new();
     for run in 0..split.runs(at) {
         let span = split.at(at, run).span;
@@ -262,7 +251,6 @@ fn the_gathered_window_names_the_rows_the_split_ran_over() {
     );
 }
 
-#[test]
 fn the_boundaries_are_rebased_over_the_union_and_not_over_one_run() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
@@ -296,7 +284,6 @@ fn the_boundaries_are_rebased_over_the_union_and_not_over_one_run() {
     );
 }
 
-#[test]
 fn the_ambient_row_tables_are_permuted_and_not_sliced() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
@@ -344,7 +331,6 @@ fn the_ambient_row_tables_are_permuted_and_not_sliced() {
     );
 }
 
-#[test]
 fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
@@ -360,8 +346,6 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     assert_eq!(gathered.spaces.len(), 1, "one kv space was handed in");
     let space = &gathered.spaces[0];
 
-    // this fire gives every class one lane at the same index as its row, so
-    // the lane list is the row map.
     let lanes_of: Vec<usize> = gathered.rows_host.iter().map(|&row| row as usize).collect();
 
     assert_eq!(
@@ -405,14 +389,11 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     );
 }
 
-#[test]
 fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
     let split = windows(&trace, &compiled, false);
 
-    // regions owed a Copy row that still split with the switch on
-    // (window::copyable declines RuntimeInput::Mask).
     let refused: Vec<u32> = withdrawn(&compiled)
         .into_iter()
         .map(|(at, _)| at)
@@ -439,7 +420,6 @@ fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
     }
 }
 
-#[test]
 fn only_a_withdrawn_mask_is_ever_in_pieces() {
     let (trace, compiled) = baked();
     let split = windows(&trace, &compiled, false);
@@ -448,7 +428,6 @@ fn only_a_withdrawn_mask_is_ever_in_pieces() {
     for (at, region) in compiled.template().iter().enumerate() {
         let at = at as u32;
         if split.runs(at) == 1 {
-            // a copy is for windows the order could not seat.
             assert_eq!(copy.runs(at), 1, "region {at} was seated and gathered anyway");
             assert!(
                 copy.at(at, 0).gathered.is_none(),
@@ -466,13 +445,11 @@ fn only_a_withdrawn_mask_is_ever_in_pieces() {
     }
 }
 
-#[test]
 fn the_builder_inherits_its_readers_answer() {
     let (trace, compiled) = baked();
     let split = windows(&trace, &compiled, false);
     let copy = windows(&trace, &compiled, true);
 
-    // fallback::copies is keyed on the mask, not the region.
     let owed: Vec<u32> = withdrawn(&compiled).into_iter().map(|(at, _)| at).collect();
     let inherited: Vec<u32> = (0..compiled.template().len() as u32)
         .filter(|at| !owed.contains(at) && split.runs(*at) > 1)
@@ -497,12 +474,9 @@ fn the_builder_inherits_its_readers_answer() {
     }
 }
 
-#[test]
 fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
-    // what Inputs::write stages and Windows::bind cuts apart: one blob,
-    // walked twice; lengths must agree.
     let mut want = 0usize;
     let mut seen: Vec<usize> = Vec::new();
     for at in 0..compiled.template().len() as u32 {

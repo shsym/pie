@@ -1,29 +1,13 @@
-//! `Lora`: the correction class. One entry, [`correct`], for `linear.lora_correct` — `y += B[a]*(A[a]*x)` over the rows `routes` gives an adapter.
-//!
-//! One launch, unlike CUDA's two: the `rows x rank` waist lives in threadgroup memory inside one threadgroup's own two halves, since a kernel entry here has no scratch slab to name.
-//! `alpha/r` is folded into the up bank's contents at registration, so this entry states shapes and nothing else. Rank diversity is bucketed by bank: an adapter shorter than its bank's rank was registered zero-padded.
-//! No segments: `engine_metal::window` serves `Fallback::Split`, so every row of the rectangle handed here is a row of the correction.
-
 use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-/// One threadgroup per token row: eight simdgroups over the rank rows of the
-/// projection, then 256 lanes striding the output columns of the accumulate.
 const GROUP: u32 = 256;
 
-/// The threadgroup array `linear/lora.metal` stages the waist in, stated here
-/// because a rank past it is a refusal and not a silent truncation.
 const MAX_RANK: u32 = 128;
 
-/// `y += B[a]·(A[a]·x)` over the rows `routes` gives an adapter.
-///
-/// `x` is `[rows, in]`, `y` is `[rows, out]`, `bank_a` is `[adapters, rank*in]`, `bank_b` is `[adapters, out*rank]`. The rank is not an argument: it is `bank_a.width / x.width`, checked against `bank_b`.
-/// `routes` is `[rows, 1]` i32; `-1` is the base model, whose row is skipped and `y` keeps the trunk's value. In place: `y` is read, added to, and written back.
-///
-/// Errs [`Error::Backend`] for banks whose widths don't divide into a common rank, mismatched adapter counts, a rank past the shader's threadgroup array, or a degenerate extent; [`Error::DtypeUnsupported`] otherwise.
 pub fn correct(
     ctx: &Ctx<'_>,
     x: Tensor,

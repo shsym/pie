@@ -1,17 +1,3 @@
-//! Host-side snapshot optimization for Python (shared-modules) components:
-//! [`instrument`] exposes memory/globals via synthesized getters, the
-//! runtime calls `prepare-snapshot` and reads them back, and [`apply`] bakes
-//! the captured post-init state into a new component binary so later
-//! instantiations skip the CPython bootstrap. [`strip_module_data`] strips
-//! data/start sections from shared modules so instantiating a snapshotted
-//! component does not overwrite the captured state.
-//!
-//! `instrument()` and `apply()` are adapted from the `component_init_transform`
-//! crate (<https://github.com/dicej/component-init>, rev
-//! 1de5906ca8c5f7093eaa9f6565f1dde5fc9608d3, file transform/src/lib.rs), with
-//! both functions counting `ComponentTypeRef::Module` imports in
-//! `module_count` to handle shared-everything dynamically linked components.
-
 use {
     anyhow::{Context, Result, anyhow, bail},
     async_trait::async_trait,
@@ -50,10 +36,6 @@ use super::runtime as py_runtime;
 const PAGE_SIZE_BYTES: i32 = 64 * 1024;
 const MAX_CONSECUTIVE_ZEROS: usize = 64;
 
-// ---------------------------------------------------------------------------
-// Invoker trait
-// ---------------------------------------------------------------------------
-
 #[async_trait]
 trait Invoker: Send {
     async fn call_s32(&mut self, function: &str) -> Result<i32>;
@@ -62,10 +44,6 @@ trait Invoker: Send {
     async fn call_f64(&mut self, function: &str) -> Result<f64>;
     async fn call_list_u8(&mut self, function: &str) -> Result<Vec<u8>>;
 }
-
-// ---------------------------------------------------------------------------
-// Data structures
-// ---------------------------------------------------------------------------
 
 struct MemoryInfo {
     module_index: u32,
@@ -291,10 +269,6 @@ impl Measurement {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Segments iterator
-// ---------------------------------------------------------------------------
-
 struct Segments<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -342,10 +316,6 @@ impl<'a> Iterator for Segments<'a> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// instrument()
-// ---------------------------------------------------------------------------
 
 fn instrument(component_bytes: &[u8]) -> Result<(Vec<u8>, Instrumentation)> {
     let mut module_count = 0;
@@ -770,10 +740,6 @@ fn instrument(component_bytes: &[u8]) -> Result<(Vec<u8>, Instrumentation)> {
     Ok((instrumented_component, instrumentation))
 }
 
-// ---------------------------------------------------------------------------
-// strip_module_data
-// ---------------------------------------------------------------------------
-
 pub(crate) fn strip_module_data(module_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut out = EncoderModule::new();
     for payload in Parser::new(0).parse_all(module_bytes) {
@@ -791,10 +757,6 @@ pub(crate) fn strip_module_data(module_bytes: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(out.finish())
 }
-
-// ---------------------------------------------------------------------------
-// rewrite_init_module_for_snapshot
-// ---------------------------------------------------------------------------
 
 fn rewrite_init_module_for_snapshot<'a>(
     module_bytes: &[u8],
@@ -924,10 +886,6 @@ fn rewrite_init_module_for_snapshot<'a>(
     Ok(module_buf)
 }
 
-// ---------------------------------------------------------------------------
-// strip_module_section
-// ---------------------------------------------------------------------------
-
 fn strip_module_section<'a>(
     outer_parser: &mut impl Iterator<Item = Result<Payload<'a>, wasmparser::BinaryReaderError>>,
     component_bytes: &[u8],
@@ -958,10 +916,6 @@ fn strip_module_section<'a>(
 
     Ok(module_buf)
 }
-
-// ---------------------------------------------------------------------------
-// apply()
-// ---------------------------------------------------------------------------
 
 fn apply(measurement: Measurement, component_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut initialized_component = EncoderComponent::new();
@@ -1105,10 +1059,6 @@ fn apply(measurement: Measurement, component_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(initialized_component)
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn get_and_increment(n: &mut u32) -> u32 {
     let v = *n;
     *n += 1;
@@ -1148,10 +1098,6 @@ fn copy_module_section(
         });
     }
 }
-
-// ===========================================================================
-// Host-side snapshot integration
-// ===========================================================================
 
 struct HostInvoker<T: 'static> {
     instance: WasmtimeInstance,
@@ -1203,16 +1149,6 @@ impl<T: Send + 'static> Invoker for HostInvoker<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point: build a throwaway linker/store, then run the pipeline.
-// ---------------------------------------------------------------------------
-
-/// Run the host-side snapshot pipeline for a Python component. Builds a
-/// throwaway linker (WASI + HTTP + API + full shared modules + deps), runs
-/// the instrumented initialization, and returns the snapshotted bytes.
-/// Synchronous (not going through the actor) since snapshot only runs
-/// during program installation, which already holds the program service
-/// lock.
 pub(crate) async fn snapshot_from_bytes(
     engine: &Engine,
     raw_bytes: &[u8],
@@ -1224,10 +1160,6 @@ pub(crate) async fn snapshot_from_bytes(
         .expect("Failed to link WASI HTTP");
     host::add_to_linker(&mut linker)?;
 
-    // Use FULL shared modules for snapshot creation: CPython must initialize
-    // from scratch so the snapshot captures the post-init state. Stripped
-    // modules are only for instantiating components that are already
-    // snapshotted (see the linker service's instantiate path).
     for (name, module) in py_runtime::full_modules() {
         linker
             .root()
@@ -1239,8 +1171,8 @@ pub(crate) async fn snapshot_from_bytes(
     let process_ctx = ProcessCtx::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
-        OutputMode::Discard, // snapshot init only — guest output is noise
-        &snapshot_policy,    // deny fs + deny network — snapshot init only
+        OutputMode::Discard,
+        &snapshot_policy,
         py_runtime::dir(),
     )
     .await?;
@@ -1256,10 +1188,6 @@ pub(crate) async fn snapshot_from_bytes(
         .await
         .map_err(|e| anyhow!("snapshot_component failed: {e:#}"))
 }
-
-// ---------------------------------------------------------------------------
-// snapshot_component -- instruments, initializes, measures, and applies.
-// ---------------------------------------------------------------------------
 
 async fn snapshot_component<T: Send + 'static>(
     engine: &Engine,

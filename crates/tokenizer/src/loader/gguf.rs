@@ -1,5 +1,3 @@
-//! Compiles GGUF's `tokenizer.ggml.*` tables into a `Tokenizer`.
-
 use std::collections::HashMap;
 
 use anyhow::{Result, bail, ensure};
@@ -7,31 +5,20 @@ use anyhow::{Result, bail, ensure};
 use crate::bpe::BpeTable;
 use crate::{AddedToken, BpeMode, Pipeline, Splitter, Tokenizer};
 
-/// ggml's `llama_token_type`, for the values this reads.
 const NORMAL: i64 = 1;
 const CONTROL: i64 = 3;
 const USER_DEFINED: i64 = 4;
 const UNUSED: i64 = 5;
 
-/// The tables as they come off the file, borrowed from the mmap.
 #[derive(Clone, Copy, Debug)]
 pub struct Tables<'a> {
-    /// `tokenizer.ggml.model`.
     pub model: &'a str,
-    /// `tokenizer.ggml.pre`.
     pub pre: Option<&'a str>,
-    /// `tokenizer.ggml.tokens`, in id order.
     pub tokens: &'a [String],
-    /// `tokenizer.ggml.token_type`, parallel to `tokens`.
     pub token_types: &'a [i64],
-    /// `tokenizer.ggml.merges`, `"left right"`, in rank order.
     pub merges: &'a [String],
 }
 
-/// Compiles a GGUF's tokenizer tables.
-///
-/// Refuses tables that are absent, inconsistent, or name a model or
-/// pre-tokenizer this crate does not resolve, rather than approximating.
 pub fn from_tables(tables: &Tables) -> Result<Tokenizer> {
     ensure!(
         !tables.tokens.is_empty(),
@@ -53,8 +40,6 @@ pub fn from_tables(tables: &Tables) -> Result<Tokenizer> {
     );
     let pipeline = pipeline_named(tables.pre)?;
 
-    // Ids index the embedding matrix and must stay where the file put them;
-    // split by type, never renumbered.
     let mut vocab = HashMap::with_capacity(tables.tokens.len());
     let mut added = Vec::new();
     let mut trailing_unused = 0usize;
@@ -67,12 +52,10 @@ pub fn from_tables(tables: &Tables) -> Result<Tokenizer> {
                     "duplicate token {token:?} in tokenizer.ggml.tokens"
                 );
             }
-            // Padding: an id with no text behind it, dropped.
             UNUSED => trailing_unused += 1,
             CONTROL | USER_DEFINED => added.push(AddedToken {
                 id,
                 content: token.clone(),
-                // CONTROL tokens are model-emitted, not user-typed: `special`.
                 special: *kind == CONTROL,
                 lstrip: false,
                 rstrip: false,
@@ -84,8 +67,6 @@ pub fn from_tables(tables: &Tables) -> Result<Tokenizer> {
         }
     }
 
-    // `BpeTable` needs ids contiguous from zero; `insert_added` needs each
-    // added id appended at the end. Checked rather than assumed.
     ensure!(
         vocab.len() + added.len() + trailing_unused == tables.tokens.len(),
         "token types do not partition the vocabulary"
@@ -114,10 +95,6 @@ pub fn from_tables(tables: &Tables) -> Result<Tokenizer> {
     Tokenizer::new(bpe, pipeline, added)
 }
 
-/// llama.cpp's pre-tokenizer name, resolved to the pipeline it stands for.
-///
-/// Patterns are `tokenizer.json`'s own spelling, not llama.cpp's. An unknown
-/// name is refused rather than defaulted, since it can't be guessed.
 fn pipeline_named(pre: Option<&str>) -> Result<Pipeline> {
     let pre = pre.unwrap_or_default();
     let (pattern, nfc) = match pre {
@@ -125,11 +102,6 @@ fn pipeline_named(pre: Option<&str>) -> Result<Pipeline> {
             r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             true,
         ),
-        // Not `qwen2` with a new name: the letter classes take combining
-        // marks too (`[\p{L}\p{M}]` for `\p{L}`, and `\p{M}` joins the
-        // negated set), so a decomposed grapheme splits where `qwen2` would
-        // cut it. Copied from the model's own `tokenizer.json`, whose
-        // normalizer is NFC.
         "qwen35" => (
             r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             true,
@@ -149,10 +121,8 @@ fn pipeline_named(pre: Option<&str>) -> Result<Pipeline> {
         nfc,
         splitters: vec![Splitter {
             regex: fancy_regex::Regex::new(pattern)?,
-            // matches become pieces; text between them survives.
             keep_gaps: true,
         }],
         bpe_mode: BpeMode::Merge,
     })
 }
-

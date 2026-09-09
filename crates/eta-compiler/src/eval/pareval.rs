@@ -1,8 +1,3 @@
-//! Host partial evaluation of stage programs: folds a stage over host-known
-//! channel values, reusing the tier-0 interpreter's op semantics, to serve
-//! prefix-cache evidence, capability-less execution, and geometry
-//! classification ([`geometry_taint`]).
-
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,21 +8,12 @@ use eta_ir::op::{Op, ValueSource};
 use eta_ir::registry::{Port, Stage};
 use eta_ir::validate::BoundTrace;
 
-/// Why a value could not be evaluated on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalBlocker {
-    /// A channel whose current value the host does not know was consumed
-    /// (device-carried state).
     UnknownChannel(u32),
-    /// A second-party kernel call — device only.
     Kernel(String),
-    /// A device intrinsic value (logits, hidden, ...).
     Intrinsic(&'static str),
-    /// An ambient-seed `Rng` draw. The seed is a per-fire device fact, so the
-    /// host cannot replay the noise — unlike `RngKeyed`, which is a pure
-    /// function of a state operand the host may well know.
     AmbientSeed,
-    /// The trace faulted under evaluation — a real bug, not a capability gap.
     Fault(String),
 }
 
@@ -47,26 +33,13 @@ impl core::fmt::Display for EvalBlocker {
     }
 }
 
-/// A completed stage fold: for every channel the stage `put` (double-put:
-/// last wins), the concrete value or the blocker its derivation hit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StageFold {
-    /// Keyed by channel index: the [`Value`] the stage put there, or the
-    /// [`EvalBlocker`] its derivation hit. A double-put keeps the last.
     pub puts: BTreeMap<u32, Result<Value, EvalBlocker>>,
 }
 
-/// One evaluated slot: a concrete value, or unknown with the first blocker
-/// on its derivation chain.
 type Slot = Result<Value, EvalBlocker>;
 
-/// Fold one stage's ops over host-known channel values. `known` supplies a
-/// channel's current (pre-pass) value or `None`; within the fold a channel
-/// behaves as a register (a read after an in-stage put sees the pending
-/// value), mirroring the interpreter's pass-overlay semantics. Nothing is
-/// committed — the caller owns channel state.
-///
-/// A trace with no program for `stage` folds to an empty [`StageFold`].
 pub fn fold_stage(
     bound: &BoundTrace,
     stage: Stage,
@@ -82,14 +55,6 @@ pub fn fold_stage(
     };
     let ops = &bound.container.stages[index].ops;
     let types = &bound.stage_types[index];
-    // `demand` is what `fold.puts` can actually observe: a value no
-    // `ChanPut` commits `Ok` can't change the answer, so evaluation outside
-    // it is discarded arithmetic. This matters: a sampler epilogue's
-    // `RngKeyed` over the full logits shape costs milliseconds per fire if
-    // evaluated for nothing.
-    // `demand` is closed under operands, so this can't move a blocker or a
-    // value, and blocker propagation (a separate, arithmetic-free pass) is
-    // untouched.
     let (demand, known_cache) = demand_set(ops, types.len(), known);
     let known = &mut |chan: u32| -> Option<Value> {
         known_cache
@@ -111,13 +76,6 @@ pub fn fold_stage(
     };
 
     let mut fold = StageFold::default();
-    // Parallel value tracks, both indexed by SSA value id: `blocked_at`
-    // carries the first blocker on a value's derivation chain (`None` = the
-    // value is real), `dense` carries the value itself for `eval_op`
-    // (placeholders are never read, since a blocked operand short-circuits
-    // before eval_op runs). Split rather than a cloned `Vec<Result<Value>>`
-    // mirror, to hold the fold to one allocation per value instead of two
-    // (measured 11.27 -> 9.56 us/fire on Qwen3-0.6B/L40S at conc 512).
     let mut blocked_at: Vec<Option<EvalBlocker>> = Vec::with_capacity(types.len());
     let mut dense: Vec<Value> = Vec::with_capacity(types.len());
     let push = |blocked_at: &mut Vec<Option<EvalBlocker>>,
@@ -145,7 +103,6 @@ pub fn fold_stage(
 
         match op {
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
-                // Take == read for value purposes: the fold never commits.
                 let slot = match fold.puts.get(chan) {
                     Some(pending) => pending.clone(),
                     None => known(*chan)
@@ -176,10 +133,6 @@ pub fn fold_stage(
                     Err(blocked.unwrap_or(EvalBlocker::Intrinsic(intr.name()))),
                 );
             }
-            // `eval_op` answers this one with `rng_ambient(0, ..)` — the
-            // reference interpreter's stand-in seed, not the seed the device
-            // will draw. Folding it would hand the caller a concrete tensor
-            // that the real fire does not produce.
             Op::Rng { .. } => {
                 push(
                     &mut blocked_at,
@@ -188,15 +141,8 @@ pub fn fold_stage(
                     Err(blocked.unwrap_or(EvalBlocker::AmbientSeed)),
                 );
             }
-            // Sinks carry no value results and configure the forward — the
-            // fold is value-only, so they are inert here.
             Op::SinkCall { .. } => {}
             _ => {
-                // Everything here is folded as a pure function of its
-                // operands, so every non-pure op must be named above. Checked
-                // against `Op::value_source`, not `is_effectful` — the latter
-                // answers a different question (whether DCE/CSE must leave an
-                // op alone) and deliberately calls `Rng` pure.
                 debug_assert!(
                     matches!(op.value_source(), ValueSource::Operands),
                     "{op:?} reached the fold's general arm, which evaluates it \
@@ -213,9 +159,6 @@ pub fn fold_stage(
                     }
                     continue;
                 }
-                // Undemanded: dead arithmetic. Stays unblocked — pass one
-                // already decided that, and flipping it would change which
-                // operand a downstream blocker is named after.
                 if !(0..op.result_count() as usize).any(|offset| demand[next_id + offset]) {
                     for offset in 0..op.result_count() as usize {
                         dense.push(placeholder(types[next_id + offset]));
@@ -224,9 +167,6 @@ pub fn fold_stage(
                     continue;
                 }
                 let ty_of = |id: eta_ir::types::ValueId| types[id as usize];
-                // `StepError`'s `Display` is the one rendering of a step
-                // failure; re-matching the variants here would be a second
-                // vocabulary for the same fault.
                 let evaled = eval_op(op, &dense, &ty_of, &inputs, 0)
                     .map_err(|error| EvalBlocker::Fault(alloc::format!("{error}")))?;
                 match evaled {
@@ -235,7 +175,6 @@ pub fn fold_stage(
                         push(&mut blocked_at, &mut dense, next_id, Ok(a));
                         push(&mut blocked_at, &mut dense, next_id + 1, Ok(b));
                     }
-                    // Channel / kernel / sink ops are matched above.
                     Evaled::Chan(_) | Evaled::Kernel { .. } | Evaled::Sink { .. } => {
                         unreachable!("effect ops handled before eval_op")
                     }
@@ -246,25 +185,14 @@ pub fn fold_stage(
     Ok(fold)
 }
 
-/// The values [`fold_stage`] must actually compute, and every channel value
-/// `known` answered on the way (so the oracle is asked once per channel, not
-/// once per read).
-///
-/// Two non-arithmetic passes: the first propagates blockedness (agreeing
-/// exactly with the fold's own `blocked_at`), the second walks backwards
-/// from every put that commits `Ok`, closing over operands.
 fn demand_set(
     ops: &[Op],
     values: usize,
     known: &mut dyn FnMut(u32) -> Option<Value>,
 ) -> (Vec<bool>, BTreeMap<u32, Option<Value>>) {
     let mut cache: BTreeMap<u32, Option<Value>> = BTreeMap::new();
-    // Pass one: blocked or not, per value id; and the same register semantics
-    // for channels the fold itself uses (a read after an in-stage put sees the
-    // pending put's blockedness).
     let mut blocked: Vec<bool> = Vec::with_capacity(values);
     let mut pending: BTreeMap<u32, bool> = BTreeMap::new();
-    // Where each op's results start, so the backward pass can find them.
     let mut first_id: Vec<usize> = Vec::with_capacity(ops.len());
     for op in ops {
         first_id.push(blocked.len());
@@ -293,19 +221,10 @@ fn demand_set(
         }
     }
 
-    // Pass two: backwards from the puts that will carry a value. A put's one
-    // operand IS its value, so the `ChanPut` arm below is both the seed and
-    // the closure step — there is no separate seeding walk.
     let mut demand = alloc::vec![false; blocked.len()];
     for (op, &first) in ops.iter().zip(first_id.iter()).rev() {
         let wanted = match op {
-            // A put carries its value only when that value is unblocked; a
-            // blocked one commits the blocker, and what it would have carried
-            // is never looked at. This is the whole prune — demanding every
-            // put's operand unconditionally would put the sampler's noise
-            // straight back in.
             Op::ChanPut { value, .. } => !blocked[*value as usize],
-            // Sinks configure the forward and produce no value the fold reads.
             Op::SinkCall { .. } => false,
             Op::ChanTake(_) | Op::ChanRead(_) => demand[first],
             _ => (0..op.result_count() as usize).any(|offset| demand[first + offset]),
@@ -319,12 +238,6 @@ fn demand_set(
     (demand, cache)
 }
 
-/// A dtype-correct stand-in for a blocked value.
-///
-/// Blocked operands short-circuit before `eval_op`, so nothing ever reads a
-/// placeholder — `dense` only needs an entry to stay index-aligned. It is
-/// empty on purpose: materializing the declared `numel()` zeroed a whole
-/// tensor per blocked op, dominating a decode epilogue's forward-submit cost.
 fn placeholder(ty: eta_ir::types::ValueType) -> Value {
     match ty.dtype {
         eta_ir::types::Dtype::F32 => Value::F32(alloc::vec::Vec::new()),
@@ -335,10 +248,6 @@ fn placeholder(ty: eta_ir::types::ValueType) -> Value {
     }
 }
 
-/// Every descriptor port's fire-time value, by folding the prologue over
-/// host-known channel state and resolving each port against the fold. A
-/// device-carried port reports its blocker without hiding the ports the
-/// host can derive.
 pub fn eval_descriptor_ports(
     bound: &BoundTrace,
     known: &mut dyn FnMut(u32) -> Option<Value>,
@@ -360,40 +269,22 @@ pub fn eval_descriptor_ports(
     Ok(ports)
 }
 
-/// Static geometry-derivability analysis (bind time, no values).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GeometryTaint {
-    /// Channels whose committed value is DEVICE-decided: some put anywhere in
-    /// the trace reaches them through a kernel call, a device intrinsic, or
-    /// another device-decided channel (fixpoint). Their next-fire values are
-    /// host-known only if the device echoes committed state back.
     pub device_decided: BTreeSet<u32>,
-    /// Descriptor ports whose fire-time value passes through a device-decided
-    /// channel (or a kernel/intrinsic directly) in the prologue fold. Empty ⇒
-    /// submission geometry is host-derivable on every fire from seeds, staged
-    /// host puts, trace constants, and host-folded stage arithmetic alone.
     pub device_dependent_ports: BTreeSet<Port>,
 }
 
 impl GeometryTaint {
-    /// The host can derive every descriptor port on every fire.
     pub fn host_derivable(&self) -> bool {
         self.device_dependent_ports.is_empty()
     }
 }
 
-/// For each channel this stage puts, whether the put's value is statically
-/// device-decided, resolved against a settled [`GeometryTaint::device_decided`].
-/// A tainted value is `Err` in `fold_stage` on every fire, since taint
-/// sources (kernel calls, device intrinsics, ambient RNG) are exactly what
-/// the fold blocks unconditionally.
 pub fn stage_put_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> BTreeMap<u32, bool> {
     stage_taint(ops, device_decided).0
 }
 
-/// One taint pass over a stage's ops against the current device-decided set.
-/// Returns (this stage's pending put taint by channel, channels newly proven
-/// device-decided by a tainted put).
 fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, bool>, BTreeSet<u32>) {
     let mut tainted: Vec<bool> = Vec::new();
     let mut pending: BTreeMap<u32, bool> = BTreeMap::new();
@@ -401,8 +292,6 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
     for op in ops {
         let arg_tainted = op.operands().iter().any(|&arg| tainted[arg as usize]);
         let out = match op {
-            // A read inherits whatever this stage already put, else whatever
-            // an earlier stage proved.
             Op::ChanTake(chan) | Op::ChanRead(chan) => match pending.get(chan) {
                 Some(&t) => t,
                 None => device_decided.contains(chan),
@@ -416,14 +305,9 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
                 false
             }
 
-            // Classified by `Op::value_source`, the same judgement
-            // `fold_stage` reads — not `is_effectful`, which would call
-            // `Rng` pure here while the fold correctly blocks it.
             other => match other.value_source() {
                 ValueSource::Device => true,
                 ValueSource::Operands => arg_tainted,
-                // The channel ops are the only `Channel` rows and both are
-                // matched above.
                 ValueSource::Channel => unreachable!("channel ops matched above"),
             },
         };
@@ -434,12 +318,6 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
     (pending, newly)
 }
 
-/// Compute [`GeometryTaint`] for a bound trace.
-///
-/// Taint sources are kernel-call results and device intrinsics; it
-/// propagates through operands and channel put/take, iterated to a fixpoint
-/// (a loop-carried channel fed by an epilogue put taints the next fire's
-/// prologue read).
 pub fn geometry_taint(bound: &BoundTrace) -> GeometryTaint {
     let mut device_decided: BTreeSet<u32> = BTreeSet::new();
     loop {
@@ -455,8 +333,6 @@ pub fn geometry_taint(bound: &BoundTrace) -> GeometryTaint {
         }
     }
 
-    // Port taint: one final prologue pass against the settled set, resolving
-    // each port like `eval_descriptor_ports` (register semantics).
     let pending = bound
         .container
         .stages
@@ -511,24 +387,20 @@ mod tests {
         }
     }
 
-    /// The SDK's `AutoGeometry::trace` prologue, hand-lowered for
-    /// `token_count = 3`, `page_count = 2`, `page_size = 4`: positions /
-    /// pages / page_indptr / kv_len / w_slot / w_off computed from `tokens`
-    /// (with `-1` in-band skips) and the `len` cursor.
     fn sdk_geometry_trace() -> TraceContainer {
         use Op::*;
         TraceContainer {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(3), Dtype::I32, 2),    // 0 tokens
-                chan(Shape::vector(1), Dtype::U32, 2),    // 1 len
-                chan(Shape::vector(3), Dtype::U32, 1),    // 2 positions
-                chan(Shape::matrix(3, 2), Dtype::U32, 1), // 3 pages
-                chan(Shape::vector(4), Dtype::U32, 1),    // 4 page_indptr
-                chan(Shape::vector(3), Dtype::U32, 1),    // 5 kv_len
-                chan(Shape::vector(3), Dtype::U32, 1),    // 6 w_slot
-                chan(Shape::vector(3), Dtype::U32, 1),    // 7 w_off
+                chan(Shape::vector(3), Dtype::I32, 2),
+                chan(Shape::vector(1), Dtype::U32, 2),
+                chan(Shape::vector(3), Dtype::U32, 1),
+                chan(Shape::matrix(3, 2), Dtype::U32, 1),
+                chan(Shape::vector(4), Dtype::U32, 1),
+                chan(Shape::vector(3), Dtype::U32, 1),
+                chan(Shape::vector(3), Dtype::U32, 1),
+                chan(Shape::vector(3), Dtype::U32, 1),
             ],
             ports: vec![
                 port(Port::EmbedTokens, 0),
@@ -542,73 +414,73 @@ mod tests {
             stages: vec![StageProgram {
                 stage: Stage::Prologue,
                 ops: vec![
-                    ChanTake(2),             // 0
-                    ChanTake(3),             // 1
-                    ChanTake(4),             // 2
-                    ChanTake(5),             // 3
-                    ChanTake(6),             // 4
-                    ChanTake(7),             // 5
-                    ChanRead(0),             // 6 tokens
-                    ChanRead(1),             // 7 len
-                    Const(Literal::I32(-1)), // 8
-                    Ne(6, 8),                // 9 valid
+                    ChanTake(2),
+                    ChanTake(3),
+                    ChanTake(4),
+                    ChanTake(5),
+                    ChanTake(6),
+                    ChanTake(7),
+                    ChanRead(0),
+                    ChanRead(1),
+                    Const(Literal::I32(-1)),
+                    Ne(6, 8),
                     Cast {
                         value: 9,
                         dtype: Dtype::U32,
-                    }, // 10
+                    },
                     Cast {
                         value: 9,
                         dtype: Dtype::F32,
-                    }, // 11
-                    CumSum(11),              // 12
-                    Sub(12, 11),             // 13
+                    },
+                    CumSum(11),
+                    Sub(12, 11),
                     Cast {
                         value: 13,
                         dtype: Dtype::U32,
-                    }, // 14 rank
+                    },
                     Broadcast {
                         value: 7,
                         shape: Shape::vector(3),
-                    }, // 15 base
-                    Add(15, 14),             // 16 positions
-                    Add(16, 10),             // 17 write_len
-                    Const(Literal::U32(3)),  // 18
-                    Add(17, 18),             // 19
-                    Const(Literal::U32(4)),  // 20
-                    Div(19, 20),             // 21 page_counts
+                    },
+                    Add(15, 14),
+                    Add(16, 10),
+                    Const(Literal::U32(3)),
+                    Add(17, 18),
+                    Const(Literal::U32(4)),
+                    Div(19, 20),
                     Cast {
                         value: 21,
                         dtype: Dtype::F32,
-                    }, // 22
-                    CumSum(22),              // 23
+                    },
+                    CumSum(22),
                     Cast {
                         value: 23,
                         dtype: Dtype::U32,
-                    }, // 24
-                    Const(Literal::U32(0)),  // 25
+                    },
+                    Const(Literal::U32(0)),
                     Broadcast {
                         value: 25,
                         shape: Shape::vector(4),
-                    }, // 26
-                    Iota { len: 3 },         // 27
-                    Const(Literal::U32(1)),  // 28
-                    Add(27, 28),             // 29
+                    },
+                    Iota { len: 3 },
+                    Const(Literal::U32(1)),
+                    Add(27, 28),
                     ScatterSet {
                         base: 26,
                         idx: 29,
                         vals: 24,
-                    }, // 30 page_indptr
-                    Iota { len: 2 },         // 31
+                    },
+                    Iota { len: 2 },
                     Reshape {
                         value: 31,
                         shape: Shape::matrix(1, 2),
-                    }, // 32
+                    },
                     Broadcast {
                         value: 32,
                         shape: Shape::matrix(3, 2),
-                    }, // 33 pages
-                    Div(16, 20),             // 34 w_slot
-                    Rem(16, 20),             // 35 w_off
+                    },
+                    Div(16, 20),
+                    Rem(16, 20),
                     ChanPut { chan: 2, value: 16 },
                     ChanPut { chan: 3, value: 33 },
                     ChanPut { chan: 4, value: 30 },
@@ -642,11 +514,15 @@ mod tests {
         }
     }
 
+    fn pareval_every_case() {
+        unknown_tokens_block_derived_ports_only();
+        keyed_rng_is_only_as_tainted_as_its_state();
+        seeded_prefill_is_host_derivable();
+    }
+
     #[test]
     fn unknown_tokens_block_derived_ports_only() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
-        // tokens (0) and len (1) unknown — every derived geometry port
-        // reports the blocking channel instead of a value.
         let seeds: Vec<(u32, Value)> = seeds()
             .into_iter()
             .filter(|(c, _)| *c != 0 && *c != 1)
@@ -657,25 +533,18 @@ mod tests {
                 Port::EmbedTokens => {
                     assert_eq!(slot, Err(EvalBlocker::UnknownChannel(0)));
                 }
-                // Derived geometry blocks on whichever unknown input its
-                // chain hits first (len for base, tokens for validity).
                 Port::Positions | Port::KvLen | Port::WSlot | Port::WOff | Port::PageIndptr => {
                     assert!(
                         matches!(slot, Err(EvalBlocker::UnknownChannel(0 | 1))),
                         "{port:?}: {slot:?}"
                     );
                 }
-                // Pages is pure iota-broadcast — derivable with no inputs.
                 Port::Pages => assert!(slot.is_ok()),
                 other => panic!("unexpected port {other:?}"),
             }
         }
     }
 
-    /// The keyed form is the opposite case and must stay untainted:
-    /// `RngKeyed` is a pure function of its `state` operand, so a host
-    /// holding the state replays the same noise.
-    #[test]
     fn keyed_rng_is_only_as_tainted_as_its_state() {
         use Op::*;
         let mut trace = sdk_geometry_trace();
@@ -683,16 +552,16 @@ mod tests {
         trace.stages.push(StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                ChanRead(8), // 0 state [2] U32, seeded ⇒ host-known
+                ChanRead(8),
                 RngKeyed {
                     state: 0,
                     shape: Shape::vector(3),
                     kind: RngKind::Uniform,
-                }, // 1
+                },
                 Cast {
                     value: 1,
                     dtype: Dtype::I32,
-                }, // 2
+                },
                 ChanPut { chan: 0, value: 2 },
             ],
         });
@@ -701,7 +570,6 @@ mod tests {
         assert!(taint.host_derivable(), "keyed noise is replayable");
     }
 
-    #[test]
     fn seeded_prefill_is_host_derivable() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         let taint = geometry_taint(&bound);

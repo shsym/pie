@@ -1,14 +1,3 @@
-//! JSON Schema grammar frontend.
-//!
-//! Supported schema forms:
-//! - Primitive JSON types, enums, and constants
-//! - String length, pattern, and selected format constraints
-//! - Inclusive i64 integer and bounded decimal number ranges
-//! - Arrays, fixed-order objects, local `$ref`, `anyOf`, and `oneOf`
-//!
-//! Bounded `number` schemas emit a sound non-exponent decimal subset.
-//! Pattern/format constraints cannot be combined with length constraints.
-
 mod typed;
 
 use anyhow::Result;
@@ -16,12 +5,9 @@ use serde_json::Value;
 
 use crate::grammar::Grammar;
 
-/// Options for JSON Schema conversion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JsonSchemaOptions {
-    /// Allow arbitrary whitespace between JSON elements.
     pub any_whitespace: bool,
-    /// If true, disallow additional properties/items not in the schema.
     pub strict_mode: bool,
 }
 
@@ -34,18 +20,15 @@ impl Default for JsonSchemaOptions {
     }
 }
 
-/// Convert a JSON Schema string directly to a grammar.
 pub fn json_schema_to_grammar(schema: &str, options: &JsonSchemaOptions) -> Result<Grammar> {
     let schema: Value = serde_json::from_str(schema)?;
     typed::convert(&schema, options)?.to_grammar()
 }
 
-/// Convert a parsed JSON Schema to an EBNF representation.
 pub fn json_schema_to_ebnf(schema: &Value, options: &JsonSchemaOptions) -> Result<String> {
     Ok(typed::convert(schema, options)?.to_ebnf())
 }
 
-/// Create a grammar for any valid JSON value.
 pub fn builtin_json_grammar() -> Result<Grammar> {
     Grammar::from_ebnf(BUILTIN_JSON_EBNF, "root")
 }

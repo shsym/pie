@@ -1,15 +1,3 @@
-//! `Spatial`: the kernels over the voxel axis — an activation is `[rows,
-//! channels]` with a row per voxel in `(t, h, w)` order (`w` fastest), one
-//! lane (an image or a clip) per contiguous row range, and the per-lane box
-//! in an `i32` table `grid: [lanes, 4] = {t, h, w, row_offset}`. Convolution
-//! (implicit GEMM, causal time with a frame cache), group norm, the
-//! index-arithmetic reshapes (nearest upsample, pixel (un)shuffle,
-//! patchify), the device-side grid rule that derives one table from
-//! another, and the frame cache's slot gather/store. No cuDNN, no cuBLAS:
-//! every kernel is carried `.cuh` text.
-//!
-//! One submodule per member; the entries inside keep one entry per op.
-
 pub mod attn;
 pub mod cache;
 pub mod conv;
@@ -31,8 +19,6 @@ use crate::jit::{count, refuse};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-/// The lane count a grid table states, checked to be the `[lanes, 4]` i32
-/// rectangle every spatial kernel reads.
 pub(crate) fn lanes_of(op: &'static str, what: &str, grid: Tensor) -> Result<i32, Error> {
     if grid.dtype != Dtype::I32 || grid.width != 4 {
         return Err(refuse(
@@ -46,8 +32,6 @@ pub(crate) fn lanes_of(op: &'static str, what: &str, grid: Tensor) -> Result<i32
     count(op, "the lane count", grid.rows)
 }
 
-/// Both tables of an entry that maps one voxel box onto another: the same
-/// lanes on both sides.
 pub(crate) fn lane_pair(op: &'static str, grid: Tensor, o_grid: Tensor) -> Result<i32, Error> {
     let lanes = lanes_of(op, "input", grid)?;
     let o_lanes = lanes_of(op, "output", o_grid)?;
@@ -60,7 +44,6 @@ pub(crate) fn lane_pair(op: &'static str, grid: Tensor, o_grid: Tensor) -> Resul
     Ok(lanes)
 }
 
-/// The element count of a flat launch, refused past a 32-bit grid.
 pub(crate) fn flat_elements(op: &'static str, t: Tensor, block: u32) -> Result<(u32, i64), Error> {
     let n = t.elements();
     let blocks = n.div_ceil(u64::from(block));

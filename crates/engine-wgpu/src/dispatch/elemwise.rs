@@ -103,12 +103,8 @@ impl Run<'_> {
             ),
 
             Elementwise::LayernormNoScale { .. }
-            // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
-            // this engine never runs that pass, so it never sees these.
             | Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
-            // M0: the generative families' conditioning ops (D6/D7) are
-            // CUDA-first; refused by name here in this phase.
             | Elementwise::Modulate { .. }
             | Elementwise::GatedResidualAdd { .. }
             | Elementwise::NormModulate { .. }

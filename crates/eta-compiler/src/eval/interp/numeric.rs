@@ -1,12 +1,8 @@
-//! The pinned numeric contract: the parts of tier-0 a backend must reproduce bit-for-bit. Reduction is a canonical width-32 tree regardless of launch geometry, argmax breaks ties toward the lower index and never selects NaN, and every lane conversion is exact in the operands' dtype rather than in f32.
-
 use alloc::vec::Vec;
 
 use eta_ir::types::{Dtype, Shape, ValueType};
 
 use super::Value;
-
-// ── value helpers (dtype-exact, unlike the PSIR f32 evaluator) ─────────────
 
 pub(super) fn lanes_f32(v: &Value) -> Vec<f32> {
     match v {
@@ -40,7 +36,6 @@ pub(super) fn pick(len: usize, i: usize) -> usize {
     if len == 1 { 0 } else { i }
 }
 
-/// Elementwise binary, exact in the operands' common dtype.
 pub(super) fn bin_arith(
     a: &Value,
     b: &Value,
@@ -98,8 +93,6 @@ pub(super) fn map_f32(v: &Value, f: impl Fn(f32) -> f32) -> Value {
     Value::F32(lanes_f32(v).into_iter().map(f).collect())
 }
 
-/// Canonical width-32 tree. Physical launch dimensions never affect this
-/// logical order.
 pub(super) fn canonical_reduce<T: Copy>(
     row: &[T],
     identity: T,
@@ -148,8 +141,6 @@ pub(super) fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> A
     }
 }
 
-/// Inclusive prefix scan of each row, combining with `combine`. Sequential and left-to-right, unlike the reduction's width-32 tree, since every prefix is an output.
-/// The caller passes the combiner rather than an `Add` bound so integer lanes can use `wrapping_add`, matching the device's wrap behavior.
 pub(super) fn scan_rows<T: Copy>(
     lanes: &[T],
     rows: usize,
@@ -168,8 +159,6 @@ pub(super) fn scan_rows<T: Copy>(
     out
 }
 
-/// Argmax with the pinned contract: lower index wins ties; NaN never selected
-/// (all-NaN row -> 0), evaluated through the canonical tree.
 pub(super) fn argmax_row(row: &[f32]) -> i32 {
     let candidates: Vec<_> = row
         .iter()
@@ -205,24 +194,18 @@ pub(super) fn argmax_ordered<T: Ord>(row: &[T]) -> i32 {
     best_index as i32
 }
 
-/// Which end of the float order an extremum walks toward.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Extremum {
     Max,
     Min,
 }
 
-/// What a NaN-against-NaN pair produces — the only axis on which the reduction
-/// and elementwise forms differ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum NanPair {
-    /// A reduction folds NaN∧NaN to its identity, so an all-NaN row reduces to ∓inf rather than to NaN.
     Identity,
-    /// Elementwise `max`/`min` propagate: NaN∧NaN yields the left operand.
     Left,
 }
 
-/// The one extremum rule. IEEE leaves NaN pairs and signed zeros to the caller; this is the tier-0 oracle, so whatever it decides is the contract every backend is compared against.
 pub(super) fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f32 {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => match pair {
@@ -234,7 +217,6 @@ pub(super) fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f
         },
         (true, false) => right,
         (false, true) => left,
-        // -0.0 == 0.0, so f32::max/min are free to return either operand; pin the sign instead.
         (false, false) if left == 0.0 && right == 0.0 => {
             let negative = match end {
                 Extremum::Max => left.is_sign_negative() && right.is_sign_negative(),
@@ -249,35 +231,29 @@ pub(super) fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f
     }
 }
 
-/// `reduce_max`'s combiner — see [`NanPair::Identity`].
 pub(super) fn canonical_max(left: f32, right: f32) -> f32 {
     extremum(left, right, Extremum::Max, NanPair::Identity)
 }
 
-/// `reduce_min`'s combiner — see [`NanPair::Identity`].
 pub(super) fn canonical_min(left: f32, right: f32) -> f32 {
     extremum(left, right, Extremum::Min, NanPair::Identity)
 }
 
-/// `max_elem`'s combiner — see [`NanPair::Left`].
 pub(super) fn element_max(left: f32, right: f32) -> f32 {
     extremum(left, right, Extremum::Max, NanPair::Left)
 }
 
-/// `min_elem`'s combiner — see [`NanPair::Left`].
 pub(super) fn element_min(left: f32, right: f32) -> f32 {
     extremum(left, right, Extremum::Min, NanPair::Left)
 }
 
-/// sort_desc order with the pinned contract: descending; ties → lower
-/// original index first; NaN below −inf (last).
 pub(super) fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..row.len() as u32).collect();
     idx.sort_by(|&a, &b| {
         let (x, y) = (row[a as usize], row[b as usize]);
         match (x.is_nan(), y.is_nan()) {
             (true, true) => a.cmp(&b),
-            (true, false) => core::cmp::Ordering::Greater, // NaN last
+            (true, false) => core::cmp::Ordering::Greater,
             (false, true) => core::cmp::Ordering::Less,
             (false, false) => y.partial_cmp(&x).unwrap().then(a.cmp(&b)),
         }
@@ -285,12 +261,10 @@ pub(super) fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     idx
 }
 
-/// [`Shape::rows`] as an index type, saturating rather than truncating: no buffer the interpreter holds is `usize::MAX` long, so an unrepresentable row count yields an empty row rather than a wrapped-small one.
 pub(super) fn rows_of(shape: Shape) -> usize {
     usize::try_from(shape.rows()).unwrap_or(usize::MAX)
 }
 
-/// Which of the three row reductions [`eval_op`] is evaluating. Named explicitly so an unmatched fourth reduce op is a compile error, not a silent fallback to one of these three.
 #[derive(Clone, Copy)]
 pub(super) enum ReduceKind {
     Sum,

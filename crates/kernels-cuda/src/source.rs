@@ -1,8 +1,3 @@
-//! The carried device text: every `.cuh` a unit compiles, the shim headers
-//! it resolves standard spellings against, and the upstream closure — plus
-//! the digests the jit cache keys them by. NVRTC resolves includes against
-//! this set and nothing else.
-
 use std::ffi::CString;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,10 +1,3 @@
-//! The canonical stage signature.
-//!
-//! A signature is the bytes that decide plan identity: two stages with the same
-//! signature may share a compiled executable. It therefore has to capture
-//! everything that changes generated code and nothing that does not --
-//! runtime extents stay symbolic, so batch shape is deliberately absent.
-
 use alloc::vec::Vec;
 
 use eta_ir::container::{PortSource, put_u16, put_u32};
@@ -19,14 +12,9 @@ use super::symbolic::{symbolic_channel_type, symbolic_port_type};
 
 pub(crate) const SIGNATURE_MAGIC: [u8; 4] = *b"PTSG";
 
-/// The canonical bytes and hash that decide a stage's plan identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageSignature {
-    /// FNV-1a-64 of [`canonical_bytes`](Self::canonical_bytes); the plan cache
-    /// key and the emitted kernel's entry-point name.
     pub hash: u64,
-    /// The canonical encoding two stages must share byte-for-byte to share a
-    /// plan. Runtime extents stay symbolic, so batch shape is absent.
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -72,8 +60,6 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
         match &binding.source {
             PortSource::Channel(global) => {
                 bytes.push(0);
-                // `localize_stage` already put every channel the stage's
-                // ports name into `channel_bindings`.
                 put_u32(
                     &mut bytes,
                     stage

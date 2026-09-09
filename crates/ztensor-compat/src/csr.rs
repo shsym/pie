@@ -1,33 +1,16 @@
-//! Assembling a `zt.sparse_csr/2` object.
-//!
-//! The profile itself, its id, metadata rules and byte plan, is
-//! [`ztensor::vocab`]'s. What is here is the data-level half: reading the
-//! planes back and checking the index rules, which needs bytes in hand and so
-//! belongs beside the projections rather than in the reader. A profile added
-//! downstream splits the same way.
-
 use ztensor::vocab::CsrPlan;
 use ztensor::{Error, Leaf, Result, Rule, Tensor, Term};
 
-/// An assembled CSR object with its data-level rules checked.
 #[derive(Debug, Clone)]
 pub struct Csr {
     pub rows: u64,
     pub cols: u64,
-    /// The value planes as laid out in the blob: everything from the first
-    /// values plane to the end, so a grouped `term` keeps its plane
-    /// padding. For a leaf term this is exactly `nnz` packed elements.
     pub values: Vec<u8>,
     pub term: Term,
-    /// Column index per value, widened to u64.
     pub indices: Vec<u64>,
-    /// Row pointers, `rows + 1` entries.
     pub indptr: Vec<u64>,
 }
 
-/// Reads and assembles a `zt.sparse_csr/2` tensor, enforcing the profile's
-/// data-level MUSTs: `indptr[0] == 0`, non-decreasing, `indptr[rows] == nnz`,
-/// per-row strictly increasing indices, and every index `< cols`.
 pub fn read(tensor: &Tensor<'_>) -> Result<Csr> {
     if tensor.layout() != Some("zt.sparse_csr/2") {
         return Err(Error::Unsupported(format!(

@@ -1,18 +1,7 @@
-//! The fact-bit predicate algebra a model splits on. A model names its own
-//! bits — `Facts::qo_one()` is a hand-written constructor over
-//! [`Predicate::fact(0)`](Predicate::fact) — and `Value::split` lowers
-//! predicates to `Guard` trees on the nodes they guard.
-
 use std::ops::{BitAnd, Not};
 
 use model_ir::Stream;
 
-/// A formula over fact bits, stated at trace time. `Rest` is the n-way
-/// split's catch-all arm and legal nowhere else.
-///
-/// A bit is a position and nothing else. The name a model calls it by lives
-/// in that model's own `Facts` impl and never travels into the plan:
-/// `Guard::Fact(bit)` is what a guard is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     Fact { bit: u8 },
@@ -32,10 +21,6 @@ impl Predicate {
         Predicate::Rest
     }
 
-    /// The stream fact, one-hot from `base`: lane is on `stream` ⇔ bit
-    /// `base + stream.code()`. The DSL side of [`Stream::word`], which a
-    /// family's `Classify::word` packs with; a family that spells its
-    /// stream bits this way carves one arm per stream it names.
     #[must_use]
     pub fn stream(base: u8, stream: Stream) -> Predicate {
         Predicate::fact(base + stream.code())

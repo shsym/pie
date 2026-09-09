@@ -1,14 +1,3 @@
-//! Python runtime resources shared across the linker and program services.
-//!
-//! Tracks the configured CPython runtime directory and lazily loads the
-//! stdlib shared modules from `<py-runtime>/shared/*.wasm` when a Python
-//! component is installed or instantiated, so non-Python components don't
-//! pay this compilation cost. Loaded modules come in two variants: full
-//! (data segments and start functions intact, for non-snapshotted
-//! components and snapshot creation) and stripped (those sections removed,
-//! so the shared modules don't clobber a snapshotted component's
-//! pre-initialized memory image). Both are compiled at most once.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -17,28 +6,17 @@ use wasmtime::{Engine, Module};
 
 use super::snapshot;
 
-/// The shared Python modules, compiled: `(full, stripped)`. Every module on
-/// disk is compiled twice — the whole module, and the snapshot-stripped
-/// variant — and each entry is `(module name, compiled module)`.
 type SharedModules = (Vec<(String, Module)>, Vec<(String, Module)>);
 
 struct State {
-    /// Wasmtime engine used to compile shared modules lazily.
     engine: Engine,
-    /// Configured py-runtime directory, if it exists on disk.
     py_runtime_dir: Option<PathBuf>,
-    /// Lazily compiled shared modules. Startup should not pay CPython
-    /// compilation cost for non-Python inferlets.
     shared_modules: OnceLock<SharedModules>,
-    /// Whether to apply the snapshot optimization to Python components.
     snapshot_enabled: bool,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
 
-/// Initializes the shared Python runtime. Must be called once at bootstrap,
-/// after the Wasmtime engine is created and before the linker/program services
-/// are spawned. Subsequent calls are no-ops.
 pub fn init(engine: &Engine, py_runtime_dir: &Path, snapshot_enabled: bool) {
     if STATE.get().is_some() {
         return;
@@ -69,27 +47,22 @@ fn state() -> &'static State {
         .expect("python::runtime::init must be called before use")
 }
 
-/// Returns the py-runtime directory path, or None if py-runtime is not installed.
 pub fn dir() -> Option<&'static Path> {
     state().py_runtime_dir.as_deref()
 }
 
-/// Returns the full (un-stripped) shared modules.
 pub fn full_modules() -> &'static [(String, Module)] {
     &loaded_modules().0
 }
 
-/// Returns the stripped (no data segments, no start sections) shared modules.
 pub fn stripped_modules() -> &'static [(String, Module)] {
     &loaded_modules().1
 }
 
-/// Whether the snapshot optimization is enabled for Python components.
 pub fn is_snapshot_enabled() -> bool {
     state().snapshot_enabled
 }
 
-/// Whether any shared modules were loaded (i.e., py-runtime is installed).
 pub fn is_available() -> bool {
     state().py_runtime_dir.is_some() && !full_modules().is_empty()
 }
@@ -121,8 +94,6 @@ fn loaded_modules() -> &'static SharedModules {
     })
 }
 
-/// Loads shared core modules (.wasm files) from a directory, producing both
-/// full and stripped variants of each.
 fn load_shared_modules(engine: &Engine, shared_dir: &Path) -> SharedModules {
     let mut full = Vec::new();
     let mut stripped = Vec::new();

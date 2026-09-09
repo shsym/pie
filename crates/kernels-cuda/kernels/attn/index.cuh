@@ -35,13 +35,9 @@ __global__ void index_knorm_rope(
     const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns — the key
-    // row and the position that dates it are both read there.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = static_cast<int>(threadIdx.x);
     T* row = idx_k + static_cast<long long>(n_row) * head_dim;
@@ -80,13 +76,9 @@ __global__ void index_q_rope(
     const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns — the query
-    // row and the position that dates it are both read there.
+
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = static_cast<int>(threadIdx.x);
     if (h >= n_heads) return;
@@ -175,16 +167,11 @@ __global__ void index_topk_paged(
     const u32* __restrict__ win)
 {
     const int t = static_cast<int>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. Only the
-    // PLANES move by it — the qo boundaries below are the window's own,
-    // rebased to its zero, and the score scratch starts at its own too.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int tid = static_cast<int>(threadIdx.x);
     i32* srow = selection + static_cast<long long>(t_row) * topk;
@@ -200,12 +187,7 @@ __global__ void index_topk_paged(
     const int kv_len =
         (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
     const int abs_q = kv_len - new_tokens + (t - qo_lo);
-    // Pooled keys: the indexer's compressor pools one entry per `ratio`
-    // tokens and stores it at the boundary cell `(c+1)*ratio - 1`, so key `c`
-    // is read there and the published ids are that pool's tokens. The tokens
-    // after the last boundary (the incomplete tail, at most `ratio - 1` of
-    // them) are always selected first, so a token always sees itself.
-    // `ratio == 1` is one key per token, published as itself.
+
     const int stride = (ratio > 0) ? ratio : 1;
     const int total = abs_q + 1;
     int npools = (total > 0) ? total / stride : 0;
@@ -235,7 +217,6 @@ __global__ void index_topk_paged(
     }
     __syncthreads();
 
-    // The tail tokens lead the selection.
     for (int i = tid; i < tail; i += kBlock) srow[i] = npools * stride + i;
 
     if (npools <= pool_budget) {

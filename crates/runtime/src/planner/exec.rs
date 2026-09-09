@@ -1,13 +1,3 @@
-//! The planner's transfer executors: eviction (D2H) and restore (H2D), run on
-//! the planner's own tasks. Quiescence is established, not requested; each
-//! failed step abandons the attempt and leaves the process resident.
-//!
-//! Eviction: gate already closed -> fence every working set (blocks new
-//! lease/prepare/submit) -> lane leaves the wait-all quorum -> drain settled
-//! host-KV ops -> quiesce to zero fire leases per set -> prepare/D2H/commit.
-//! Fences stay up for the whole evicted period and clear at restore commit
-//! or working-set release.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,9 +8,6 @@ use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
 use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn};
 
-/// Spawn one executor plus its join watcher, which fails the attempt on an
-/// abnormal join. Returns false when no runtime exists, so the caller can
-/// run its no-runtime fallback.
 fn spawn_watched(
     planner: Arc<ResidencyPlanner>,
     pid: ProcessId,
@@ -56,7 +43,6 @@ pub(super) fn spawn_restore(
     pid: ProcessId,
     pages: super::grant::DevicePageReservation,
 ) {
-    // No-runtime path drops `pages` back to the pool; the entry re-queues.
     let task = restore(planner.clone(), pid, pages);
     let spawned = spawn_watched(planner.clone(), pid, "restore", task, |planner, pid| {
         planner.restore_failed(pid, "restore executor died")
@@ -66,8 +52,6 @@ pub(super) fn spawn_restore(
     }
 }
 
-/// Unfences on drop — armed for every abandon path, disarmed on the one
-/// path where the fences must OUTLIVE the task (a committed eviction).
 struct FenceGuard {
     handles: Vec<KvSuspendHandle>,
     armed: bool,
@@ -105,9 +89,6 @@ enum ResidencyTxn {
     Restore(KvRestoreTxn),
 }
 
-/// Abort a residency transaction against its store — the one rollback
-/// dispatch, shared by the sync path (guard drop with no copy in flight)
-/// and the deferred copy-completion path.
 fn abort_residency_txn(model: usize, engine: usize, txn: ResidencyTxn) {
     let stores = crate::store::registry::get(model, engine);
     let tag = match &txn {
@@ -168,7 +149,6 @@ impl ResidencyTxnGuard {
         }
     }
 
-    /// The engine copy plan `(gpu_ids, host_slots)` of the held transaction.
     fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
         match self.txn.as_ref().expect("transaction present") {
             ResidencyTxn::Suspend(txn) => (txn.gpu_ids(), txn.host_slots()),
@@ -212,12 +192,6 @@ impl Drop for ResidencyTxnGuard {
     }
 }
 
-/// Best-effort detachable drain of `pid`'s pipeline FIFOs — settled host-KV
-/// ops only. The planner must never await an unsettled fire completion: the
-/// waker table parks one waker per slot, and a second registration would
-/// overwrite the first and strand whichever task lost. Unsettled or
-/// non-detachable entries are left to the guest's own settle path; the lease
-/// quiescence wait below is the actual correctness gate.
 async fn drain_detachable(pid: ProcessId) {
     let pipelines = crate::inferlet::process::residency::pipelines_of(pid);
     for fires in pipelines {
@@ -254,20 +228,12 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_failed(pid);
         return;
     }
-    // Step 2: fences up — no new fire can lease/prepare against these sets.
     let mut fence = FenceGuard::raise(handles);
-    // Step 3: every lane the victim owns leaves the wait-all quorum
-    // (process-wide, not lane-keyed); rejoin is implicit on the next
-    // accepted fire post-restore.
     crate::scheduler::worker::notify_process_suspend(pid);
-    // Step 4: settle what the planner can (host-KV ops); the victim's own
-    // yielded fire task settles the rest. Quiescence below is the gate.
     drain_detachable(pid).await;
-    // Step 5: lease quiescence — the seal against mid-build stragglers.
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
-    // Step 6: prepare → D2H → commit.
     let stores = crate::store::registry::get(model, engine);
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
         kv.prepare_suspend(&working_sets)
@@ -279,8 +245,6 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            // Without swap room this victim cannot move; park it so the
-            // deterministic re-pick cannot spin on it.
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
             planner.eviction_failed_host_swap_full(pid);
             return;
@@ -319,8 +283,6 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     });
     match freed {
         Ok(freed) => {
-            // The fences outlive the task: the evicted period keeps them up,
-            // restore (or working-set release) clears them.
             fence.keep_raised();
             planner.report_evicted(pid, freed as u32);
         }
@@ -337,12 +299,9 @@ async fn restore(
     mut pages: super::grant::DevicePageReservation,
 ) {
     let (model, engine) = planner.locus();
-    // Unfencing on the success paths is owned by `report_restored`
-    // ("restored ⇒ unfenced", one site); failure paths keep the fences up.
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
     if working_sets.is_empty() {
-        // Everything was released while evicted: trivially resident again.
         drop(pages);
         planner.report_restored(pid, 0);
         return;
@@ -351,27 +310,20 @@ async fn restore(
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
         kv.prepare_restore(&working_sets, pages.lend())
     });
-    // Surplus pages (the swapped count shrank since serve) return via Drop.
     drop(pages);
     let txn = match prepared {
         Ok(txn) => txn,
         Err(error) => {
-            // Worth one more round: `Step::ServeRestore` rebuilds the ask
-            // from what is swapped now, so a short grant is not short twice.
             planner.restore_deferred(pid, &error.to_string());
             return;
         }
     };
     if txn.page_count() == 0 {
-        // Nothing left on swap (discarded/released while evicted): commit
-        // the empty transaction and rejoin.
         let committed = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
             kv.commit_restore(txn)
         });
         match committed {
             Ok(_) => planner.report_restored(pid, 0),
-            // Page-table bookkeeping, not transport: it fails identically
-            // on a second commit of the same empty transaction.
             Err(error) => planner.restore_failed(pid, &error.to_string()),
         }
         return;
@@ -383,8 +335,6 @@ async fn restore(
         Ok(completion) => completion,
         Err(error) => {
             restore.abort_now();
-            // Retried once: a failed submit may be a transient refusal
-            // rather than a dead context.
             planner.restore_deferred(pid, &format!("H2D submit: {error:#}"));
             return;
         }
@@ -395,7 +345,6 @@ async fn restore(
     restore.disarm_completion();
     if let Err(error) = copied {
         restore.abort_now();
-        // Same benefit of the doubt as the submit above.
         planner.restore_deferred(pid, &format!("H2D copy: {error}"));
         return;
     }
@@ -409,7 +358,6 @@ async fn restore(
             crate::scheduler::nudge(engine);
         }
         Err(error) => {
-            // The copy landed; only the page table refused. Deterministic.
             planner.restore_failed(pid, &error.to_string());
         }
     }

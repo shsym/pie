@@ -1,7 +1,3 @@
-//! The launch call itself: geometry into `CUlaunchConfig`, the cooperative
-//! attribute when a kernel grid-synchronises, and the one-time raising of
-//! the dynamic shared-memory cap past the 48KB default.
-
 use core::ffi::c_void;
 
 use cudarc::driver::sys as dr;

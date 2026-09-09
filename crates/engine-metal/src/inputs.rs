@@ -1,8 +1,3 @@
-//! Resident fire inputs: one allocation per in-flight step, carved once at
-//! load and never moved. Writes are direct memcpys (`StorageModeShared`);
-//! ordering is write, then encode, then commit. Each staged vector is
-//! followed by a mint into [`crate::device::Handles`].
-
 use kernels_metal::Tensor;
 use model_compiler::Budget;
 use model_ir::Dtype;
@@ -12,42 +7,73 @@ use crate::error::{Fault, Result};
 use crate::store::SpaceSeat;
 use crate::store::kv::{Geometry, Paging};
 
-// No schedule-grant workspace on this plane: `kernels-metal`'s sdpa shaders
-// split no kv, so there are no partials to hold.
-
-/// The alignment every carved region starts on.
 const ALIGN: u64 = 256;
 
-/// The axes a multimodal position carries: time, row, column. Matches
-/// `kernels_metal::elemwise::rope_mrope::AXES`.
 const AXES: u64 = 3;
 
-/// What a plan's patch axis asks of the store, read off the ladder at load;
-/// `None` for a plan with no patch row, so a text-only load carves nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSeat {
-    /// The most patch rows one fire may carry — the ladder's `max_patches`.
     pub rows: u64,
-    /// One patch row's bytes: the plan's declared `[Dim::Patches, C·T·P²]`
-    /// width, times its element.
     pub row_bytes: u64,
-    /// The most images one fire may carry — the ladder's `max_images`, which
-    /// is what `[Dim::ImagesPlus(1)]` is sized at.
     pub images: u64,
-    /// The element the plan computes patches in, which the marshal converts
-    /// the submission's `f32` into.
     pub dtype: Dtype,
-    /// `RuntimeInput::PatchEmbedRows`' declared tap count — 1 on the native
-    /// grid, 2 for a separable table, 4 bilinear, 16 bicubic. `0` for a plan
-    /// that declares no position-table read at all.
     pub embed_taps: u64,
-    /// Whether the plan also declares `RuntimeInput::PatchEmbedWeights`. A
-    /// native-grid read has ids and no weights, and then this region is not
-    /// carved.
     pub embed_weights: bool,
 }
 
-/// The patch axis's six regions, as offsets into the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSeat {
+    pub kind: engine::fire::PortKind,
+    pub port: u8,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
+impl PortSeat {
+    #[must_use]
+    pub fn per_lane(&self) -> bool {
+        self.kind == engine::fire::PortKind::LaneVector
+    }
+
+    #[must_use]
+    pub fn row_bytes(&self) -> u64 {
+        u64::from(self.width) * model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortAt {
+    seat: PortSeat,
+    at: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackingAt {
+    group_indptr: u64,
+    lane_indptr: u64,
+    reference_tag: u64,
+    permutation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoxelSeat {
+    pub rows: u64,
+    pub clips: u64,
+    pub channels: u64,
+    pub dtype: Dtype,
+    pub token_grid: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VoxelAt {
+    payload: u64,
+    grid: u64,
+    token_grid: u64,
+    slots: u64,
+    seat: VoxelSeat,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PatchAt {
     payload: u64,
@@ -59,7 +85,6 @@ struct PatchAt {
     seat: PatchSeat,
 }
 
-/// One kv space's six vectors, as offsets into the store.
 #[derive(Debug, Clone, Copy)]
 struct SpaceAt {
     indptr: u64,
@@ -70,157 +95,118 @@ struct SpaceAt {
     write_offset: u64,
 }
 
-/// The handles one fire's inputs resolve to.
 #[derive(Debug, Clone)]
 pub struct Handles {
-    /// `RuntimeInput::Tokens`.
     pub tokens: Tensor,
-    /// `RuntimeInput::Positions`.
     pub positions: Tensor,
-    /// The handle the packed per-window boundary vectors were minted at;
-    /// [`Windows::bind`](crate::window::Windows::bind) cuts one row per
-    /// window out of it.
     pub windows: u32,
-    /// One entry per kv geometry space, in space order.
     pub spaces: Vec<SpaceHandles>,
-    /// `i32`, `[lanes]`: which recurrent bank each lane owns.
     pub slot_ids: Tensor,
-    /// `i32`, one per token ROW: which recurrent bank the row's lane owns —
-    /// the vector the ssm shaders actually index. See the carve.
     pub slot_of_row: Tensor,
-    /// The padding mask the kv writers read.
     pub row_valid: Tensor,
-    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row.
-    /// `None` when no lane of this fire carried one, and no seat is bound.
     pub adapter_routes: Option<Tensor>,
-    /// `i32`, one per token row: which lane owns it. Read directly by every
-    /// sdpa entry.
     pub request_of_token: Tensor,
-    /// `u8`, `[rows * mask_stride]`: 1 keeps the (query, key) pair. Always
-    /// bound — see [`mask_enabled`](Handles::mask_enabled).
+    pub readout_rows: Tensor,
     pub mask: Tensor,
-    /// `u8`, one per token row: whether that row's mask plane is consulted.
-    /// Always bound, never optional — every sdpa entry reads it on every
-    /// launch; zeroed means unmasked.
     pub mask_enabled: Tensor,
-    /// Key positions from one row's plane to the next, as the shaders read
-    /// it.
     pub mask_stride: u32,
-    /// The second row axis's seats, or `None` for a fire whose lanes carried
-    /// no image.
     pub patches: Option<PatchHandles>,
-    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]`, the trunk's
-    /// triple-wide position stream. `None` for a plan with no `rope_mrope`.
     pub mrope_positions: Option<Tensor>,
-    /// `RuntimeInput::SelfCondRows` / `SelfCondWeights`: `i32` and `f32`,
-    /// `[rows, taps]`; `None` for a plan that reads no self-conditioning.
     pub self_cond_rows: Option<Tensor>,
     pub self_cond_weights: Option<Tensor>,
-    /// `i32`, `[lanes]`: buffered tokens each lane replays ahead of its rows,
-    /// and the rows of its extended run whose recurrent state persists
-    /// (`crate::rs`). `None` for a fire every lane of which folds.
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<PackingHandles>,
+    pub ports: Vec<Tensor>,
+    pub voxels: Option<VoxelHandles>,
 }
 
-/// The patch axis's device seats, as one fire resolved them.
+#[derive(Debug, Clone, Copy)]
+pub struct VoxelHandles {
+    pub payload: Tensor,
+    pub grid: Tensor,
+    pub token_grid: Option<Tensor>,
+    pub slots: Tensor,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PackingHandles {
+    pub group_indptr: Tensor,
+    pub lane_indptr: Tensor,
+    pub reference_tag: Tensor,
+    pub permutation: Tensor,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PatchHandles {
-    /// `RuntimeInput::Patches`: `[patch rows, C·T·P²]` in the plan's element.
     pub patches: Tensor,
-    /// `RuntimeInput::PatchSegments`: `i32`, `[images + 1]`.
     pub segments: Tensor,
-    /// `RuntimeInput::PatchRoutes`: `i32`, `[patch rows]`, `-1` for a row
-    /// with no destination.
     pub routes: Tensor,
-    /// `RuntimeInput::PatchPositions`: `i32`, `[patch rows, 3]`.
     pub positions: Tensor,
-    /// `RuntimeInput::PatchEmbedRows`: `i32`, `[patch rows, taps]`, or `None`
-    /// for a plan that reads the table on its native grid.
     pub embed_rows: Option<Tensor>,
-    /// `RuntimeInput::PatchEmbedWeights`: `f32`, `[patch rows, taps]`.
     pub embed_weights: Option<Tensor>,
 }
 
-/// One kv space's device seats.
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceHandles {
-    /// `GeomKind::Indptr`.
     pub indptr: Tensor,
-    /// `GeomKind::Indices`.
     pub indices: Tensor,
-    /// `GeomKind::LastPageLen`.
     pub last_page_len: Tensor,
-    /// `GeomKind::KvLen`.
     pub kv_len: Tensor,
-    /// `GeomKind::WritePage`.
     pub write_page: Tensor,
-    /// `GeomKind::WriteOffset`.
     pub write_offset: Tensor,
 }
 
-/// What one fire wants written, host side.
 #[derive(Debug, Clone)]
 pub struct Fire<'a> {
-    /// Token ids, in fire row order.
     pub tokens: &'a [i32],
-    /// Absolute positions, in fire row order.
     pub positions: &'a [i32],
-    /// Every window's rebased boundaries, end to end
-    /// ([`Windows::packed`](crate::window::Windows::packed)).
     pub windows: &'a [i32],
-    /// Which recurrent bank each lane owns, in fire lane order.
     pub slot_ids: &'a [i32],
-    /// The same fact per token ROW, in fire row order — what the ssm
-    /// shaders index.
     pub slot_of_row: &'a [i32],
-    /// Which adapter each token row routes to, in fire row order (the
-    /// correction kernel indexes `routes[row]` beside `x[row]`), or `None`
-    /// when no lane carried one.
     pub adapter_routes: Option<&'a [i32]>,
-    /// Which lane owns each token row, in fire row order.
     pub request_of_token: &'a [i32],
-    /// One geometry per kv space, in space order.
+    pub readout_rows: &'a [i32],
     pub spaces: &'a [Geometry],
-    /// This fire's expanded lane masks, or `None` when no lane carried one.
     pub mask: Option<&'a crate::mask::Staged>,
-    /// The patch rectangle, already seriated into fire patch order, or `None`
-    /// for a fire with no image in it.
     pub patches: Option<PatchFire<'a>>,
-    /// The trunk's `(t, h, w)` stream, three per TOKEN row in fire row order,
-    /// or `None` for a plan that declares no `rope_mrope`.
+    pub voxels: Option<VoxelFire<'a>>,
     pub mrope_positions: Option<&'a [i32]>,
-    /// The denoiser's self-conditioning taps, `taps` ids and weights per
-    /// TOKEN row in fire row order, or `None` for a plan that reads none.
     pub self_cond_rows: Option<&'a [i32]>,
     pub self_cond_weights: Option<&'a [f32]>,
-    /// The recurrent seat's two per-lane tables (`crate::rs`), or `None` for
-    /// a fire every lane of which folds in the forward.
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    pub group_of_lane: &'a [i32],
+    pub packings: &'a [PackingFire<'a>],
 }
 
-/// The patch axis's six vectors, host side, in fire patch order. Already
-/// placed at each lane's own `patch_offset`; the seriation happened upstream
-/// in `serve`.
+#[derive(Debug, Clone, Copy)]
+pub struct PackingFire<'a> {
+    pub group_indptr: &'a [i32],
+    pub lane_indptr: &'a [i32],
+    pub reference_tag: &'a [i32],
+    pub permutation: &'a [i32],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoxelFire<'a> {
+    pub grid: &'a [i32],
+    pub token_grid: &'a [i32],
+    pub slots: &'a [i32],
+    pub payload: &'a [u8],
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PatchFire<'a> {
-    /// `[patch rows, C·T·P²]` in the plan's element, little-endian.
     pub payload: &'a [u8],
-    /// `[images + 1]` `i32`: the patch axis's own indptr.
     pub segments: &'a [i32],
-    /// `[patch rows]` `i32`, already rebased onto absolute fire token rows —
-    /// except the `-1`s, which are a sentinel and not an address.
     pub routes: &'a [i32],
-    /// `[patch rows * 3]` `i32`.
     pub positions: &'a [i32],
-    /// `[patch rows * taps]` `i32`, or empty on the native grid.
     pub embed_rows: &'a [i32],
-    /// `[patch rows * taps]` `f32`, or empty beside an empty `embed_rows`.
     pub embed_weights: &'a [f32],
 }
 
-/// The resident inputs, carved once.
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -233,39 +219,24 @@ pub struct Inputs {
     slot_of_row: u64,
     adapter_routes: u64,
     request_of_token: u64,
+    readout_rows: u64,
     mask_planes: u64,
     mask_plane_bytes: u64,
     mask_enabled: u64,
-    /// Key positions from one masked row's plane to the next, at the ceiling
-    /// — what a lane can hold, so every fire's own stride fits inside it.
+    group_of_lane: u64,
+    packings: Vec<PackingAt>,
+    ports: Vec<PortAt>,
+    voxels: Option<VoxelAt>,
     mask_stride: u32,
     spaces: Vec<SpaceAt>,
-    /// The patch axis's six regions, or `None` for a load whose plan states
-    /// no patch row — where the axis costs the reservation nothing.
     patch: Option<PatchAt>,
-    /// `RuntimeInput::MropePositions`' region, or `None` for a plan that
-    /// declares no multimodal rotation. `rows * 3` `i32` at the ceiling.
     mrope: Option<u64>,
-    /// `RuntimeInput::SelfCondRows/Weights`' regions and the plan's tap
-    /// width, or `None` for a plan that reads no self-conditioning.
-    /// `rows * taps` `i32` and as many `f32` at the ceiling.
     self_cond: Option<(u64, u64, u64)>,
-    /// The recurrent seat's per-lane tables, `lanes` `i32` each. Reserved
-    /// unconditionally: two words a lane.
     rs_replay: u64,
     rs_commit: u64,
 }
 
 impl Inputs {
-    /// Reserve the vectors a deployment's ceilings admit. `device` is taken
-    /// because an `MTLBuffer` is made by a device object.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`](crate::Fault::Device) when the device declined the
-    /// reservation, [`Fault::Ceiling`](crate::Fault::Ceiling) when the carve
-    /// is longer than one `MTLBuffer` may be, and
-    /// [`Fault::Deviceless`](crate::Fault::Deviceless) off Apple.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: &Context,
@@ -275,15 +246,15 @@ impl Inputs {
         classes: usize,
         gathered: usize,
         patch: Option<PatchSeat>,
+        voxel: Option<VoxelSeat>,
         mrope: bool,
         self_cond_taps: u32,
+        ports: &[PortSeat],
+        selections: usize,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        // At most `k(k+1)/2` windows for `k` classes, plus one shared zero
-        // window; `gathered` bounds how many need the larger `Fallback::Copy`
-        // layout.
         let per_gathered =
             3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
@@ -300,21 +271,14 @@ impl Inputs {
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);
-        // Per row, not per lane: every metal ssm shader indexes `slots[r]` by
-        // token row.
         let slot_of_row = take(rows * 4);
-        // Reserved unconditionally so the store's layout does not depend on
-        // whether the plan declares a correction.
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
-        // One byte per (query, key) pair, row-major with a stated stride
-        // (`attention_mask[row * stride + kp]`).
+        let readout_rows = take(rows * 4);
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
-        // Always bound: read on every sdpa launch, so an unbound seat would
-        // be a null dereference.
         let mask_enabled = take(rows);
         let spaces: Vec<SpaceAt> = (0..spaces)
             .map(|_| SpaceAt {
@@ -326,7 +290,6 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
-        // `None` for a text-only load: no region taken, `at` does not move.
         let patch = patch.map(|seat| PatchAt {
             payload: take(seat.rows * seat.row_bytes),
             segments: take((seat.images + 1) * 4),
@@ -339,6 +302,40 @@ impl Inputs {
                 0
             },
             seat,
+        });
+        let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
+        let packings: Vec<PackingAt> = (0..selections)
+            .map(|_| PackingAt {
+                group_indptr: take((lanes + 1) * 4),
+                lane_indptr: take((lanes + 1) * 4),
+                reference_tag: take(rows * 4),
+                permutation: take(rows * 4),
+            })
+            .collect();
+        let ports: Vec<PortAt> = ports
+            .iter()
+            .map(|seat| {
+                let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
+                PortAt {
+                    seat: *seat,
+                    at: take(bytes),
+                    bytes,
+                }
+            })
+            .collect();
+        let voxels = voxel.map(|seat| {
+            let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+            VoxelAt {
+                payload: take(seat.rows * seat.channels * element),
+                grid: take(seat.clips * 4 * 4),
+                token_grid: if seat.token_grid {
+                    take(seat.clips * 4 * 4)
+                } else {
+                    0
+                },
+                slots: take(seat.clips * 4),
+                seat,
+            }
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let self_cond = (self_cond_taps > 0).then(|| {
@@ -361,9 +358,14 @@ impl Inputs {
             slot_of_row,
             adapter_routes,
             request_of_token,
+            readout_rows,
             mask_planes,
             mask_plane_bytes,
             mask_enabled,
+            group_of_lane,
+            packings,
+            ports,
+            voxels,
             mask_stride,
             spaces,
             patch,
@@ -374,37 +376,32 @@ impl Inputs {
         })
     }
 
-    /// The self-conditioning seat: the store and the byte offsets of its
-    /// `[rows, taps]` ids and weights regions, or `None` for a plan that
-    /// reads none. A fire blits channel-fed taps into it device-side.
     #[must_use]
     pub fn self_cond_seat(&self) -> Option<(&Buffer, u64, u64)> {
         self.self_cond
             .map(|(at_ids, at_ws, _)| (&self.store, at_ids, at_ws))
     }
 
-    /// The patch element this load computes in, or `None` for a plan that
-    /// states no patch row.
+    #[must_use]
+    pub fn port_seat(&self, port: usize) -> Option<(&Buffer, u64)> {
+        self.ports.get(port).map(|at| (&self.store, at.at))
+    }
+
+    #[must_use]
+    pub fn voxel_payload(&self) -> Option<(&Buffer, u64)> {
+        self.voxels.map(|at| (&self.store, at.payload))
+    }
+
     #[must_use]
     pub fn patch_element(&self) -> Option<Dtype> {
         self.patch.map(|at| at.seat.dtype)
     }
 
-    /// Every byte the inputs hold.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
     }
 
-    /// Write one fire's vectors into the store and hand back their handles.
-    /// The caller must call this before committing the command buffer that
-    /// reads what it wrote.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved
-    /// ceilings or a handle table that is full,
-    /// [`Fault::Deviceless`](crate::Fault::Deviceless) off Apple.
     pub fn write(
         &mut self,
         handles: &crate::device::Handles,
@@ -413,7 +410,6 @@ impl Inputs {
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32;
 
-        // All-valid in an eager fire; the kv writers read this unconditionally.
         let valid = vec![1u8; rows as usize];
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
@@ -430,6 +426,15 @@ impl Inputs {
         self.store.write(self.slot_ids, bytes_of(fire.slot_ids))?;
         self.store
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
+        if fire.readout_rows.len() > rows as usize {
+            return Err(Fault::Ceiling {
+                what: "readout rows in one fire",
+                need: fire.readout_rows.len() as u64,
+                have: u64::from(rows),
+            });
+        }
+        self.store
+            .write(self.readout_rows, bytes_of(fire.readout_rows))?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
@@ -448,7 +453,6 @@ impl Inputs {
             _ => false,
         };
 
-        // A fire no lane routed writes nothing here and binds no seat.
         let adapter_routes = match fire.adapter_routes {
             None => None,
             Some(routes) => {
@@ -457,8 +461,6 @@ impl Inputs {
             }
         };
 
-        // Both are read on every launch, so always bound; no lane masked
-        // means the enable column is zeroed, not that the seat is absent.
         let stride = fire.mask.map_or(0, |staged| staged.stride);
         if u64::from(stride) > u64::from(self.mask_stride) {
             return Err(Fault::Ceiling {
@@ -485,7 +487,6 @@ impl Inputs {
             }
         }
 
-        // A fire with no image writes nothing here and binds no seat.
         let patches = match (fire.patches, self.patch) {
             (None, _) => None,
             (Some(_), None) => {
@@ -497,8 +498,6 @@ impl Inputs {
             }
             (Some(staged), Some(at)) => {
                 let seat = at.seat;
-                // Each of the six is checked against its own reservation,
-                // never against the region behind it.
                 let rows = (staged.payload.len() as u64)
                     .checked_div(seat.row_bytes)
                     .unwrap_or(0);
@@ -548,7 +547,6 @@ impl Inputs {
                         staged.segments.len() as u32,
                     )?,
                     routes: i32s(handles, &self.store, at.routes, staged.routes.len() as u32)?,
-                    // `[patch rows, 3]`: one triple per row, not a column.
                     positions: Tensor::new(
                         handles.bind(
                             &self.store,
@@ -591,7 +589,6 @@ impl Inputs {
             }
         };
 
-        // `[rows, 3]` `i32`. A plan with no multimodal rotation binds nothing.
         let mrope_positions = match (fire.mrope_positions, self.mrope) {
             (None, _) | (_, None) => None,
             (Some(triples), Some(at)) => {
@@ -612,8 +609,6 @@ impl Inputs {
             }
         };
 
-        // `[rows, taps]` `i32` ids and `f32` weights. A plan that reads no
-        // self-conditioning binds nothing.
         let (self_cond_rows, self_cond_weights) =
             match (fire.self_cond_rows, fire.self_cond_weights, self.self_cond) {
                 (Some(ids), Some(ws), Some((at_ids, at_ws, taps))) => {
@@ -646,6 +641,130 @@ impl Inputs {
                 _ => (None, None),
             };
 
+        let group_of_lane = if self.packings.is_empty() {
+            None
+        } else {
+            if fire.group_of_lane.len() as u32 > lanes {
+                return Err(Fault::Ceiling {
+                    what: "group-of-lane entries",
+                    need: fire.group_of_lane.len() as u64,
+                    have: u64::from(lanes),
+                });
+            }
+            self.store
+                .write(self.group_of_lane, bytes_of(fire.group_of_lane))?;
+            Some(i32s(handles, &self.store, self.group_of_lane, lanes)?)
+        };
+        if fire.packings.len() != self.packings.len() {
+            return Err(Fault::Ceiling {
+                what: "packing tables against the selections this load carved",
+                need: fire.packings.len() as u64,
+                have: self.packings.len() as u64,
+            });
+        }
+        let mut packings = Vec::with_capacity(self.packings.len());
+        let mut scratch: Vec<i32> = Vec::new();
+        for (at, staged) in self.packings.iter().zip(fire.packings) {
+            for (what, have, ceiling) in [
+                ("group indptr entries", staged.group_indptr.len() as u64, u64::from(lanes) + 1),
+                ("lane indptr entries", staged.lane_indptr.len() as u64, u64::from(lanes) + 1),
+                ("reference tags", staged.reference_tag.len() as u64, u64::from(rows)),
+                ("packed row permutation", staged.permutation.len() as u64, u64::from(rows)),
+            ] {
+                if have > ceiling {
+                    return Err(Fault::Ceiling { what, need: have, have: ceiling });
+                }
+            }
+            csr(&mut scratch, staged.group_indptr, lanes + 1);
+            self.store.write(at.group_indptr, bytes_of(&scratch))?;
+            csr(&mut scratch, staged.lane_indptr, lanes + 1);
+            self.store.write(at.lane_indptr, bytes_of(&scratch))?;
+            rows_table(&mut scratch, staged.reference_tag, rows);
+            self.store.write(at.reference_tag, bytes_of(&scratch))?;
+            rows_table(&mut scratch, staged.permutation, rows);
+            self.store.write(at.permutation, bytes_of(&scratch))?;
+            packings.push(PackingHandles {
+                group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
+                lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
+                reference_tag: i32s(handles, &self.store, at.reference_tag, rows)?,
+                permutation: i32s(handles, &self.store, at.permutation, rows)?,
+            });
+        }
+
+        let mut ports = Vec::with_capacity(self.ports.len());
+        for at in &self.ports {
+            let seat = at.seat;
+            let carved = if seat.per_lane() { lanes } else { rows };
+            ports.push(Tensor::new(
+                handles.bind(&self.store, at.at, at.bytes)?,
+                carved,
+                seat.width,
+                seat.dtype,
+            ));
+        }
+
+        let voxels = match (fire.voxels, self.voxels) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Fault::Ceiling {
+                    what: "voxel rows against a load that reserved none",
+                    need: 1,
+                    have: 0,
+                });
+            }
+            (Some(staged), Some(at)) => {
+                let seat = at.seat;
+                let element = model_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
+                let clips = (staged.grid.len() / 4) as u64;
+                for (what, have, ceiling) in [
+                    ("voxel clips", clips, seat.clips),
+                    ("voxel payload bytes", staged.payload.len() as u64, seat.rows * seat.channels * element),
+                    ("voxel token grid", (staged.token_grid.len() / 4) as u64, if seat.token_grid { seat.clips } else { 0 }),
+                    ("voxel clip slots", staged.slots.len() as u64, seat.clips),
+                ] {
+                    if have > ceiling {
+                        return Err(Fault::Ceiling { what, need: have, have: ceiling });
+                    }
+                }
+                self.store.write(at.grid, bytes_of(staged.grid))?;
+                self.store.write(at.slots, bytes_of(staged.slots))?;
+                if !staged.token_grid.is_empty() {
+                    self.store.write(at.token_grid, bytes_of(staged.token_grid))?;
+                }
+                if !staged.payload.is_empty() {
+                    self.store.write(at.payload, staged.payload)?;
+                }
+                let clips32 = u32::try_from(clips).unwrap_or(u32::MAX);
+                let width = u32::try_from(seat.channels).unwrap_or(u32::MAX);
+                let voxel_rows = u32::try_from(seat.rows).unwrap_or(u32::MAX);
+                Some(VoxelHandles {
+                    payload: Tensor::new(
+                        handles.bind(&self.store, at.payload, seat.rows * seat.channels * element)?,
+                        voxel_rows,
+                        width,
+                        seat.dtype,
+                    ),
+                    grid: Tensor::new(
+                        handles.bind(&self.store, at.grid, clips * 4 * 4)?,
+                        clips32,
+                        4,
+                        Dtype::I32,
+                    ),
+                    token_grid: seat.token_grid.then(|| {
+                        Tensor::new(
+                            handles
+                                .bind(&self.store, at.token_grid, clips * 4 * 4)
+                                .expect("a handle"),
+                            clips32,
+                            4,
+                            Dtype::I32,
+                        )
+                    }),
+                    slots: i32s(handles, &self.store, at.slots, clips32)?,
+                })
+            }
+        };
+
         let mut spaces = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
@@ -675,8 +794,6 @@ impl Inputs {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
-            // Minted whole, at the bytes this fire wrote; `Windows::bind`
-            // cuts one row per window out of it.
             windows: handles.bind(
                 &self.store,
                 self.windows,
@@ -696,7 +813,16 @@ impl Inputs {
                 Dtype::U8,
             ),
             request_of_token: i32s(handles, &self.store, self.request_of_token, rows)?,
-            // Minted at the fire's own rectangle: `rows` of `stride` bytes.
+            readout_rows: i32s(
+                handles,
+                &self.store,
+                self.readout_rows,
+                fire.readout_rows.len() as u32,
+            )?,
+            group_of_lane,
+            packings,
+            ports,
+            voxels,
             mask: Tensor::new(
                 handles.bind(
                     &self.store,
@@ -731,9 +857,6 @@ impl Inputs {
         })
     }
 
-    /// The pool seats one fire lends its cache table. Nothing is minted
-    /// here — every seat is a view [`write`](Inputs::write) already minted,
-    /// so this stays infallible.
     #[must_use]
     pub fn seats(
         &self,
@@ -763,8 +886,19 @@ impl Inputs {
     }
 }
 
-/// One `i32` column, `rows` tall, as a freshly minted handle into `store`.
-/// Fallible: the handle table is bounds-checked and finite.
+fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    let last = into.last().copied().unwrap_or(0);
+    into.resize(ceiling as usize, last);
+}
+
+fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    into.resize(rows as usize, -1);
+}
+
 fn i32s(
     handles: &crate::device::Handles,
     store: &Buffer,
@@ -775,8 +909,6 @@ fn i32s(
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
 }
 
-/// The same column, wearing `u32` — for `write_page`/`write_offset`, which
-/// `attn/kv_write.metal` declares `const device uint*` (same bytes).
 fn u32s(
     handles: &crate::device::Handles,
     store: &Buffer,
@@ -787,8 +919,6 @@ fn u32s(
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
 }
 
-/// A vector of `f32` as the bytes a copy takes — [`bytes_of`]'s twin for the
-/// one staged vector that is not an integer (interpolation weights).
 fn f32_bytes_of(values: &[f32]) -> &[u8] {
     // SAFETY: `f32` is `Copy` with no padding/niche; all bytes are init and
     // readable as `u8`.
@@ -797,8 +927,6 @@ fn f32_bytes_of(values: &[f32]) -> &[u8] {
     }
 }
 
-/// A vector of `i32` as the bytes a copy takes. Little-endian, which every
-/// device this ships on is.
 fn bytes_of(values: &[i32]) -> &[u8] {
     // SAFETY: `i32` is `Copy` with no padding/niche; all bytes are init and
     // readable as `u8`.

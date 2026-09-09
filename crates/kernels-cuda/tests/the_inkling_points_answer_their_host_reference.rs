@@ -1,13 +1,3 @@
-//! The three points Inkling added, each held against a host transcription
-//! of the reference's rule: the short convolution (`x + conv(x)`, no
-//! activation), the relative-position profile (`r ⊗ P` per row and head),
-//! and the sink router (top-k over the routed sigmoid scores plus bias, every
-//! chosen and sink score over their common sum, times the scale).
-//!
-//! ```text
-//! cargo test -p kernels-cuda --features cuda --test the_inkling_points_answer_their_host_reference
-//! ```
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,6 +7,12 @@ use dtype::Dtype;
 use kernels_cuda::attn::ssm;
 use kernels_cuda::linear::{moe, rel_bias};
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
+
+fn the_inkling_points_answer_their_host_reference_every_case() {
+    the_short_conv_adds_the_input_back_and_shifts_the_window();
+    the_relative_profile_is_the_features_through_the_bank();
+    the_sink_router_normalizes_the_picks_with_the_sinks();
+}
 
 #[test]
 fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
@@ -73,7 +69,6 @@ fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
                 };
                 acc += w[c * k as usize + t] * xv;
             }
-            // No activation, the token's own input added back.
             let expect = acc + x[r * channels + c];
             let got = from_bf16(got_y[r * channels + c]);
             assert!(close(got, expect), "row {r} channel {c}: {got} against {expect}");
@@ -92,7 +87,6 @@ fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
     }
 }
 
-#[test]
 fn the_relative_profile_is_the_features_through_the_bank() {
     let (rows, heads, d_rel, extent) = (5u32, 4u32, 16u32, 96u32);
     let mut lcg = Lcg::seeded(0x2b);
@@ -135,14 +129,12 @@ fn the_relative_profile_is_the_features_through_the_bank() {
     }
 }
 
-#[test]
 fn the_sink_router_normalizes_the_picks_with_the_sinks() {
     let (rows, experts, sink, top_k) = (7u32, 16u32, 2u32, 6u32);
     let width = (experts + sink) as usize;
     let fan = (top_k + sink) as usize;
     let mut lcg = Lcg::seeded(0x3c);
     let (l_raw, l) = lcg.row(rows as usize * width);
-    // A correction bias wide enough to move the choice, and a global scale.
     let bias: Vec<f32> = (0..experts).map(|e| 0.25 * f32::from(u8::try_from(e % 4).unwrap()) - 0.3).collect();
     let scale: [f32; 1] = [1.375];
     let route_scale = 8.0f32;
@@ -175,7 +167,6 @@ fn the_sink_router_normalizes_the_picks_with_the_sinks() {
     for row in 0..rows as usize {
         let logits = &l[row * width..(row + 1) * width];
         let sigma: Vec<f32> = logits.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
-        // The choice: top-k of sigma + bias over the routed experts alone.
         let mut order: Vec<usize> = (0..experts as usize).collect();
         order.sort_by(|&a, &b| {
             (sigma[b] + bias[b]).partial_cmp(&(sigma[a] + bias[a])).expect("finite scores")
@@ -186,7 +177,6 @@ fn the_sink_router_normalizes_the_picks_with_the_sinks() {
         let sum: f32 = chosen.iter().map(|&e| sigma[e]).sum();
         let got_r = &got_routes[row * fan..(row + 1) * fan];
         let got_w = &got_weights[row * fan..(row + 1) * fan];
-        // The routed picks land first (in rank order), the sinks after them.
         let mut got_picks: Vec<i32> = got_r[..top_k as usize].to_vec();
         let mut want_picks: Vec<i32> = picks.iter().map(|&e| e as i32).collect();
         got_picks.sort_unstable();

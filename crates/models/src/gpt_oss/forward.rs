@@ -5,7 +5,6 @@ use super::model::{Model, Reading};
 pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
-    /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
     pub block_draft: bool,
 }
 
@@ -14,15 +13,10 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// True for rows routed to a registered adapter. A fire with no adapter
-    /// rows has zero rows in this class, so the correction dispatches nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
 
-    /// Lanes whose rows are a block drafter's proposal rather than the
-    /// sequence's own — `[anchor, MASK x block-1]`, which the trunk must not
-    /// run over. Bit 2 of the fact word; the hook `qwen_3` and `gemma_4` spell.
     pub fn block_draft() -> Predicate {
         Predicate::fact(2)
     }
@@ -64,16 +58,11 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let mask = inputs.mask();
-        // The drafter's rows leave before the classes are cut, so a plan and
-        // the query it is consumed by say the same guard (see `qwen_3`); the
-        // trunk's positions come off the same arm for the same reason.
         let (_, trunk_inputs) = match &m.dflash {
             Some(_) => inputs.split(&Facts::block_draft()),
             None => (inputs.clone(), inputs.clone()),
         };
         let positions = trunk_inputs.positions();
-        // gpt-oss layers alternate sliding-window and full attention; each
-        // reading gets its own plan (window vs None), indexed by Reading.
         let (input_d, input_p) = trunk_inputs.split(&Facts::qo_one());
         let plan_d = [
             ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
@@ -85,9 +74,6 @@ impl ForwardHybrid for Model {
         ];
         let ids = inputs.tokens();
         let y = ops::layout::embed(&ids, &m.embed, m.vocab);
-        // **THE BLOCK DRAFTER'S ROWS LEAVE HERE**, before the first layer, and
-        // are the drafter's input as they are (an unscaled embedding, which is
-        // what the reference feeds it). See `qwen_3` for the rest of the hook.
         let (h_block, mut y) = match &m.dflash {
             Some(_) => {
                 let (block, rest) = y.split(&Facts::block_draft());
@@ -165,7 +151,6 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // Applied after all_reduce and after the output bias.
             let o = ops::elemwise::add_bias(&at.o_bias, &o);
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
@@ -209,8 +194,6 @@ impl ForwardHybrid for Model {
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
-        // The drafter reads out through the TARGET's head, so its rows join
-        // the trunk's before the one `lm_head`.
         let (x, hb) = match (&m.dflash, h_block) {
             (Some(dr), Some(block)) => {
                 let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
@@ -220,8 +203,6 @@ impl ForwardHybrid for Model {
             _ => (x, None),
         };
         let logits = ops::linear::lm_head(&x, &m.head);
-        // This rank landed its COLUMNS of the logits; the plan wants all of
-        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
         let logits = if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
         } else {

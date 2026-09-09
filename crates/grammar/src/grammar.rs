@@ -4,40 +4,29 @@ pub(crate) mod normalize;
 
 use std::fmt;
 
-/// Index into the grammar's rule list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RuleId(pub u32);
 
-/// Index into the grammar's expression arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExprId(pub u32);
 
-/// A grammar rule: a named production with a body expression.
 #[derive(Debug, Clone)]
 pub(crate) struct Rule {
     pub(crate) name: String,
     pub(crate) body: ExprId,
 }
 
-/// A grammar expression node. Expressions are stored in an arena
-/// (`Grammar.exprs`) and referenced by `ExprId`.
 #[derive(Debug, Clone)]
 pub(crate) enum Expr {
     EmptyString,
 
-    /// A literal byte string (UTF-8 encoded).
     ByteString(Vec<u8>),
 
-    /// A character class matching Unicode codepoint ranges, e.g. `[a-z0-9]`.
-    /// When `negated` is true, matches any codepoint NOT in the ranges.
     CharacterClass {
         negated: bool,
-        /// Inclusive ranges of Unicode codepoints: `(lower, upper)`.
         ranges: Vec<(u32, u32)>,
     },
 
-    /// Kleene star of a character class, e.g. `[a-z]*`.
-    /// Optimized to avoid rule recursion during matching.
     CharacterClassStar {
         negated: bool,
         ranges: Vec<(u32, u32)>,
@@ -45,14 +34,10 @@ pub(crate) enum Expr {
 
     RuleRef(RuleId),
 
-    /// An ordered sequence of expressions (concatenation).
     Sequence(Vec<ExprId>),
 
-    /// A choice between expressions (alternation / union).
     Choices(Vec<ExprId>),
 
-    /// Bounded repetition of a rule: `rule{min, max}`.
-    /// `max = None` means unbounded.
     Repeat {
         rule: RuleId,
         min: u32,
@@ -60,8 +45,6 @@ pub(crate) enum Expr {
     },
 }
 
-/// An immutable context-free grammar, constructed via `Grammar::from_ebnf()`
-/// or [`GrammarCompiler`](crate::compiler::GrammarCompiler).
 #[derive(Debug, Clone)]
 pub struct Grammar {
     pub(crate) rules: Vec<Rule>,

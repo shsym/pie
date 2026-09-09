@@ -1,6 +1,3 @@
-//! The model-facing entry: classify a request into facts, declare cache
-//! spaces, trace the forward pass, and hand back a checked `Trace`.
-
 use std::cell::Cell;
 use std::marker::PhantomData;
 
@@ -13,30 +10,19 @@ use crate::seam;
 
 pub use model_ir::Request;
 
-/// How a model sorts a request into its facts, and how it packs them into the
-/// one `u64` the fire carries. Each family writes its own by hand.
 pub trait Classify: Sized {
     fn of(r: &Request) -> Self;
     fn word(&self) -> u64;
 }
 
-/// The body of a catalog row's [`ClassifyFn`](crate::ClassifyFn) column.
-/// `_model` is a thunk, never called — only its return type `M` is used.
 #[must_use]
 pub fn word_of<M: ForwardHybrid>(_model: impl FnOnce() -> M, r: &Request) -> u64 {
     <M::Facts as Classify>::of(r).word()
 }
 
-/// A declared kv geometry space: the group of kv rows one page table serves,
-/// keyed by id. A model never writes the number — it names a kv row and
-/// [`Input`] resolves the space the row joined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvSpace(pub u32);
 
-/// The caches a model declares, in `Trace::caches` order. A kv row is
-/// declared as a plane list — per-token width in elements, e.g. `[w, w]`
-/// for a k|v pair, `[w]` shared as both, `[kv_lora_rank, rope_dim]` a latent
-/// page. Every kv row joins a [`KvSpace`], whose [`Dtype`] is its layout.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HybridSpec {
     pub rows: Vec<CacheRow>,
@@ -49,16 +35,11 @@ impl HybridSpec {
         HybridSpec::default()
     }
 
-    /// Declare a geometry space: one paged group of kv rows storing `dtype`
-    /// elements.
     pub fn kv_space(&mut self, dtype: Dtype) -> KvSpace {
         self.dtypes.push(dtype);
         KvSpace(self.dtypes.len() as u32 - 1)
     }
 
-    /// One kv row of `space`: `planes` states the per-token widths in
-    /// elements — `[w, w]` a k|v pair, `[w]` shared, `[kv_lora_rank,
-    /// rope_dim]` a latent page.
     pub fn kv(
         &mut self,
         space: KvSpace,
@@ -77,8 +58,6 @@ impl HybridSpec {
         });
     }
 
-    /// One recurrent-state slab. `dtype` is the slab's own: e.g. bf16 for
-    /// ssm history, or an integer dtype for a window that keeps token ids.
     pub fn state(
         &mut self,
         name: impl Into<String>,
@@ -93,7 +72,6 @@ impl HybridSpec {
     }
 }
 
-/// A forward pass over paged kv and/or recurrent state caches.
 pub trait ForwardHybrid {
     type Facts: Classify;
     fn caches(&self) -> HybridSpec;
@@ -101,12 +79,9 @@ pub trait ForwardHybrid {
 }
 
 thread_local! {
-    // Set by [`trace_hybrid`] around the model's `forward`, cleared after.
     static TRACING: Cell<Option<Platform>> = const { Cell::new(None) };
 }
 
-/// The platform this trace is being taken for, for a backend-conditional
-/// fused op. Ambient for the length of one `forward`; panics outside one.
 #[must_use]
 pub fn platform() -> Platform {
     TRACING
@@ -114,15 +89,6 @@ pub fn platform() -> Platform {
         .expect("no trace is being taken")
 }
 
-/// Trace one plan for one platform: seam the boundary, run the model's
-/// forward, and `finish` through the validator. A nested trace on one
-/// thread is refused (it would have two answers to [`platform`]).
-///
-/// The returned value is planted as [`seam::OUT`] — the logits — unless the
-/// forward already planted it under a float readout ([`seam::VELOCITY`],
-/// [`seam::HIDDEN`]): a denoiser returns its velocity and has no logits to
-/// speak of, and a plan with no `out` seam is a plan whose readout is the
-/// float one (`seam::FLOAT_READOUTS`).
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
     let caches = m.caches();
     let rec = Recorder::new(name, platform, caches.rows.clone());
@@ -134,8 +100,6 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
         );
         tracing.set(Some(platform));
     });
-    // Cleared on the way out whether the forward returns or panics, so a
-    // refused trace caught by a test leaves the thread free for the next.
     struct Tracing;
     impl Drop for Tracing {
         fn drop(&mut self) {
@@ -160,15 +124,8 @@ pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> 
     rec.finish()
 }
 
-/// The geometry space of the token axis itself: the first kv space when a
-/// plan declares one, and still space 0 when it declares none. The
-/// per-token and per-lane tables that describe the fire rather than a
-/// cache (`RequestOfToken`, the group tables) live here, so a denoiser
-/// with no kv reads them without a cache to name.
 const TOKEN_SPACE: u32 = 0;
 
-/// Walks a model's per-layer weights, keeping the recorder's layer mark in
-/// step so every node knows which layer said it.
 pub struct Layers<'a, T> {
     rec: &'a Recorder,
     ws: core::slice::Iter<'a, T>,
@@ -193,22 +150,13 @@ impl<T> Drop for Layers<'_, T> {
     }
 }
 
-/// What a forward pass may reach for: the typed runtime inputs and the
-/// declared cache spaces, read for one class of rows. `F` ties the model's
-/// fact vocabulary to its trace and is otherwise phantom. Splittable like
-/// [`Value`]: [`split`](Input::split) hands back arms carrying a class.
 pub struct Input<F> {
     rec: Recorder,
     caches: HybridSpec,
-    /// `Always` for the whole fire; a split arm carries its class here, and
-    /// every value read off the arm carries it too.
     over: Guard,
     _facts: PhantomData<F>,
 }
 
-/// Written out rather than derived: `#[derive(Clone)]` would demand
-/// `F: Clone`, and `F` is a phantom fact vocabulary that no family bothers to
-/// make cloneable.
 impl<F> Clone for Input<F> {
     fn clone(&self) -> Input<F> {
         Input {
@@ -232,17 +180,11 @@ impl<F> Refine for Input<F> {
 }
 
 impl<F> Input<F> {
-    /// The trace's recorder, for a wrapper that reads no activation and so
-    /// has no value to take it from — a table computed from weights alone
-    /// ([`ops::elemwise::relative_bucket_bias`](crate::ops::elemwise::relative_bucket_bias)).
     #[must_use]
     pub fn recorder(&self) -> &Recorder {
         &self.rec
     }
 
-    /// The inputs of one class of rows each, cut by `spec` — the same
-    /// algorithm and conds [`Value::split`] uses, so an `Input` arm and a
-    /// `Value` arm taken with the same spec meet without complaint.
     pub fn split<S: SplitSpec>(&self, spec: S) -> S::Arms<Input<F>> {
         spec.arms(self)
     }
@@ -273,8 +215,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The trunk's triple-wide position stream: `[Dim::Tokens, 3]` `i32`,
-    /// one `(t, h, w)` per token row. A text lane's triple is `(p, p, p)`.
     #[must_use]
     pub fn mrope_positions(&self) -> Value {
         self.rec
@@ -288,8 +228,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The model's paged-kv space's custom attention mask: packed `u8` mask
-    /// bits, token-aligned, read by `attention.masked`.
     #[must_use]
     pub fn mask(&self) -> Value {
         self.rec
@@ -305,9 +243,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The fire's per-row adapter ids: `i32`, one entry per token row, `-1`
-    /// for a row whose lane registered no adapter. Deduped by
-    /// [`Recorder::input`], so many correction ops share one input.
     #[must_use]
     pub fn adapter_routes(&self) -> Value {
         self.rec
@@ -321,10 +256,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// Which token row each readout row gathers: `[Dim::Readouts]` `i32`,
-    /// one entry per row a reader takes (its lane's last row by default).
-    /// Read by [`ops::layout::gather_rows`](crate::ops::layout::gather_rows),
-    /// which is what puts the trunk head on those rows alone.
     #[must_use]
     pub fn readout_rows(&self) -> Value {
         self.rec
@@ -338,8 +269,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The fire's patch rows, pre-unfolded: `[Dim::Patches, width]`. `width`
-    /// is `C * T * P^2` (channels x temporal/spatial patch extents).
     #[must_use]
     pub fn patches(&self, width: impl Into<u64>) -> Value {
         self.rec
@@ -353,8 +282,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The patch axis's own indptr: `i32`, `images + 1` long, where image
-    /// `i` owns patch rows `[segments[i], segments[i + 1])`.
     #[must_use]
     pub fn patch_segments(&self) -> Value {
         self.rec
@@ -368,8 +295,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// Where each tower row lands in the token rectangle: `i32`, one
-    /// destination token row per patch row.
     #[must_use]
     pub fn patch_routes(&self) -> Value {
         self.rec
@@ -383,9 +308,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The tower's own position stream: `[Dim::Patches, 3]` `i32`, one
-    /// `(t, h, w)` per patch row (each patch's `(h, w)` in its own image's
-    /// grid). The `t` column is currently always zero.
     #[must_use]
     pub fn patch_positions(&self) -> Value {
         self.rec
@@ -399,10 +321,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// Which row of the learned position table each patch reads:
-    /// `[Dim::Patches, taps]` `i32`. `taps`: `1` native grid, `4` bilinear,
-    /// `16` bicubic — paired with
-    /// [`patch_embed_weights`](Input::patch_embed_weights).
     #[must_use]
     pub fn patch_embed_rows(&self, taps: u32) -> Value {
         self.rec
@@ -416,8 +334,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// How much of each tap: `[Dim::Patches, taps]` `f32`. A native-grid
-    /// tower never calls this.
     #[must_use]
     pub fn patch_embed_weights(&self, taps: u32) -> Value {
         self.rec
@@ -431,10 +347,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The denoiser's self-conditioning taps: `[Dim::Tokens, taps]` `i32`
-    /// token ids, one row of `taps` per token row, paired with
-    /// [`self_cond_weights`](Input::self_cond_weights) in a weighted gather
-    /// over the embedding table.
     #[must_use]
     pub fn self_cond_rows(&self, taps: u32) -> Value {
         self.rec
@@ -448,7 +360,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// How much of each self-conditioning tap: `[Dim::Tokens, taps]` `f32`.
     #[must_use]
     pub fn self_cond_weights(&self, taps: u32) -> Value {
         self.rec
@@ -462,57 +373,41 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// Where each lane's run of page indices starts, `lanes + 1` long.
     #[must_use]
     pub fn kv_indptr(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::Indptr)
     }
 
-    /// The page indices themselves, viewed through [`kv_indptr`](Input::kv_indptr).
     #[must_use]
     pub fn kv_indices(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::Indices)
     }
 
-    /// How many slots of each lane's last page are filled.
     #[must_use]
     pub fn last_page_len(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::LastPageLen)
     }
 
-    /// Each lane's cached key length.
     #[must_use]
     pub fn kv_len(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::KvLen)
     }
 
-    /// The packed `u8` graph-padding mask: which token rows of the fire are
-    /// real.
     #[must_use]
     pub fn row_valid(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::RowValid)
     }
 
-    /// The token→lane map: which request each token row belongs to. The
-    /// token axis's own table — read in space 0 whether or not a cache
-    /// joined it, so a cacheless denoiser can broadcast a per-lane vector
-    /// over its rows (`ops::elemwise::modulate`).
     #[must_use]
     pub fn request_of_token(&self) -> Value {
         self.geometry(TOKEN_SPACE, GeomKind::RequestOfToken)
     }
 
-    /// Which attention group each lane belongs to: `[Dim::Lanes]` `i32`,
-    /// dense from 0 — the lanes one request submitted share a group.
     #[must_use]
     pub fn group_of_lane(&self) -> Value {
         self.geometry(TOKEN_SPACE, GeomKind::GroupOfLane)
     }
 
-    /// Per-group bounds over THIS ARM's rows once packed by group:
-    /// `[Dim::LanesPlus(1)]` `i32`, the CSR `attention.ragged` pairs
-    /// segments by. The selection is the arm's own guard — call it on the
-    /// `Input` arm whose class the queries (or the keys) come from.
     #[must_use]
     pub fn group_indptr(&self) -> Value {
         self.geometry(
@@ -523,8 +418,6 @@ impl<F> Input<F> {
         )
     }
 
-    /// Per-lane bounds over this arm's packed rows: `[Dim::LanesPlus(1)]`
-    /// `i32`, the finer CSR a lane-block-diagonal ragged attention passes.
     #[must_use]
     pub fn lane_indptr(&self) -> Value {
         self.geometry(
@@ -535,9 +428,6 @@ impl<F> Input<F> {
         )
     }
 
-    /// Per packed row of this arm, its lane index when the lane is on
-    /// [`Stream::Reference`](model_ir::Stream::Reference), else `-1`:
-    /// `[Dim::Tokens]` `i32`, what `RaggedMask::ReferenceSelfOnly` reads.
     #[must_use]
     pub fn reference_tags(&self) -> Value {
         self.geometry(
@@ -548,10 +438,6 @@ impl<F> Input<F> {
         )
     }
 
-    /// The row order that packs this arm's rows by group: `[Dim::Tokens]`
-    /// `i32`, `perm[i]` the fire row of packed row `i` and `-1` past the
-    /// arm's row count. What `ops::layout::pack_rows` gathers by and
-    /// `unpack_rows` scatters by.
     #[must_use]
     pub fn row_permutation(&self) -> Value {
         self.rec
@@ -567,10 +453,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// A latent float port: `[Dim::Tokens, width]` of `dtype` (`F32` or
-    /// `Bf16`, as the family states — the reference schedulers keep fp32
-    /// masters), fed from a guest channel at every submit. `port` is the
-    /// family's index for it, `0` for the only one.
     #[must_use]
     pub fn latents(&self, port: u8, width: u32, dtype: Dtype) -> Value {
         assert!(
@@ -588,9 +470,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// A per-lane float port: `[Dim::Lanes, width]` `f32` — a timestep, a
-    /// guidance scale, a sigma per modality. `port` as for
-    /// [`latents`](Input::latents).
     #[must_use]
     pub fn lane_vector(&self, port: u8, width: u32) -> Value {
         self.rec
@@ -604,10 +483,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// A context lane's rows: `[Dim::Tokens, width]` `bf16`, an encoder's
-    /// output constant across steps; only rows of lanes on
-    /// [`Stream::Context`](model_ir::Stream::Context) carry data. `port` as
-    /// for [`latents`](Input::latents).
     #[must_use]
     pub fn context(&self, port: u8, width: u32) -> Value {
         self.rec
@@ -621,10 +496,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The guest's per-axis rotary positions: `[Dim::Tokens, axes]` `f32`,
-    /// `1 <= axes <= 4`, read by `ops::elemwise::rope_axes`. `port` as for
-    /// [`latents`](Input::latents) — LTX rotates queries and keys by two
-    /// different position streams.
     #[must_use]
     pub fn axis_positions(&self, port: u8, axes: u8) -> Value {
         assert!((1..=4).contains(&axes), "a rope has one to four axes, not {axes}");
@@ -639,10 +510,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The voxel axis's lane table: `[Dim::Clips, 4]` `i32`
-    /// `{t, h, w, row_offset}` per clip at the voxel port's resolution
-    /// (`RuntimeInput::Grid`). What every `ops::spatial` wrapper reads
-    /// beside its rows; later resolutions' grids are computed from it.
     #[must_use]
     pub fn grid(&self) -> Value {
         self.rec
@@ -656,9 +523,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// A voxel float port: `[Dim::Voxels, channels]` of `dtype` (`F32` or
-    /// `Bf16`) — a VAE's input tile, one row per voxel of
-    /// [`grid`](Input::grid). `port` as for [`latents`](Input::latents).
     #[must_use]
     pub fn voxels(&self, port: u8, channels: u32, dtype: Dtype) -> Value {
         assert!(
@@ -676,9 +540,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The clip table at TOKEN resolution for the patch `p`: `[Dim::Clips,
-    /// 4]` `i32` `{t/pt, h/ph, w/pw, token_row_offset}` — the token side of
-    /// `ops::spatial::{patchify, unpatchify}` (`RuntimeInput::TokenGrid`).
     #[must_use]
     pub fn token_grid(&self, p: [u32; 3]) -> Value {
         assert!(p.iter().all(|&n| n > 0), "a patch of {p:?} is empty");
@@ -693,9 +554,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// This arm's lanes as the host sees them: its guard as a mask/value
-    /// pair over the fact word. An `Input` arm always has one — split arms
-    /// are conjunctions of fact literals — so the `expect` never fires.
     fn selection(&self) -> Selection {
         Selection::of(&self.over).unwrap_or_else(|| {
             panic!(
@@ -706,20 +564,16 @@ impl<F> Input<F> {
         })
     }
 
-    /// The page each token row appends to, in the space the kv row `row`
-    /// joined — the same key [`kv`](Input::kv) takes.
     #[must_use]
     pub fn write_page(&self, row: &str) -> Value {
         self.geometry(self.space_of(row), GeomKind::WritePage)
     }
 
-    /// The offset within that page.
     #[must_use]
     pub fn write_offset(&self, row: &str) -> Value {
         self.geometry(self.space_of(row), GeomKind::WriteOffset)
     }
 
-    /// The storage value of a paged kv space — a pool pointer, nothing more.
     #[must_use]
     pub fn kv(&self, name: &str) -> ValueId {
         assert!(
@@ -732,7 +586,6 @@ impl<F> Input<F> {
         self.rec.cache(name)
     }
 
-    /// The storage value of a recurrent state space.
     #[must_use]
     pub fn state(&self, name: &str) -> ValueId {
         assert!(
@@ -753,9 +606,6 @@ impl<F> Input<F> {
         }
     }
 
-    /// One geometry vector of a kv space. Indptr is `lanes + 1` long,
-    /// page-table vectors are per-lane, fire tables are per-token. All
-    /// `i32` except `RowValid` (`u8`).
     fn geometry(&self, space: u32, kind: GeomKind) -> Value {
         let (rows, dtype) = match kind {
             GeomKind::Indptr | GeomKind::GroupIndptr { .. } | GeomKind::LaneIndptr { .. } => {
@@ -783,10 +633,6 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
-    /// The model's paged-kv geometry space: the first space `caches()`
-    /// declared. Its per-token tables are also the token axis's own
-    /// ([`TOKEN_SPACE`]), which is why a cacheless plan still reads
-    /// [`request_of_token`](Input::request_of_token).
     fn kv_space(&self) -> u32 {
         assert!(
             !self.caches.dtypes.is_empty(),
@@ -795,7 +641,6 @@ impl<F> Input<F> {
         0
     }
 
-    /// The geometry space a named kv row joined.
     fn space_of(&self, name: &str) -> u32 {
         self.caches
             .rows

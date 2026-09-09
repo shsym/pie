@@ -1,5 +1,3 @@
-//! Latent-attention scheduler: splits packed query tiles over CTA clusters by a cost heap, carves kv spans at `kv_len_limit`, and books the partial-output merge the split spans need.
-
 use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, Live, MlaPlanInfo};
@@ -9,21 +7,15 @@ use crate::attn::sched::{
 };
 use crate::jit::refuse;
 
-/// The device text's bound on the schedule's work items.
 pub const MAX_TOTAL_NUM_WORKS: usize = 16384;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// Host copy of the query indptr — `[batch_size + 1]`.
     pub qo_indptr: &'a [i32],
-    /// Host copy of the kv element offsets — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// Host per-request kv lengths, in tokens — `[batch_size]`.
     pub kv_len_arr: &'a [i32],
-    /// Row and lane counts this schedule is carved for; the cluster split averages `rows * heads / lanes` from this pair.
     pub total_num_rows: u32,
     pub batch_size: u32,
-    /// This fire's own host vectors; drives the kv-span carve and work-list staging.
     pub live: Live,
     pub num_heads: u32,
     pub head_dim_o: u32,
@@ -42,7 +34,6 @@ struct ClusterWork {
     kv_end: Vec<i32>,
 }
 
-/// The computed schedule: pure data, laid out and staged by [`plan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub cluster_size: u32,
@@ -67,8 +58,6 @@ pub struct Schedule {
     pub merge_partial_stride: Vec<i32>,
 }
 
-/// The kv split threshold: the per-cluster average kv walk, stepped up to
-/// the tier the device text tiles at.
 #[must_use]
 pub fn kv_len_limit_step(x: u64) -> u64 {
     if x <= 8 {
@@ -97,7 +86,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let kv_lens = lengths(op, "kv length table", req.kv_len_arr, batch)?;
 
-    // packed extent of every request must fit the device's i32; merge offsets are staged in it.
     let packed_qo_lens: Vec<u32> = qo_lens
         .iter()
         .map(|&q| {
@@ -114,11 +102,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         narrow(op, "mla_kv_len", i64::from(kv_len))?;
     }
 
-    // avg packed extent is exactly rows * heads / lanes, a function of the carve rather than of per-request lengths.
     let avg_packed_qo_len =
         u64::from(req.total_num_rows) * u64::from(req.num_heads) / u64::from(req.batch_size);
 
-    // cluster_size/num_clusters (num_blks_x/num_blks_y) affect only performance, not correctness: kv extents and the merge are booked off the actual walk regardless.
     let cluster_size: u32 = if avg_packed_qo_len > 64 { 2 } else { 1 };
     let num_clusters = device.num_sm / cluster_size;
     if num_clusters == 0 {
@@ -230,8 +216,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                     accum_cost + cost_function(cluster_tile_q, actual_len),
                 );
                 let cluster = &mut clusters[cluster_idx as usize];
-                // Narrowed above: qo_len, kv_len, and every packed offset
-                // fit the device's i32.
                 cluster.q_len.push(qo_len as i32);
                 cluster.kv_len.push(kv_len as i32);
                 cluster.q_indptr.push(req.qo_indptr[i]);

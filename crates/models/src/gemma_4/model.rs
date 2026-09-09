@@ -7,21 +7,12 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// Same query head count under both readings (a fact about the text,
-    /// not a layer).
     pub q_heads: u32,
-    /// The two readings this text carves attention schedules for; a layer
-    /// only names which one it uses.
     pub sliding: Sliding,
     pub global: Global,
 
-    /// Adapter banks, one set of numbers per layer — the correction is a
-    /// per-lane axis, not a per-layer one.
     pub adapters: Adapters,
 
-    /// The vision tower, when the checkpoint ships one. `Option` because
-    /// it's a fact about the artifact (not every SKU has a tower), and its
-    /// presence is what makes the plan a two-unit one.
     pub tower: Option<Tower>,
 
     pub kv: Dtype,
@@ -32,88 +23,28 @@ pub struct Model {
     pub final_norm: Weight,
     pub final_norm_eps: f32,
 
-    /// The aux draft head, when an overlay carries one. `None` for every
-    /// stock checkpoint — no gemma checkpoint publishes one; it is obtained
-    /// separately and baked in via `pie model import --aux`.
-    ///
-    /// Speculative decoding is exact here because gemma attends and does
-    /// not recur: a rejected draft row leaves only a kv cell to be
-    /// overwritten, unlike a hybrid text with recurrent state.
     pub draft: Option<Draft>,
 
-    /// Google's own Gemma 4 assistant — the trained MTP drafter
-    /// (`google/gemma-4-*-it-assistant`), when an overlay carries one. See
-    /// [`Assistant`].
     pub assistant: Option<Assistant>,
 
-    /// z-lab's block drafter (`gemma-4-26B-A4B-it-DFlash`), when an overlay
-    /// carries one — the same text every family carries it as
-    /// (`crate::drafter::dflash`), tapping this trunk's layers.
     pub dflash: Option<DFlash>,
-    /// DiffusionGemma's denoiser input: the self-conditioning block and the
-    /// scale-free post-norm every denoise row's embedding passes through.
-    /// `None` on every autoregressive Gemma 4. See [`SelfCond`].
     pub self_cond: Option<SelfCond>,
 }
 
-/// **THE DENOISER'S INPUT** (DiffusionGemma's `self_conditioning`): a Gemma
-/// gated MLP over the previous denoising step's soft embedding
-/// (`softmax(logits/T) · E · sqrt(hidden)`), added to the canvas embedding,
-/// then a scale-free RMSNorm over the sum:
-///
-/// ```text
-/// n     = pre_norm(soft)
-/// x_in  = post_norm( embed(ids)·sqrt(H) + down( gelu_tanh(gate(n)) * up(n) ) )
-/// ```
-///
-/// The post-norm applies even when there is no signal yet (the first step,
-/// or a program that feeds none): `soft = 0` makes the MLP exactly zero, and
-/// the input is still `post_norm(embed)`. That is why the block is an
-/// optional PART of the text and not a second model: the encoder reading of
-/// the same rows skips all of it.
 pub struct SelfCond {
-    /// How many of the previous step's predictions per canvas row the
-    /// signal is built from: `soft ≈ Σₜ p[r, t] · E[id[r, t]]`, a weighted
-    /// gather over the top-`taps` of `softmax(logits / T)` instead of the
-    /// reference's full `probs · E`. The guest computes the taps (its
-    /// temperature, its truncation); the text only states their count,
-    /// which is what shapes the two runtime inputs.
     pub taps: u32,
-    /// `self_conditioning.pre_norm`, `[hidden]`, with scale.
     pub pre_norm: Weight,
     pub norm_eps: f32,
-    /// `[2 * inter, hidden]`, gate first — the dense MLP's shape.
     pub gate_up: Weight,
     pub inter: u32,
-    /// `[hidden, inter]`.
     pub down: Weight,
 }
 
-/// **GEMMA 4'S OWN DRAFTER**: a four-layer text stack that reads the trunk's
-/// kv instead of keeping any. Per draft step it is fed the concatenation of
-/// the trunk's token embedding (of the token the trunk chose) and a 2816-wide
-/// hidden state — the trunk's post-norm readout at step 0, its own
-/// `post_projection` after — projected by `pre_projection` to its hidden
-/// width. Its layers are ordinary Gemma 4 layers whose attention has only a
-/// `q_proj`: the sliding ones attend over the trunk's LAST sliding layer's kv
-/// row, the global one over the last global's, every query rotated at the
-/// row's own position and held there across the chain (transformers'
-/// `SinglePositionMultiTokenCandidateGenerator`, mlx-vlm's `draft_block`).
-/// It reads out through its own tied `embed_tokens`, no softcap. Its banks
-/// take the row's weight dtype — the import quantizes the bf16 source on the
-/// way in — because a chain step reads the whole head, and at bf16 that is
-/// 0.8 GB a step, more than the trunk's own active bytes. A bank encoded on
-/// the way in is named `*.weight`, where its scales are named beside it.
 pub struct Assistant {
-    /// Draft tokens chained per row; what `mtp_depth` advertises.
     pub depth: u32,
-    /// `pre_projection`'s two column halves: `[hidden, trunk_hidden]` each,
-    /// the embedding half first.
     pub pre_embed: Weight,
     pub pre_hidden: Weight,
-    /// `post_projection`: `[trunk_hidden, hidden]`.
     pub post: Weight,
-    /// Its own `[vocab, hidden]` table, read out through as the lm head.
     pub embed: Weight,
     pub norm: Weight,
     pub norm_eps: f32,
@@ -121,8 +52,6 @@ pub struct Assistant {
 }
 
 pub struct AssistantLayer {
-    /// `banks` is always [`AttnBanks::Shared`]; `kv` names the trunk row it
-    /// borrows.
     pub attn: Attn,
     pub o_proj: Weight,
     pub attn_norm: Weight,
@@ -135,15 +64,8 @@ pub struct AssistantLayer {
     pub scalar: Weight,
 }
 
-/// The self-conditioning gather's width. 64 of 262 144: at the reference's
-/// temperatures (0.8 down to 0.4) the softmax over a softcapped row is
-/// peaked enough that the tail past the top 64 carries little mass; the
-/// deviation from the exact `probs · E` is a measurement against the
-/// transformers golden, and this constant is where it is tuned.
 pub const SELF_COND_TAPS: u32 = 64;
 
-/// The assistant's shape, the same for every published size: the trunk's
-/// width differs, the drafter's does not.
 const ASSISTANT_HIDDEN: u32 = 1024;
 const ASSISTANT_INTER: u32 = 8192;
 const ASSISTANT_READINGS: [Reading; 4] = [
@@ -152,19 +74,8 @@ const ASSISTANT_READINGS: [Reading; 4] = [
     Reading::Sliding,
     Reading::Global,
 ];
-/// Chained drafts per verify. Every chain step is a head pass paid whether
-/// or not the window uses it, and on the M1 Max a verify row costs 0.5–0.6
-/// of a first row, so the only window that pays for itself is `k = 1`:
-/// measured on the 26B-A4B, depth 2 at `k = 1` is 18.0 ms a token against
-/// 16.3 plain, depth 1 is 16.6 — parity. mlx-vlm's best block (three, two
-/// drafts) is a batch-of-four number on an M3 Max. A device where rows are
-/// cheap wants this at 2 or 3; that is a re-import, not a runtime knob.
 pub const ASSISTANT_DEPTH: u32 = 1;
 
-/// One EAGLE-style aux head: fuses a hidden state with the next token's
-/// embedding, runs one decoder block, and reads out through the base
-/// model's own head. `fc` is two banks (`[a|b]·[We|Wh]^T = a·We^T + b·Wh^T`);
-/// import slices the stored `[hidden, 2*hidden]` bank at column `hidden`.
 pub struct Draft {
     pub fc_embed: Weight,
     pub fc_hidden: Weight,
@@ -172,8 +83,6 @@ pub struct Draft {
     pub post_attn_norm: Weight,
     pub pre_ffw_norm: Weight,
     pub post_ffw_norm: Weight,
-    /// Reads globally (full attention), its own kv row. One prefill plan
-    /// covers both prefill and decode shapes.
     pub attn: Attn,
     pub o_proj: Weight,
     pub gate_up: Weight,
@@ -199,21 +108,12 @@ pub struct PleLayer {
     pub scalar: Weight,
 }
 
-/// Gemma's vision tower: four-norm block, `sm_scale` fixed at 1.0 (not
-/// `head_dim^-0.5`), `v_norm` unscaled, and a separable two-tap position
-/// table (`[2, positions, hidden]`) rather than bilinear interpolation.
-/// Every projection's input/output clamps to per-checkpoint learned bounds,
-/// so `gate`/`up` can't share a packed bank.
 pub struct Tower {
     pub hidden: u32,
     pub heads: u32,
     pub head_dim: u32,
-    /// `pooling_kernel_size`: folds `pool^2` consecutive patch rows into one
-    /// soft token.
     pub pool: u32,
-    /// `C * P^2`; no temporal axis.
     pub patch_width: u32,
-    /// `2 * position_embedding_size`: the two axis tables, end to end.
     pub positions: u32,
     pub theta: f32,
     pub norm_eps: f32,
@@ -221,31 +121,20 @@ pub struct Tower {
     pub patch_embed: Weight,
     pub pos_embed: Weight,
     pub blocks: Vec<TowerBlock>,
-    /// `[trunk hidden, hidden]`: makes a pooled soft token a token row. The
-    /// one tower-side plane a 4-bit artifact quantizes (every other tower
-    /// bank is dense).
     pub projection: Weight,
-    /// `vision_tower.std_{bias,scale}`, when the tower states
-    /// `standardize: true`.
     pub std: Option<Standardization>,
 }
 
-/// The two `[hidden]` planes `vision_config.standardize` publishes:
-/// `y = (x - bias) * scale`, the last thing the tower does to a soft token.
 pub struct Standardization {
     pub bias: Weight,
     pub scale: Weight,
 }
 
-/// One `Gemma4ClippableLinear`: the bank, and the four bounds (as `[1]`
-/// weights, not plan constants) when `use_clipped_linears` is on.
 pub struct Clippable {
     pub bank: Weight,
     pub clip: Option<Bounds>,
 }
 
-/// The four saturating bounds of one clipped linear, in the order
-/// `Gemma4ClippableLinear.forward` reads them.
 pub struct Bounds {
     pub in_lo: Weight,
     pub in_hi: Weight,
@@ -253,8 +142,6 @@ pub struct Bounds {
     pub out_hi: Weight,
 }
 
-/// One vision block: four norms, a bidirectional attention over seven clipped
-/// linears' worth of banks, and a gated ungated-by-fusion MLP.
 pub struct TowerBlock {
     pub attn_norm: Weight,
     pub post_attn_norm: Weight,
@@ -289,65 +176,29 @@ pub struct Layer {
     pub inter: u32,
     pub down: Weight,
 
-    /// Per-layer output scalar; applied whether or not there's a PLE relay.
-    /// Learned values vary widely across layers (not close to 1), so
-    /// dropping them changes results materially.
-    ///
-    /// `Some` exactly when this text declares no PLE — a PLE stack's scalar
-    /// lives in [`PleLayer::scalar`] instead.
     pub scalar: Option<Weight>,
 
-    /// This layer's adapter bank (`[slots, rank, hidden]` /
-    /// `[slots, hidden, rank]`) for the attention sublayer's correction
-    /// site: input is the `attn_norm`ed residual, output is `o_proj`'s
-    /// result after `all_reduce` — both replicated values, so the
-    /// correction can't be folded in earlier (a per-rank partial) or later
-    /// (past `post_attn_norm`).
-    ///
-    /// Applied even on shared-kv tail layers: the correction site is not
-    /// the attention bank, so every layer needs its own.
     pub lora_a: Weight,
     pub lora_b: Weight,
 
-    /// The routed feedforward branch, when the checkpoint ships one
-    /// (`text_config.enable_moe_block`). `None` on dense layers, adding
-    /// nothing to the stack.
     pub moe: Option<Moe>,
 }
 
-/// The routed branch of gemma-4-26B-A4B: runs beside the dense MLP (both
-/// read the same post-attention residual `h`), not in place of it, then
-/// both outputs sum before the sandwich's own closing norm.
-///
-/// The router's norm gain is `router.scale * hidden**-0.5`; scores get
-/// top-k, softmax over the selected k, then a per-expert gain
-/// (`per_expert_scale`).
 pub struct Moe {
-    /// `router.scale`, times `hidden**-0.5`, folded into the plane at import.
     pub router_norm: Weight,
     pub router_norm_eps: f32,
-    /// `router.proj`, `[experts, hidden]`, no bias.
     pub router: Weight,
-    /// `router.per_expert_scale`, `[experts]`, indexed by expert.
     pub per_expert_scale: Weight,
-    /// `pre_feedforward_layernorm_2` — the routed branch's entry norm.
     pub pre_ffw_norm_2: Weight,
     pub pre_ffw_norm_2_eps: f32,
-    /// `post_feedforward_layernorm_1` — the dense branch's exit norm (only
-    /// present because there's a sibling to add to).
     pub post_ffw_norm_1: Weight,
     pub post_ffw_norm_1_eps: f32,
-    /// `post_feedforward_layernorm_2` — the routed branch's exit norm.
     pub post_ffw_norm_2: Weight,
     pub post_ffw_norm_2_eps: f32,
-    /// `[experts, 2 * inter, hidden]`, gate first, cut at axis 1.
     pub gate_up: Weight,
-    /// `[experts, hidden, inter]`.
     pub down: Weight,
     pub experts: u32,
     pub top_k: u32,
-    /// `moe_intermediate_size`, narrower than the dense `Layer::inter`
-    /// (704 vs 2112 on the 26B).
     pub inter: u32,
 }
 
@@ -361,16 +212,12 @@ pub struct Attn {
     pub banks: AttnBanks,
 }
 
-/// Which of the text's two readings of the one sequence a layer takes. The
-/// discriminant is the index: anything the forward pass carves per reading is
-/// a two-element array `[sliding, global]` indexed by `reading as usize`.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Reading {
     Sliding = 0,
     Global = 1,
 }
 
-/// The local reading: narrow heads over a window of recent keys.
 pub struct Sliding {
     pub head_dim: u32,
     pub kv_heads: u32,
@@ -378,8 +225,6 @@ pub struct Sliding {
     pub theta: f32,
 }
 
-/// The global reading: wide heads over the whole sequence, rotated over only
-/// the leading `rotary_dim` of each head.
 pub struct Global {
     pub head_dim: u32,
     pub kv_heads: u32,
@@ -399,33 +244,24 @@ pub enum AttnBanks {
     },
 }
 
-/// The tower's own numbers. Nothing here divides by `tp`: the tower is
-/// replicated, not sharded.
 #[derive(Clone, Copy)]
 struct TowerDims {
     depth: u32,
     hidden: u32,
     heads: u32,
     inter: u32,
-    /// `in_channels * patch_size^2`; gemma's patch has no temporal extent.
     patch_width: u32,
     pool: u32,
-    /// `position_embedding_size`, per axis. The declared table is twice it.
     positions: u32,
     out_hidden: u32,
     theta: f32,
     norm_eps: f32,
     sm_scale: f32,
-    /// `use_clipped_linears`: whether every projection reads four learned
-    /// bounds beside its bank.
     clipped: bool,
-    /// `standardize`: whether the pooled answer is centred and scaled by two
-    /// `[hidden]` planes before the projection.
     standardize: bool,
 }
 
 impl TowerDims {
-    /// E4B's tower dims, read off `vision_config`.
     const fn e4b() -> TowerDims {
         TowerDims {
             depth: 16,
@@ -444,10 +280,6 @@ impl TowerDims {
         }
     }
 
-    /// The wide tower, shared by both 31B and A4B (identical `vision_config`,
-    /// only `out_hidden` differs, so it is this function's argument).
-    /// Unlike [`e4b`](TowerDims::e4b): `use_clipped_linears: false`,
-    /// `standardize: true`.
     const fn wide(out_hidden: u32) -> TowerDims {
         TowerDims {
             depth: 27,
@@ -469,10 +301,6 @@ impl TowerDims {
 
 const SLIDING: Option<u32> = Some(2_048);
 
-/// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
-/// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
-/// out through gemma's softcapped head (monotone, so the argmax is the
-/// head's own). The head is a Qwen3-style stack whatever the target.
 pub const GEMMA4_26B_A4B_DFLASH: dflash::Head = dflash::Head {
     taps: &[1, 6, 11, 17, 22, 27],
     windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
@@ -491,18 +319,10 @@ pub const GEMMA4_26B_A4B_DFLASH: dflash::Head = dflash::Head {
 
 struct Dims {
     tower: Option<TowerDims>,
-    /// Whether this text is DiffusionGemma's: the self-conditioning block
-    /// beside the trunk, and a denoise reading of its rows.
     self_cond: bool,
-    /// The self-conditioning block's element type when it is not the dense
-    /// weights' (`None`): a published quantization may leave it at the
-    /// default bits while the dense stack sits at another.
     self_cond_w: Option<Dtype>,
-    /// Whether this SKU's artifact carries an `aux.*` overlay head.
     draft: bool,
-    /// Whether it carries Google's assistant instead (see [`Assistant`]).
     assistant: bool,
-    /// The published block drafter it carries instead, if any.
     dflash: Option<&'static dflash::Head>,
     hidden: u32,
     layers: u32,
@@ -526,8 +346,6 @@ struct Dims {
     moe: Option<MoeDims>,
 }
 
-/// `text_config`'s mixture: `num_experts`, `top_k_experts` and
-/// `moe_intermediate_size`.
 #[derive(Clone, Copy)]
 struct MoeDims {
     experts: u32,
@@ -540,11 +358,6 @@ impl Model {
         Model::new(w, kv, tp, Model::e4b_dims())
     }
 
-    /// E4B cut to its first `layers` layers — the miniature a parity gate
-    /// reads against an external reference truncated the same way, when the
-    /// full stack cannot be tapped layer by layer. The shared tail keeps its
-    /// place: layers from 24 on borrow their kv, however many of them the cut
-    /// keeps. Everything else is the E4B's own.
     pub fn e4b_mini(layers: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::e4b_dims();
         let owned = d.layers - d.shared_tail.unwrap_or(0);
@@ -584,26 +397,18 @@ impl Model {
         }
     }
 
-    /// The same 42 layers reading the 16-block tower E4B's checkpoint ships.
-    /// A separate row (not an optional tower field) because whether a tower
-    /// exists changes the plan's unit count.
     pub fn e4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::e4b_dims();
         d.tower = Some(TowerDims::e4b());
         Model::new(w, kv, tp, d)
     }
 
-    /// The same 42 layers with an EAGLE draft head overlaid. A separate row
-    /// because whether a head exists is a fact about the artifact.
     pub fn e4b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::e4b_dims();
         d.draft = true;
         Model::new(w, kv, tp, d)
     }
 
-    /// The 31B with Google's own drafter overlaid
-    /// (`gemma-4-31B-it-assistant`): the same four-layer head over a
-    /// 5376-wide trunk. See [`Model::a4b_mtp`].
     pub fn b31_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::b31_dims();
         d.assistant = true;
@@ -614,10 +419,6 @@ impl Model {
         Model::new(w, kv, tp, Model::b31_dims())
     }
 
-    /// The 31B reading its own checkpoint's wide tower ([`TowerDims::wide`]),
-    /// landing in this trunk's 5376-wide embedding. Weights (bf16 tower over
-    /// a U4 trunk) come from the checkpoint's own pairing, not a
-    /// configuration choice.
     pub fn b31_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::b31_dims();
         d.tower = Some(TowerDims::wide(d.hidden));
@@ -649,41 +450,26 @@ impl Model {
             shared_tail: None,
             ple_dim: None,
             softcap: Some(30.0),
-            // `text_config.sliding_window`, from the checkpoint. Distinct
-            // from e4b's 512; the two stacks are separate models.
             window: 1024,
             norm_eps: 1e-6,
             moe: None,
         }
     }
 
-    /// The mixture SKU: 30 layers, hidden 2816. Global layers are
-    /// `layer_types`'s `full_attention` entries (`l % 6 == 5`); those five
-    /// publish no `v_proj` (`attention_k_eq_v: true`). No shared kv tail, no
-    /// per-layer embeddings.
     pub fn a4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::a4b_dims())
     }
 
-    /// `google/diffusiongemma-26B-A4B-it`: the mixture's trunk with the
-    /// self-conditioning block beside it, read as a block-diffusion text
-    /// (`crate::gemma_4_diffusion`).
     pub fn a4b_diffusion(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::a4b_diffusion_experts(w, w, kv, tp)
     }
 
-    /// The diffusion text with the routed experts in `xw` and the dense
-    /// weights in `w`.
     pub fn a4b_diffusion_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.self_cond = true;
         Model::new_with_experts(w, xw, kv, tp, d)
     }
 
-    /// The diffusion text with the dense weights in `w`, the routed experts
-    /// in `xw` and the self-conditioning block in `sw` — the plan
-    /// `mlx-community/diffusiongemma-26B-A4B-it-4bit` ships (dense at 8
-    /// bits, experts and the block at the 4-bit default).
     pub fn a4b_diffusion_experts_self_cond(
         w: Dtype,
         xw: Dtype,
@@ -697,25 +483,18 @@ impl Model {
         Model::new_with_experts(w, xw, kv, tp, d)
     }
 
-    /// The mixture with Google's own drafter overlaid
-    /// (`gemma-4-26B-A4B-it-assistant`). A separate row: whether a head
-    /// exists is a fact about the artifact.
     pub fn a4b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.assistant = true;
         Model::new(w, kv, tp, d)
     }
 
-    /// The mixture with z-lab's block drafter overlaid
-    /// (`gemma-4-26B-A4B-it-DFlash`). A separate row for the same reason.
     pub fn a4b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.dflash = Some(&GEMMA4_26B_A4B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
-    /// The mixture reading the same wide tower as [`Model::b31_vision`],
-    /// landing in 2816 instead of 5376.
     pub fn a4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.tower = Some(TowerDims::wide(d.hidden));
@@ -761,32 +540,11 @@ impl Model {
         Model::new_with_experts(w, w, kv, tp, d)
     }
 
-    /// [`Model::new`] with the routed experts' banks in their own dtype:
-    /// the dense projections in `w`, `experts_gate_up`/`experts_down` in
-    /// `xw`. The diffusion rows use it to price precision where it is
-    /// spent — 4-bit experts triple a denoiser's step count (wiki §23)
-    /// while the dense weights are a tenth of the bytes.
     fn new_with_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         assert!(
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
-        // **The `tp` convention (design D14).** This text cuts BY HEADS and
-        // by the intermediate: `qkv` at its three seams, `o_proj` and `down`
-        // by rows (their partial products meet in the plan's `all_reduce`),
-        // `gate_up` at its gate/up seam, and every routed expert bank by its
-        // own intermediate. Norms, the embedding, the PLE planes and the
-        // vision tower are replicated.
-        //
-        // So `tp` must DIVIDE every count it cuts. It is checked here rather
-        // than left to integer division, which lands a zero-width band
-        // silently — a `[512, 0, 0]` `qkv` cut, weights that read as
-        // present, and a rank that attends to nothing. The KV heads are the
-        // binding count: E4B is 8 query heads over 2 KV heads, so it cuts at
-        // one and two ranks and REFUSES four. A 4-rank row for a GQA text
-        // this narrow needs a convention this tree does not have — a strided
-        // query-head cut with the KV planes replicated, or a band index that
-        // repeats across a group of ranks. See `.wiki/tp-verification.md`.
         for (count, what) in [
             (d.q_heads, "query heads"),
             (d.kv_heads, "sliding KV heads"),
@@ -807,11 +565,7 @@ impl Model {
                 moe.inter
             );
         }
-        // Everything declared here that is not a matmul bank: norms and the
-        // per-layer scalar. See `crate::dense`.
         let dense = crate::dense(w);
-        // The router's projection is quantized at 8 bits (group 64) even
-        // when the rest of the stack is 4-bit.
         let gate = match w {
             Dtype::U4g64 => Dtype::U8g64,
             other => other,
@@ -951,8 +705,6 @@ impl Model {
             })
             .collect();
 
-        // Every tower plane is replicated (not sharded); names live under
-        // the `vision.` namespace.
         let tower = d.tower.map(|t| {
             assert_eq!(
                 t.out_hidden, d.hidden,
@@ -970,13 +722,8 @@ impl Model {
             let ti = t.inter as u64;
             let head_dim = t.hidden / t.heads;
             let n = |s: String| format!("vision.{s}");
-            // Tower banks are always dense; only `projection` (a trunk-width
-            // bank) is quantized to `w` — the checkpoints ship no quantized
-            // tower plane besides it.
             let bank = |s: String, dims: [u64; 2]| Weight::sym(n(s), dims, dense);
             let vec1 = |s: String, len: u64| Weight::sym(n(s), [len], dense);
-            // The bank, plus four bounds when `use_clipped_linears` says the
-            // checkpoint ships them.
             let clip = |s: &str, dims: [u64; 2]| Clippable {
                 bank: bank(s.to_string(), dims),
                 clip: t.clipped.then(|| Bounds {
@@ -1026,9 +773,6 @@ impl Model {
             }
         });
 
-        // Named under `aux.` (the namespace `pie model import --aux`
-        // prefixes a second checkpoint's tensors with). Reads globally; its
-        // kv row is `kv.mtp` in the trunk's page-id space.
         let draft = d.draft.then(|| {
             let hd = global.head_dim as u64;
             let q_w = q_heads as u64 * hd;
@@ -1037,8 +781,6 @@ impl Model {
             let n = |s: &str| format!("aux.{s}");
             let norm = |s: &str, len: u64| Weight::sym(n(s), [len], dense);
             Draft {
-                // Both fusion banks are replicated: a token embedding every
-                // rank holds, and the trunk's residual after its reduce.
                 fc_embed: Weight::sym(n("fc_embed"), [hidden, hidden], w),
                 fc_hidden: Weight::sym(n("fc_hidden"), [hidden, hidden], w),
                 attn_norm: norm("attn_norm", hidden),
@@ -1066,8 +808,6 @@ impl Model {
             }
         });
 
-        // The assistant borrows the trunk's LAST row of each reading —
-        // the kv the trunk itself publishes as `shared_kv_states`.
         let assistant = d.assistant.then(|| {
             assert_eq!(tp, 1, "the assistant head is written for one rank");
             let last = |want_full: bool| {
@@ -1126,20 +866,6 @@ impl Model {
             }
         });
 
-        // The tied table is banded on the VOCAB axis rather than replicated.
-        // It is the single biggest read a decode step makes — gemma's
-        // vocabulary is 262144, so a replicated tied head streams 1.3 GB per
-        // step PER RANK. Banded, each rank holds `vocab / tp` rows: the gather
-        // zeroes the ids outside its band (the forward all-reduces them back
-        // into one row) and the tied head lands a logits shard (the forward
-        // all-gathers it). Both are BITWISE identical to the replicated form —
-        // partitioning a GEMM's output changes no reduction, and the gather's
-        // zeros sum exactly.
-        //
-        // A self-conditioning SKU keeps the whole table: its soft-embedding
-        // gather is `layout.embed_weighted`, which has no banded form.
-        // `PIE_NO_VOCAB_SHARD` keeps the whole table on every rank, for
-        // bisecting a suspected banding fault against the replicated form.
         let banded = tp > 1
             && !d.self_cond
             && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
@@ -1160,18 +886,12 @@ impl Model {
             tower,
             kv,
             softcap: d.softcap,
-            // A diffusion text keeps its table dense: the self-conditioning
-            // gather (`layout.embed_weighted`) reads bf16/f16 tables only,
-            // and the tied head pays the wider read. Revisit when the gather
-            // learns a quantized table.
             embed: {
                 let table = Weight::sym(
                     "embed",
                     [vocab_rows, hidden],
                     if d.self_cond { dense } else { w },
                 );
-                // The cut axis is the vocabulary's; `forward` reads the band
-                // back off `dim(0) < vocab` rather than a second flag.
                 if banded { table.packed([vocab_rows]) } else { table }
             },
             ple: d.ple_dim.map(|dim| {
@@ -1202,7 +922,6 @@ impl Model {
             final_norm_eps: d.norm_eps,
             draft,
             assistant,
-            // The dense MLP's shape and cut, under its own names.
             self_cond: d.self_cond.then(|| {
                 let iw = intermediate as u64;
                 let sw = d.self_cond_w.unwrap_or(w);
@@ -1216,8 +935,6 @@ impl Model {
                     down: Weight::sym("self_cond.down", [hidden, iw], sw).rows(),
                 }
             }),
-            // The block drafter's geometry is its OWN (`drafter::dflash`); it
-            // reads nothing off `Dims` but the trunk's widths and element types.
             dflash: d.dflash.map(|head| {
                 DFlash::declare(
                     head,
@@ -1236,8 +953,6 @@ impl Model {
     }
 }
 
-/// What every SKU seats. Not a checkpoint fact — a deployment ceiling,
-/// changed by editing this line and re-tracing.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {}

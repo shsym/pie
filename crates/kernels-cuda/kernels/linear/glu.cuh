@@ -16,19 +16,14 @@ __global__ void mlp_geglu_tanh(
 {
     const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `idx` is the element already.
+
     if (win != nullptr &&
         static_cast<long long>(idx) >=
             static_cast<long long>(win[0]) * fan * width) return;
     const long long at = win != nullptr
         ? idx + static_cast<long long>(win[1]) * fan * width
         : idx;
-    // `gate`, `up` and `y` are one row per token on the axis the guard counts,
-    // so all three read the shifted element.
+
     constexpr float c = 0.7978845608028654f;
     const float g = Elem<T>::to_f32(gate[at]);
     const float u = Elem<T>::to_f32(up[at]);
@@ -36,21 +31,6 @@ __global__ void mlp_geglu_tanh(
     y[at] = Elem<T>::from_f32(gelu * u);
 }
 
-/// **THE UNGATED GELU** (`.wiki/alto/multimodal.md` §6.2).
-///
-/// `y = gelu_tanh(x)`, one thread per element, no `up` half to multiply.
-/// `Qwen3_5VisionMLP` is `linear_fc2(act(linear_fc1(x)))` with
-/// `hidden_act: gelu_pytorch_tanh` and the merger is the same shape — NOT
-/// gated, which every other gelu arm on this plane assumes.
-///
-/// **WHAT NOT HAVING THIS COSTS, said so the arm's existence is a number.**
-/// It is bakeable without a kernel: declare `gate_up` at `[2*inter, hidden]`
-/// with the `up` half zero and the `up` half of the bias one, and
-/// `mlp_geglu_tanh_packed` computes `gelu_tanh(fc1(x)) * 1`. That pays the
-/// GEMM and the bank twice over — on qwen36's 27 blocks at 1152 -> 4304 it is
-/// 268 M parameters, 0.5 GiB of bf16, written and multiplied to produce ones.
-/// The tanh polynomial here is `mlp_geglu_tanh`'s, transcribed, so the two
-/// spellings answer the same number.
 template <class T>
 __global__ void mlp_gelu_tanh(
     const T* __restrict__ x,
@@ -62,19 +42,14 @@ __global__ void mlp_gelu_tanh(
 {
     const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `idx` is the element already.
+
     if (win != nullptr &&
         static_cast<long long>(idx) >=
             static_cast<long long>(win[0]) * fan * width) return;
     const long long at = win != nullptr
         ? idx + static_cast<long long>(win[1]) * fan * width
         : idx;
-    // `x` and `y` are one row per token on the axis the guard counts, so both
-    // read the shifted element.
+
     constexpr float c = 0.7978845608028654f;
     const float g = Elem<T>::to_f32(x[at]);
     y[at] = Elem<T>::from_f32(
@@ -92,34 +67,20 @@ __global__ void gate_sigmoid_mul(
 {
     const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, the planes
-    // arrive at their base and this lane owns element `at`; null, they arrived
-    // pre-shifted and `i` is the element already.
+
     if (win != nullptr &&
         static_cast<long long>(i) >=
             static_cast<long long>(win[0]) * fan * width) return;
     const long long at = win != nullptr
         ? i + static_cast<long long>(win[1]) * fan * width
         : i;
-    // `x` and its gate are one row per token on the axis the guard counts, so
-    // both read the shifted element.
+
     const float xv = Elem<T>::to_f32(x[at]);
     const float gv = Elem<T>::to_f32(gate[at]);
     const float s = 1.f / (1.f + __expf(-gv));
     x[at] = Elem<T>::from_f32(xv * s);
 }
 
-/// **THE PER-HEAD GATE**: one logit per head per row, broadcast across the
-/// head's channels, with a constant in front of the sigmoid
-/// (`x[h·head_dim + j] *= scale · σ(gate[h])`). LTX-2's gated attention is
-/// this at `scale = 2`; the flat `gate_sigmoid_mul` above wants a gate plane
-/// as wide as the rectangle, which a `[rows, heads]` logit is not.
-///
-/// One block per ROW (`rope_axes`'s seat, not the flat one): the gate plane
-/// is `heads` wide and the gated plane `heads·head_dim`, so an element index
-/// answers neither. fp32 sigmoid and product, one rounding at the store.
 template <class T>
 __global__ void gate_sigmoid_mul_heads(
     T* __restrict__ x,
@@ -162,33 +123,13 @@ __device__ __forceinline__ void mlp_swiglu_body(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // **THE SEAT COUNTS TOKENS AND THIS PLANE COUNTS `fan` ROWS PER TOKEN.**
-    // The staged-geometry seat (qkv_fused.cuh's idiom) retires the rows a
-    // replay's bucket-carved grid added, off a word the fire staged and not a
-    // parameter the recording baked — and `win[0]` counts them in TOKENS. A
-    // dense MLP's packed rectangle is one row per token and `fan` is 1; a
-    // ROUTED one is a `select`'s output, one row per ROUTE, so a window of
-    // `win[0]` token rows starting at `win[1]` is a run of `win[0] * fan`
-    // rows starting at row `win[1] * fan`. `moe.cuh`'s select states the
-    // identical rule at its own guard, and multiplies once for it.
-    //
-    // Comparing a route index against a token count is what this multiply
-    // closes: at eight tokens and a fan-out of eight it computed the first
-    // eight of sixty-four routes and returned from the rest, so every route
-    // past the first token's kept the bytes of the fire before this one — a
-    // one-fire lag on a routed SKU, invisible on a dense one, and absent
-    // whenever the seat is null because then nothing is retired at all.
+
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
-    // The seat's second word says WHERE those rows are, on this plane's own
-    // axis. Armed, the pointers are the plane's own base and this block owns
-    // plane row `win[1] * fan + n`; null, they arrived pre-shifted and `n` is
-    // the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    // `packed` and `y` are both one row per PLANE ROW — the axis the guard
-    // counts once it is scaled by `fan` — so both read the shifted row.
     const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
@@ -212,33 +153,13 @@ __device__ __forceinline__ void mlp_situ_body(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // **THE SEAT COUNTS TOKENS AND THIS PLANE COUNTS `fan` ROWS PER TOKEN.**
-    // The staged-geometry seat (qkv_fused.cuh's idiom) retires the rows a
-    // replay's bucket-carved grid added, off a word the fire staged and not a
-    // parameter the recording baked — and `win[0]` counts them in TOKENS. A
-    // dense MLP's packed rectangle is one row per token and `fan` is 1; a
-    // ROUTED one is a `select`'s output, one row per ROUTE, so a window of
-    // `win[0]` token rows starting at `win[1]` is a run of `win[0] * fan`
-    // rows starting at row `win[1] * fan`. `moe.cuh`'s select states the
-    // identical rule at its own guard, and multiplies once for it.
-    //
-    // Comparing a route index against a token count is what this multiply
-    // closes: at eight tokens and a fan-out of eight it computed the first
-    // eight of sixty-four routes and returned from the rest, so every route
-    // past the first token's kept the bytes of the fire before this one — a
-    // one-fire lag on a routed SKU, invisible on a dense one, and absent
-    // whenever the seat is null because then nothing is retired at all.
+
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
-    // The seat's second word says WHERE those rows are, on this plane's own
-    // axis. Armed, the pointers are the plane's own base and this block owns
-    // plane row `win[1] * fan + n`; null, they arrived pre-shifted and `n` is
-    // the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    // `packed` and `y` are both one row per PLANE ROW — the axis the guard
-    // counts once it is scaled by `fan` — so both read the shifted row.
     const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
@@ -268,32 +189,13 @@ __device__ __forceinline__ void mlp_geglu_tanh_packed_body(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // **THE SEAT COUNTS TOKENS AND THIS PLANE COUNTS `fan` ROWS PER TOKEN.**
-    // The staged-geometry seat (qkv_fused.cuh's idiom) retires the rows a
-    // replay's bucket-carved grid added, off a word the fire staged and not a
-    // parameter the recording baked — and `win[0]` counts them in TOKENS. A
-    // dense MLP's packed rectangle is one row per token and `fan` is 1; a
-    // ROUTED one is a `select`'s output, one row per ROUTE, so a window of
-    // `win[0]` token rows starting at `win[1]` is a run of `win[0] * fan`
-    // rows starting at row `win[1] * fan`. `moe.cuh`'s select states the
-    // identical rule at its own guard, and multiplies once for it.
-    //
-    // Comparing a route index against a token count is what this multiply
-    // closes: at eight tokens and a fan-out of eight it computed the first
-    // eight of sixty-four routes and returned from the rest, so every route
-    // past the first token's kept the bytes of the fire before this one — a
-    // one-fire lag on a routed SKU, invisible on a dense one, and absent
-    // whenever the seat is null because then nothing is retired at all.
+
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
-    // The seat's second word says WHERE those rows are, on this plane's own
-    // axis. Armed, the pointers are the plane's own base and this block owns
-    // plane row `win[1] * fan + n`; null, they arrived pre-shifted and `n` is
-    // the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
-    // `packed` and `y` are both one row per PLANE ROW — the axis the guard
-    // counts once it is scaled by `fan` — so both read the shifted row.
+
     const long long packed_row = static_cast<long long>(plane_row) * 2 * I;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
     const float u = Elem<T>::to_f32(packed[packed_row + up_offset<GateSecond>(i, I)]);
@@ -321,33 +223,13 @@ __global__ void mlp_swiglu_clamp(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // **THE SEAT COUNTS TOKENS AND THIS PLANE COUNTS `fan` ROWS PER TOKEN.**
-    // The staged-geometry seat (qkv_fused.cuh's idiom) retires the rows a
-    // replay's bucket-carved grid added, off a word the fire staged and not a
-    // parameter the recording baked — and `win[0]` counts them in TOKENS. A
-    // dense MLP's packed rectangle is one row per token and `fan` is 1; a
-    // ROUTED one is a `select`'s output, one row per ROUTE, so a window of
-    // `win[0]` token rows starting at `win[1]` is a run of `win[0] * fan`
-    // rows starting at row `win[1] * fan`. `moe.cuh`'s select states the
-    // identical rule at its own guard, and multiplies once for it.
-    //
-    // Comparing a route index against a token count is what this multiply
-    // closes: at eight tokens and a fan-out of eight it computed the first
-    // eight of sixty-four routes and returned from the rest, so every route
-    // past the first token's kept the bytes of the fire before this one — a
-    // one-fire lag on a routed SKU, invisible on a dense one, and absent
-    // whenever the seat is null because then nothing is retired at all.
+
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
-    // The seat's second word says WHERE those rows are, on this plane's own
-    // axis. Armed, the pointers are the plane's own base and this block owns
-    // plane row `win[1] * fan + n`; null, they arrived pre-shifted and `n` is
-    // the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    // `packed` and `y` are both one row per PLANE ROW — the axis the guard
-    // counts once it is scaled by `fan` — so both read the shifted row.
     const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     float g = Elem<T>::to_f32(packed[packed_row + i]);
@@ -366,33 +248,13 @@ __global__ void mlp_swiglu_clamp_alpha(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // **THE SEAT COUNTS TOKENS AND THIS PLANE COUNTS `fan` ROWS PER TOKEN.**
-    // The staged-geometry seat (qkv_fused.cuh's idiom) retires the rows a
-    // replay's bucket-carved grid added, off a word the fire staged and not a
-    // parameter the recording baked — and `win[0]` counts them in TOKENS. A
-    // dense MLP's packed rectangle is one row per token and `fan` is 1; a
-    // ROUTED one is a `select`'s output, one row per ROUTE, so a window of
-    // `win[0]` token rows starting at `win[1]` is a run of `win[0] * fan`
-    // rows starting at row `win[1] * fan`. `moe.cuh`'s select states the
-    // identical rule at its own guard, and multiplies once for it.
-    //
-    // Comparing a route index against a token count is what this multiply
-    // closes: at eight tokens and a fan-out of eight it computed the first
-    // eight of sixty-four routes and returned from the rest, so every route
-    // past the first token's kept the bytes of the fire before this one — a
-    // one-fire lag on a routed SKU, invisible on a dense one, and absent
-    // whenever the seat is null because then nothing is retired at all.
+
     if (win != nullptr && n >= static_cast<i32>(win[0]) * fan) return;
-    // The seat's second word says WHERE those rows are, on this plane's own
-    // axis. Armed, the pointers are the plane's own base and this block owns
-    // plane row `win[1] * fan + n`; null, they arrived pre-shifted and `n` is
-    // the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) * fan : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    // `packed` and `y` are both one row per PLANE ROW — the axis the guard
-    // counts once it is scaled by `fan` — so both read the shifted row.
     const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     float g = Elem<T>::to_f32(packed[packed_row + i]);
@@ -447,19 +309,13 @@ __global__ void moe_sigmoid_gate_add(
     const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<i32>(win[0])) return;
-    // The seat's second word says WHERE those rows are. Armed, the pointers
-    // are the plane's own base and this block owns plane row `win[1] + n`;
-    // null, they arrived pre-shifted and `n` is the row already.
+
     const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= H) return;
-    // The gate is one scalar per token row at its row's head, so it is a
-    // plane of the guarded axis like `out`, `sum` and `x`: all four shift
-    // together, or the row would be gated by another row's scalar.
+
     const float gv =
         Elem<T>::to_f32(scalar_gate[static_cast<long long>(plane_row) * stride]);
     const float s = 1.f / (1.f + __expf(-gv));

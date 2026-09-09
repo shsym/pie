@@ -1,11 +1,3 @@
-//! Metal (MSL) region emitters: the only producer of Pie's generated MSL.
-//! Emission is a pure function of the plan, so the same stage emits the
-//! same bytes every time and `compiler/tests/golden-msl/` pins them.
-//!
-//! Most emitters return `Result<String, EmitError>` and refuse rather than
-//! emit a kernel they cannot justify; the three taking no plan return a bare
-//! `String` because their inputs are a name and a closed-enum tag.
-
 pub mod effects;
 pub mod fused;
 pub mod intrinsics;
@@ -37,46 +29,24 @@ pub use streamed::{
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the engine's pipeline cache keys on it.
-pub const METAL_M1_EMITTER_VERSION: u16 = 52;
+pub const METAL_M1_EMITTER_VERSION: u16 = 53;
 
-/// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
-/// `words_N` buffer per channel starting at buffer 2, and Metal's highest
-/// buffer index is 30. Enforced by `emit_readiness` / `emit_commit`.
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 
-/// `kMetalM2MaxFusedChannels` — a fused region binds committed/pending pairs
-/// from buffer 7, which caps the direct-binding form at 12 channels. Lower
-/// for a region that also reads a second intrinsic rectangle (binding down
-/// from index 30); [`intrinsics::fused_channel_ceiling`] knows which applies.
 pub const METAL_M2_MAX_FUSED_CHANNELS: usize = 12;
 
-/// `M1ChannelEffect` — what one channel needs before a lane may run, and what
-/// the lane does to it on commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct M1ChannelEffect {
-    /// The lane may run only when this channel's ring is non-empty — a
-    /// `take`/`read` precondition.
     pub requires_full: bool,
-    /// The lane may run only when this channel's ring has room — a `put`
-    /// precondition.
     pub requires_empty: bool,
-    /// On commit the lane pops one committed cell from this channel.
     pub take: bool,
-    /// On commit the lane pushes one value to this channel.
     pub put: bool,
-    /// The channel ring's capacity — its bound on committed cells.
     pub capacity: u32,
 }
 
-/// `M1OpMeta` — one accepted singleton op: where it sits in the stage, the SSA
-/// id its first result defines, and the `COp` view the engine dispatches on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct M1OpMeta {
-    /// The op's position in the stage op list.
     pub node: u32,
-    /// The SSA id this op's first result defines.
     pub result_base: u32,
-    /// The decoded [`OpView`] the engine dispatches on.
     pub op: OpView,
 }

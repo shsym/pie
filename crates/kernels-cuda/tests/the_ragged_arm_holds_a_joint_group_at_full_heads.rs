@@ -1,12 +1,3 @@
-//! `attention.ragged` lands what `attention.dense` lands over ONE joint
-//! group of a DiT's shape — text rows then a whole latent grid, every head
-//! its own kv head (`group_size = 1`, 24 heads of width 128: FLUX.2-klein's
-//! joint attention) — at the row counts a 512-token prompt and a 1024²,
-//! 512² or 800² latent give. The sibling test covers grouped heads over
-//! several small groups; this is the one-long-group, ungrouped shape.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_holds_a_joint_group_at_full_heads`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,7 +8,6 @@ use kernels_cuda::attn_dense;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
 use kernels_cuda::tensor::Tensor;
 
-/// Two bf16 roundings at `|o| < 1`.
 const TOLERANCE: f32 = 1.0e-2;
 
 fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
@@ -89,17 +79,21 @@ fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
     );
 }
 
+fn the_ragged_arm_holds_a_joint_group_at_full_heads_every_case() {
+    a_512_plus_4096_row_group_at_24_full_heads();
+    a_512_plus_1024_row_group_at_24_full_heads();
+    a_512_plus_2500_row_group_at_24_full_heads();
+}
+
 #[test]
 fn a_512_plus_4096_row_group_at_24_full_heads() {
     against_dense(512 + 4096, 128, 24, 0x4608);
 }
 
-#[test]
 fn a_512_plus_1024_row_group_at_24_full_heads() {
     against_dense(512 + 1024, 128, 24, 0x1536);
 }
 
-#[test]
 fn a_512_plus_2500_row_group_at_24_full_heads() {
     against_dense(512 + 2500, 128, 24, 0x3012);
 }

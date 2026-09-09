@@ -1,35 +1,3 @@
-//! **THE WAN 2.2 IMPORT READS EVERY `dit.` TENSOR OF THE TI2V-5B SNAPSHOT,
-//! EVERY `te.` TENSOR, THE VAE'S DECODER SIDE AND NOTHING OF ITS ENCODER —
-//! AND EVERY PLANE IT DECLARES TYPES TO THE EXTENTS THE PLAN STATES.**
-//!
-//! ```text
-//! cargo test -p models --test the_wan_2_import_reads_the_ti2v_snapshot
-//! ```
-//!
-//! A diffusers pipeline opens as one prefixed name space
-//! (`checkpoint::file::diffusers`): `dit.<transformer>`, `te.<text_encoder>`,
-//! `vae.<vae>`. This test builds the rows' contracts and checks them from
-//! both ends — what they read against the index, and what they declare
-//! against the contract type checker and the load-plan compiler:
-//!
-//! ```text
-//! (a) over a SYNTHETIC source shaped like `wan22_golden.py --mini`'s
-//!     state_dicts (fp32, no bytes): each miniature reads every tensor,
-//!     once per slice it is cut into (the modulation planes six or two
-//!     times, `time_embedder.linear_2` three); every plane types to its
-//!     extents and lowers to a load plan; the same under `dit.`
-//! (b) over the REAL `Wan-AI/Wan2.2-TI2V-5B-Diffusers` snapshot, when the
-//!     HuggingFace cache holds one: every `dit.` tensor is read at the
-//!     counts the cuts imply; every `te.` tensor once; EVERY `vae.` tensor
-//!     once — decoder, encoder, `post_quant_conv` and `quant_conv`, both
-//!     readings being declared; the contract types and lowers;
-//!     identification lands on the flagship
-//! (c) over the goldens' own `wan22_mini_{d128,nano}.safetensors`, when
-//!     present: each miniature reads its file and types
-//! ```
-//!
-//! (b) and (c) are skipped by name where their files are absent.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -45,11 +13,8 @@ const TI2V: &str = "wan22-ti2v-5b-bf16-kv-bf16";
 const D128: &str = "wan22-mini-d128-bf16-kv-bf16";
 const NANO: &str = "wan22-mini-nano-bf16-kv-bf16";
 
-/// One tensor of a checkpoint: its name, its shape, its element.
 type Named = (String, Vec<u64>, Leaf);
 
-/// The transformer's `state_dict`, as `wan22_golden.py --mini` and the
-/// snapshot's index both spell it, at one [`Dims`], one element type.
 fn transformer(d: &Dims, leaf: Leaf) -> Vec<Named> {
     let dim = u64::from(d.dim);
     let ffn = u64::from(d.ffn);
@@ -109,7 +74,6 @@ fn transformer(d: &Dims, leaf: Leaf) -> Vec<Named> {
     out
 }
 
-/// `UMT5EncoderModel`'s `state_dict` (`text_encoder/model.safetensors.index.json`).
 fn text_encoder() -> Vec<Named> {
     let hidden = u64::from(model::TE_HIDDEN);
     let inner = u64::from(model::TE_HEADS * model::TE_HEAD_DIM);
@@ -142,8 +106,6 @@ fn text_encoder() -> Vec<Named> {
     out
 }
 
-/// The VAE's decoder side as `AutoencoderKLWan` spells it, plus the
-/// encoder's first conv and the quant conv, which the encode arms read.
 fn vae() -> Vec<Named> {
     let dims = model::VAE_DECODER_DIMS;
     let mut out: Vec<Named> = Vec::new();
@@ -241,8 +203,6 @@ fn vae() -> Vec<Named> {
         dims[4],
         [3, 3, 3],
     );
-    // The encoder's own first conv (its input channels permuted at import)
-    // and the quant conv (its first 48 output rows).
     conv(&mut push, "encoder.conv_in", 160, 12, [3, 3, 3]);
     conv(&mut push, "quant_conv", 96, 96, [1, 1, 1]);
     out
@@ -263,9 +223,6 @@ fn bytes_of(leaf: Leaf) -> u64 {
     }
 }
 
-/// A source of these names and shapes over a sparse file holding no bytes:
-/// enough for a contract to build and type-check, which never reads a
-/// value.
 fn synthetic(dir: &Path, tensors: &[Named]) -> ztensor::Source {
     let path = dir.join("synthetic.bin");
     let mut catalog = Catalog::new();
@@ -307,7 +264,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// The checkpoint's types, for the contract type checker.
 struct Types<'a>(&'a ztensor::Source);
 
 impl CheckpointTypes for Types<'_> {
@@ -321,7 +277,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-/// How many times each checkpoint tensor is named by the contract.
 fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -332,9 +287,6 @@ fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     counts
 }
 
-/// Every declared plane, in contract order, types to the extents it
-/// declares — `Out` references resolving against what came before — and the
-/// whole contract lowers to a load plan.
 fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     let types = Types(src);
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
@@ -363,9 +315,6 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     assert!(!plan.instrs.is_empty());
 }
 
-/// The read counts a transformer's tensors get: one each, but the sliced
-/// modulation planes (six, or two for the head's table),
-/// `time_embedder.linear_2` (its own read plus the two-fold stack).
 fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
     transformer(d, Leaf::F32)
         .into_iter()
@@ -379,13 +328,6 @@ fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
             } else if name.starts_with("condition_embedder.time_embedder.linear_2.") {
                 3
             } else {
-                // `proj_out` is read ONCE, permutation and all: its
-                // `(ph, pw, c)` → `(c, ph, pw)` row gather rides inside a
-                // `read_over`, where the ladder lowers it under the cast
-                // rather than around it. (It was one slice per row while the
-                // permutation was spelled as a concatenation of one-row
-                // slices — the shape `read_expr` forced, and the reason the
-                // fp32 → bf16 cast refused the plane it landed.)
                 1
             };
             (format!("{prefix}{name}"), count)
@@ -393,7 +335,6 @@ fn expected_dit_reads(prefix: &str, d: &Dims) -> BTreeMap<String, usize> {
         .collect()
 }
 
-/// A miniature's contract over `src` (bare names or `dit.`-prefixed).
 fn check_mini(sku: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
     let row = models::sku(sku).expect("the catalog ships the miniature");
     let contract = row
@@ -407,7 +348,13 @@ fn check_mini(sku: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
     type_checks(&contract, src);
 }
 
-/// (a)
+fn the_wan_2_import_reads_the_ti2v_snapshot_every_case() {
+    each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed();
+    the_flagship_refuses_a_bare_miniature();
+    the_flagship_reads_the_real_snapshot();
+    each_miniature_reads_its_golden_fixture();
+}
+
 #[test]
 fn each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     for (sku, d) in [(D128, Dims::mini_d128()), (NANO, Dims::mini_nano())] {
@@ -423,13 +370,6 @@ fn each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     }
 }
 
-/// The flagship over a bare miniature refuses at build, having no encoder
-/// or VAE to read; a miniature over the flagship's transformer alone
-/// refuses too (`ffn.net.0.proj` is there, `dit.` or not, but its
-/// `condition_embedder.time_proj` slices are cut at the wrong width and
-/// the type checker refuses — the names are read, the shapes are not, at
-/// build; identification is the whole reading).
-#[test]
 fn the_flagship_refuses_a_bare_miniature() {
     let dir = scratch();
     let bare = transformer(&Dims::mini_d128(), Leaf::F32);
@@ -442,8 +382,6 @@ fn the_flagship_refuses_a_bare_miniature() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The repo directory in the HuggingFace cache, honoring the same
-/// precedence `huggingface_hub` uses.
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -463,8 +401,6 @@ fn snapshot() -> Option<PathBuf> {
         .find(|path| path.join("model_index.json").is_file())
 }
 
-/// (b)
-#[test]
 fn the_flagship_reads_the_real_snapshot() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no Wan-AI/Wan2.2-TI2V-5B-Diffusers snapshot in the HuggingFace cache");
@@ -474,8 +410,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let index: BTreeSet<String> = src.names().map(str::to_string).collect();
 
-    // The synthetic transformer and encoder of (a) are the snapshot's,
-    // name for name and shape for shape.
     for (component, synthesized) in [
         (
             "dit.",
@@ -499,7 +433,6 @@ fn the_flagship_reads_the_real_snapshot() {
     assert_eq!(index.iter().filter(|n| n.starts_with("dit.")).count(), 825);
     assert_eq!(index.iter().filter(|n| n.starts_with("te.")).count(), 242);
     assert_eq!(index.iter().filter(|n| n.starts_with("vae.")).count(), 196);
-    // And the decoder names of (a) are all in the snapshot at their shapes.
     for (name, shape, _) in prefixed("vae.", vae()) {
         let real = src
             .get(&name)
@@ -513,7 +446,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));
     let counts = reads(&contract);
 
-    // Every `dit.` tensor, at the counts the cuts imply.
     let dit: BTreeMap<String, usize> = counts
         .iter()
         .filter(|(n, _)| n.starts_with("dit."))
@@ -521,23 +453,14 @@ fn the_flagship_reads_the_real_snapshot() {
         .collect();
     assert_eq!(dit, expected_dit_reads("dit.", &Dims::ti2v_5b()));
 
-    // Every `te.` tensor, once: the whole encoder runs.
     let te_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("te.")).collect();
     let te_want: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("te.")).collect();
     assert_eq!(te_read, te_want, "every encoder plane is read");
 
-    // The VAE, whole: both readings are declared, so the decoder, the
-    // encoder and the two 1x1 convs between them are all read.
     let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
     let vae_want: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("vae.")).collect();
     assert_eq!(vae_read, vae_want, "every VAE plane is read");
 
-    // Every other tensor exactly once — the row-permuted VAE convs
-    // included. A `time_conv` `(r1, c)` → `(c, r1)` and `conv_out`'s
-    // `(c, pw, ph)` → `(c, ph, pw)` are gathers inside a `read_over`, which
-    // the ladder lowers UNDER the fp32 → bf16 cast; spelled as a
-    // concatenation of one-row slices they were one read per row, and the
-    // cast then refused the plane they landed.
     let odd: BTreeSet<&String> = counts
         .iter()
         .filter(|(n, c)| !n.starts_with("dit.") && **c != 1)
@@ -547,7 +470,6 @@ fn the_flagship_reads_the_real_snapshot() {
 
     type_checks(&contract, &src);
 
-    // The identification sweep lands on the flagship and no earlier row.
     let identified = models::identify(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the snapshot identifies as nothing: {why}"));
     assert_eq!(identified, TI2V);
@@ -561,8 +483,6 @@ fn golden(file: &str) -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// (c)
-#[test]
 fn each_miniature_reads_its_golden_fixture() {
     for (sku, d, file) in [
         (D128, Dims::mini_d128(), "wan22_mini_d128.safetensors"),

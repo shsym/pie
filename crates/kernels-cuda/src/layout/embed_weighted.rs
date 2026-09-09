@@ -1,8 +1,3 @@
-//! `EmbedWeighted`: the interpolating gather for position embeddings. The
-//! table is resampled per image grid, which an import cannot precompute, so
-//! it is read at fire time; on the native grid, `layout.embed` is used
-//! unchanged.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -15,18 +10,6 @@ const WARP: u32 = 32;
 
 const MAX_BLOCK: u32 = 1024;
 
-/// **`y[r] = Σₜ weights[r, t] · table[ids[r, t]]`.**
-///
-/// `ids` is `[rows, taps]` `i32` and `weights` is `[rows, taps]` `f32`;
-/// `taps` is read off their width (4 for bilinear, 16 for bicubic). `vocab`
-/// is the table's row count.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for a table that is not bf16 or f16; a refusal
-/// for an `ids` that is not `i32` or a `weights` that is not `f32`, for the
-/// two geometry rectangles disagreeing with each other or with `y`, for a
-/// zero tap count, and for an empty output.
 pub fn embed_weighted(
     ctx: &Ctx,
     ids: Tensor,
@@ -90,7 +73,6 @@ pub fn embed_weighted(
             hidden.arg(),
             vocab.arg(),
             taps.arg(),
-            // staged-geometry seat: live-rows word, or the null seat (`ABSENT`).
             ctx.stage(),
         ],
     )

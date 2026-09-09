@@ -1,12 +1,3 @@
-//! **THE VOXEL-AXIS RESHAPES MOVE EVERY ELEMENT WHERE THE REFERENCE PUTS
-//! IT**: `pixel_shuffle` lands the `torch.pixel_shuffle` ordering on a
-//! hand-computed example, `pixel_unshuffle` inverts it, `patchify` and
-//! `unpatchify` round-trip, and `upsample_nearest` matches the host
-//! reference with and without the causal first-frame rule, and `avg_down`
-//! answers `AvgDown3D` — on two lanes of different boxes.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_voxel_reshapes_land_the_reference_ordering`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -21,17 +12,16 @@ use kernels_cuda::spatial::{
 };
 use kernels_cuda::tensor::Tensor;
 
-/// `torch.pixel_shuffle(x, 2)` on `x = arange(8).reshape(1, 4, 1, 2)`:
-///
-/// ```text
-/// x[c][0][w] = 2c + w          out[0][ho][wo] = x[(ho % 2) * 2 + wo % 2][0][wo / 2]
-/// out[0][0] = [x0[0], x1[0], x0[1], x1[1]] = [0, 2, 1, 3]
-/// out[0][1] = [x2[0], x3[0], x2[1], x3[1]] = [4, 6, 5, 7]
-/// ```
-///
-/// In the voxel-row layout the input is two rows (`w = 0, 1`) of four
-/// channels, `[[0, 2, 4, 6], [1, 3, 5, 7]]`, and the output eight rows of
-/// one channel in `(h, w)` order.
+fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
+    pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example();
+    pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference();
+    patchify_and_unpatchify_round_trip_over_the_token_box();
+    upsample_nearest_repeats_every_frame();
+    upsample_nearest_keeps_the_first_frame_single();
+    avg_down_answers_the_avgdown3d_reference();
+    avg_down_pads_a_short_chunks_time_axis_in_front();
+}
+
 #[test]
 fn pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example() {
     let x: Vec<u16> = [0.0, 2.0, 4.0, 6.0, 1.0, 3.0, 5.0, 7.0]
@@ -70,7 +60,6 @@ const BOXES: [Box3; 2] = [Box3::new(2, 4, 6), Box3::new(4, 2, 4)];
 
 const R: [u32; 3] = [2, 2, 2];
 
-#[test]
 fn pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference() {
     let c = 3usize;
     let vol = 8usize;
@@ -105,7 +94,6 @@ fn pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference() {
     assert_eq!(got_back, x_raw, "the round trip");
 }
 
-#[test]
 fn patchify_and_unpatchify_round_trip_over_the_token_box() {
     let c = 4usize;
     let p = [1u32, 2, 2];
@@ -174,26 +162,14 @@ fn upsample(keep_first: bool) {
     assert_eq!(got, want, "keep_first {keep_first}");
 }
 
-#[test]
 fn upsample_nearest_repeats_every_frame() {
     upsample(false);
 }
 
-#[test]
 fn upsample_nearest_keeps_the_first_frame_single() {
     upsample(true);
 }
 
-/// `AvgDown3D` against the module it is: the same channel-major block
-/// `pixel_unshuffle` lays out, averaged in runs of `group`, with the TIME
-/// axis zero-padded IN FRONT where the box does not fill the block.
-///
-/// Three shapes, all of them Wan 2.2's: `(1, 2, 2)` with `group = 4` (the
-/// first down block's shortcut — a plain 2x2 spatial pool), `(2, 2, 2)`
-/// with `group = 4` (the temporal ones — a spatial pool that keeps the
-/// time block as two channels per input channel), and `(1, 1, 1)` with
-/// `group = 1`, which the reference builds for the last down block and
-/// which must be the identity.
 fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
     let (grid, rows) = table(boxes);
     let ru = r.map(|v| v as usize);
@@ -240,11 +216,7 @@ fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
     eprintln!("avg_down {r:?} group {group}: {rows} -> {rows_out} rows, max |err| {worst:.5}");
 }
 
-#[test]
 fn avg_down_answers_the_avgdown3d_reference() {
-    // Boxes that DIVIDE the time block and one that does not: `t = 1` under
-    // `factor_t = 2` is the encoder head chunk, where the front pad is a
-    // whole frame of zeros and halves every channel it reaches.
     const EVEN: [Box3; 2] = [Box3::new(4, 4, 6), Box3::new(2, 2, 4)];
     const ODD: [Box3; 2] = [Box3::new(1, 4, 6), Box3::new(3, 2, 4)];
     avg_down_case(&EVEN, 5, [1, 2, 2], 4);
@@ -254,15 +226,9 @@ fn avg_down_answers_the_avgdown3d_reference() {
     avg_down_case(&ODD, 3, [1, 1, 1], 1);
 }
 
-/// The front pad, stated on its own: one frame under a factor-2 time block
-/// leaves the EVEN widened channels reading a zero frame, so a `group` of
-/// `fh·fw` (which never crosses the time block) lands exactly half of the
-/// spatial pool on those channels and the pool itself on the odd ones.
-#[test]
 fn avg_down_pads_a_short_chunks_time_axis_in_front() {
     let boxes = [Box3::new(1, 2, 2)];
     let (grid, rows) = table(&boxes);
-    // One channel, four voxels, values 1..4: the 2x2 spatial pool is 2.5.
     let x: Vec<u16> = [1.0f32, 2.0, 3.0, 4.0].map(to_bf16).to_vec();
     let (o_grid, rows_out) = table(&[Box3::new(1, 1, 1)]);
     assert_eq!((rows, rows_out), (4, 1));
@@ -289,6 +255,5 @@ fn avg_down_pads_a_short_chunks_time_axis_in_front() {
         .into_iter()
         .map(from_bf16)
         .collect();
-    // Channel 0 is the padded (zero) frame's pool, channel 1 the real one.
     assert_eq!(got, [0.0, 2.5]);
 }

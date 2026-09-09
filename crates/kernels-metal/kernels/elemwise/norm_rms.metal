@@ -93,15 +93,6 @@ template <typename T, int N_READS>
       inv_rms, partials, lid, simd_lane, simd_group, tg_size);
 }
 
-/// **THE RESIDUAL FOLD AND THE NORM THAT READS IT, ONE LAUNCH** —
-/// `Elementwise::ResidualAddRmsnorm`, which `model_ir::fuse` writes for every
-/// `residual_add` whose result the next `rmsnorm` reads (a pre-norm block's
-/// tail and the next block's head). CUDA has had the kernel; Metal paid two
-/// launches for the fused node until this one. Bit for bit the two launches'
-/// answer: `y` is folded and STORED as bf16 first, the moments are taken over
-/// the stored value, and the second pass is `rms_row_body`'s epilogue over
-/// `y` as it lies — so nothing is computed from an unrounded intermediate the
-/// separate norm never saw.
 template <typename T, int N_READS>
 [[kernel]] void residual_add_rms_single_row(
     const device T* x          [[buffer(0)]],
@@ -239,16 +230,8 @@ instantiate_rms_strided_head_row(bfloat16, bfloat, 4)
 
 instantiate_rms_single_row(bfloat16, bfloat, 4)
 
-// The hyper-connection norm (`norm.cuh`'s `rmsnorm_grouped_plus_one`): the
-// moments are per `axis_size`-wide group, exactly as `rms_single_row` already
-// takes them, and the ONE thing that differs is where the gain comes from.
-// `rms_single_row` reads one `axis_size`-wide weight plane and shares it
-// across every group of the row; this one gives each group its OWN plane, so
-// the bank is `groups * axis_size` wide and the group picks its slice.
-//
-// The flattening is `rms_single_row`'s: one threadgroup per (row, group), laid
-// out `rows x groups`, so `gid % groups` is the group and the weight plane
-// moves with it while the data pointer does not care which is which.
+instantiate_rms_single_row(float32, float, 4)
+
 template <typename T, int N_READS>
 [[kernel]] void rms_grouped_row(
     const device T* x          [[buffer(0)]],

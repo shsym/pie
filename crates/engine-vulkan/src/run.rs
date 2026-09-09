@@ -363,13 +363,11 @@ impl<'c> Run<'c> {
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            // Gathered across every lane: handed over whole.
             Some(Dim::Readouts) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
-            // M0: the voxel axis (D8) is CUDA-only; this shell seats no voxel rectangle.
             Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
                 panic!("value {} lives on the voxel axis, which this shell does not seat", id.0)
             }
@@ -437,7 +435,6 @@ impl<'c> Run<'c> {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
-            // This shell dispatches no `layout.gather_rows`, so nothing reads it.
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.tokens,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
 
@@ -508,8 +505,6 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // M0: the float ports (D3) and the row-packing table (D2) are
-            // CUDA-first; this shell stages none of them in this phase.
             Def::Input(
                 which @ (RuntimeInput::RowPermutation { .. }
                 | RuntimeInput::Latents { .. }
@@ -539,8 +534,6 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => seat.request_of_token,
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
-                    // M0: the group tables (D2) are CUDA-first; this shell
-                    // stages none of them in this phase.
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
                     | GeomKind::LaneIndptr { .. }

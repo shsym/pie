@@ -1,51 +1,34 @@
-// selector_walk.metal — DFlash2's candidate selector, walked.
-//
-// The reference (`mlx_dspark.dflash_model.CandidateSelector`) scores every
-// `(predecessor, candidate)` pair of adjacent slots,
-//
-//     scores[s, p, c] = unary[s, c] + < A[pred[s, p]] * hp[s], B[cand[s, c]] >
-//
-// and `walk_greedy` follows the best successor from the anchor: only the ROW
-// of the predecessor actually chosen is ever read, so a walk is `slots x K`
-// dot products of `rank` terms, not `slots x K x K`. One threadgroup per
-// request: 256 threads are sixteen lanes a candidate, the lanes stride the
-// rank and fold with shuffles inside their aligned sixteen (two candidates a
-// simdgroup), thread 0 takes the argmax (ties to the lower candidate) and the
-// pick becomes the next slot's predecessor. Rows are the request's span in
-// order: the first is the anchor (its pick is its first candidate, unread by
-// any guest), the rest are mask slots.
-//
-// bf16 in, f32 accumulation; the reference is bf16 bilinear plus f32 unary.
+
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
 
 constant constexpr uint kWalkThreads = 256;
-constant constexpr uint kWalkLanes = 16;          // lanes a candidate
+constant constexpr uint kWalkLanes = 16;
 constant constexpr uint kWalkMaxK = kWalkThreads / kWalkLanes;
 
 template <typename T>
 [[kernel]] void selector_walk(
-    const device int* cand        [[buffer(0)]],   // [rows, k]
-    const device int* indptr      [[buffer(1)]],   // [lanes + 1]
-    const device float* unary     [[buffer(2)]],   // [rows, k]
-    const device T* hp            [[buffer(3)]],   // [rows, rank]
-    const device int* tokens      [[buffer(4)]],   // [rows]
-    const device T* pred          [[buffer(5)]],   // [vocab, rank]
-    const device T* succ          [[buffer(6)]],   // [vocab, rank]
-    device int* picks             [[buffer(7)]],   // [rows]
+    const device int* cand        [[buffer(0)]],
+    const device int* indptr      [[buffer(1)]],
+    const device float* unary     [[buffer(2)]],
+    const device T* hp            [[buffer(3)]],
+    const device int* tokens      [[buffer(4)]],
+    const device T* pred          [[buffer(5)]],
+    const device T* succ          [[buffer(6)]],
+    device int* picks             [[buffer(7)]],
     const constant int& k         [[buffer(8)]],
     const constant int& rank      [[buffer(9)]],
     const constant int& vocab     [[buffer(10)]],
-    const constant int& has_hp    [[buffer(11)]],   // 0: a plain bigram lattice
-    const constant int& first     [[buffer(12)]],   // the span's first slot row
+    const constant int& has_hp    [[buffer(11)]],
+    const constant int& first     [[buffer(12)]],
     uint2 pos                     [[thread_position_in_grid]],
     uint2 lpos                    [[thread_position_in_threadgroup]]) {
   const int r = int(pos.y);
   const uint tid = lpos.x;
-  const uint c = tid / kWalkLanes;     // this thread's candidate
-  const uint lane = tid % kWalkLanes;  // its lane inside the candidate
+  const uint c = tid / kWalkLanes;
+  const uint lane = tid % kWalkLanes;
   const int begin = indptr[r];
   const int end = indptr[r + 1];
   if (end <= begin) {
@@ -55,9 +38,7 @@ template <typename T>
   threadgroup float score[kWalkMaxK];
   threadgroup int prev_id;
   if (tid == 0) {
-    // The predecessor of the first slot is the anchor's own token. When the
-    // anchor row is not a slot (`first == 1`) it proposes nothing, and its
-    // pick is its own first candidate.
+
     if (first > 0) {
       picks[begin] = cand[size_t(begin) * size_t(k)];
     }
@@ -86,9 +67,7 @@ template <typename T>
         }
       }
     }
-    // Fold the sixteen lanes of this candidate; the xor tree stays inside
-    // the aligned sixteen, so the two candidates sharing a simdgroup do not
-    // mix.
+
     partial += simd_shuffle_xor(partial, 8u);
     partial += simd_shuffle_xor(partial, 4u);
     partial += simd_shuffle_xor(partial, 2u);

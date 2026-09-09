@@ -1,14 +1,3 @@
-//! The planner: a pure function from cluster membership to the two published
-//! snapshots. The worker view pairs decode clients with bounded,
-//! model-compatible prefill and encode executors.
-//!
-//! The gateway view is global (same for every gateway), so the wire
-//! [`RoutingTable`] is produced directly. The worker view is per-worker, so
-//! the internal [`Topology`] holds every worker's wire-ready peer list keyed
-//! by id; the service projects one [`Neighbors`] from it per `watch_worker`.
-//!
-//! [`Neighbors`]: controller_api::Neighbors
-
 use std::collections::HashMap;
 
 use controller_api::{
@@ -20,21 +9,13 @@ use crate::state::Cluster;
 
 const PARTNERS_PER_ROLE: usize = 2;
 
-/// Worker-facing plan: each worker's wire-ready peer list plus the global
-/// gateway roster, versioned by `worker_epoch`. Internal; the service projects
-/// one entry per `watch_worker`.
 #[derive(Debug, Clone, Default)]
 pub struct Topology {
     pub epoch: u64,
     pub peers: HashMap<WorkerId, Vec<NeighborPeer>>,
-    /// The live gateway roster, identical for every worker (global full-mesh
-    /// dial-in). Copied verbatim into each projected [`Neighbors`].
     pub gateways: Vec<GatewayEndpoint>,
 }
 
-/// Build deterministic D4 pairings. Decode workers are assigned at most
-/// [`PARTNERS_PER_ROLE`] same-model executors of each role. Executors with the
-/// lowest current decode fan-in win, with [`WorkerId`] breaking ties.
 fn pairing_plan(cluster: &Cluster) -> HashMap<WorkerId, Vec<NeighborPeer>> {
     let mut peers: HashMap<WorkerId, Vec<NeighborPeer>> =
         cluster.workers.keys().map(|&id| (id, Vec::new())).collect();
@@ -89,9 +70,6 @@ fn pairing_plan(cluster: &Cluster) -> HashMap<WorkerId, Vec<NeighborPeer>> {
     peers
 }
 
-/// The global gateway roster: every registered gateway as a dial-in target.
-/// Identical for every worker (full-mesh dial-in), so it is computed once and
-/// cloned into each projected [`Neighbors`]. Sorted for stable snapshots.
 fn gateway_roster(cluster: &Cluster) -> Vec<GatewayEndpoint> {
     let mut gateways: Vec<GatewayEndpoint> = cluster
         .gateways
@@ -105,9 +83,6 @@ fn gateway_roster(cluster: &Cluster) -> Vec<GatewayEndpoint> {
     gateways
 }
 
-/// Recompute both snapshots from current membership. Pure: reads `cluster`
-/// (including its already-bumped epochs) and stamps the new versions. The actor
-/// bumps the epoch(s) **before** calling this.
 pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
     let topology = Topology {
         epoch: cluster.worker_epoch,
@@ -123,7 +98,7 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
             addr: w.addr.clone(),
             role: w.role,
             model: w.model.clone(),
-            health: Health::Healthy, // present (non-evicted) ⇒ healthy, minimal start
+            health: Health::Healthy,
             coarse_load: w.load,
         })
         .collect();
@@ -136,14 +111,10 @@ pub fn reassign(cluster: &Cluster) -> (Topology, RoutingTable) {
     (topology, routing)
 }
 
-/// Rebuild only the gateway-facing routing table (used on a coarse-load change,
-/// which never alters worker topology). Reads the already-bumped `gateway_epoch`.
 pub fn routing_only(cluster: &Cluster) -> RoutingTable {
     reassign(cluster).1
 }
 
-/// An empty routing table at epoch 0 — the initial watch-channel value (the wire
-/// [`RoutingTable`] has no `Default`).
 pub fn empty_routing() -> RoutingTable {
     RoutingTable {
         epoch: 0,
@@ -151,10 +122,6 @@ pub fn empty_routing() -> RoutingTable {
     }
 }
 
-/// Project the full [`Topology`] down to one worker's wire [`Neighbors`] view.
-/// An absent id (e.g. evicted mid-watch) projects to an empty peer set at the
-/// current epoch — the worker learns it is gone via its next `heartbeat` `Ack`.
-/// The global gateway roster is copied verbatim regardless of the worker id.
 pub fn project(topology: &Topology, id: WorkerId) -> Neighbors {
     Neighbors {
         epoch: topology.epoch,
@@ -182,6 +149,12 @@ mod tests {
 
     fn peer_ids(topology: &Topology, id: WorkerId) -> Vec<WorkerId> {
         topology.peers[&id].iter().map(|peer| peer.id).collect()
+    }
+
+    fn topology_every_case() {
+        pairings_filter_same_roles_and_cross_model_workers();
+        fan_in_is_balanced_deterministically();
+        roster_projects_into_every_neighbors();
     }
 
     #[test]
@@ -219,7 +192,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn fan_in_is_balanced_deterministically() {
         let mut cluster = Cluster::new();
         let prefill0 = add_worker(&mut cluster, Role::Prefill, "model");
@@ -245,7 +217,6 @@ mod tests {
         assert_eq!(peer_ids(&first, prefill2).len(), 3);
     }
 
-    #[test]
     fn roster_projects_into_every_neighbors() {
         let mut cluster = Cluster::new();
         let now = Instant::now();
@@ -256,13 +227,10 @@ mod tests {
         assert_eq!(topology.gateways.len(), 1);
         assert_eq!(topology.gateways[0].id, g);
 
-        // The registered worker sees the global roster.
         let neighbors = project(&topology, w);
         assert_eq!(neighbors.gateways.len(), 1);
         assert_eq!(neighbors.gateways[0].addr, "10.0.0.9:8080");
 
-        // An unknown (evicted mid-watch) worker still gets the global roster,
-        // just an empty peer set.
         let unknown = project(&topology, WorkerId(999));
         assert_eq!(unknown.gateways.len(), 1);
         assert!(unknown.peers.is_empty());

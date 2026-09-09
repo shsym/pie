@@ -1,24 +1,5 @@
 #pragma once
 
-// selector_walk.cuh — DFlash2's candidate selector, walked. The
-// transcription of `kernels-metal/kernels/attn/selector_walk.metal`.
-//
-// The reference (`mlx_dspark.dflash_model.CandidateSelector`) scores every
-// `(predecessor, candidate)` pair of adjacent slots,
-//
-//     scores[s, p, c] = unary[s, c] + < A[pred[s, p]] * hp[s], B[cand[s, c]] >
-//
-// and `walk_greedy` follows the best successor from the anchor: only the ROW
-// of the predecessor actually chosen is ever read, so a walk is `slots x K`
-// dot products of `rank` terms, not `slots x K x K`. One block per request:
-// 256 threads are sixteen lanes a candidate, the lanes stride the rank and
-// fold with shuffles inside their aligned sixteen (two candidates a warp),
-// thread 0 takes the argmax (ties to the lower candidate) and the pick
-// becomes the next slot's predecessor. Rows are the request's span in order:
-// the first is the anchor (its pick is its first candidate, unread by any
-// guest), the rest are mask slots.
-//
-// bf16 in, f32 accumulation; the reference is bf16 bilinear plus f32 unary.
 
 #include "prelude/device.cuh"
 
@@ -28,31 +9,31 @@ template <class T>
 using Elem = ::pie::Elem<T>;
 
 constexpr unsigned WALK_THREADS = 256;
-constexpr unsigned WALK_LANES = 16;  // lanes a candidate
+constexpr unsigned WALK_LANES = 16;
 constexpr unsigned WALK_MAX_K = WALK_THREADS / WALK_LANES;
 
 template <class T>
 __global__ void __launch_bounds__(WALK_THREADS) selector_walk(
-    const i32* __restrict__ cand,     // [rows, k]
-    const i32* __restrict__ indptr,   // [lanes + 1]
-    const float* __restrict__ unary,  // [rows, k]
-    const T* __restrict__ hp,         // [rows, rank], read when has_hp
-    const i32* __restrict__ tokens,   // [rows]
-    const T* __restrict__ pred,       // [vocab, rank]
-    const T* __restrict__ succ,       // [vocab, rank]
-    i32* __restrict__ picks,          // [rows]
+    const i32* __restrict__ cand,
+    const i32* __restrict__ indptr,
+    const float* __restrict__ unary,
+    const T* __restrict__ hp,
+    const i32* __restrict__ tokens,
+    const T* __restrict__ pred,
+    const T* __restrict__ succ,
+    i32* __restrict__ picks,
     int k,
     int rank,
     int vocab,
-    int has_hp,  // 0: a plain bigram lattice
-    int first,   // the span's first slot row
+    int has_hp,
+    int first,
     const u32* __restrict__ win)
 {
     const int r = static_cast<int>(blockIdx.x);
     if (win != nullptr && blockIdx.x >= win[2]) return;
     const unsigned tid = threadIdx.x;
-    const unsigned c = tid / WALK_LANES;     // this thread's candidate
-    const unsigned lane = tid % WALK_LANES;  // its lane inside the candidate
+    const unsigned c = tid / WALK_LANES;
+    const unsigned lane = tid % WALK_LANES;
     const int begin = indptr[r];
     const int end = indptr[r + 1];
     if (end <= begin) return;
@@ -60,9 +41,7 @@ __global__ void __launch_bounds__(WALK_THREADS) selector_walk(
     __shared__ float score[WALK_MAX_K];
     __shared__ int prev_id;
     if (tid == 0) {
-        // The predecessor of the first slot is the anchor's own token. When
-        // the anchor row is not a slot (`first == 1`) it proposes nothing,
-        // and its pick is its own first candidate.
+
         if (first > 0) {
             picks[begin] = cand[static_cast<size_t>(begin) * static_cast<size_t>(k)];
         }
@@ -91,9 +70,7 @@ __global__ void __launch_bounds__(WALK_THREADS) selector_walk(
                 }
             }
         }
-        // Fold the sixteen lanes of this candidate; the xor tree stays inside
-        // the aligned sixteen, so the two candidates sharing a warp do not
-        // mix.
+
         partial += __shfl_xor_sync(0xffffffffu, partial, 8);
         partial += __shfl_xor_sync(0xffffffffu, partial, 4);
         partial += __shfl_xor_sync(0xffffffffu, partial, 2);
@@ -119,4 +96,4 @@ __global__ void __launch_bounds__(WALK_THREADS) selector_walk(
     }
 }
 
-}  // namespace pie::attn
+}

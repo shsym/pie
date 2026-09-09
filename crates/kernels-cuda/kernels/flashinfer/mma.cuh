@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_MMA_CUH_
 #define FLASHINFER_MMA_CUH_
 
@@ -59,13 +59,12 @@ enum class MMAMode {
   kInplaceUpdate = 1U,
 };
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
- *   to fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -78,13 +77,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
- *   to fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -97,13 +95,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_p
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
- *   to fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -116,13 +113,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 transposed instruction, loads data from
- *   shared memory to fragment and transposes the fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -135,13 +131,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 transposed instruction, loads data from
- *   shared memory to fragment and transposes the fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -154,13 +149,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* 
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX ldmatrix m8n8.x4 transposed instruction, loads data from
- *   shared memory to fragment and transposes the fragment
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
@@ -173,13 +167,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T*
 #endif
 }
 
-/*!
- * \brief Wrapper of PTX stmatrix m8n8.x4 instruction, stores data from fragment
- *   to shared memory
- * \tparam T data type of the fragment
- * \param R pointer to the fragment
- * \param smem_ptr pointer to the shared memory
- */
+
+
+
+
+
+
 template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
@@ -188,7 +181,7 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
                :
                : "r"(smem_int_ptr), "r"(R[0]), "r"(R[1]), "r"(R[2]), "r"(R[3]));
 #else
-  // Fallback implementation, slower than PTX instruction
+
   const uint32_t tx = threadIdx.x;
   uint4 word;
 #pragma unroll
@@ -204,15 +197,14 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #endif
 }
 
-/*!
- * \brief Wrapper of two mma m16n8k32 instructions for row major and column major f8 matrix
- *   multiplication, accumulated in f32.
- * \tparam T data type of the fragment
- * \tparam mma_mode whether we are initializing the accumulator or updating it
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
- */
+
+
+
+
+
+
+
+
 template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uint32_t* A,
                                                                    uint32_t* B) {
@@ -238,7 +230,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
           : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
           : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(0.f), "f"(0.f),
             "f"(0.f), "f"(0.f));
-    } else {  // e5m2
+    } else {
       asm volatile(
           "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -278,7 +270,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
           : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
           : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(C[4]), "f"(C[5]),
             "f"(C[6]), "f"(C[7]));
-    } else {  // e5m2
+    } else {
       asm volatile(
           "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -305,15 +297,14 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
 #endif
 }
 
-/*!
- * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
- *   multiplication, accumulated in f32.
- * \tparam T data type of the fragment
- * \tparam mma_mode whether we are initializing the accumulator or updating it
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
- */
+
+
+
+
+
+
+
+
 template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
@@ -476,9 +467,8 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 #endif
 }
 
-/*!
- * \brief Use mma instructions to compute rowsum.
- */
+
+
 template <typename DType>
 __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
@@ -496,7 +486,7 @@ __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
         : "=f"(d[0]), "=f"(d[1])
         : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(943208504),
           "r"(943208504), "f"(d[0]), "f"(d[1]));
-  } else {  // e5m2
+  } else {
     asm volatile(
         "{\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.e5m2.e5m2.f32 "
@@ -515,9 +505,8 @@ __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
 #endif
 }
 
-/*!
- * \brief Use mma instructions to compute rowsum.
- */
+
+
 template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
@@ -578,14 +567,13 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
 #endif
 }
 
-/*!
- * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
- *   multiplication, accumulated in f16.
- * \tparam mma_mode whether we are initializing the accumulator or updating it
- * \param C pointer to the accumulator
- * \param A pointer to the fragment of matrix A
- * \param B pointer to the fragment of matrix B
- */
+
+
+
+
+
+
+
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C, uint32_t* A,
                                                                      uint32_t* B) {
@@ -698,8 +686,8 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
 #endif
 }
 
-}  // namespace mma
+}
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_MMA_CUH_
+#endif

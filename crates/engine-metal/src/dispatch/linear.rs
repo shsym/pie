@@ -1,6 +1,3 @@
-//! The `linear` family: `impl DispatchLinear for Run<'_>`, holding the gemm
-//! arms plus the absorbed `mlp` and `moe` groups.
-
 use kernels_metal::linear;
 use model_exec::{DispatchLinear, KernelError};
 use model_ir::{Linear, Operands};
@@ -14,13 +11,20 @@ impl DispatchLinear for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-metal`'s error vocabulary, lifted by
-    /// [`kernel`](crate::error::kernel) above.
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
-            // Run::banked answers None for a dense row; capacity is the min
-            // of act/y's padded row count, bounding the FP16 staging
-            // rectangle crate::scratch reserved.
+            Linear::Matmul { act, w, y }
+                if self.tensor(*act).dtype == model_ir::Dtype::F32
+                    && self.banked(*w).is_none() =>
+            {
+                linear::lane_gemm::act_x_wt(
+                    self.ctx(),
+                    "linear.matmul",
+                    self.tensor(*act),
+                    self.tensor(*w),
+                    self.tensor(*y),
+                )
+            }
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),
@@ -60,7 +64,6 @@ impl Run<'_> {
                 ),
             },
 
-            // The absorbed `mlp` family, calling into kernels_metal::linear::mlp.
             Linear::MlpSwiglu {
                 packed,
                 intermediate,
@@ -97,7 +100,6 @@ impl Run<'_> {
                 *alpha,
                 self.tensor(*y),
             ),
-            // Unfused twin of MlpSwigluClamp: reads two rectangles instead of one row's halves.
             Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
                 linear::mlp::swiglu_clamp_split(
                     self.ctx(),
@@ -118,7 +120,6 @@ impl Run<'_> {
                 self.tensor(*x),
                 self.tensor(*y),
             ),
-            // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
             Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
             | Linear::RelBias { .. }
@@ -150,7 +151,6 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            // The absorbed `moe` family, calling into kernels_metal::linear::moe.
             Linear::MoeTopkSoftmax {
                 logits,
                 experts,
@@ -230,7 +230,6 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            // `hint` is the tier's to read at the cut, never the kernel's.
             Linear::MoeTopkSqrtSoftplus {
                 logits,
                 bias,
@@ -252,7 +251,6 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),
-            // `experts` is no argument of the kernel: the table names ids outright.
             Linear::MoeHashRoute {
                 ids,
                 tid2eid,
@@ -279,10 +277,6 @@ impl Run<'_> {
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe::group_routes(self.ctx(), *groups, self.tensor(*routes))
             }
-            // The plane is a dense resident weight — quantized or not — and
-            // the entry is the routed select over its `groups`-expert
-            // reading; which of the two selects fires is the plane's own
-            // representation, as `Linear::Matmul` resolves it one arm up.
             Linear::MatmulGrouped {
                 x,
                 w,
@@ -307,8 +301,6 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*y),
             ),
-            // the sorted arm is offered first and declines by answering
-            // false; this arm supplies the working plane and expert count.
             Linear::MoeMatmulSelectBias {
                 x,
                 bank,
@@ -342,8 +334,6 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            // the routed bias of a rows-cut expert lands afterwards via
-            // MoeBiasSum; the matvec is the below-threshold arm.
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
                 const OP: &str = "linear.moe_matmul_select_quant";
                 if let Some(scratch) = self.routed_scratch()
@@ -370,8 +360,6 @@ impl Run<'_> {
                     self.tensor(*y),
                 )
             }
-            // in place: y_out aliases y, so an unrouted row reads the
-            // uncorrected value at the same address (identity without a merge).
             Linear::LoraCorrect {
                 x,
                 bank_a,

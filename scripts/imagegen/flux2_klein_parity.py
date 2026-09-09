@@ -126,19 +126,15 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 
 TOLERANCES = ["--cos-tol", "0.999"]
 
-# What `compare` gates at `--cos-tol`. The trajectory keys are written to
-# their own npz pair and reported, for the reason NUMERICS states.
 GATED_KEYS = ["text.hidden", "dit.step0.out", "probe.step0.out", "probe.step1.out",
               "probe.step2.out", "probe.step3.out"]
 TRAJECTORY_KEYS = ["sched.x1", "sched.x2", "sched.x3", "sched.x4", "latent.final"]
-
 
 def snapshot(args) -> str:
     found = sorted(glob.glob(args.snapshot))
     if not found:
         raise SystemExit(f"{args.snapshot}: no snapshot; `hf download black-forest-labs/FLUX.2-klein-4B`")
     return found[-1]
-
 
 def context_embedder(snap: str) -> np.ndarray:
     """`transformer/context_embedder.weight` `[3072, 7680]` (bf16) as float32."""
@@ -153,15 +149,9 @@ def context_embedder(snap: str) -> np.ndarray:
                 return w.to(torch.float32).numpy()
     raise SystemExit(f"{snap}/transformer: no context_embedder.weight")
 
-
 def fold(embeds: np.ndarray, w: np.ndarray) -> np.ndarray:
     """`context_embedder(cat(h9, h18, h27))`: `[L, 7680] @ W.T`, no bias, fp32."""
     return (embeds.astype(np.float32) @ w.T).astype(np.float32)
-
-
-# ----------------------------------------------------------------------------
-# case
-# ----------------------------------------------------------------------------
 
 def case(args) -> None:
     dump = np.load(os.path.join(args.golden, "flux2_golden.npz"))
@@ -172,21 +162,21 @@ def case(args) -> None:
                          "`flux2_golden.py --full`")
     mask = dump["text.attention_mask"]
     ids = dump["text.input_ids"][mask > 0]
-    pe = dump["prompt_embeds"][0]                      # [512, 7680]
-    noise = dump["dit.step0.in.hidden_states"][0]      # [4096, 128]
+    pe = dump["prompt_embeds"][0]
+    noise = dump["dit.step0.in.hidden_states"][0]
     init = dump["noise.init.0"][0]
     if not np.array_equal(noise, init):
         print(f"[case] note: step-0 hidden_states differ from noise.init.0 (max {np.abs(noise - init).max():.3g}); "
               f"the step-0 input is what is fed")
-    img_ids = dump["dit.step0.in.img_ids"][0]          # [4096, 4]
-    txt_ids = dump["dit.step0.in.txt_ids"][0]          # [512, 4]
+    img_ids = dump["dit.step0.in.img_ids"][0]
+    txt_ids = dump["dit.step0.in.txt_ids"][0]
     sigmas = dump["sigmas"].astype(np.float32)
     assert sigmas[-1] == 0.0, sigmas
     timestep = float(dump["dit.step0.in.timestep"][0])
     assert abs(timestep - sigmas[0]) < 1e-6, (timestep, sigmas[0])
 
     w = context_embedder(snapshot(args))
-    ctx = fold(pe, w)                                  # [512, 3072]
+    ctx = fold(pe, w)
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -212,16 +202,10 @@ def case(args) -> None:
     }
     with open(os.path.join(args.out, "case.json"), "w") as f:
         json.dump(doc, f, indent=1)
-    # What the harness expects back, beside the case (never sent to the guest).
     np.savez(os.path.join(args.out, "expected.npz"),
              **{"text.input_ids": ids, "text.hidden": ctx[: len(ids)]})
     print(f"[case] prompt {prompt!r}: {len(ids)} ids {ids.tolist()}")
     print(f"[case] context {ctx.shape}, noise {noise.shape}, sigmas {doc['sigmas']} -> {args.out}")
-
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
 
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
@@ -245,7 +229,6 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
-
 def scratch_base(config: str) -> str:
     with open(os.path.expanduser(config), "rb") as f:
         cfg = tomllib.load(f)
@@ -256,11 +239,7 @@ def scratch_base(config: str) -> str:
     if not base:
         raise SystemExit(f"{config}: set `[sandbox] fs_scratch_dir` to a directory of its own")
     os.makedirs(base, exist_ok=True)
-    # No `submit_deadline` demand here, deliberately: see the module doc.
-    # The runtime keeps a stated cohort whole, so the default 50 ms leash is
-    # what this parity runs under and what it proves safe.
     return base
-
 
 def run(args) -> None:
     case_path = os.path.join(args.out, "case.json")
@@ -292,15 +271,9 @@ def run(args) -> None:
     stderr_path = os.path.join(args.out, "pie.stderr")
     with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
         proc = subprocess.Popen(cmd, stdout=out, stderr=err, cwd=REPO, text=True)
-        # The instance's scratch dir appears when it starts; drop the case in.
         deadline = time.time() + args.wait
         target = None
         while proc.poll() is None and time.time() < deadline:
-            # A DIRECTORY, not merely the newest entry: pie makes one per
-            # process under the scratch root, and a caller whose `--out` is
-            # that same root (a gate runner's, say) puts this script's own
-            # `pie.stdout` in the running too — copying the case into a file
-            # then fails with `NotADirectoryError` and reads as pie's fault.
             fresh = sorted(
                 name for name in set(os.listdir(base)) - before
                 if os.path.isdir(os.path.join(base, name))
@@ -313,7 +286,7 @@ def run(args) -> None:
             proc.wait()
             raise SystemExit(f"no scratch dir appeared under {base} (pie exited {proc.returncode}); "
                              f"see {stderr_path}")
-        for name in payload[1:] + payload[:1]:      # the arrays first, case.json last
+        for name in payload[1:] + payload[:1]:
             tmp = os.path.join(target, f".{name}.tmp")
             shutil.copyfile(os.path.join(args.out, name), tmp)
             os.replace(tmp, os.path.join(target, name))
@@ -324,11 +297,6 @@ def run(args) -> None:
         sys.stderr.write(open(stderr_path).read())
         raise SystemExit(f"pie run failed ({proc.returncode})")
     print(f"[run] -> {stdout_path}, files in {files_dir}")
-
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
 
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
@@ -341,7 +309,6 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
-
 
 def collect(args) -> None:
     doc = document(os.path.join(args.out, "pie.stdout"))
@@ -399,8 +366,6 @@ def collect(args) -> None:
         if f"probe.step{k}.out" in mine:
             theirs[f"probe.step{k}.out"] = dump[f"dit.step{k}.out"][0]
 
-    # Two pairs: the gated readings and the trajectory, which NUMERICS says
-    # is reported rather than gated.
     pie_npz = os.path.join(args.out, "flux2_klein_pie.npz")
     target_npz = os.path.join(args.out, "flux2_klein_target.npz")
     traj_npz = os.path.join(args.out, "flux2_klein_pie_trajectory.npz")
@@ -420,15 +385,9 @@ def collect(args) -> None:
     with open(os.path.join(args.out, "ids.json"), "w") as f:
         json.dump({"pie": ids.tolist(), "golden": want.tolist(), "match": bool(np.array_equal(ids, want))}, f)
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     a, b = a.astype(np.float64).ravel(), b.astype(np.float64).ravel()
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
-
 
 def compare(args) -> int:
     mine = os.path.join(args.out, "flux2_klein_pie.npz")
@@ -465,15 +424,9 @@ def compare(args) -> int:
                 print(f"  {key:<28} cos {cosine(n[key], golden):.6f} vs the golden's")
     return status
 
-
-# ----------------------------------------------------------------------------
-# decode
-# ----------------------------------------------------------------------------
-
 def psnr(a: np.ndarray, b: np.ndarray) -> float:
     mse = float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
     return float("inf") if mse == 0 else 10.0 * np.log10(255.0 ** 2 / mse)
-
 
 def decode(args) -> None:
     import torch
@@ -487,7 +440,7 @@ def decode(args) -> None:
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     vae = AutoencoderKLFlux2.from_pretrained(snap, subfolder="vae", torch_dtype=dtype).to(device)
     dump = np.load(os.path.join(args.golden, "flux2_golden.npz"))
-    ids = torch.from_numpy(dump["noise.init.1"]).to(device)         # [1, 4096, 4]
+    ids = torch.from_numpy(dump["noise.init.1"]).to(device)
     size = int(json.load(open(os.path.join(args.golden, "MANIFEST.json")))["size"])
     scale = 2 ** (len(vae.config.block_out_channels) - 1)
     lat_h, lat_w = 2 * (size // (scale * 2)), 2 * (size // (scale * 2))
@@ -518,7 +471,6 @@ def decode(args) -> None:
     if os.path.exists(native):
         native_png = to_png(np.load(native)["native.latent.final"], "native.png")
         print(f"[decode] PSNR(native.png, golden.png)       = {psnr(native_png, golden_png):.2f} dB  (unpadded text rows; not gated)")
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -552,7 +504,6 @@ def main() -> int:
         decode(args)
         return status
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

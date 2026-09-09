@@ -35,7 +35,6 @@ import time
 
 import numpy as np
 
-
 def xorshift_canvas(seed: int, length: int, vocab: int):
     """The `diffusion-baseline` inferlet's host noise, bit for bit."""
     x = (seed | 1) & 0xFFFFFFFF
@@ -47,10 +46,8 @@ def xorshift_canvas(seed: int, length: int, vocab: int):
         out.append(x % vocab)
     return out
 
-
 def softcap(x, cap):
     return cap * np.tanh(x / cap)
-
 
 def row_stats(logits, temperature, k=8):
     """Per-row argmax, entropy of softmax(logits / T), top-k ids and probs."""
@@ -67,7 +64,6 @@ def row_stats(logits, temperature, k=8):
         "top8_ids": top.astype(int).ravel().tolist(),
         "top8_probs": topp.astype(float).ravel().tolist(),
     }
-
 
 def ref(args):
     import torch
@@ -106,8 +102,6 @@ def ref(args):
     c1 = torch.tensor([canvas1], device=device)
 
     with torch.no_grad():
-        # Prefill + step 0 in one forward: the encoder writes the cache, the
-        # decoder reads it with no self-conditioning.
         out0 = model(input_ids=ids_t, decoder_input_ids=c0)
         pkv = out0.past_key_values
         enc_hidden = out0.encoder_last_hidden_state[0, -1]
@@ -115,27 +109,14 @@ def ref(args):
             model.lm_head(enc_hidden.to(model.lm_head.weight.device)).float().cpu().numpy(), cap
         )
         step0 = out0.logits[0].float().cpu().numpy()
-        # The reference feeds step 1 the TEMPERATURE-SCALED step-0 logits, in
-        # the embedding dtype, exactly as `_denoising_step` does.
         scaled0 = (out0.logits / args.temperature).to(model.model.decoder.embed_tokens.weight.dtype)
         out1 = model(past_key_values=pkv, decoder_input_ids=c1, self_conditioning_logits=scaled0)
         step1 = out1.logits[0].float().cpu().numpy()
-        # The same step with the distribution TRUNCATED to the top-`taps`
-        # (everything else -inf): the reference renormalizes those taps to
-        # one where pie feeds them unnormalized, but the block's pre-norm is
-        # an RMSNorm and scale-invariant, so the two agree up to rounding.
-        # This is the exact target for pie's step 1; `step1` above carries
-        # the truncation's own error on top.
         top = torch.topk(scaled0.float(), args.taps, dim=-1).indices
         truncated = torch.full_like(scaled0, float("-inf"))
         truncated.scatter_(-1, top, scaled0.gather(-1, top))
         out1t = model(past_key_values=pkv, decoder_input_ids=c1, self_conditioning_logits=truncated)
         step1_trunc = out1t.logits[0].float().cpu().numpy()
-        # Diagnostics that isolate the trunk from the denoiser: the ENCODER
-        # (causal, no post-norm) over the prompt at every position, and over
-        # `[prompt | canvas0]` at the canvas positions. A pie encode pass over
-        # the same rows must agree with these up to quantization; the gap
-        # between that agreement and the decoder's is the denoise path's own.
         prefill_all = softcap(
             model.lm_head(out0.encoder_last_hidden_state[0].to(model.lm_head.weight.device))
             .float()
@@ -150,7 +131,6 @@ def ref(args):
         )
     print(f"prefill + two steps in {time.time() - t0:.0f}s", flush=True)
 
-    # Taps for the pie side: top-`taps` of softmax(step0 / T), unnormalized.
     scaled = step0.astype(np.float64) / args.temperature
     scaled -= scaled.max(axis=-1, keepdims=True)
     p = np.exp(scaled)
@@ -210,22 +190,18 @@ def ref(args):
         flush=True,
     )
 
-
 def agreement(a, b):
     a = np.asarray(a)
     b = np.asarray(b)
     return float((a == b).mean())
-
 
 def top8_overlap(a, b, k=8):
     a = np.asarray(a).reshape(-1, k)
     b = np.asarray(b).reshape(-1, k)
     return float(np.mean([len(set(x) & set(y)) / k for x, y in zip(a, b)]))
 
-
 def compare(args):
     ref_out = json.load(open(os.path.join(args.out, "ref.json")))
-    # `pie run` prints a human header before the document; take the JSON line.
     lines = [line for line in open(args.pie).read().splitlines() if line.startswith("{")]
     if not lines:
         raise SystemExit(f"{args.pie}: no JSON document (did the run fail?)")
@@ -259,7 +235,6 @@ def compare(args):
     cov = ref_out["tap_coverage"]
     print(f"tap coverage: min {cov['min']:.4f} p10 {cov['p10']:.4f} mean {cov['mean']:.4f}")
 
-
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -280,7 +255,6 @@ def main():
     c.set_defaults(fn=compare)
     args = ap.parse_args()
     args.fn(args)
-
 
 if __name__ == "__main__":
     main()

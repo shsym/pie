@@ -1,6 +1,3 @@
-//! The checkpoint-provenance authoring eDSL: a family's import calls
-//! [`Builder`]'s verbs to produce a [`ModelContract`].
-
 use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
 use checkpoint::types::{
     Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
@@ -8,9 +5,6 @@ use checkpoint::types::{
 };
 use model_dsl::{Dtype, Platform, Shard, Weight};
 
-/// Why a read refused: the checkpoint lacks the name, states it in terms no
-/// reader here can name, or holds it in a representation the declared one is
-/// not decoded from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Missing(String),
@@ -51,8 +45,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// One checkpoint being read into one [`ModelContract`]. Each `read*` line
-/// states where one declared weight's bytes come from.
 pub struct Builder<'a> {
     src: &'a ztensor::Source,
     tp: u32,
@@ -61,8 +53,6 @@ pub struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    /// `tp` feeds [`read_own`](Builder::read_own) alone; the foreign verbs
-    /// read a whole checkpoint and refuse `tp > 1`.
     #[must_use]
     pub fn new(src: &'a ztensor::Source, tp: u32, platform: Platform) -> Builder<'a> {
         Builder {
@@ -73,9 +63,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Read `w` from the checkpoint tensor named `from`: one stored tensor
-    /// for bf16, the `.weight/.scales/.biases` triplet for an MLX affine bank,
-    /// relabelled into fragment order for a bank placed `U4g64tiled`.
     pub fn read(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
         let w = &w.placed(self.platform);
         self.whole_checkpoint(w)?;
@@ -84,8 +71,6 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Read `w` from several checkpoint tensors, concatenated on the weight's
-    /// own cut axis.
     pub fn read_concat(
         &mut self,
         w: &Weight,
@@ -98,10 +83,6 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Read `w` via a stated expression. Every source it names must exist and
-    /// agree on one stored representation.
-    /// One MLX affine bank stored a row at a time: `rows[i]` names the
-    /// `.weight` planes that fuse along the cut axis into row `i` of axis 0.
     pub fn read_stack(
         &mut self,
         w: &Weight,
@@ -114,20 +95,6 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Read `w` from `from` with `over` applied to the plane AS STORED, then
-    /// adapted to the encoding the row declares.
-    ///
-    /// Two things make this its own verb rather than a use of
-    /// [`read_expr`](Builder::read_expr). The order is one: `read_expr`
-    /// states its expression over the stored bytes and lets the ladder wrap
-    /// a cast around the result, which buries the transform's kernel under
-    /// that cast where nothing lowers it. The arithmetic is the other: a
-    /// transform that undoes what a converter folded in — subtracting the
-    /// one an RMSNorm's weight was stored with, say — is a small difference
-    /// of near-equal numbers, and doing it after narrowing to the row's
-    /// dtype cancels away the very residual it is recovering. So `over`
-    /// applies at the checkpoint's own width, under its own internal
-    /// tensor, and the adaptation happens above it.
     pub fn read_over(
         &mut self,
         w: &Weight,
@@ -167,8 +134,6 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Read `w` from the tensor of its own name, banded into `tp` ranks when
-    /// the weight is declared cut.
     pub fn read_own(&mut self, w: &Weight) -> Result<(), Error> {
         let w = &w.placed(self.platform);
         let read = resolve(self.src, claim(w, self.tp))?;
@@ -176,7 +141,6 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// A contract this language cannot say, stated raw.
     pub fn push(&mut self, tensor: TensorContract) {
         self.tensors.push(tensor);
     }
@@ -213,9 +177,6 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// The load contract of a serving artifact: every checkpoint-sourced weight
-/// of the trace read from the tensor of its own name. Companion planes come
-/// with their codes.
 pub fn own_contract(
     src: &ztensor::Source,
     params: &[model_dsl::Param],
@@ -261,13 +222,9 @@ fn claim_kind(dtype: Dtype) -> Kind {
     }
 }
 
-/// How many codes one group of a packed bank shares a scale with — a number
-/// per scheme, not a single constant for the tree, since MLX's affine U4
-/// groups a different count than mxfp4.
 fn group_of(dtype: Dtype) -> u32 {
     match dtype {
         Dtype::Mxfp4 => 32,
-        // Groups sixty-four codes, not sixty-four bytes.
         Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U4g64tiled => 64,
         Dtype::U4g32 | Dtype::U2g32 => 32,
         Dtype::U2g128 => 128,
@@ -275,10 +232,6 @@ fn group_of(dtype: Dtype) -> u32 {
     }
 }
 
-/// How many affine codes the checkpoint packs into one `u32` word — MLX's own
-/// packing, least-significant code first. Derived from the code's bit width,
-/// not a fixed constant: a u32 holds eight four-bit codes but only four
-/// eight-bit ones.
 fn word_codes(dtype: Dtype) -> i64 {
     let bits = i64::try_from(dtype.bits()).expect("a code width inside i64");
     assert!(
@@ -324,7 +277,6 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U64
         | Dtype::U16
         | Dtype::Bool => (encoding(w.dtype), None),
-        // Self-contained: factors live in the payload, no `.scales`/`.biases`.
         Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
             (encoding(w.dtype), None)
         }
@@ -332,8 +284,6 @@ fn claim(w: &Weight, tp: u32) -> Claim {
             "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        // Served, but no load contract declares one yet — the same
-        // statement `model_dsl::Weight::planes` makes, one crate over.
         Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
             "a {:?} weight is served but no load contract declares one",
             w.dtype
@@ -348,9 +298,6 @@ fn claim(w: &Weight, tp: u32) -> Claim {
     }
 }
 
-/// A tiled affine weight claims the rectangle it was repacked into: output
-/// columns rounded up to a whole mma band ([`TILED_BAND`]), matching the
-/// padded shape the engine checks arriving tensors against.
 fn banded_rows(w: &Weight, shape: Vec<i64>) -> Vec<i64> {
     if w.dtype != Dtype::U4g64tiled {
         return shape;
@@ -367,8 +314,6 @@ fn banded_rows(w: &Weight, shape: Vec<i64>) -> Vec<i64> {
     shape
 }
 
-/// One claim, checked against the source and stated as the one, two or
-/// three tensors the checkpoint stores it as.
 fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, Error> {
     let mut tensors = Vec::new();
     let Claim {
@@ -388,21 +333,15 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
         Encoding::Quant(_) => TensorContract::inferred(name.clone(), expr, encoding.clone()),
     });
     match (&stored, scales) {
-        // Checkpoint shipped both planes: say where they are.
         (Encoding::Quant(_), Some(pairing)) => {
             tensors.extend(interned(&name, &shape, bands, pairing));
         }
-        // Raw stored, quantized wanted: the loader encodes on the way in and
-        // publishes the scales plane itself; nothing more to declare here.
         (Encoding::Raw(_), Some(_)) => {}
         (Encoding::Quant(_), None) | (Encoding::Raw(_), None) => {}
     }
     Ok(tensors)
 }
 fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContract, Error> {
-    // A quantized want states its blocked axis (the contracted, last one),
-    // so a raw source encoded on the way in lands the grouping the bank's
-    // own contract asks for.
     let want = match encoding(w.dtype) {
         Encoding::Quant(_) => grouped(w),
         raw => raw,
@@ -418,16 +357,6 @@ fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContra
     })
 }
 
-/// That a quantized source holds as many values as the row declares.
-///
-/// A quantized plane's contract is `inferred` — the shape comes from the file,
-/// because a packed bank's stored extents are the authority on its own
-/// blocking. That leaves nothing comparing the file against the model, so a
-/// row of another width reads a checkpoint it has no business claiming, and
-/// identification hands back the wrong SKU rather than a refusal. Counting is
-/// the check that costs nothing and catches that: a bank fused from several
-/// parts sums them, and a source that states no extents (every shape `[1]`)
-/// is not judged, exactly as [`flattened`](crate::flattened) does not judge it.
 fn holds_the_declared_count(src: &ztensor::Source, w: &Weight, expr: &Expr) -> Result<(), Error> {
     let mut stored: i128 = 0;
     for source in expr.sources() {
@@ -472,19 +401,6 @@ fn fused(
     declare(src, w, Expr::concat(pack_axis(w), legs))
 }
 
-/// A fused bank whose legs are stored under DIFFERENT encodings, wanted raw.
-///
-/// llama.cpp mixes schemes tensor by tensor — a `Q4_K_M` file holds one
-/// projection at q5_k and the gate beside it at q4_k — and a row that fuses
-/// the two into one bf16 plane is not asking for the impossible: each leg
-/// decodes on its own, and raw legs concatenate. A decode is a KERNEL, and a
-/// kernel nested inside a `Concat` has no byte-run lowering, so each leg is
-/// taken to the wanted dtype under its own internal name (never the engine's,
-/// as [`affine_reencoded`] does the same for a re-quantized bank) and the
-/// published contract joins those outputs, which are plain byte runs.
-///
-/// Only a QUANTIZED want has no answer here, because codes of two schemes do
-/// not join, so this returns `None` and the caller's own refusal stands.
 fn decoded_legs(
     src: &ztensor::Source,
     w: &Weight,
@@ -518,8 +434,6 @@ fn decoded_legs(
     Some(Ok(tensors))
 }
 
-/// Whether `name` is stored as a raw floating-point tensor — what a bank the
-/// text wants quantized has to be ENCODED from, rather than transmuted.
 fn stored_raw(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     Ok(matches!(
         stored_encoding(src, name)?,
@@ -527,13 +441,6 @@ fn stored_raw(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     ))
 }
 
-/// Whether `name` is stored in a scheme that keeps its factors INSIDE the
-/// payload — every ggml block type, `q4_k` and friends.
-///
-/// The distinction that matters to a reader: an MLX affine bank names its
-/// scales and biases in companion tensors, so another affine form is reached
-/// by reading those planes; a ggml block names nothing beside itself, so the
-/// only road out of it is through values.
 fn stored_block(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     Ok(match stored_encoding(src, name)? {
         Encoding::Quant(spec) => spec.scheme.is_self_contained(),
@@ -541,19 +448,6 @@ fn stored_block(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     })
 }
 
-/// A bank the row wants quantized, read out of ggml block codes.
-///
-/// llama.cpp picks a scheme per tensor — a `Q4_K_M` of one model holds `q4_k`,
-/// `q5_k`, `q6_k` and `q8_0` side by side — and none of those is a form this
-/// catalog's rows name. Codes of two schemes do not transmute into each other,
-/// so the value is what carries over: each part decodes to bf16 under its own
-/// internal name, the join is materialised (a decode is a KERNEL, and a kernel
-/// nested inside a `Concat` has no byte-run lowering), and the ladder encodes
-/// that join into the bank the row declares. The encode is paid ONCE, at
-/// import, which is the same trade [`affine_reencoded`] makes for a bank
-/// stored wider than its row, and what `refuse_a_decode_of_packed_codes` means
-/// by "a re-encode takes its stored codes through bf16 on the way to the codes
-/// it publishes".
 fn reencoded_from_block(
     src: &ztensor::Source,
     w: &Weight,
@@ -570,8 +464,6 @@ fn reencoded_from_block(
         tensors.push(TensorContract::inferred(decoded.clone(), expr, bf16.clone()).internal());
         legs.push(Expr::out(decoded));
     }
-    // One part is already its own byte run; several join on the cut axis, and
-    // the join needs a name before anything reads it.
     let values = if legs.len() == 1 {
         format!("{}.block0", w.name)
     } else {
@@ -596,38 +488,6 @@ fn reencoded_from_block(
     Ok(tensors)
 }
 
-/// A placed dtype names a byte ORDER, and [`tiled_planes`] is the only door
-/// here that writes one. Every other road to a quantized want publishes the
-/// CANONICAL order — an encode's `Cast` emits a bank's three planes together,
-/// and the grammar has no way to name one of them and repack it — so a placed
-/// row reaching one of those doors would land row-major bytes under a
-/// fragment-order declaration.
-///
-/// That combination is unrefusable downstream and answers nonsense:
-/// `kernels_cuda::linear::tiled` says so itself ("an un-repacked plane is not
-/// refusable and answers nonsense"), and it is what
-/// `qwen35-d0.8b-u4g64-kv-bf16` did on CUDA — importing cleanly from a bf16
-/// snapshot and then decoding gibberish, while the same row on a backend
-/// whose kernels read the canonical order served correctly. So refuse here,
-/// where the road is still named, rather than write bytes no reader can
-/// question.
-///
-/// Lifting this needs the encode to publish its planes under names a
-/// `Repack` can take as operands, the way [`affine_reencoded`] already
-/// publishes a stored bank's three planes internally; until then a dense
-/// source and a placed row have no shared road.
-/// The three public planes of a placed bank whose codes an ENCODE produced.
-///
-/// [`tiled_planes`] states the placement over source codes it can name. An
-/// encode cannot be taken apart that way — one `Cast` writes the codes and
-/// their scales and biases together — so the encode runs under an internal
-/// name at the canonical dtype and the placement is stated over what it
-/// wrote. The companions are nameable because the plan publishes them
-/// (`plan::build`), which is the whole reason this road exists.
-///
-/// The factor relabel is the same [`RepackLayout::TiledAffineFactor`]
-/// [`relaid`] uses: rows are padded up to a band, never reordered, so a
-/// weight whose rows already divide the band gets an identity pass.
 fn placed_from_encode(
     w: &Weight,
     canonical: impl FnOnce(&Weight) -> Result<Vec<TensorContract>, Error>,
@@ -682,7 +542,6 @@ fn placed_from_encode(
     Ok(out)
 }
 
-/// Whether [`placed_from_encode`] knows this placement's relabelling.
 fn placed_road_covers(w: &Weight) -> bool {
     w.dtype == Dtype::U4g64tiled
 }
@@ -711,9 +570,6 @@ fn planes(
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
-    // A quantized bank stated by a RAW source (a bf16 head overlaid onto a
-    // quantized trunk) is not MLX codes to transmute: it takes the raw
-    // reader, whose ladder has the loader encode it on the way in.
     if stored_raw(src, &from)? {
         if placed_road_covers(w) {
             return placed_from_encode(w, |canon| Ok(vec![copy(src, canon, from)?]));
@@ -721,9 +577,6 @@ fn planes(
         placed_wants_its_own_order(w, "a raw plane")?;
         return Ok(vec![copy(src, w, from)?]);
     }
-    // Codes with no companion planes: whatever the row wants, the road runs
-    // through values (see [`reencoded_from_block`]). A raw want takes the
-    // ordinary ladder below, which already decodes.
     if stored_block(src, &from)? && matches!(encoding(w.dtype), Encoding::Quant(_)) {
         if placed_road_covers(w) {
             let parts = [from];
@@ -732,9 +585,6 @@ fn planes(
         placed_wants_its_own_order(w, "a self-contained block")?;
         return reencoded_from_block(src, w, &[from]);
     }
-    // A RAW want over MLX affine codes (a quantized conversion's embedding
-    // read by a row that keeps its table dense): the triplet decodes through
-    // its own scales and biases and the values are the plane.
     if matches!(encoding(w.dtype), Encoding::Raw(_)) && stored_mlx_codes(src, &from)? {
         return affine_decoded(src, w, from);
     }
@@ -766,8 +616,6 @@ fn planes_fused(
         placed_wants_its_own_order(w, "raw planes to fuse")?;
         return Ok(vec![fused(src, w, parts)?]);
     }
-    // Every leg a self-contained block, and a quantized want: the legs need
-    // not agree on a scheme, since each decodes on its own before the join.
     if parts.iter().try_fold(true, |all, part| {
         Ok::<bool, Error>(all && stored_block(src, part)?)
     })? && matches!(encoding(w.dtype), Encoding::Quant(_))
@@ -787,9 +635,6 @@ fn planes_fused(
         | Dtype::U2g64
         | Dtype::U2g128 => affine_planes(src, w, parts),
         Dtype::Mxfp4 => mx_planes(src, w, parts),
-        // The ordinary case is one ladder over the whole join. Legs stored
-        // under different encodings have no single ladder, and a raw want
-        // decodes each of them instead; anything else keeps the refusal.
         _ => match fused(src, w, parts.clone()) {
             Ok(contract) => Ok(vec![contract]),
             Err(disagreement) => decoded_legs(src, w, &parts).unwrap_or(Err(disagreement)),
@@ -797,9 +642,6 @@ fn planes_fused(
     }
 }
 
-/// The codes, the scales and the biases of one MLX affine-U4 bank, read out of
-/// the `<stem>.weight` / `<stem>.scales` / `<stem>.biases` triplet each part
-/// names.
 fn affine_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -839,7 +681,6 @@ fn affine_planes(
         &w.name,
     );
     Ok(vec![
-        // inferred: the transmute above already stated each leg's shape.
         TensorContract::inferred(w.name.clone(), joined(axis, codes), grouped(w)),
         factors(
             src,
@@ -849,18 +690,11 @@ fn affine_planes(
             axis,
         )?
         .scaling(pairing),
-        // offsetting: the zero-point entry, names which weight it centres.
         factors(src, model_dsl::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
     ])
 }
 
-/// The width the file stores an affine bank at, read off its word count: a
-/// `[N, K / codes-a-word]` u32 plane spans the declared `K`, so the codes a
-/// word holds — and the bits — are the ratio. The row's dtype names the
-/// SERVED form; where the two differ, [`affine_reencoded`] takes the bank
-/// through its values. A pack joined on the contracted axis has no one `K`
-/// a leg spans, so it is read as stored at the row's own width.
 fn stored_affine(src: &ztensor::Source, w: &Weight, part: &str, axis: u8) -> Result<Dtype, Error> {
     let declared = extents(w);
     let Some(&k) = declared.last() else {
@@ -907,14 +741,6 @@ fn stored_affine(src: &ztensor::Source, w: &Weight, part: &str, axis: u8) -> Res
     }
 }
 
-/// [`affine_planes`] for a bank the file stores at another width than the
-/// row serves (an 8-bit conversion read by a 4-bit row): no kernel re-encodes
-/// codes in one step, so the stored triplet is read under `<name>.stored`
-/// (internal: never the engine's), taken to bf16 by its own scales and
-/// biases — the affine fragment's per-block `Scale` decodes MLX codes — and
-/// that value plane is encoded as the row's form, which publishes the new
-/// scales and biases itself. A second quantization: a row takes it on
-/// purpose (pinned), never by identification.
 fn affine_reencoded(
     src: &ztensor::Source,
     w: &Weight,
@@ -988,8 +814,6 @@ fn affine_reencoded(
     ])
 }
 
-/// Whether `name` holds MLX affine codes: raw u32 words under a `.weight`
-/// with a `.scales` companion beside it.
 fn stored_mlx_codes(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     let Some(stem) = name.strip_suffix(".weight") else {
         return Ok(false);
@@ -998,12 +822,6 @@ fn stored_mlx_codes(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
         && src.get(&model_dsl::scales_name(stem)).is_some())
 }
 
-/// The decode half of [`affine_reencoded`] for a row that wants the VALUES:
-/// the stored triplet is read under `<name>.stored` (internal), taken to
-/// bf16 by its own scales and biases, and that plane — cast to the declared
-/// raw element if it is not bf16 — is the weight. A dense table over a
-/// quantized checkpoint (DiffusionGemma's embedding, which the
-/// self-conditioning gather reads unquantized) is the case.
 fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec<TensorContract>, Error> {
     let illegible = |detail: String| Error::Illegible {
         name: w.name.clone(),
@@ -1018,9 +836,6 @@ fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec
             ))
         })?
         .to_string();
-    // The stored form, read off the file: the bits from the words a row
-    // packs over the declared width, the group from the scales a row holds.
-    // (`stored_affine` answers for a quantized want only.)
     let last = |name: &str| -> Result<i64, Error> {
         let tensor = src.get(name).ok_or_else(|| Error::Missing(name.to_string()))?;
         let extent = *tensor
@@ -1131,8 +946,6 @@ fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec
     Ok(out)
 }
 
-/// [`affine_planes`] for a bank stored one row at a time: each row's parts
-/// fuse along the cut axis, and the rows stack on a new leading axis.
 fn affine_stacked(
     src: &ztensor::Source,
     w: &Weight,
@@ -1264,11 +1077,6 @@ fn affine_stacked(
     ])
 }
 
-/// The codes and the exponents of one MLX mxfp4 bank, read out of the
-/// `<stem>.weight` (u32 words, eight e2m1 codes each) / `<stem>.scales` (one
-/// e8m0 byte per 32 codes) pair each part names. MLX packs the words the way
-/// the artifact holds its mxfp4 planes, so both are transmuted, not
-/// re-encoded; there is no bias plane — mxfp4 centres on zero.
 fn mx_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -1325,10 +1133,6 @@ fn mx_planes(
     ])
 }
 
-/// The same triplet, relaid — [`affine_planes`]'s three entries with an
-/// [`Expr::Repack`] on the end of each, target rows rounded up to a whole
-/// [`TILED_BAND`] as [`claim`] claims. Padding is zero codes beside zero
-/// factors, decoding to a zero weight.
 fn tiled_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -1366,11 +1170,8 @@ fn tiled_planes(
         scales.push(model_dsl::scales_name(stem));
         biases.push(model_dsl::biases_name(stem));
     }
-    // Checked against the flat rectangle the legs join into; the band order
-    // below is a relabelling of that same shape.
     holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(w);
-    // The flat rectangle, and the banded one it's relaid into.
     let flat = extents(w);
     let landed = banded_rows(w, flat.clone());
     let counted = divided(&landed, pairing.channel_axis, pairing.group_size, &w.name);
@@ -1405,8 +1206,6 @@ fn tiled_planes(
     ])
 }
 
-/// [`factors`] with the relabelling on the end — one companion plane, joined
-/// at its seams and then put into band order.
 fn relaid(
     src: &ztensor::Source,
     name: String,
@@ -1424,9 +1223,6 @@ fn relaid(
     ))
 }
 
-/// One companion plane of an affine bank, joined across the parts and brought
-/// to bf16 — a real cast: mlx-community ships some conversions with F16
-/// factors and others with BF16.
 fn factors(
     src: &ztensor::Source,
     name: String,
@@ -1449,11 +1245,6 @@ fn joined(axis: u8, mut legs: Vec<Expr>) -> Expr {
     }
 }
 
-/// The logical shape of a stored affine-U4 plane: what the checkpoint holds,
-/// with its contracted axis multiplied back out of the words it was packed
-/// into. Read off the file, not the declaration: the declaration is the
-/// whole joined bank and this is one leg, and a qkv pack's legs are not
-/// equal width.
 fn unpacked_extents(src: &ztensor::Source, w: &Weight, name: &str) -> Result<Vec<i64>, Error> {
     let Some(tensor) = src.get(name) else {
         return Err(Error::Missing(name.to_string()));
@@ -1484,18 +1275,6 @@ fn unpacked_extents(src: &ztensor::Source, w: &Weight, name: &str) -> Result<Vec
     Ok(dims)
 }
 
-/// Checks that the legs join into the rectangle this text declared.
-/// [`TensorContract::inferred`] never compares stored width to the declared
-/// one on its own, so this is what catches a bank read by the wrong row
-/// (e.g. a 64-expert bank silently served as 16).
-///
-/// Checked against the joined shape, not per leg: a fused bank's legs need
-/// not be equal width (a qkv pack), so they must agree everywhere off the
-/// seam and sum to the declaration on it.
-///
-/// The contract is always built at `tp == 1` ([`Builder::read`] and siblings
-/// call `whole_checkpoint` first), so [`extents`] here is the whole model's
-/// rectangle.
 fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Result<(), Error> {
     let declared = extents(w);
     let refuse = |detail: String| Error::Illegible {
@@ -1538,10 +1317,6 @@ fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Resu
     Ok(())
 }
 
-/// The companion planes the checkpoint shipped beside `of`, declared in their
-/// own right. mxfp4 has one companion (an exponent byte per block); MLX
-/// affine U4 has two (scale and offset, `code * scale + bias`), declared as
-/// siblings the way MLX ships them. `pairing.form` says how many there are.
 fn interned(
     of: &str,
     shape: &[i64],
@@ -1595,8 +1370,6 @@ fn agreed(src: &ztensor::Source, name: &str, expr: &Expr) -> Result<Encoding, Er
     Ok(first.clone())
 }
 
-/// How the checkpoint stores `name`, read off the file's own header — the
-/// fact every conversion decision here starts from.
 pub fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, Error> {
     let Some(tensor) = src.get(name) else {
         return Err(Error::Missing(name.to_string()));
@@ -1612,8 +1385,6 @@ fn ladder(name: &str, expr: Expr, stored: &Encoding, want: &Encoding) -> Result<
     match (stored, want) {
         (s, w) if s == w => Ok(expr),
         (Encoding::Raw(_), Encoding::Raw(_)) => Ok(expr.cast(want.clone())),
-        // Packed codes are not values to quantize: a stored u32-word bank
-        // must be read by naming its planes, not by encoding its words.
         (Encoding::Raw(DType::U32), Encoding::Quant(_)) => Err(Error::Illegible {
             name: name.to_string(),
             detail: "it is stored as raw u32 words and this model wants it \
@@ -1667,7 +1438,6 @@ fn banded(name: &str, bands: Option<&(u32, Vec<i64>)>) -> Expr {
     }
 }
 
-/// `w`'s declared shape, as the signed extents a contract states.
 pub fn extents(w: &Weight) -> Vec<i64> {
     w.shape
         .iter()
@@ -1699,8 +1469,6 @@ fn whole(w: &Weight, tp: u32) -> Vec<i64> {
     }
 }
 
-/// `shape` with `axis` counted in `group`-code blocks — the shape of a scales
-/// plane, derived from the bank it reads.
 pub fn divided(shape: &[i64], axis: u32, group: u32, name: &str) -> Vec<i64> {
     let mut dims = shape.to_vec();
     let at = axis as usize;
@@ -1734,9 +1502,6 @@ fn seams_clear_the_blocked_axis(
     );
 }
 
-/// How `w`'s codes are paired with the numbers that read them. Group width
-/// and form both come from the same scheme (e.g. mxfp4: 32 codes under one
-/// exponent byte) — mixing them would produce a pairing nothing ships.
 pub fn scaling(w: &Weight) -> Scales {
     let form = match w.dtype {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
@@ -1762,8 +1527,6 @@ pub fn scaling(w: &Weight) -> Scales {
     }
 }
 
-/// `w`'s quantized encoding with its blocked axis stated — the channel axis
-/// is the bank's own last, because a rank is not a fact about a scheme.
 pub fn grouped(w: &Weight) -> Encoding {
     match encoding(w.dtype) {
         Encoding::Quant(spec) => Encoding::Quant(QuantSpec {
@@ -1806,13 +1569,6 @@ fn as_axis(axis: u32, name: &str) -> u8 {
         .unwrap_or_else(|_| panic!("`{name}` is cut on axis {axis}, which is no axis"))
 }
 
-/// The stored representation each weight [`Dtype`] declares -- raw of
-/// itself for everything that stores itself verbatim, and the quantization
-/// spec of the scheme for a packed bank's codes.
-///
-/// # Panics
-///
-/// On a [`Dtype::Quant`] whose term no self-contained scheme here has.
 pub fn encoding(dtype: Dtype) -> Encoding {
     match dtype {
         Dtype::Bf16 => Encoding::Raw(DType::Bf16),
@@ -1837,7 +1593,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 32,
             channel_axis: None,
         }),
-        // MLX affine U4: 64 codes under one bf16 scale and one bf16 offset.
         Dtype::U4g64 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
@@ -1845,7 +1600,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 64,
             channel_axis: None,
         }),
-        // Same scheme, twice the code width (`bits_per_element` says how wide).
         Dtype::U8g64 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
@@ -1853,7 +1607,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 64,
             channel_axis: None,
         }),
-        // Same scheme, half the group (`group_size` codes share a scale).
         Dtype::U4g32 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
@@ -1861,8 +1614,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 32,
             channel_axis: None,
         }),
-        // Same encoding as `U4g64`; a repack moves no value, only layout
-        // (tensor-core fragment order), which lives on the `Dtype` instead.
         Dtype::U4g64tiled => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
@@ -1870,7 +1621,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 64,
             channel_axis: None,
         }),
-        // Same scheme at two bits, over its three group sizes.
         Dtype::U2g32 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
@@ -1900,8 +1650,6 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             "a {:?} weight is served but no load contract declares one",
             dtype
         ),
-        // This variant carries the arithmetic itself; look up which block
-        // scheme has it rather than respelling the numbers here.
         Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
             Encoding::Quant(checkpoint::spec_of_term(dtype.repr()).unwrap_or_else(|| {
                 panic!(
@@ -1923,8 +1671,6 @@ mod tests {
     const ROWS: u64 = 32;
     const K: u64 = 128;
 
-    /// One bf16 plane and nothing beside it — the shape a dense snapshot
-    /// has, and the shape [`stored_raw`] answers `true` for.
     fn raw_source(dir: &std::path::Path) -> ztensor::Source {
         let path = dir.join("dense.zt");
         let mut writer = ztensor::Writer::create(&path).expect("the container opens");
@@ -1936,19 +1682,14 @@ mod tests {
         ztensor::Source::open(&path).expect("it reads back")
     }
 
-    /// **A PLACED ROW AND A DENSE SOURCE NOW SHARE A ROAD, AND IT LANDS THE
-    /// PLACEMENT.** `U4g64tiled` names a byte ORDER, and for a while
-    /// [`tiled_planes`] was the only door that wrote one — so a raw source
-    /// took the encode road, which publishes the canonical order, the import
-    /// wrote row-major bytes under a fragment-order declaration,
-    /// `kernels_cuda::linear::tiled` read them as fragments, and
-    /// `qwen35-d0.8b-u4g64-kv-bf16` answered gibberish on CUDA while the
-    /// same row served correctly everywhere else. The encode runs under an
-    /// internal name now and the placement is stated over what it wrote, so
-    /// what a reader gets is fragments. The assertion is that the public
-    /// codes carry the fragment `Repack` and that the encode itself is not
-    /// public — a canonical plane left visible is the old bug wearing a
-    /// different name.
+    fn lib_every_case() {
+        a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote();
+        an_uncovered_placement_still_refuses_by_name();
+        the_unplaced_sibling_of_that_row_still_reads_it();
+        the_mlx_road_lands_the_placed_order_and_bands_its_rows();
+        a_dense_row_is_untouched_by_the_guard();
+    }
+
     #[test]
     fn a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote() {
         let dir = tempfile::tempdir().expect("a scratch directory");
@@ -1980,11 +1721,6 @@ mod tests {
         );
     }
 
-    /// The fallback CUDAQ left, tested where it lives: `U4g64tiled` is the
-    /// only placed variant today, so nothing reaches this through
-    /// [`planes`] — and the day a second one lands, it refuses by name
-    /// rather than quietly publishing canonical bytes again.
-    #[test]
     fn an_uncovered_placement_still_refuses_by_name() {
         let w = Weight::sym("proj", [ROWS, K], Dtype::U4g64tiled);
         let why = placed_wants_its_own_order(&w, "a raw plane")
@@ -1996,11 +1732,6 @@ mod tests {
         );
     }
 
-    /// The same source and the same width, unplaced: the encode road is
-    /// exactly right, and nothing above refuses it. This is the half that
-    /// keeps the refusal from being a blanket one — every backend whose
-    /// kernels read the canonical order still imports this checkpoint.
-    #[test]
     fn the_unplaced_sibling_of_that_row_still_reads_it() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let src = raw_source(dir.path());
@@ -2008,22 +1739,12 @@ mod tests {
         planes(&src, &w, "proj").expect("the canonical order is what an encode publishes");
     }
 
-    /// **THE ROAD THAT DOES LAND THE PLACED ORDER STILL DOES.** MLX affine
-    /// codes name their factors in companion tensors, so [`tiled_planes`]
-    /// can put a `Repack` on each of the three planes — and it band-pads the
-    /// rows while it is there, which no other road does. 24 rows landing 32
-    /// is the cheapest proof that this contract went through the repack and
-    /// not through an encode; nothing else in this crate rounds a row count
-    /// up to a whole `TILED_BAND`.
-    #[test]
     fn the_mlx_road_lands_the_placed_order_and_bands_its_rows() {
         const ODD: u64 = 24;
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = dir.path().join("affine.zt");
         let mut writer = ztensor::Writer::create(&path).expect("the container opens");
         let groups = (K / 64) as usize;
-        // Sorted insertion, which is what canonical `.zt` form requires:
-        // the two factor planes sort before the codes.
         for plane in ["proj.biases", "proj.scales"] {
             writer
                 .add(
@@ -2034,7 +1755,6 @@ mod tests {
                 )
                 .expect("factors land");
         }
-        // MLX codes are raw u32 words, eight four-bit codes to a word.
         writer
             .add(
                 "proj.weight",
@@ -2066,9 +1786,6 @@ mod tests {
         );
     }
 
-    /// A dense row over the same plane, which is neither placed nor
-    /// quantized: the guard is on the placement, not on the door.
-    #[test]
     fn a_dense_row_is_untouched_by_the_guard() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let src = raw_source(dir.path());

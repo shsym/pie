@@ -1,8 +1,3 @@
-//! pie:instruct/chat — Conversation management
-//!
-//! Imported by inferlets that support chat-style interaction.
-//! Delegates to the model's `Instruct` implementation.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
@@ -11,13 +6,6 @@ use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Chat decoder resource — wraps a model-specific ChatDecoder trait object.
-///
-/// A decoder answers a batch with everything that batch contained, which can
-/// be more than one event: a stop token in the middle of a batch closes the
-/// turn and the tokens after it are the next one. The WIT `feed` hands back a
-/// single event, so the surplus queues here and drains on the following calls
-/// rather than being dropped.
 pub struct Decoder {
     inner: Box<dyn ChatDecoder>,
     pending: VecDeque<ChatEvent>,

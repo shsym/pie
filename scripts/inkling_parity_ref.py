@@ -43,7 +43,6 @@ PROMPTS = [
     ),
 ]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
@@ -100,7 +99,6 @@ def main():
         )
         print(f"  {name}: {len(ids)} tokens, vocab {vocab}, gen={produced[:12]}  ({time.time() - started:.1f}s)")
         print(f"      {tokenizer.decode(produced)!r}")
-
 
 if __name__ == "__main__":
     main()

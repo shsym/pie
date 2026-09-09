@@ -1,11 +1,3 @@
-//! The dotted-path config schema, read out of the config source itself.
-//!
-//! `pie config list` prints every key a person may set, what it is currently
-//! worth, and what it means. The first two come from serde; the description
-//! has no runtime representation (Rust discards doc comments), so this
-//! module parses them back out of the source with [`include_str!`] rather
-//! than keep a hand-written table that could drift from the field.
-
 use std::collections::BTreeMap;
 
 use crate::config::{Config, EngineKind};
@@ -16,45 +8,27 @@ const SOURCE: &str = concat!(
     include_str!("backend.rs"),
 );
 
-/// One settable key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
-    /// Dotted path as `pie config set` spells it, e.g. `server.port`.
     pub key: String,
-    /// The field's summary paragraph, joined into one line. Empty only if the
-    /// doc-comment test has been circumvented.
     pub doc: String,
-    /// What the field is worth when the file does not say. `None` means
-    /// either pie derives the value at bootstrap, or (when `required`) the
-    /// file must say.
     pub default: Option<toml::Value>,
-    /// The file has to carry this one.
     pub required: bool,
 }
 
-/// A field as it appears in the source, before nesting is resolved.
 struct Parsed {
     name: String,
     ty: String,
     doc: String,
     skip: bool,
-    /// No serde `default`, from the field or from the struct: omitting it is
-    /// a parse error rather than a choice.
     required: bool,
 }
 
-/// Pull `(struct -> fields)` out of the source text.
-///
-/// Only `pub` fields of `pub struct`s, and only where an identifier is
-/// followed immediately by `:` -- without that last part this also matches
-/// `pub const fn from_secs(s: u64)` in the newtypes' impl blocks.
 fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
     let mut out: BTreeMap<String, Vec<Parsed>> = BTreeMap::new();
     let mut current = String::new();
     let mut doc: Vec<String> = Vec::new();
     let mut attrs: Vec<String> = Vec::new();
-    // `#[serde(default)]` on the struct makes every one of its fields
-    // optional, so field attributes alone do not decide requiredness.
     let mut struct_defaults_all = false;
 
     for line in SOURCE.lines() {
@@ -78,9 +52,6 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
             continue;
         }
         if trimmed == "///" {
-            // A blank doc line ends the summary paragraph. Everything after it
-            // is the rationale, which belongs in the source and not in a table
-            // of 80-odd rows.
             doc.push(String::new());
             continue;
         }
@@ -114,8 +85,6 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
                         .map(|s| s.as_str())
                         .collect::<Vec<_>>()
                         .join(" "),
-                    // A skipped field is populated by pie from somewhere else,
-                    // so listing it would offer a key that `set` cannot honour.
                     skip: attr_text.contains("skip)") || attr_text.contains("skip,"),
                     required: !struct_defaults_all && !attr_text.contains("default"),
                 });
@@ -127,10 +96,6 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
     out
 }
 
-/// The option struct an engine kind parses `[model.engine.options]` into, or
-/// `None` for a kind with no typed table. Every kind has one today; the
-/// `Option` stays for the next kind that lands before its options do. A key is
-/// listed only when a seam reads it.
 fn options_struct(engine: EngineKind) -> Option<&'static str> {
     match engine {
         EngineKind::CudaNative => Some("CudaNativeEngineOptions"),
@@ -140,20 +105,11 @@ fn options_struct(engine: EngineKind) -> Option<&'static str> {
     }
 }
 
-/// Every key settable under `[worker]`, in declaration order, for a config
-/// using `engine`.
-///
-/// The engine matters because `[model.engine.options]` is an untyped table
-/// until the engine kind picks the struct it parses into -- so a listing that
-/// ignored it would either show the wrong knobs or none.
 pub fn fields(engine: EngineKind) -> Vec<Field> {
     let structs = parse_structs();
     let defaults = default_values(engine);
     let mut out = Vec::new();
     walk(&structs, "Config", "", engine, &defaults, &mut out);
-    // The struct paths are an implementation detail; what `pie config set`
-    // accepts is what the file spells. One translation, at the boundary, so
-    // the walk stays a walk.
     for field in &mut out {
         field.key = crate::config::layout::to_file_path(&field.key);
     }
@@ -188,12 +144,7 @@ fn walk(
         } else {
             format!("{prefix}.{}", field.name)
         };
-        // `options` is the one field whose shape depends on another field's
-        // value, so it is the one place the walk consults the engine kind.
         let nested = if field.ty == "toml::Table" {
-            // No struct, no keys, and the untyped table itself is not one
-            // either: a kind with no typed options parses nothing out of
-            // `[model.engine.options]`, so nothing under it is settable.
             let Some(inner) = options_struct(engine) else {
                 continue;
             };
@@ -222,10 +173,6 @@ fn walk(
     }
 }
 
-/// A config carrying nothing but its required keys, serialized -- so every
-/// other value in it is the one serde reaches for when the file is silent.
-/// Built by parsing rather than `Config::default()` (which doesn't exist,
-/// since `model` has required fields).
 fn default_values(engine: EngineKind) -> toml::Value {
     let minimal = format!(
         "[model]\nname = \"x\"\nmodel = \"x\"\n\
@@ -238,14 +185,7 @@ fn default_values(engine: EngineKind) -> toml::Value {
     let mut root =
         toml::Value::try_from(parsed).unwrap_or_else(|_| toml::Value::Table(Default::default()));
 
-    // `options` round-trips as the empty table it was parsed from, so the
-    // engine's own option defaults have to be asked for separately -- by
-    // deserializing an empty table, which is serde applying the same defaults
-    // it would apply to a config that omitted the section.
     let empty = toml::Value::Table(Default::default());
-    // Deserialize then re-serialize: the round trip is what applies serde's
-    // defaults, and the two halves have different error types, so neither is
-    // chained onto the other.
     fn defaults_of<T>(empty: &toml::Value) -> Option<toml::Value>
     where
         T: serde::de::DeserializeOwned + serde::Serialize,
@@ -270,8 +210,6 @@ fn default_values(engine: EngineKind) -> toml::Value {
     root
 }
 
-/// Follow a dotted path. Returns `None` for an absent key, which for a
-/// serialized default means the field is an `Option` that is `None`.
 pub fn lookup<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
     let mut cursor = root;
     for part in key.split('.') {
@@ -288,13 +226,14 @@ mod tests {
         fields(engine).into_iter().map(|f| f.key).collect()
     }
 
+    fn schema_every_case() {
+        schema_covers_exactly_the_settable_keys();
+        the_summary_stops_at_the_blank_doc_line();
+        a_derived_field_has_no_default_to_print();
+    }
+
     #[test]
     fn schema_covers_exactly_the_settable_keys() {
-        // The walk is a parse of the source; `Config::parse` is the schema
-        // itself. Serializing a default config produces every non-`Option` key
-        // serde will accept, so anything there and not here means the listing
-        // has a blind spot -- which is how a parse that quietly broke would
-        // otherwise present itself.
         let listed: std::collections::BTreeSet<String> =
             keys(EngineKind::CudaNative).into_iter().collect();
 
@@ -326,10 +265,7 @@ mod tests {
         );
     }
 
-    #[test]
     fn the_summary_stops_at_the_blank_doc_line() {
-        // Several fields carry paragraphs of measurement rationale after the
-        // summary. A table of 80 rows cannot hold those.
         let fields = fields(EngineKind::CudaNative);
         let threads = fields
             .iter()
@@ -341,7 +277,6 @@ mod tests {
             "rationale leaked into the summary: {}",
             threads.doc
         );
-        // Multi-line summaries are joined rather than cut at the first line.
         let hosts = fields
             .iter()
             .find(|f| f.key == "sandbox.network_allowed_hosts")
@@ -349,14 +284,11 @@ mod tests {
         assert!(hosts.doc.ends_with("for any."), "got: {}", hosts.doc);
     }
 
-    #[test]
     fn a_derived_field_has_no_default_to_print() {
         let fields = fields(EngineKind::CudaNative);
         let by_key = |k: &str| fields.iter().find(|f| f.key == k).expect(k);
-        // `Option` and `None`: absence is the setting.
         assert!(by_key("runtime.max_concurrent_processes").default.is_none());
         assert!(by_key("engine.kv_page_size").default.is_none());
-        // A concrete default prints as itself.
         assert_eq!(
             by_key("server.port").default,
             Some(toml::Value::Integer(8080))

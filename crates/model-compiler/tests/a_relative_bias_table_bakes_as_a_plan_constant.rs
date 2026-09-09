@@ -1,23 +1,3 @@
-//! **A TWO-LAYER T5-STYLE ENCODER — one `elementwise.relative_bucket_bias`
-//! table per layer under its `attention.ragged` — BAKES ON EVERY PLATFORM,
-//! AND EACH TABLE IS AN ARENA RECTANGLE OF `heads · (2·max_len − 1)` f32
-//! THAT LIVES FROM ITS NODE TO THE ATTENTION THAT READS IT.**
-//!
-//! ```text
-//! cargo test -p model-compiler --test a_relative_bias_table_bakes_as_a_plan_constant
-//! ```
-//!
-//! The table is the one activation of the plan with `Dim::Const` rows: it
-//! reads a weight and no row of any axis. The compiler must:
-//!
-//! ```text
-//! (a) bake the text with no kv space, on every platform
-//! (b) place each table in the arena at exactly `heads · (2·max_len − 1) · 4`
-//!     bytes — no row ceiling multiplies it
-//! (c) keep each table alive through the attention node that names it in
-//!     its mask, and demand every node somewhere (nothing dead)
-//! ```
-
 mod common;
 
 use model_compiler::Placement;
@@ -103,7 +83,6 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
         let trace = trace_hybrid("encoder", &Encoder, platform);
         assert!(trace.caches.is_empty());
 
-        // (a)
         let compiled = common::bake(&trace).unwrap_or_else(|e| panic!("{platform:?}: {e}"));
         assert!(
             compiled.classes.dead.is_empty(),
@@ -117,7 +96,6 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
                 continue;
             };
             seen += 1;
-            // (b)
             let slot = y.0 as usize;
             let Placement::Arena { bytes, .. } = compiled.arena.placements[slot] else {
                 panic!(
@@ -130,7 +108,6 @@ fn the_tables_are_fixed_rectangles_alive_through_their_attention() {
                 u64::from(HEADS) * (2 * u64::from(MAX_LEN) - 1) * 4,
                 "{platform:?}: the table is heads · (2·max_len − 1) f32, no ceiling applied"
             );
-            // (c)
             let reader = trace
                 .nodes
                 .iter()

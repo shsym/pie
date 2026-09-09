@@ -69,22 +69,12 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import mini_dit_parity as P  # noqa: E402
+import mini_dit_parity as P
 
 REPO = P.REPO
 
-# How large a threshold means "always".  `rel` is a ratio of L1 norms of
-# bf16-derived velocities; 1e9 is past anything finite this model produces.
 HUGE = 1e9
-# Claim 2 divides the trajectory by `dt` to recover a velocity, so it is the
-# one claim that is not exact.  f32 division of numbers that ARE equal lands
-# well inside this.
 VELOCITY_REL_TOL = 1e-5
-
-
-# ----------------------------------------------------------------------------
-# run one configuration
-# ----------------------------------------------------------------------------
 
 def run_cache(args, where: str, threshold: float | None) -> list[dict]:
     """Fire the cached loop once per batch element; answer the documents."""
@@ -131,19 +121,12 @@ def run_cache(args, where: str, threshold: float | None) -> list[dict]:
         docs.append(P.document(out))
     return docs
 
-
 def trajectory(doc: dict) -> np.ndarray:
     """`[fires, rows * feats]` — the latent after every fire."""
     return np.asarray(doc.get("cache_x", []), dtype=np.float32)
 
-
 def series(doc: dict, key: str) -> np.ndarray:
     return np.asarray(doc.get(key, []), dtype=np.float64)
-
-
-# ----------------------------------------------------------------------------
-# the three claims
-# ----------------------------------------------------------------------------
 
 def claim_one(base: dict, zero: dict, at: int) -> int:
     """Threshold 0: nothing skipped, and the trajectory IS the plain loop's."""
@@ -172,7 +155,6 @@ def claim_one(base: dict, zero: dict, at: int) -> int:
         bad += 1
     return bad
 
-
 def claim_two(big: dict, steps: int, at: int) -> int:
     """A large threshold: everything after the first step is the first step held."""
     x = trajectory(big)
@@ -192,8 +174,6 @@ def claim_two(big: dict, steps: int, at: int) -> int:
               f"and the device counted {count[-1] if count.size else 'n/a'}; "
               f"every-after-the-first is {want}")
         bad += 1
-    # The velocity each step actually integrated, recovered from the
-    # trajectory itself: x_k = x_{k-1} + dt_k * v_k.
     used = []
     for k in range(1, x.shape[0]):
         dt = float(dts[k]) if k < dts.size else 0.0
@@ -213,7 +193,6 @@ def claim_two(big: dict, steps: int, at: int) -> int:
         bad += 1
     return bad
 
-
 def claim_three(doc: dict, threshold: float, at: int, label: str) -> int:
     """The device's skip count is the rule applied to the reported metric."""
     rel = series(doc, "cache_rel")
@@ -223,7 +202,6 @@ def claim_three(doc: dict, threshold: float, at: int, label: str) -> int:
         print(f"[cache] batch {at} {label}: FAIL claim 3 — the probe reported "
               f"{rel.size} metrics and {did.size} decisions")
         return 1
-    # Fire k acts on the flag fire k-1 wrote: `k-1 >= 1 and rel[k-1] < thr`.
     want = np.zeros_like(did)
     for k in range(1, did.size):
         want[k] = 1.0 if (k - 1 >= 1 and rel[k - 1] < threshold) else 0.0
@@ -245,11 +223,6 @@ def claim_three(doc: dict, threshold: float, at: int, label: str) -> int:
         bad += 1
     return bad
 
-
-# ----------------------------------------------------------------------------
-# the gate
-# ----------------------------------------------------------------------------
-
 def gate(args) -> int:
     case_args = argparse.Namespace(**vars(args))
     case_args.euler = True
@@ -259,11 +232,6 @@ def gate(args) -> int:
     zero = run_cache(args, os.path.join(args.out, "thr0"), 0.0)
     big = run_cache(args, os.path.join(args.out, "thrbig"), HUGE)
 
-    # A middle threshold picked off the UNSKIPPED metric series, so claim 3 is
-    # exercised somewhere that is neither all nor nothing.  The median of the
-    # decidable fires: half of them would skip if nothing else moved.  (It
-    # does move — a skip changes the next metric — which is exactly why the
-    # rule has to be re-derived from what was REPORTED rather than predicted.)
     decidable = [series(doc, "cache_rel")[1:-1] for doc in zero]
     pool = np.concatenate([d for d in decidable if d.size]) if decidable else np.zeros(0)
     middle = float(np.median(pool)) if pool.size else 0.5
@@ -287,7 +255,6 @@ def gate(args) -> int:
     print(f"[cache] {'PASS' if bad == 0 else 'FAIL'} {bad} claim(s) failed")
     return 1 if bad else 0
 
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -308,7 +275,6 @@ def main() -> int:
         P.cases(args)
         return 0
     return gate(args)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

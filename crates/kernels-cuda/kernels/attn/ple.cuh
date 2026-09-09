@@ -4,19 +4,6 @@
 
 namespace pie::attn {
 
-// The PLE n-gram hasher (qwen4): every token's hashed n-gram table rows,
-// one column per head. The hash is the reference's own — token ids
-// multiplied by seed-derived odd constants, xor-folded, reduced modulo a
-// per-head prime plus a per-head offset — and its constants arrive by value
-// in one aggregate parameter, because no checkpoint plane needs to be read
-// to know them.
-//
-// The window cache is a per-lane state slab of `ngram - 1` i32 cells storing
-// PREVIOUS token ids as `id + 1`, so a zeroed slot reads as "no history" and
-// the reference's eos padding falls out of the sentinel rather than out of a
-// separate reset. The eos-segmentation rule reduces, for a window of two,
-// to: the id one back is itself; the id two back is eos when the id one
-// back is eos.
 
 constexpr int PLE_MAX_NGRAM = 4;
 constexpr int PLE_MAX_HEADS = 32;
@@ -31,7 +18,6 @@ struct PleHash {
     int eos;
 };
 
-// Hash the window [t, p1, p2, ...] (newest first) for every head.
 __device__ __forceinline__ void ple_hash_row(
     const PleHash& h, const int* window, int* out)
 {
@@ -49,9 +35,6 @@ __device__ __forceinline__ void ple_hash_row(
     }
 }
 
-// Apply the eos-segmentation rule to the raw window: a previous id is
-// replaced by eos when a NEARER previous id is eos (the window crossed a
-// sequence boundary).
 __device__ __forceinline__ void ple_mask_window(
     const PleHash& h, int* window)
 {
@@ -62,8 +45,6 @@ __device__ __forceinline__ void ple_mask_window(
     }
 }
 
-// Decode form: one thread per lane row. Reads the lane's state, hashes the
-// one new token, shifts the window.
 __global__ void ple_ngram_ids_update(
     const int* __restrict__ ids,
     int* __restrict__ state_base,
@@ -76,14 +57,9 @@ __global__ void ple_ngram_ids_update(
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first thread owns. The token
-    // it reads and the table row it lands are both there; the slot table is
-    // the LANES', and a lane ordinal is not a row.
+
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int slot = slot_ids[r];
     if (slot < 0) return;
@@ -108,9 +84,6 @@ __global__ void ple_ngram_ids_update(
     state[span - 1] = ids[r_row] + 1;
 }
 
-// Prefill form: one thread block per request; walks the request's tokens in
-// order (the window is tiny, so every thread rebuilds its own token's
-// window from the fire's rows and the state fills only the first `span`).
 __global__ void ple_ngram_ids_chunked(
     const int* __restrict__ ids,
     int* __restrict__ state_base,
@@ -127,31 +100,15 @@ __global__ void ple_ngram_ids_chunked(
 {
     const int r = blockIdx.x;
 
-    // **THE STAGED-GEOMETRY SEAT, ON THE LANE AXIS** (the chunked-arm wave).
-    // One block per REQUEST, so the word that retires a ceiling grid's padding
-    // is `win[2]` — the window's live lane count — and not `win[0]`, which is
-    // the row count the decode form above reads.
     if (win != nullptr && r >= static_cast<int>(win[2])) return;
-    // **AND THE LANE READS SPLIT, WHICH IS THIS WAVE'S CRUX.** `qo_indptr` is
-    // the WINDOW's own rebased CSR — staged into the fixed-stride window blob
-    // at an address a body may bake — so it is read at the window-local `r`.
-    // `slot_ids`, the fold predicate, the commit length and the segment origin
-    // are the FIRE's tables, handed over whole under a plane base
-    // (`Run::recurrent_absolute`) because `lane_offset` is not a function of a
-    // body key; those are read at `r + win[3]`.
+
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    // And the ROW axis: `ids` and `ngram_ids` are the fire's own planes,
-    // handed as BASES under an armed seat while the CSR above counts from the
-    // window's zero, so `win[1]` bridges the two. The state slab is addressed
-    // by the slot's VALUE and moves for neither.
+
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
 
     int t0 = (int)qo_indptr[r] + row0;
     int Nr = (int)qo_indptr[r + 1] - (int)qo_indptr[r];
 
-    // The segment this launch owns (the 2R split) — the causal conv's own
-    // trimming, read for the same reason: state may only advance over the
-    // committed prefix, and the tail launch re-covers the rest.
     if (begin_at != nullptr) {
         int b = begin_at[rl];
         if (b > Nr) b = Nr;
@@ -193,7 +150,7 @@ __global__ void ple_ngram_ids_chunked(
     if (write_state &&
         (write_state_mask == nullptr || write_state_mask[rl] != 0) &&
         tid == 0) {
-        // The new window: the last `span` ids of (state ++ segment).
+
         int next[PLE_MAX_NGRAM];
         for (int p = 0; p < span; ++p) {
             const int src_t = Nr - span + p;
@@ -203,4 +160,4 @@ __global__ void ple_ngram_ids_chunked(
     }
 }
 
-} // namespace pie::attn
+}

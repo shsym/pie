@@ -1,14 +1,8 @@
-//! pie:core/model - Model and tokenizer global functions.
-//!
-//! The runtime serves exactly one model, so these are free functions over the
-//! single global [`crate::model::Model`] rather than resource methods.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-/// A catalog stream as the WIT enum spells it.
 pub fn lane_stream(stream: models::Stream) -> pie::inferlet::model::LaneStream {
     use pie::inferlet::model::LaneStream;
     match stream {
@@ -21,7 +15,6 @@ pub fn lane_stream(stream: models::Stream) -> pie::inferlet::model::LaneStream {
     }
 }
 
-/// The WIT enum as the catalog spells it.
 pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Stream {
     use pie::inferlet::model::LaneStream;
     match stream {
@@ -34,7 +27,6 @@ pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> models::Strea
     }
 }
 
-/// One catalog axis role as the facts spell it.
 fn axis_role(role: models::AxisRole) -> pie::inferlet::model::AxisRole {
     use pie::inferlet::model::AxisRole;
     match role {
@@ -45,7 +37,6 @@ fn axis_role(role: models::AxisRole) -> pie::inferlet::model::AxisRole {
     }
 }
 
-/// One catalog reading as `model.readings()` answers it.
 fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingFact {
     use pie::inferlet::model::{PortKind, ReadoutKind};
     pie::inferlet::model::ReadingFact {
@@ -67,8 +58,6 @@ fn reading_fact(reading: &models::ReadingFact) -> pie::inferlet::model::ReadingF
                     models::PortKind::Voxels => PortKind::Voxels,
                 },
                 width: port.width,
-                // Every float port is fed from an f32 channel: the WIT dtype
-                // set has no bf16, and the engine marshals at the feed.
                 dtype: pie::inferlet::types::Dtype::F32,
                 streams: port.streams.iter().copied().map(lane_stream).collect(),
                 rows: port.rows,
@@ -122,16 +111,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
         )
     }
 
-    /// Which forward-pass interface the bound model requires, keyed on state
-    /// semantics: recurrent state is present iff the engine handshake
-    /// reports a non-zero folded-state size; paged KV is present iff the
-    /// model has a KV page size.
     async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
         use pie::inferlet::model::ForwardKind;
         let model = model::model();
-        // A diffusion row states its canvas on the catalog; the kind is
-        // that statement, not a reading of its page sizes (which are an
-        // attention model's).
         if model.diffusion().is_some() {
             return Ok(ForwardKind::Diffusion);
         }
@@ -144,7 +126,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
         })
     }
 
-    /// The canvas a diffusion row denoises; `None` for every other kind.
     async fn canvas(&mut self) -> Result<Option<pie::inferlet::model::CanvasShape>> {
         Ok(model::model()
             .diffusion()
@@ -155,13 +136,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
             }))
     }
 
-    /// The family's readings (design D12), in index order; empty for a
-    /// text row.
     async fn readings(&mut self) -> Result<Vec<pie::inferlet::model::ReadingFact>> {
         Ok(model::model().readings().iter().map(reading_fact).collect())
     }
 
-    /// The latent space a denoiser works in; `None` for a text row.
     async fn latent(&mut self) -> Result<Option<pie::inferlet::model::LatentSpace>> {
         Ok(model::model().generative().and_then(|g| g.latent).map(|l| {
             pie::inferlet::model::LatentSpace {
@@ -175,8 +153,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
         }))
     }
 
-    /// The schedule the denoiser was trained under; `None` when nothing
-    /// denoises.
     async fn schedule(&mut self) -> Result<Option<pie::inferlet::model::ScheduleFact>> {
         use pie::inferlet::model::ScheduleKind;
         Ok(model::model()
@@ -203,13 +179,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
             }))
     }
 
-    /// The most latent rows one pass carries; 0 without a float lane.
     async fn max_latent_rows(&mut self) -> Result<u32> {
         Ok(model::model().generative().map_or(0, |g| g.max_rows))
     }
 
-    /// LM-head output dimension (`hf_config.vocab_size`), not the tokenizer
-    /// vocab.
     async fn output_vocab_size(&mut self) -> Result<u32> {
         Ok(model::model().vocab_size())
     }
@@ -218,40 +191,26 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().kv_page_size())
     }
 
-    /// Waves per frame (k) — the static deployment constant `forward.submit`
-    /// sizes its slot list to. Fixed at runtime start, like `kv-page-size`.
     async fn frame_size(&mut self) -> Result<u32> {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
-    /// Bound on how long a pipeline may hold a frame's wait-set without
-    /// submitting. See `scheduler::configured_submit_deadline`.
     async fn submit_deadline_us(&mut self) -> Result<u64> {
         Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
     }
 
-    /// Host-reader channel capacity, in cells, that sustains the runtime's
-    /// run-ahead for one lane. Includes the staging margin; see
-    /// `scheduler::channel_capacity`.
     async fn channel_capacity(&mut self) -> Result<u32> {
         Ok(crate::scheduler::channel_capacity() as u32)
     }
 
-    /// The run-ahead window in fires; see `scheduler::run_ahead_window`.
     async fn run_ahead_window(&mut self) -> Result<u32> {
         Ok(crate::scheduler::run_ahead_window() as u32)
     }
 
-    /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
-    /// budget, sourced from the bound engine's structural per-launch token
-    /// capacity.
     async fn max_embed_length(&mut self) -> Result<u32> {
         Ok(crate::engine::get_spec(0)?.limits.max_forward_tokens as u32)
     }
 
-    /// The prefill chunk the scheduler would like right now: the forward
-    /// token budget shared evenly among live processes, in whole KV pages.
-    /// See `model.wit`.
     async fn prefill_chunk_hint(&mut self) -> Result<u32> {
         let budget = crate::engine::get_spec(0)?.limits.max_forward_tokens;
         let live = crate::inferlet::process::live_count().max(1);
@@ -260,25 +219,18 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(share.clamp(page.min(budget.max(1)), budget.max(1)) as u32)
     }
 
-    // working-set / arena capabilities, global over the bound model.
-
-    /// Bytes of one folded recurrent-state object (0 if the model has no RS).
     async fn rs_state_size(&mut self) -> Result<u64> {
         Ok(model::model().rs_caps().state_size)
     }
 
-    /// Tokens per buffered RS page (0 if the model has no RS).
     async fn rs_buffer_page_size(&mut self) -> Result<u32> {
         Ok(model::model().rs_caps().buffer_page_size)
     }
 
-    /// Fold granularity in tokens; 1 = unconstrained. An RS fold of `n`
-    /// tokens requires `n` to be a positive multiple of this.
     async fn rs_fold_granularity(&mut self) -> Result<u32> {
         Ok(model::model().rs_caps().fold_granularity)
     }
 
-    /// KV page size (tokens) of the bound model.
     async fn arena_block_size(&mut self) -> Result<u64> {
         Ok(crate::store::registry::get(0, 0).kv_page_size as u64)
     }

@@ -1,7 +1,3 @@
-//! `MoeRoute`: the router that reads no logits. One entry,
-//! `linear.moe_hash_route`, kept apart from the ranked routers in
-//! [`super::moe`] — it shares nothing with them but the shape of the answer.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -10,23 +6,8 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "linear/moe_route.cuh";
 
-/// One thread per (token row, slot); the gather is two loads wide and wants
-/// the lanes, not the block shape.
 const BLOCK: u32 = 256;
 
-/// Routes by lookup, not by a gate: `tid2eid` is `[vocab, top_k]` i64,
-/// naming the `top_k` experts each token id routes to at uniform weight
-/// `1/top_k`. Lands the same `routes` i32 / `weights` f32 pair a ranked gate
-/// in [`super::moe`] would.
-///
-/// The i64 table narrows to i32 routes in the gather, since an expert count
-/// never approaches `2^31`. An out-of-range token id falls to table row 0,
-/// matching [`crate::layout::embed`]'s gather.
-///
-/// # Errors
-///
-/// A refusal for a zero fan-out, a zero vocabulary, an empty row count, and
-/// for a `tokens x top_k` lane count that does not fit a 32-bit grid.
 #[allow(clippy::too_many_arguments)]
 pub fn hash_route(
     ctx: &Ctx,
@@ -41,8 +22,6 @@ pub fn hash_route(
     weights: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_hash_route";
-    // The weights are the gate's sqrt-softplus scores at the table's picks
-    // (the official `Gate.forward`), so the router logits are read too.
     debug_assert_eq!(logits.dtype, Dtype::Bf16, "`{OP}` reads bf16 router logits");
     debug_assert_eq!(
         logits.rows, routes.rows,
@@ -57,7 +36,6 @@ pub fn hash_route(
         tid2eid.width, top_k,
         "the hash table names `top_k` experts per token id"
     );
-    // Restated here: this file shares no validator with the ranked router.
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` lands i32 routes");
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` lands f32 route weights");
     debug_assert!(
@@ -77,7 +55,6 @@ pub fn hash_route(
     let top_k = nonzero(OP, "the fan-out this router states", top_k)?;
     let vocab = nonzero(OP, "the vocabulary this table spans", vocab)?;
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
-    // One thread per token row: the row's weights normalize together.
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::linear::hash_route_gather").apply(Launch::flat(rows, BLOCK)),
@@ -93,13 +70,11 @@ pub fn hash_route(
             stated(OP, top_k)?.arg(),
             i32::from(renormalize).arg(),
             scaling.arg(),
-            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )
 }
 
-/// **THE STATIC ROUTES OF A GROUPED PROJECTION**: `routes[n, g] = g`.
 pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.group_routes";
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` lands i32 routes");
@@ -116,7 +91,6 @@ pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), E
             routes.arg(),
             stated(OP, rows)?.arg(),
             stated(OP, groups)?.arg(),
-            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )

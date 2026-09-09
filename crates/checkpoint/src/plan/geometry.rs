@@ -1,6 +1,3 @@
-//! Strided-extent geometry: build and measure the source/dest extents that
-//! back every copy instruction.
-
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
 use crate::plan::DestExtent;
@@ -18,11 +15,6 @@ pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
             Ok(elems.div_ceil(2))
         }
         RepackLayout::MarlinMxfp4Scale => Ok(0),
-        // **NO STAGE, AND THE ZERO IS THE STATEMENT.** The tiled affine pair
-        // is a pure gather: one output word is eight input nibbles read
-        // straight out of the operand, and one output factor is one input
-        // factor. There is nothing to lay out on the way, so an executor
-        // that reserved a slab for it would be reserving one nothing writes.
         RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor => Ok(0),
     }
 }

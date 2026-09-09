@@ -1,13 +1,3 @@
-//! `AttnScore`: per-key attention mass for an observation window, mirroring
-//! `kernels_cuda::attn_score`.
-//!
-//! One entry, one stamp ladder, no workspace: recomputes the softmax weights
-//! from the pages rather than materializing a `heads x window x kv_len` F32
-//! slab. Unverified on device; the tests below pin the host half (ladder,
-//! refusals, grid, argument order).
-//!
-//! [`dense`]: crate::attn::dense
-
 use dtype::Dtype;
 
 use crate::attn::{KvPool, PrefillPlan, RaggedTensor};
@@ -17,18 +7,12 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "attn/score.metal";
 
-/// Simdgroups per threadgroup; keys are split across them and folded once
-/// per window row (the CUDA twin's `WARPS`).
 const SIMDS: u32 = 8;
 
-/// Threads per threadgroup — one Apple simdgroup is 32 lanes wide.
 const THREADS: u32 = SIMDS * 32;
 
-/// The dot-product stamps, tightest first. A stamp bounds the head width
-/// from above; e.g. widths 64, 72 and 80 all share the 128 stamp.
 const STAMPS: [u32; 4] = [64, 128, 256, 512];
 
-/// The shipped point per stamp, in [`STAMPS`] order.
 const CAPTURE: [&str; 4] = [
     "attn_score_capture_bfloat16_d_64",
     "attn_score_capture_bfloat16_d_128",
@@ -36,40 +20,10 @@ const CAPTURE: [&str; 4] = [
     "attn_score_capture_bfloat16_d_512",
 ];
 
-/// The tightest stamp that holds this head, as an index into [`STAMPS`], or
-/// `None` if it is wider than the last stamp (refused, not truncated).
 fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
-/// Per-key attention mass for an observation window, written into a
-/// caller-owned F32 slab.
-///
-/// `q` is the capture window's query rows paired with a window-rebased
-/// `qo_indptr`; `plan`'s position table gives the causal bound; `pool` is
-/// the paged cache read.
-///
-/// For request `r`, head `h`: row `(lane_offset + r) * plane_stride + plane
-/// + h` holds `(1/rows) * sum_w softmax_j(sm_scale * <q_w, k_j>)`, where
-/// `rows = min(observe, qo_len)` walks the last `rows` query rows. A
-/// probability distribution over the request's live KV; no fold over heads.
-///
-/// The whole row is always written; the tail past live keys is exactly
-/// `0.0` (the slab is reused across fires, so a stale tail would misread as
-/// mass on keys that no longer exist).
-///
-/// # Errors
-///
-/// Refuses: a sliding window (semantically not this softmax, not a missing
-/// instantiation); non-bf16 key pages (nothing here dequantizes); a
-/// head/kv-head shape mismatch; a head wider than the widest stamp; a
-/// non-F32 or wrong-width score slab; a non-`i32` position table or boundary
-/// vector; `observe`, `kv_max`, `page_size`, or request count of zero; or an
-/// overflowing extent. [`Error::DtypeUnsupported`] for a non-bf16 query.
-///
-/// A live kv extent past `kv_max` is a caller error not knowable here (it is
-/// device-side); the kernel stays safe, softmax over the true extent, store
-/// clamped to `kv_max`.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx<'_>,
@@ -130,8 +84,6 @@ pub fn capture(
             ),
         ));
     }
-    // Unnamed seats bypass the trace-time validator, so mismatches are
-    // refused here rather than asserted.
     if plan.positions.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -184,7 +136,6 @@ pub fn capture(
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
 
-    // The landing contract, checked only once the fire is admissible.
     debug_assert!(
         plane + num_q_heads <= plane_stride,
         "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
@@ -236,8 +187,6 @@ mod tests {
     
     use crate::probe::Probe;
 
-    // Spelled as a number: this crate names no registry, the ceiling is
-    // just a caller-stated argument.
     const KV_MAX: u32 = 2048;
 
     fn bf16(rows: u32, width: u32) -> Tensor {
@@ -256,7 +205,6 @@ mod tests {
         Tensor::new(4, rows, KV_MAX, Dtype::F32)
     }
 
-    /// A pool whose strides spell `kv_heads` heads of `head_dim`.
     fn pool(kv_heads: u32, head_dim: u32, keys: Dtype) -> KvPool {
         KvPool {
             keys: Tensor::new(5, 64, kv_heads * head_dim, keys),
@@ -279,7 +227,6 @@ mod tests {
         }
     }
 
-    /// 16 query heads of 64 over 8 kv heads, two requests, whole slab.
     #[allow(clippy::too_many_arguments)]
     fn fire(probe: &Probe, window: Option<u32>, keys: Dtype, scores: Tensor) -> Result<(), Error> {
         let (q_heads, kv_heads, head_dim, rows) = (16u32, 8u32, 64u32, 40u32);
@@ -305,6 +252,16 @@ mod tests {
         )
     }
 
+    fn score_every_case() {
+        the_head_lands_on_the_tightest_stamp_that_holds_it();
+        a_sliding_window_is_refused_as_a_different_quantity();
+        a_quantized_key_plane_is_refused_by_name();
+        a_slab_that_is_not_the_ceiling_is_refused_by_name();
+        an_observation_window_of_zero_rows_is_refused_by_name();
+        a_head_past_the_last_stamp_is_refused_by_name();
+        an_element_this_plane_has_no_point_for_is_refused_by_dtype();
+    }
+
     #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
@@ -314,15 +271,11 @@ mod tests {
         assert_eq!(stamp_for(128), Some(1));
         assert_eq!(stamp_for(129), Some(2));
         assert_eq!(stamp_for(256), Some(2));
-        // gemma-4's global reading.
         assert_eq!(stamp_for(512), Some(3));
-        // Past the last stamp is not a wider point, it is no point.
         assert_eq!(stamp_for(513), None);
         assert_eq!(STAMPS.len(), CAPTURE.len());
     }
 
-    /// The sliding-window refusal is semantic, not a missing instantiation.
-    #[test]
     fn a_sliding_window_is_refused_as_a_different_quantity() {
         let probe = Probe::default();
         let why = fire(&probe, Some(512), Dtype::Bf16, slab(4 * 96))
@@ -333,9 +286,6 @@ mod tests {
         assert!(probe.fires().is_empty(), "a refused capture launched anyway");
     }
 
-    /// The second semantic refusal: a pool this capture cannot read at all,
-    /// because it reads keys straight out of the pages.
-    #[test]
     fn a_quantized_key_plane_is_refused_by_name() {
         let probe = Probe::default();
         let why = fire(&probe, None, Dtype::U8, slab(4 * 96))
@@ -345,7 +295,6 @@ mod tests {
         assert!(probe.fires().is_empty(), "a refused capture launched anyway");
     }
 
-    #[test]
     fn a_slab_that_is_not_the_ceiling_is_refused_by_name() {
         let probe = Probe::default();
         let narrow = Tensor::new(4, 4 * 96, KV_MAX / 2, Dtype::F32);
@@ -359,7 +308,6 @@ mod tests {
         assert!(format!("{dtype}").contains("f32 rectangle"), "{dtype}");
     }
 
-    #[test]
     fn an_observation_window_of_zero_rows_is_refused_by_name() {
         let probe = Probe::default();
         let why = capture(
@@ -386,7 +334,6 @@ mod tests {
         assert!(format!("{why}").contains("observes nothing"), "{why}");
     }
 
-    #[test]
     fn a_head_past_the_last_stamp_is_refused_by_name() {
         let probe = Probe::default();
         let why = capture(
@@ -413,7 +360,6 @@ mod tests {
         assert!(format!("{why}").contains("stamped for"), "{why}");
     }
 
-    #[test]
     fn an_element_this_plane_has_no_point_for_is_refused_by_dtype() {
         let probe = Probe::default();
         let why = capture(

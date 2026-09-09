@@ -2,6 +2,14 @@ use crate::common::grammar_accepts;
 use ::grammar::grammar::Grammar;
 use ::grammar::json_schema::{JsonSchemaOptions, json_schema_to_ebnf, json_schema_to_grammar};
 
+fn json_schema_every_case() {
+    typed_ebnf_rendering_roundtrips();
+    root_ref_resolves_local_defs();
+    bounded_number_handles_cross_zero_and_one_sided_ranges();
+    integer_bounds_combine_without_overflow();
+    any_schema_rejects_raw_control_characters();
+}
+
 #[test]
 fn typed_ebnf_rendering_roundtrips() {
     let schema = r#"{
@@ -29,7 +37,6 @@ fn typed_ebnf_rendering_roundtrips() {
     }
 }
 
-#[test]
 fn root_ref_resolves_local_defs() {
     let schema = r##"{
         "$ref": "#/$defs/name",
@@ -39,7 +46,6 @@ fn root_ref_resolves_local_defs() {
     assert!(grammar_accepts(grammar, r#""alice""#));
 }
 
-#[test]
 fn bounded_number_handles_cross_zero_and_one_sided_ranges() {
     let cross_zero = json_schema_to_grammar(
         r#"{"type":"number","minimum":-1,"maximum":2}"#,
@@ -76,7 +82,6 @@ fn bounded_number_handles_cross_zero_and_one_sided_ranges() {
     );
 }
 
-#[test]
 fn integer_bounds_combine_without_overflow() {
     let schema = r#"{
         "type":"integer",
@@ -97,7 +102,6 @@ fn integer_bounds_combine_without_overflow() {
     assert!(json_schema_to_grammar(no_upper_value, &JsonSchemaOptions::default()).is_err());
 }
 
-#[test]
 fn any_schema_rejects_raw_control_characters() {
     let grammar = json_schema_to_grammar("{}", &JsonSchemaOptions::default()).unwrap();
     assert!(!grammar_accepts(grammar, "\"\n\""));

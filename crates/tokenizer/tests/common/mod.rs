@@ -232,18 +232,7 @@ pub fn gemma_json() -> Value {
     })
 }
 
-/// **A SENTENCEPIECE UNIGRAM**, in the shape umT5's `tokenizer.json` states
-/// it: an ordered `[[piece, score], …]` vocabulary (index IS id), a Metaspace
-/// pre-tokenizer and decoder at `prepend_scheme = "always"`, the space-run
-/// collapse normalizer, and a `TemplateProcessing` that ends every encode
-/// with `</s>`.
-///
-/// Small on purpose — the point is the WALK and the wrapping, both of which
-/// are the same at four pieces as at 256 300, and `tokenizers` is the judge
-/// either way.
 pub fn unigram_json() -> Value {
-    // Scores chosen so the walk cannot be greedy and pass: `ab` is worse than
-    // `a` + `b`, and `▁re` is better than `▁` + `re`.
     let vocab = json!([
         ["<pad>", 0.0],
         ["</s>", 0.0],

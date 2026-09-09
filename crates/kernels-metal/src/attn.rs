@@ -1,27 +1,20 @@
-//! `Attention`: paged sdpa over the fire's kv pool — the vector/tiled shaders, appenders, and plan payloads this plane's attention carries.
-
 pub mod arbiter;
 
-/// The vision towers' bidirectional attention over the patch window,
-/// sharing nothing with the paged family but the word.
 pub mod dense;
 
 pub mod merge;
 
-/// qwen4's ple n-gram hasher: an `Attention` only by the clause that
-/// counts a sequence cache; otherwise per-token integer arithmetic over token ids.
 pub mod ple;
 
-/// The observability door's capture: per-key attention mass over an observation window.
 pub mod score;
 
 pub mod ssm;
 
-/// DFlash2's two-tap grouped dynamic convolution along a request's block rows.
 pub mod dynconv;
 
-/// DFlash2's candidate selector, walked from each request's anchor.
 pub mod selector;
+
+pub mod ragged;
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -70,50 +63,32 @@ const SDPA_TILED_LSE: [&str; 4] = [
     "sdpa_paged_tiled_lse_bfloat16_d_512",
 ];
 
-/// What a decode fire needs beside the pool: the fire tables the vector sdpa
-/// shader reads per token. Built once per fire by [`plan_decode`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
-    /// `i32`, one per token: absolute position — the causal bound.
     pub positions: Tensor,
 
-    /// `i32`, one per token: the owning request.
     pub request_of_token: Tensor,
 
-    /// `u8` packed mask planes, one row per request.
     pub mask: Tensor,
 
-    /// `u8`, one per request: whether its mask row is live.
     pub mask_enabled: Tensor,
 
-    /// Elements from one request's mask row to the next.
     pub mask_stride: u32,
 }
 
-/// The prefill twin of [`DecodePlan`] — same tables (the tiled shader
-/// reads them the same way), kept a distinct type since the IR declares
-/// distinct struct kinds the driver downcasts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPlan {
-    /// `i32`, one per token: absolute position — the causal bound.
     pub positions: Tensor,
 
-    /// `i32`, one per token: the owning request.
     pub request_of_token: Tensor,
 
-    /// `u8` packed mask planes, one row per request.
     pub mask: Tensor,
 
-    /// `u8`, one per request: whether its mask row is live.
     pub mask_enabled: Tensor,
 
-    /// Elements from one request's mask row to the next.
     pub mask_stride: u32,
 }
 
-/// The fire tables the driver binds beside the ops' named operands,
-/// reaching the plan builders without any op naming them, so the
-/// trace-time validator never sees this binding — disagreement is refused, not asserted.
 fn tables_agree(
     op: &'static str,
     positions: Tensor,
@@ -172,14 +147,6 @@ fn tables_agree(
     Ok(())
 }
 
-/// Builds the decode plan. Metal derives no split policy and sizes no
-/// partials, so building encodes no device work; it fails only by refusing
-/// fire tables the driver bound wrong.
-///
-// The IR's `plan_decode` op names kv geometry (kv_indptr/kv_indices/
-// last_page_len/kv_len) this plan never reads — the pool row carries the
-// page walk instead. The fire tables it does carry aren't named by the
-// op; the driver binds them from its own fire state.
 pub fn plan_decode(
     ctx: &Ctx<'_>,
     kv_len: Tensor,
@@ -206,8 +173,6 @@ pub fn plan_decode(
     })
 }
 
-/// Builds the prefill plan; see [`plan_decode`] — the same tables, the
-/// same absence of device work and the same op/plan geometry mismatch.
 pub fn plan_prefill(
     ctx: &Ctx<'_>,
     kv_len: Tensor,
@@ -241,8 +206,6 @@ fn head_point(op: &'static str, head_dim: u32, points: &[u32]) -> Result<usize, 
         .ok_or_else(|| refuse(op, format!("no sdpa shader is stamped at head width {head_dim}")))
 }
 
-/// The sliding extent the shader reads: 0 is "no window", so a stated window
-/// of zero is a degenerate statement, not an unwindowed one.
 fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     match window {
         None => Ok(0),
@@ -253,21 +216,11 @@ fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     }
 }
 
-/// The window int the shaders read: a stated extent, or `-(extent + 1)` when
-/// the row's mask is authoritative and the causal upper bound must not apply.
-///
-/// `window_extent` answers `0` for no window and a positive number for one,
-/// so the negative half of the int is free to say something else. Spending
-/// it here keeps the mask ABI and every other entry's argument list
-/// untouched — see `attn/sdpa_paged.metal`, which decodes it.
 fn encoded_window(op: &'static str, window: Option<u32>, causal: bool) -> Result<i32, Error> {
     let extent = window_extent(op, window)?;
     Ok(if causal { extent } else { -(extent + 1) })
 }
 
-/// The kv head count the pool row's strides spell, against the stated head
-/// width. Pool strides are driver facts the validator never sees, so
-/// disagreement is refused, not asserted.
 fn pool_heads(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
     if pool.head_stride != u64::from(head_dim) {
@@ -326,8 +279,6 @@ fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> 
     Ok(width / head_dim)
 }
 
-/// The paged shape one sdpa fire launches over: heads from the query row,
-/// kv heads from the pool strides.
 struct Paged {
     q_heads: u32,
 
@@ -369,11 +320,6 @@ impl Paged {
             q_heads,
             kv_heads,
             gqa: q_heads / kv_heads,
-            // **THE WINDOW INT CARRIES THE CAUSALITY.** `None` is 0 and a
-            // stated extent is positive, so the negative half is free: a
-            // non-causal read is `-(extent + 1)`, which the shader decodes
-            // back into an extent and a flag. That keeps the mask ABI and
-            // every other entry's arguments exactly as they were.
             window: encoded_window(op, window, causal)?,
             rows: nonzero(op, "rows", q.rows)?,
             at: head_point(op, head_dim, &SDPA_WIDTHS)?,
@@ -409,7 +355,6 @@ fn tiled_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], Err
     Ok([x, rows.div_ceil(SDPA_TILE), 1])
 }
 
-/// One token-row per grid row: the decode shader.
 #[allow(clippy::too_many_arguments)]
 fn vector(
     ctx: &Ctx<'_>,
@@ -451,7 +396,7 @@ fn vector(
         plan.mask_stride.arg(),
         plan.mask_enabled.arg(),
         shape.window.arg(),
-        ctx.absent()?, // the sink seat; `attention.sink` folds that mass in afterwards
+        ctx.absent()?,
     ];
     if let Some(lse) = lse {
         lse_plane(op, lse, &shape);
@@ -466,10 +411,6 @@ fn vector(
     )
 }
 
-/// [`SDPA_TILE`] token-rows per grid row: the prefill shader. `mask` is the
-/// plane riding the shader's mask seat — the plan's own for the causal
-/// entries (`mask_enabled` gates it per request), the op-named one for
-/// [`masked`].
 #[allow(clippy::too_many_arguments)]
 fn tiled(
     ctx: &Ctx<'_>,
@@ -512,7 +453,7 @@ fn tiled(
         plan.mask_stride.arg(),
         plan.mask_enabled.arg(),
         shape.window.arg(),
-        ctx.absent()?, // the sink seat; `attention.sink` folds that mass in afterwards
+        ctx.absent()?,
         stated(op, shape.rows)?.arg(),
     ];
     if let Some(lse) = lse {
@@ -581,8 +522,6 @@ pub fn decode_lse(
     )
 }
 
-/// The boundaries ride in `q`, but this shader walks the plan's
-/// `request_of_token` instead — the indptr goes unread.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx<'_>,
@@ -633,25 +572,6 @@ pub fn prefill_lse(
     )
 }
 
-/// Prefill under the op-named `mask` **on top of** the causal bound, not in
-/// place of it — the same tiled shader, with `mask` in the seat the causal
-/// entries fill from the plan.
-///
-/// **A STATED MASK CAN ONLY NARROW WHAT A ROW SEES.** The shader keeps a key
-/// when `kp <= q_pos && kp >= my_start` and then asks the mask
-/// (`sdpa_paged_mma.metal`, "keep = kp <= q_pos"), so a mask may hide a key
-/// the causal bound admits and can NEVER reveal one past the row's own
-/// position. That is right for every caller here, which states a mask to
-/// restrict a causal model — and it makes a BIDIRECTIONAL window
-/// inexpressible, which a block drafter's full-attention layer needs
-/// (`models::qwen_3`'s `DFlash`). Measured: an all-visible mask and a causal
-/// one give a block drafter identical tokens, because neither loosens
-/// anything. Widening wants a stated flag on the op and a shader that skips
-/// the upper bound when it is set.
-///
-// The op-named `mask` and `plan.mask` are one buffer wearing two names:
-// the driver resolves `RuntimeInput::Mask` onto the same fire table every
-// sdpa launch reads. `mask_stride`/`mask_enabled` stay plan-carried since no op names them.
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx<'_>,
@@ -680,7 +600,6 @@ pub fn masked(
     )
 }
 
-/// Folds attention-sink mass into `o` using its log-sum-exp, in place on `o`.
 pub fn sink(
     ctx: &Ctx<'_>,
     o: Tensor,
@@ -703,8 +622,6 @@ pub fn sink(
     )
 }
 
-/// Merges two attention readings over disjoint key sets by their
-/// log-sum-exps — the fold lives in [`merge`].
 #[allow(clippy::too_many_arguments)]
 pub fn merge_lse(
     ctx: &Ctx<'_>,
@@ -720,7 +637,6 @@ pub fn merge_lse(
     merge::merge_lse(ctx, o1, lse1, o2, lse2, heads, head_dim, o, lse)
 }
 
-/// `x = cap * tanh(x / cap)`, in place on `x`.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     const OP: &str = "attention.logit_softcap";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "logit_softcap_bfloat16" });
@@ -731,8 +647,6 @@ pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     )
 }
 
-/// The row split the pool strides spell for an appended `[heads x head_dim]`
-/// row; strides are driver facts, so disagreement is refused.
 fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(u32, u32), Error> {
     let head_dim = u32::try_from(pool.head_stride)
         .ok()
@@ -795,24 +709,20 @@ fn append_paged(
             pool.values.arg_mut(),
             ctx.absent()?, // the linear appender's position stream (buffer 4)
             stated(op, head_dim)?.arg(),
-            ctx.absent()?, // …and its stride seats (buffers 6-9)
+            ctx.absent()?,
             ctx.absent()?,
             ctx.absent()?,
             ctx.absent()?,
             pool.page_size.arg(),
-            ctx.absent()?, // buffer 11, unseated in the paged variant
+            ctx.absent()?,
             stated(op, heads)?.arg(),
             write_page.arg(),
             write_offset.arg(),
-            0_i32.arg(), // src_row_stride: the appended rows are dense
+            0_i32.arg(),
         ],
     )
 }
 
-/// Appends `k`/`v` into the pool's pages, at the op-named write tables. The
-/// write-geometry seam is closed: `attention.kv_append` states
-/// `write_page`/`write_offset` itself, the appender reads exactly what the
-/// op names, and the pool stays storage.
 pub fn kv_append(
     ctx: &Ctx<'_>,
     k: Tensor,
@@ -832,7 +742,6 @@ pub fn kv_append(
     )
 }
 
-/// Appends one plane shared as both k and v, at the op-named write tables.
 pub fn kv_append_shared(
     ctx: &Ctx<'_>,
     plane: Tensor,
@@ -851,13 +760,6 @@ pub fn kv_append_shared(
     )
 }
 
-/// `Mla`: multi-head latent attention — the metal mirror of `kernels-cuda`'s
-/// `attn/mla.rs`/`attn/mla.cuh`. The projection prepare pipeline (latent
-/// split/norm/rope, the per-head q-absorb, the paged latent appender) and the
-/// naive simd flash engine are written here; the shaders live in
-/// `attn/mla.metal`. Both the dense readers and the sparse (selected) ones —
-/// the NSA index set's consumers — fire off that engine. The output-absorb
-/// GEMM stays a typed refusal and names its own gap below.
 pub mod mla {
     use dtype::Dtype;
 
@@ -867,30 +769,16 @@ pub mod mla {
 
     const FILE: &str = "attn/mla.metal";
 
-    /// One threadgroup per prepared row for the rms-reducing kernels.
     const PREP_THREADS: u32 = 256;
 
-    /// The simdgroup width the flash kernel folds each key's dot over.
     const SIMD: u32 = 32;
 
-    /// The latent-strip ceilings the flash kernel's register arrays hold
-    /// (`kMaxCkvPer`/`kMaxKpePer` in the shader): rank up to 512, rope up to
-    /// 128, both a whole number of 32-lane strips.
     const MAX_CKV: u32 = 16 * SIMD;
     const MAX_KPE: u32 = 4 * SIMD;
 
-    /// Carries no device state: the metal flash engine reads the fire's
-    /// position/owning-request tables and the pool's page walk directly at each
-    /// attention arm, the way the paged sdpa family does — so the plan an
-    /// `attention.mla_plan` builds is empty, and its only role is the struct
-    /// value decode and prefill name. (The CUDA plan sizes an fa2 workspace;
-    /// the naive engine this plane runs needs none.)
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MlaPlan;
 
-    // The op names kv geometry (kv_indptr/kv_indices/last_page_len/kv_len)
-    // this plane's attention never reads (the pool row carries the page
-    // walk); the builder takes them only to stay shaped like the paged plan builders.
     pub fn plan(
         _ctx: &Ctx<'_>,
         _kv_indptr: Tensor,
@@ -901,9 +789,6 @@ pub mod mla {
         Ok(MlaPlan)
     }
 
-    /// Splits `kv_a` into the rmsnormed compressed latent (`kv_c`, the first
-    /// `kv_lora_rank` lanes) and the rope tail (`k_pe`, the remainder). Mirrors
-    /// `mla.cuh`'s `mla_latents`.
     #[allow(clippy::too_many_arguments)]
     pub fn latents(
         ctx: &Ctx<'_>,
@@ -917,9 +802,6 @@ pub mod mla {
         split_kv_a_norm(ctx, "attention.mla_latents", kv_a, weight, eps, kv_lora_rank, kv_c, k_pe)
     }
 
-    /// [`latents`], then a partial rope over the rope tail — the same
-    /// `rope::partial_q` the CUDA entry rotates `k_pe` with, at head width
-    /// `rope_dim` (the tail is one rope-wide plane per row).
     #[allow(clippy::too_many_arguments)]
     pub fn latents_rope(
         ctx: &Ctx<'_>,
@@ -995,8 +877,6 @@ pub mod mla {
         )
     }
 
-    /// Splits `q_b` into per-head nope (`q_nope`) and rope (`q_pe`) planes —
-    /// one thread per source element, mirroring `mla.cuh`'s `mla_split_q_b`.
     #[allow(clippy::too_many_arguments)]
     pub fn split_q_b(
         ctx: &Ctx<'_>,
@@ -1037,10 +917,6 @@ pub mod mla {
         )
     }
 
-    /// Absorbs `kv_b`'s up-projection into q: the per-head matmul
-    /// `q_latent[t,h,:] = q_nope[t,h,:] · kv_b_nope[h]`, where `kv_b` is the
-    /// `[heads·(nope+v_dim), rank]` checkpoint weight. Mirrors `mla.cuh`'s
-    /// `absorb_q` batched GEMM as one thread per output element.
     #[allow(clippy::too_many_arguments)]
     pub fn absorb_q(
         ctx: &Ctx<'_>,
@@ -1077,16 +953,6 @@ pub mod mla {
         )
     }
 
-    /// The absorb's other half — latent attention read back through
-    /// `kv_b`'s value planes: `o[t,h,:] = latent[t,h,:] · W_UV[h]ᵀ`, where
-    /// `W_UV[h]` is the `[v_dim, rank]` block right after head `h`'s
-    /// `[nope, rank]` key-up block, inside the same `[heads·(nope+v_dim),
-    /// rank]` checkpoint weight `absorb_q` reads.
-    ///
-    /// The V-block base is `nope·rank` elements (`Tensor::ptr`'s offset is
-    /// in bytes, not elements); the per-head stride is `(nope+v_dim)·rank`,
-    /// heads outer with key-up/value-up blocks contiguous within a head.
-    /// `mla_on_device.rs` measures this end to end against the unabsorbed attention.
     #[allow(clippy::too_many_arguments)]
     pub fn absorb_out(
         ctx: &Ctx<'_>,
@@ -1102,8 +968,6 @@ pub mod mla {
         let entry = dtype_dispatch!(OP, latent.dtype, { Bf16 => "mla_absorb_out_bfloat16" });
         let heads_i = stated(OP, heads)?;
         let rank = stated(OP, kv_lora_rank)?;
-        // The value width sizes the threadgroup as well as the grid, so a zero
-        // is refused by name rather than launched as an empty group.
         let v_dim = stated(OP, crate::encode::nonzero(OP, "the value head dim", v_head_dim)?)?;
         let nope = stated(OP, nope_dim)?;
         let rows = crate::encode::nonzero(OP, "rows", latent.rows)?;
@@ -1130,9 +994,6 @@ pub mod mla {
         )
     }
 
-    /// Appends one latent row (`kv_c` beside `k_pe`) into the pool's pages at
-    /// the op-named write tables. `kv_c` lands in the keys pages (rank-wide,
-    /// one kv head), `k_pe` in the values pages (rope-wide).
     pub fn kv_append(
         ctx: &Ctx<'_>,
         kv_c: Tensor,
@@ -1173,18 +1034,6 @@ pub mod mla {
         )
     }
 
-    /// The naive paged flash engine all four readers share: one simdgroup per
-    /// (head, query row), an online-softmax sweep over `[0, position]` of the
-    /// latent kv. `positions`/`request_of_token` are the fire tables the driver
-    /// binds beside the pool — the causal bound and the owning request per row.
-    ///
-    /// `selection`, when present, is the `i32` index row
-    /// `attention.index_topk` published for this token: the sweep then walks
-    /// that row's `top_k` entries instead of `[0, position]`, dropping every
-    /// entry outside the causal bound (the -1 padded tail included). This is
-    /// `mla_naive_paged_kernel`'s nullable `selection`/`top_k` pair, which on
-    /// this plane picks the shader entrypoint rather than a null pointer —
-    /// metal cannot leave a declared buffer seat empty.
     #[allow(clippy::too_many_arguments)]
     fn flash(
         ctx: &Ctx<'_>,
@@ -1218,8 +1067,6 @@ pub mod mla {
                 format!("the {}-wide rotated q plane does not divide by the {heads} heads", q_pe.width),
             ));
         }
-        // A nope-only mixer states no rope plane: the kernel walks zero
-        // rope strips and never reads `q_pe` or the values pages.
         let kpe = if q_pe.width == 0 {
             0
         } else {
@@ -1250,8 +1097,6 @@ pub mod mla {
             sm_scale.arg(),
         ];
         if let Some(selection) = selection {
-            // `mla.rs`'s two selection guards, verbatim: an `i32` row per query
-            // row, and the budget the shader strides it by is its width.
             debug_assert!(
                 selection.dtype == Dtype::I32,
                 "the selection is an i32 key-index row"
@@ -1274,12 +1119,8 @@ pub mod mla {
         )
     }
 
-    /// The shader's `kMlaSplit`: simdgroups per (head, query row), each
-    /// sweeping every eighth key and folded at the end.
     const MLA_SPLIT: u32 = 8;
 
-    /// A latent width the flash kernel can lane-split: a nonzero whole number
-    /// of 32-lane strips, at most `max` (the register-array ceiling).
     fn latent_strip(op: &'static str, what: &str, width: u32, max: u32) -> Result<i32, Error> {
         if width == 0 || width % SIMD != 0 || width > max {
             return Err(refuse(
@@ -1293,9 +1134,6 @@ pub mod mla {
         stated(op, width)
     }
 
-    /// Latent attention over one token per row (decode). The plan carries no
-    /// device state — the fire tables reach the kernel through
-    /// `positions`/`request_of_token`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_decode(
         ctx: &Ctx<'_>,
@@ -1325,8 +1163,6 @@ pub mod mla {
         )
     }
 
-    /// Latent attention over ragged prefixes (prefill); same flash engine, the
-    /// causal bound per row read from `positions`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill(
         ctx: &Ctx<'_>,
@@ -1356,10 +1192,6 @@ pub mod mla {
         )
     }
 
-    /// Decode over the sparse selection `attention.index_topk` produced: the
-    /// same flash engine, its key sweep handed the index row instead of the
-    /// causal range. `selection` is `[rows, top_k]` i32, ascending key ids with
-    /// a -1 padded tail.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_decode_selected(
         ctx: &Ctx<'_>,
@@ -1390,16 +1222,6 @@ pub mod mla {
         )
     }
 
-    /// Prefill over the sparse selection; same engine, same selection row, the
-    /// causal bound per row read from `positions` as the dense prefill reads it.
-    ///
-    /// Causality is one bound here, not two. `mla.rs` splits the two
-    /// selected entries by a `causal` flag (`false` for decode, `true` for
-    /// prefill) that only ever chooses between `kv_len` and `abs_q + 1`. This
-    /// plane's engine bounds by `positions[row] + 1` for both, which is
-    /// `abs_q + 1` exactly, and for a decode row — whose position IS the last
-    /// cached slot — is `kv_len` exactly. The divergence the file header states
-    /// for the dense readers covers these two, unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_selected(
         ctx: &Ctx<'_>,
@@ -1430,18 +1252,6 @@ pub mod mla {
         )
     }
 
-    /// The key walk a selected reader performs, in host arithmetic — the
-    /// deviceless pin on the one part of `mla_naive_paged_selected` that is a
-    /// semantic rather than a launch.
-    ///
-    /// It is here so the selection read can be tested without a gpu, the
-    /// way [`super::index::bisect_select`] pins the selection *write*. Nothing
-    /// on the fire path calls it: the sweep runs on the device, in the shader,
-    /// over the row `index_topk_paged` wrote. Every line has a line above it in
-    /// `attn/mla.metal`'s body and in `mla.cuh`'s `mla_naive_paged_kernel` —
-    /// `top_k` steps, `j = srow[n]`, and `continue` on any `j` outside
-    /// `[0, j_end)`, which is both the -1 padded tail and any id the causal
-    /// bound does not reach.
     #[must_use]
     pub fn selected_sweep(selection: &[i32], j_end: i32) -> Vec<i32> {
         let mut keys = Vec::with_capacity(selection.len());
@@ -1454,15 +1264,6 @@ pub mod mla {
         keys
     }
 
-    /// The online-softmax accumulation the flash body runs over the keys a
-    /// sweep names, in host arithmetic: `m`/`lsum` rescaled per key, the
-    /// value strip accumulated in the same pass, normalized once at the end.
-    ///
-    /// Also deviceless-only, and here for one claim: that the streaming form
-    /// the shader runs equals the batch softmax over the same key set, so a
-    /// selected reading equals the dense reading restricted to the selected
-    /// keys. `scores` are the pre-softmax logits (already `sm_scale`d) and
-    /// `values` the matching value rows, `width` wide.
     #[must_use]
     pub fn flash_reading(scores: &[f32], values: &[f32], width: usize) -> Vec<f32> {
         let mut acc = vec![0.0f32; width];
@@ -1508,8 +1309,6 @@ pub mod mla {
             Tensor::new(buf, rows, 1, Dtype::U32)
         }
 
-        /// A latent pool: `keys` are the rank-wide ckv pages, `values` the
-        /// rope-wide kpe pages — the split `mla.cuh`'s `Layer` reads.
         fn latent_pool() -> KvPool {
             KvPool {
                 keys: bf16(30, 4096, RANK),
@@ -1522,8 +1321,13 @@ pub mod mla {
             }
         }
 
-        /// A latent rank the register strips cannot hold is refused by name,
-        /// not launched.
+        fn attn_every_case() {
+            a_rank_the_strips_cannot_hold_is_refused();
+            a_zero_value_width_is_refused_rather_than_launched();
+            a_selection_that_is_not_one_row_per_query_is_refused();
+            the_selected_point_refuses_the_geometries_the_dense_one_does();
+        }
+
         #[test]
         fn a_rank_the_strips_cannot_hold_is_refused() {
             let probe = Probe::default();
@@ -1537,9 +1341,6 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        /// A zero value width sizes an empty threadgroup as well as an empty
-        /// grid; it is refused by name rather than launched.
-        #[test]
         fn a_zero_value_width_is_refused_rather_than_launched() {
             let probe = Probe::default();
             let why = absorb_out(&probe, bf16(1, 1, HEADS * RANK), bf16(2, HEADS * NOPE, RANK), HEADS, RANK, 0, NOPE, bf16(3, 1, 1))
@@ -1548,14 +1349,10 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        /// A selection row, `TOPK` wide, one per query row.
         fn sel(buf: u32, rows: u32, top_k: u32) -> Tensor {
             Tensor::new(buf, rows, top_k, Dtype::I32)
         }
 
-        /// A selection carrying a different row count than the reading is
-        /// refused by name — `mla.rs`'s guard, mirrored.
-        #[test]
         fn a_selection_that_is_not_one_row_per_query_is_refused() {
             let probe = Probe::default();
             let pool = latent_pool();
@@ -1568,9 +1365,6 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        /// The geometry refusals bind on the selected point too: the rank the
-        /// register strips cannot hold is refused before any launch.
-        #[test]
         fn the_selected_point_refuses_the_geometries_the_dense_one_does() {
             let probe = Probe::default();
             let pool = latent_pool();
@@ -1583,34 +1377,9 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        // ── the sweep semantics, deviceless ────────────────────────────────
-
     }
 }
 
-/// `Index`: the NSA sparse-attention indexer — the metal mirror of
-/// `kernels-cuda`'s `attn/index.rs`/`attn/index.cuh`, kernel for kernel.
-///
-/// Top-k selection in front of sparse attention: the index key cache is
-/// layernormed and roped as it's appended, the index query is roped per
-/// head, and `attention.index_topk` scores every visible cached key and
-/// publishes the selection row the `attention.mla_*_selected` readers walk.
-///
-/// | op                              | shader                       |
-/// |---------------------------------|------------------------------|
-/// | `attention.index_layernorm_rope`| `index_knorm_rope_bfloat16`  |
-/// | `attention.index_rope`          | `index_q_rope_bfloat16`      |
-/// | `attention.index_kv_append`     | `mla_kv_append_bfloat16`     |
-/// | `attention.index_topk`          | `index_topk_paged_bfloat16`  |
-///
-/// `index_kv_append` routes to the mla appender (as the CUDA twin does): an
-/// index key row is one contiguous plane with no rotated tail, exactly the
-/// latent writer with its rope plane nulled, so this calls
-/// [`mla::kv_append`] with a zero-wide rope plane.
-///
-/// `index_topk_mask` (the dense/unpaged variant) is intentionally
-/// unported: no IR op names it and no host plane fires it, so a metal
-/// twin would be a shader with no caller.
 pub mod index {
     use dtype::Dtype;
 
@@ -1620,27 +1389,15 @@ pub mod index {
 
     const FILE: &str = "attn/index.metal";
 
-    /// `index.cuh`'s `kBlock`: the threadgroup the norm and the selection
-    /// launch.
     const K_BLOCK: u32 = 256;
 
-    /// `index.cuh`'s `kMaxRopeDim`. On CUDA it is the `float buf[]` each
-    /// roping thread stages through; the metal kernels spread the pairs over
-    /// the launch and need no buffer, so here it is only the ceiling past
-    /// which the authority is undefined — kept so the two planes refuse the
-    /// same geometries rather than one of them quietly answering.
     const MAX_ROPE_DIM: u32 = 256;
 
-    /// The threadgroup `index_q_rope` launches: one thread per index head,
-    /// rounded up to a whole simdgroup. `index.rs`'s `q_rope_block`.
     #[must_use]
     fn q_rope_block(n_heads: u32) -> u32 {
         (n_heads.div_ceil(32) * 32).max(32)
     }
 
-    /// The rotated prefix this launch may state: an even width inside both
-    /// the row it rotates and the authority's ceiling. Zero rotates nothing
-    /// (a nope-only indexer: the kernels loop over `rope_dim / 2` pairs).
     fn rotated(op: &'static str, rope_dim: u32, head_dim: u32) -> Result<i32, Error> {
         if rope_dim % 2 != 0 {
             return Err(refuse(
@@ -1669,10 +1426,6 @@ pub mod index {
         stated(op, rope_dim)
     }
 
-    /// The index pool stores whole key rows contiguously; its token pitch
-    /// must spell exactly that. `index.rs`'s `pool_pitch`, minus the hnd
-    /// clause — the metal pool carries no layout enumerator, and the pitch
-    /// question is the same question that clause was asking.
     fn pool_pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<(), Error> {
         if row == 0 {
             return Err(refuse(op, "the index key row is zero-wide"));
@@ -1689,11 +1442,6 @@ pub mod index {
         Ok(())
     }
 
-    /// Layernorms the index key row and ropes its head, in place on `k`.
-    ///
-    /// A mean-subtracting layernorm with a learned bias, not the rms norm
-    /// every other entry in this file reaches for — two reductions and an
-    /// affine, which is what `index_knorm_rope` is.
     #[allow(clippy::too_many_arguments)]
     pub fn layernorm_rope(
         ctx: &Ctx<'_>,
@@ -1726,7 +1474,6 @@ pub mod index {
         )
     }
 
-    /// Ropes the index query's head, per `(row, head)`, in place on `q`.
     pub fn rope(
         ctx: &Ctx<'_>,
         q: Tensor,
@@ -1757,13 +1504,6 @@ pub mod index {
         )
     }
 
-    /// Appends index key rows into the pool's pages, at the op-named write
-    /// tables — the mla latent writer with a null rope plane, which is
-    /// what `index.rs` routes to as well.
-    ///
-    // Unlike `attention.mla_kv_append`'s CUDA twin: the op states
-    // `write_page`/`write_offset` and this appender actually reads them,
-    // rather than re-deriving the cell.
     pub fn kv_append(
         ctx: &Ctx<'_>,
         k: Tensor,
@@ -1774,28 +1514,10 @@ pub mod index {
         const OP: &str = "attention.index_kv_append";
         dtype_dispatch!(OP, k.dtype, { Bf16 => () });
         pool_pitch(OP, keys, k.width)?;
-        // A zero-wide rope plane: the store's `rope` bound is 0, so its rope
-        // half never reads this handle and never writes the value pages.
         let no_rope = Tensor::new(k.buf, k.rows, 0, k.dtype);
         super::mla::kv_append(ctx, k, no_rope, keys, write_page, write_offset)
     }
 
-    /// Scores `q` against every cached index key visible to its row and
-    /// publishes the top-`top_k` cached positions, ascending, `-1`-padded.
-    ///
-    /// `positions`/`request_of_token` are the fire tables the driver binds
-    /// beside the pool, and they are this plane's divergence from the CUDA
-    /// twin: `index_topk_paged` re-derives each row's absolute query position
-    /// from `qo_indptr` and `kv_last_page_lens`, which the metal pool does not
-    /// carry, so the two numbers are read here the way `mla::flash` and
-    /// `pool::attention_lse` already read them.
-    ///
-    /// `scores` is the per-row working slab the selection writes and then
-    /// bisects over — `crate::scratch`'s index role on the shell side, the
-    /// process-global scratch on the CUDA one. Its width is the `score_stride`
-    /// the shader clamps `nkeys` against, so a row that can see more keys than
-    /// the slab is wide scores its first `score_stride` and no more — which is
-    /// `index.cuh`'s own clamp against its own slab, at the same place.
     #[allow(clippy::too_many_arguments)]
     pub fn topk(
         ctx: &Ctx<'_>,
@@ -1822,12 +1544,6 @@ pub mod index {
         let heads = nonzero(OP, "the head count this ranking states", heads)?;
         let head_dim = nonzero(OP, "the key width this ranking states", head_dim)?;
         let top_k = nonzero(OP, "the selection budget this ranking states", top_k)?;
-        // The key stride, which is which cached rows are keys. `1` reads
-        // one key per token at its own cell (glm_5); a compressor's ratio
-        // reads one key per compressed block at the boundary cell
-        // `(c+1)*ratio - 1` (dsv4-flash), and the ids published are then
-        // compressed rows. Zero is no stride at all and is refused rather
-        // than silently taken for one.
         let ratio = nonzero(OP, "the key stride this ranking states", ratio)?;
         if keys.page_size <= 0 {
             return Err(refuse(OP, "the index cache page size is zero"));
@@ -1888,20 +1604,6 @@ pub mod index {
         )
     }
 
-    /// The bisection this family selects by, in host arithmetic — the
-    /// deviceless pin on the one part of `index_topk_paged` that is an
-    /// algorithm rather than a launch.
-    ///
-    /// It is here so the semantics can be tested without a gpu. Nothing on
-    /// the fire path calls it: the selection runs on the device, in the
-    /// shader, over scores the device wrote. What the tests below ask of it is
-    /// what no `Probe` can ask of a `Fire` — that 40 halvings of `[min, max]`
-    /// counting `>= mid`, with `lo = mid` when the count still exceeds the
-    /// budget and `hi = mid` when it does not, followed by an ascending walk
-    /// taking the first `topk` keys at or above `hi`, selects the set the CUDA
-    /// kernel selects. Every line below has a line above it in
-    /// `attn/index.metal` and in `index.cuh`, and the iteration count is
-    /// contract rather than tolerance.
     #[must_use]
     pub fn bisect_select(scores: &[f32], topk: usize) -> Vec<i32> {
         let nkeys = scores.len();
@@ -1946,8 +1648,6 @@ pub mod index {
         
         use crate::probe::Probe;
 
-        /// dsv4-flash's indexer geometry: 64 index heads of 128 lanes, a 512
-        /// selection budget.
         const HEADS: u32 = 64;
         const DIM: u32 = 128;
         const TOPK: u32 = 512;
@@ -1965,7 +1665,6 @@ pub mod index {
             Tensor::new(buf, rows, width, Dtype::F32)
         }
 
-        /// The index cache: whole `dim`-wide key rows, one per cached token.
         fn index_pool() -> KvPool {
             KvPool {
                 keys: bf16(50, 4096, DIM),
@@ -1978,9 +1677,13 @@ pub mod index {
             }
         }
 
-        /// A pool whose token pitch is not the index row refuses by name — the
-        /// index cache stores whole rows contiguously or it stores them
-        /// scattered.
+        fn attn_1_every_case() {
+            kv_append_refuses_a_pool_that_is_not_one_row_per_token();
+            topk_refuses_a_zero_key_stride();
+            topk_refuses_the_three_shapes_its_cuda_twin_refuses();
+            topk_refuses_a_score_slab_shorter_than_the_launch();
+        }
+
         #[test]
         fn kv_append_refuses_a_pool_that_is_not_one_row_per_token() {
             let probe = Probe::default();
@@ -1991,9 +1694,6 @@ pub mod index {
             assert!(probe.fires().is_empty());
         }
 
-        /// A zero stride is no stride at all — refused by name rather than
-        /// taken for one, which is what a `/ 0` in the shader would be.
-        #[test]
         fn topk_refuses_a_zero_key_stride() {
             let probe = Probe::default();
             let pool = index_pool();
@@ -2007,11 +1707,6 @@ pub mod index {
             assert!(probe.fires().is_empty());
         }
 
-        /// A query row that does not divide by the stated head count and
-        /// width, head weights that are not one per head, and a selection
-        /// that is not the stated budget: `index.rs`'s three shape refusals,
-        /// each by name and none launched.
-        #[test]
         fn topk_refuses_the_three_shapes_its_cuda_twin_refuses() {
             let probe = Probe::default();
             let pool = index_pool();
@@ -2042,10 +1737,6 @@ pub mod index {
             assert!(probe.fires().is_empty());
         }
 
-        /// The score slab is the one thing this plane has that the CUDA twin
-        /// allocates per fire, so a slab too short for the launch is refused
-        /// with both numbers rather than overrun.
-        #[test]
         fn topk_refuses_a_score_slab_shorter_than_the_launch() {
             let probe = Probe::default();
             let pool = index_pool();
@@ -2059,15 +1750,9 @@ pub mod index {
             assert!(probe.fires().is_empty());
         }
 
-        // ── the selection semantics, pinned without a device ────────────────
-
     }
 }
 
-/// `Pool`: pooled (compressed) attention — the dsv4 compressor's
-/// KV-time-axis pooling, ported from `kernels-cuda/kernels/attn/pool.cuh`.
-/// The paged shaders live in `attn/pool.metal`. All five ops are wired
-/// here; four read only what their IR op names, the fifth ([`gather`]) does not — spelled out there.
 pub mod pool {
     use dtype::Dtype;
 
@@ -2077,24 +1762,12 @@ pub mod pool {
 
     const FILE: &str = "attn/pool.metal";
 
-    /// The flat block the boundary detectors launch (`pool.cuh`'s META_BLOCK).
     const META_BLOCK: u32 = 128;
 
-    /// The threadgroup width the compressed-cache flash reader launches
-    /// (`pool.cuh`'s ATTN_BLOCK).
     const ATTN_BLOCK: u32 = 128;
 
-    /// The widest head the flash reader holds in its q tile — the shader's
-    /// `POOL_HEAD_MAX` threadgroup array bound.
     const POOL_HEAD_MAX: u32 = 512;
 
-    /// `2` for the overlapping `2*ratio` window of the ratio-4 compressor,
-    /// `1` otherwise — the twin of `pool.rs`'s `compressor_coff`.
-    ///
-    /// Derived here and not stated by the caller, which is the CUDA
-    /// entry's choice for the CUDA entry's reason: `coff` is a function of the
-    /// ratio the op already states, so a caller that could pass a third answer
-    /// could bind a window the state slabs are not laid out for.
     const fn compressor_coff(ratio: u32) -> i32 {
         if ratio == 4 { 2 } else { 1 }
     }
@@ -2108,8 +1781,6 @@ pub mod pool {
         );
     }
 
-    /// The third boundary column: the compressed row's rope position, one
-    /// entry per token row like the two beside it.
     fn boundary_rope_table(op: &'static str, boundary_pos: &Tensor, boundary_rope: &Tensor) {
         debug_assert_eq!(
             boundary_rope.dtype,
@@ -2122,13 +1793,6 @@ pub mod pool {
         );
     }
 
-    /// Marks which decode rows close a pooling boundary. `row_valid` is the
-    /// CUDA-graph padding mask, an op-named `u8` input.
-    ///
-    /// `boundary_rope` is the compressed row's own rope position — the
-    /// block's first token `(p / ratio) · ratio`, not `boundary_pos`'s last
-    /// one — which the CUDA twin has always computed and which had nowhere to
-    /// land on this plane until the compressor fired. See the shader's note.
     pub fn boundary_decode(
         ctx: &Ctx<'_>,
         positions: Tensor,
@@ -2158,8 +1822,6 @@ pub mod pool {
         )
     }
 
-    /// The prefill twin: boundaries within each request's ragged span, the
-    /// owning request a binary search over the fire's `qo_indptr`.
     #[allow(clippy::too_many_arguments)]
     pub fn boundary_prefill(
         ctx: &Ctx<'_>,
@@ -2196,18 +1858,6 @@ pub mod pool {
         )
     }
 
-    /// The rolling state's writer. `kv` is the compressor's `wkv · x` and
-    /// `score` its `wgate · x`, both `[rows, coff · head_dim]`; each row is
-    /// scattered into the cell `write_page`/`write_offset` name for it — the
-    /// source cache's own slot, which is the cell the latent appender writes
-    /// in the same fire.
-    ///
-    /// This is the op that makes [`gather`] pool something. The two state
-    /// slabs are a seam the shell owns and no IR value names, and until this
-    /// entry existed nothing wrote a byte of either: the gather fired, read
-    /// zeros, and the compressor's four checkpoint planes were interned. The
-    /// slabs stay seam arguments here for the same reason they are there —
-    /// they are addressed by the cache's cell and not by the fire's row.
     #[allow(clippy::too_many_arguments)]
     pub fn state_write(
         ctx: &Ctx<'_>,
@@ -2240,10 +1890,6 @@ pub mod pool {
         }
         let head_dim = nonzero(OP, "the head width this compressor states", head_dim)?;
         let ratio = nonzero(OP, "the pooling ratio", ratio)?;
-        // The projection's own width states the window (the CUDA twin's
-        // rule): `head_dim` for one block per pool (GLM's kpool compressor),
-        // `2 * head_dim` for the overlapping pair (dsv4). What the gather
-        // over the same plane reads back.
         let width = nonzero(OP, "the compressor's row width", kv.width)?;
         if (width != head_dim && width != 2 * head_dim) || score.width != width {
             return Err(refuse(
@@ -2260,8 +1906,6 @@ pub mod pool {
             score.rows, kv.rows,
             "the two projections are one row per token row"
         );
-        // The plane's row, which is not always this layer's `width`: see
-        // [`gather`]'s note on one artifact holding two ratios.
         let pitch = state_kv.width;
         if state_score.width != pitch {
             return Err(refuse(
@@ -2299,21 +1943,6 @@ pub mod pool {
         )
     }
 
-    /// Pools the closing window out of the rolling compressor state into
-    /// per-boundary entries — the learned gated softmax pool. One thread
-    /// per `(entry, head-dim lane)`; each walks its `coff * ratio` window
-    /// serially, so the whole gate is one launch and no threadgroup memory.
-    ///
-    /// `state_kv`/`state_score` have no IR seat: the engine binds them
-    /// from its own scratch reservation (`crate::scratch`'s pool role),
-    /// addressed by the same paged slot the `pages` cache uses, at a row
-    /// pitch of `coff * head_dim` — not a fire-shaped rectangle.
-    /// [`state_write`] is what fills them.
-    ///
-    /// `ape` is a real operand: the compressor's absolute-position weight
-    /// (`[ratio, coff * head_dim]` f32), kept `Option` because the CUDA
-    /// shader keys on `ape != nullptr` and Metal has no null buffer —
-    /// `None` binds `state_score`'s handle into the unread seat and states `has_ape = 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn gather(
         ctx: &Ctx<'_>,
@@ -2362,9 +1991,6 @@ pub mod pool {
         }
         let rows = nonzero(OP, "rows", boundary_pos.rows)?;
         let ratio = nonzero(OP, "the pooling ratio", ratio)?;
-        // The window's blocks: read off the `[ratio, coff * head_dim]` ape
-        // when one is stated (the CUDA twin's rule), else the ratio's own
-        // default.
         let coff = match ape {
             None => compressor_coff(ratio),
             Some(ape) if ape.width == head_dim => 1,
@@ -2379,14 +2005,7 @@ pub mod pool {
                 ));
             }
         };
-        // The columns this gather reads out of one state row.
         let width = head_dim.saturating_mul(coff.unsigned_abs());
-        // The row pitch is the slab's, which is not always this gather's
-        // width: one artifact can hold pooled layers at two ratios in the
-        // same tower, and the reservation lays one plane at the widest
-        // pitch any of its gathers states. A narrower gather strides by
-        // the plane's row and reads its own `coff x head_dim` columns
-        // inside it; a slab narrower than the columns read is still refused.
         let pitch = state_kv.width;
         if state_score.width != pitch {
             return Err(refuse(
@@ -2427,8 +2046,6 @@ pub mod pool {
             &[
                 state_kv.arg(),
                 state_score.arg(),
-                // The unread seat when no plane was staged — see the entry
-                // note. It is a bound buffer and never a read.
                 ape.unwrap_or(state_score).arg(),
                 boundary_pos.arg(),
                 boundary_req.arg(),
@@ -2445,11 +2062,6 @@ pub mod pool {
         )
     }
 
-    /// Stores each pooled entry into its cell of the compressed cache. One
-    /// threadgroup lane per `(entry, head-dim)`; a masked boundary writes
-    /// nothing. `write_page`/`write_offset` are the op's stated write
-    /// descriptors, but (like the CUDA twin) the store still re-derives its
-    /// cell from the boundary and page tables, so the stated pair goes unread.
     #[allow(clippy::too_many_arguments)]
     pub fn kv_append(
         ctx: &Ctx<'_>,
@@ -2490,9 +2102,6 @@ pub mod pool {
         )
     }
 
-    /// Attention over the compressed entries, publishing the base-2
-    /// log-sum-exp plane a later `attention.merge_lse` folds against the dense
-    /// pass. One threadgroup per `(query row, query head)`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_lse(
         ctx: &Ctx<'_>,
@@ -2548,21 +2157,6 @@ pub mod pool {
         )
     }
 
-    /// [`attention_lse`] over the compressed rows `attention.index_topk`
-    /// chose — the NSA fine branch, and the one reader this family was
-    /// missing.
-    ///
-    /// The selected branch is the compressed one, narrowed. The
-    /// reference oracle attends `concat(the 128-wide sliding window over the
-    /// per-token latent, every visible compressed row)` under one softmax
-    /// with the per-head sink in the denominator; pie computes that as
-    /// `prefill_lse` at `window` merged with `pool_lse` and closed by `sink`.
-    /// The window is fixed, so the only key set the indexer's budget can cap
-    /// is the compressed one — which is also why the ratio-128 layers carry
-    /// no indexer. `selection` is `[rows, top_k]` i32, ascending
-    /// compressed-row ids with `-1` padding, and a row whose visible count
-    /// fits its budget selects the identity and lands `attention_lse`'s own
-    /// numbers.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_lse_selected(
         ctx: &Ctx<'_>,
@@ -2646,18 +2240,6 @@ pub mod pool {
         )
     }
 
-    /// The selected reader's key walk, in host arithmetic — the deviceless
-    /// pin on the one part of `pool_lse_selected_paged` that is a decision
-    /// rather than a launch, in the idiom of
-    /// [`index::bisect_select`](super::index::bisect_select).
-    ///
-    /// Given a row's selection and how many compressed rows it can see, this
-    /// is the sequence of cells the shader reads, in the order it reads them:
-    /// ids below zero are the pad and ids at or past the visible count are
-    /// out of the causal bound, both skipped rather than clamped, and a kept
-    /// id `c` becomes the boundary cell `(c + 1) * ratio - 1` — the same
-    /// arithmetic `pool_lse_paged` walks densely and `index_topk_paged` keys
-    /// by.
     #[must_use]
     pub fn selected_cells(selection: &[i32], num_visible: i32, ratio: i32) -> Vec<i32> {
         selection
@@ -2667,23 +2249,6 @@ pub mod pool {
             .collect()
     }
 
-    /// The compressed row's rope position, in host arithmetic — the
-    /// deviceless twin of the boundary kernels' `out_rope` column, and the
-    /// other half of [`selected_cells`]'s claim.
-    ///
-    /// A pooled entry has two positions and they are `ratio - 1` apart. The
-    /// cell it is cached at is the one its window closes on — `selected_cells`
-    /// above, `(c + 1) · ratio - 1`, the block's last token — because that is
-    /// the cell the readers address. The position IT IS roped AT is the
-    /// compressed row's own, `c · ratio`, the block's first token: the
-    /// reference ropes the pooled plane at `rows = arange(0, cutoff, ratio)`
-    /// = `0, ratio, 2·ratio, …` (`v4mlx/compressor.py`'s `compressor_prefill`,
-    /// both the attention compressor and the `rotate=True` indexer one), not
-    /// at the tokens the block ended on.
-    ///
-    /// Given the closing token position `p` this returns that rope position.
-    /// It is `(p / ratio) · ratio` and not `p`, which is the whole distance
-    /// between the two readings.
     #[must_use]
     pub fn compressed_rope_pos(closing_pos: i32, ratio: i32) -> i32 {
         (closing_pos / ratio) * ratio

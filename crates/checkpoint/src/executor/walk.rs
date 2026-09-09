@@ -1,5 +1,3 @@
-//! Walks a finished plan against checkpoint bytes; the only module below `lib.rs` that opens files.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
@@ -50,8 +48,6 @@ enum Root {
     Owned(BufferId),
 }
 
-/// Fill value for freshly allocated buffers. Non-zero so a missing
-/// [`StorageInstr::Fill`] doesn't look like valid zeroed data.
 const POISON: u8 = 0xAB;
 
 pub(super) fn run(
@@ -73,7 +69,6 @@ pub(super) fn run(
         Residency::Arena(arena) => (arena, false),
         Residency::Streaming => (&mut nothing, true),
     };
-    // Cached once: a property of the backing, not of a moment.
     let arena_runs_kernels = arena.runs_named_kernels();
     let files = plan
         .files
@@ -88,7 +83,6 @@ pub(super) fn run(
             (file.id.0, path)
         })
         .collect::<HashMap<_, _>>();
-    // Streaming has no arena: every buffer is owned and freed at its last use.
     let arena_len = if stream {
         0
     } else {
@@ -101,7 +95,6 @@ pub(super) fn run(
             ArenaBacking::len(arena)
         )));
     }
-    // Poison marks "never touched"; a legal tensor value can itself be zero.
     arena.fill(0, arena_len, POISON)?;
     let last_use = if stream {
         last_uses(plan)?
@@ -124,12 +117,10 @@ pub(super) fn run(
         consume,
     };
     executor.execute()?;
-    // finish() drains in-flight writes; CudaArena leaves them in flight until then.
     executor.arena.finish()?;
     Ok(())
 }
 
-/// Last schedule position each buffer is referenced, following views to their root.
 fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
     let mut roots: HashMap<BufferId, BufferId> = HashMap::new();
     let mut last: HashMap<BufferId, usize> = HashMap::new();
@@ -178,41 +169,20 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
 
 struct Walk<'a, 'p> {
     plan: &'a LoadPlan,
-    /// Tensor-id lookup; ids interleave two allocators so a map is needed
-    /// (buffers/instructions are dense).
     index: PlanIndex,
     files: HashMap<u32, PathBuf>,
     arena: &'p mut dyn ArenaBacking,
     buffers: HashMap<BufferId, BufferLoc>,
     sink: &'p mut dyn TensorSink,
-    /// Names already published; finalizing one twice is a plan bug.
     finalized: HashSet<String>,
-    /// Streaming: no arena, owned buffers, freed at last use.
     stream: bool,
-    /// Filled only when streaming; see [`last_uses`].
     last_use: HashMap<BufferId, usize>,
     progress: &'p mut dyn FnMut(Progress<'_>),
     read_bytes: u64,
-    /// Whether the arena backing runs TileMap kernels itself; cached once at entry.
     arena_runs_kernels: bool,
-    /// **`--consume-source`, reaching the DECODE.** Present when the caller is
-    /// consuming the checkpoint it is converting: each source range this walk
-    /// reads for the last time is handed back to the filesystem as the read
-    /// returns, so the source shrinks while the output grows.
-    ///
-    /// `Some` also makes the source handles WRITABLE, which is the only reason
-    /// the ledger has to reach this far down —
-    /// [`consume::release`](crate::consume::release) needs a descriptor it can
-    /// punch a hole in.
-    ///
-    /// The ledger is what says "for the last time"; see its module note for the
-    /// proof, which names this file's two read sites — [`Walk::read_file`] and
-    /// [`Walk::fp8_block_operand`] — by hand.
     consume: Option<&'p SourceLedger>,
 }
 
-/// GGUF `Q4_0` block: F16 scale + 16 packed bytes; low nibble = element
-/// 0..16, high nibble = element 16..32, value = (nibble − 8) × scale.
 fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     for i in 0..16 {
@@ -224,8 +194,6 @@ fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `Q5_0` block: F16 scale + 32-bit fifth-bit plane + 16 packed bytes;
-/// plane bit `i`/`i+16` is the fifth bit of byte `i`'s low/high nibble.
 fn decode_gguf_q5_0_block_into(block: &[u8; 22], values: &mut [f32; 32]) {
     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let plane = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
@@ -240,8 +208,6 @@ fn decode_gguf_q5_0_block_into(block: &[u8; 22], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `Q8_0` block: F16 scale + 32 signed bytes, value = byte × scale
-/// (no packing).
 fn decode_gguf_q8_0_block_into(block: &[u8; 34], values: &mut [f32; 32]) {
     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     for i in 0..32 {
@@ -249,8 +215,6 @@ fn decode_gguf_q8_0_block_into(block: &[u8; 34], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `Q4_1` block: F16 scale `d`, F16 offset `m`, 16 packed bytes;
-/// value = nibble × d + m (affine, not symmetric).
 fn decode_gguf_q4_1_block_into(block: &[u8; 20], values: &mut [f32; 32]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -261,8 +225,6 @@ fn decode_gguf_q4_1_block_into(block: &[u8; 20], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `Q5_1` block: [`decode_gguf_q4_1_block_into`] plus the fifth-bit
-/// plane [`decode_gguf_q5_0_block_into`] carries, indexed the same way.
 fn decode_gguf_q5_1_block_into(block: &[u8; 24], values: &mut [f32; 32]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -276,9 +238,6 @@ fn decode_gguf_q5_1_block_into(block: &[u8; 24], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `Q2_K` super-block: 256 elements as 16 sub-blocks with 4-bit
-/// scale+min each, over one F16 scale/min (closing the block, bytes 80/82).
-/// Payload is two 32-byte windows, each visited 4 times at shifts 0/2/4/6.
 fn decode_gguf_q2_k_block_into(block: &[u8; 84], values: &mut [f32; 256]) {
     let scales = &block[0..16];
     let qs = &block[16..80];
@@ -304,9 +263,6 @@ fn decode_gguf_q2_k_block_into(block: &[u8; 84], values: &mut [f32; 256]) {
     }
 }
 
-/// `Q3_K`'s sixteen scales, unpacked from 12 bytes: low 4 bits from the
-/// first 8 bytes, top 2 bits from the last 4 (two bits at a time); result
-/// is biased by 32, which the caller subtracts.
 fn gguf_q3_k_scales(raw: &[u8; 12]) -> [i8; 16] {
     const LOW_NIBBLES: u32 = 0x0f0f_0f0f;
     const BIT_PAIRS: u32 = 0x0303_0303;
@@ -326,10 +282,6 @@ fn gguf_q3_k_scales(raw: &[u8; 12]) -> [i8; 16] {
     scales
 }
 
-/// GGUF `Q3_K` super-block: 256 elements, 16 sub-blocks, symmetric, each
-/// element's third bit in a separate mask (inverted: set bit = no borrow).
-/// The mask's 32 bytes are read 8 times, one bit per (window, shift) pair,
-/// and must not restart at the second window.
 fn decode_gguf_q3_k_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
     let hmask = &block[0..32];
     let qs = &block[32..96];
@@ -358,9 +310,6 @@ fn decode_gguf_q3_k_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
     }
 }
 
-/// Six-bit scale + six-bit minimum for one of `Q4_K`/`Q5_K`'s eight
-/// sub-blocks, unpacked from the shared 12 bytes (ggml's `get_scale_min_k4`).
-/// Sub-blocks 4-7 splice their bits from the high bits sub-blocks 0-3 leave unused.
 fn gguf_k_scale_min(index: usize, scales: &[u8; 12]) -> (u8, u8) {
     if index < 4 {
         (scales[index] & 63, scales[index + 4] & 63)
@@ -371,10 +320,6 @@ fn gguf_k_scale_min(index: usize, scales: &[u8; 12]) -> (u8, u8) {
     }
 }
 
-/// GGUF `Q4_K` super-block: 256 elements as 8 sub-blocks with own 6-bit
-/// scale/min, over one F16 scale/min. Affine: d×scaleᵢ×nibble − dmin×minᵢ.
-/// Payload read in sub-block pairs (low nibble = even, high = odd), so the
-/// loop steps by 64 elements.
 fn decode_gguf_q4_k_block_into(block: &[u8; 144], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -394,9 +339,6 @@ fn decode_gguf_q4_k_block_into(block: &[u8; 144], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `Q5_K` super-block: `Q4_K` plus a 32-byte fifth-bit plane, read per
-/// sub-block pair `p` (bit `2p` for the low nibble, `2p+1` for the high);
-/// the fifth bit adds 16 before the affine minimum is subtracted.
 fn decode_gguf_q5_k_block_into(block: &[u8; 176], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
@@ -420,10 +362,6 @@ fn decode_gguf_q5_k_block_into(block: &[u8; 176], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `Q6_K` super-block: 256 elements as 16 sub-blocks with signed 8-bit
-/// scale, over one F16 scale. Two 128-element halves, each with 4 strided
-/// quarters (low 4 bits from `ql`, top 2 from `qh`); scale index advances
-/// by 2 per quarter.
 fn decode_gguf_q6_k_block_into(block: &[u8; 210], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[208], block[209]]).to_f32();
     for half_index in 0..2 {
@@ -448,15 +386,10 @@ fn decode_gguf_q6_k_block_into(block: &[u8; 210], values: &mut [f32; 256]) {
     }
 }
 
-/// The sixteen levels an `IQ4_NL`/`IQ4_XS` code indexes (llama.cpp's
-/// `kvalues_iq4nl`), non-uniform and compiled in rather than read from the file.
 const IQ4_LEVELS: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
-/// GGUF `IQ4_NL` block: 32 elements as 16 bytes of paired 4-bit indices
-/// over one F16 scale. Byte `j` holds element `j` (low nibble) and
-/// element `j + 16` (high nibble), not adjacent elements.
 fn decode_gguf_iq4_nl_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let qs = &block[2..18];
@@ -466,9 +399,6 @@ fn decode_gguf_iq4_nl_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
     }
 }
 
-/// GGUF `IQ4_XS` super-block: 256 elements as 8 sub-blocks over
-/// [`decode_gguf_iq4_nl_block_into`]'s levels. Each sub-block's 6-bit scale
-/// is 4 bits from `scales_l` + 2 from `scales_h`, read as `ls - 32`.
 fn decode_gguf_iq4_xs_block_into(block: &[u8; 136], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let scales_h = u16::from_le_bytes([block[2], block[3]]);
@@ -488,14 +418,8 @@ fn decode_gguf_iq4_xs_block_into(block: &[u8; 136], values: &mut [f32; 256]) {
     }
 }
 
-/// The sixteen values an E2M1 nibble stands for, doubled so the table is
-/// exact in `i8` (llama.cpp's `kvalues_mxfp4`); sign is the top nibble bit.
 const MXFP4_LEVELS: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-/// GGUF `MXFP4` block: 32 elements as one E8M0 scale byte + 16 bytes of
-/// paired E2M1 nibbles (17 bytes total, scale interleaved per block rather
-/// than a separate tensor). Scale is applied as `2^(e-128)`, halved to
-/// cancel [`MXFP4_LEVELS`]'s doubling.
 fn decode_gguf_mxfp4_block_into(block: &[u8; 17], values: &mut [f32; 32]) {
     let d = mxfp4_scale(block[0]);
     let qs = &block[1..17];
@@ -505,8 +429,6 @@ fn decode_gguf_mxfp4_block_into(block: &[u8; 17], values: &mut [f32; 32]) {
     }
 }
 
-/// `2^(e - 128)` for an E8M0 exponent byte, formed exactly. The two lowest
-/// inputs are subnormal (exponent field can't reach that low).
 fn mxfp4_scale(e: u8) -> f32 {
     if e < 2 {
         f32::from_bits(0x0020_0000 << e)
@@ -515,14 +437,11 @@ fn mxfp4_scale(e: u8) -> f32 {
     }
 }
 
-/// The sign byte a IQ2/IQ3 seven-bit sign index stands for (llama.cpp's
-/// `ksigns_iq2xs`): low 7 bits are the index, the 8th makes popcount even.
 fn iq_sign_byte(index: u8) -> u8 {
     let index = index & 0x7f;
     index | (((index.count_ones() & 1) as u8) << 7)
 }
 
-/// Applies sign bit `bit` of `signs` to `value`: set means negate.
 fn iq_signed(value: f32, signs: u8, bit: usize) -> f32 {
     if (signs >> bit) & 1 == 1 {
         -value
@@ -531,11 +450,6 @@ fn iq_signed(value: f32, signs: u8, bit: usize) -> f32 {
     }
 }
 
-/// GGUF `IQ2_XXS` block: 256 elements in 66 bytes. F16 `d` + 16 `u32` in
-/// pairs (32 elements each): four grid-point bytes into
-/// [`IQ2XXS_GRID`](iq_grid::IQ2XXS_GRID), then four 7-bit sign indices at
-/// bit offsets 0/7/14/21 plus a 4-bit scale in the top nibble, applied as
-/// `(0.5 + s) * 0.25`.
 fn decode_gguf_iq2_xxs_block_into(block: &[u8; 66], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     for group in 0..8 {
@@ -555,10 +469,6 @@ fn decode_gguf_iq2_xxs_block_into(block: &[u8; 66], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `IQ2_XS` block: 256 elements in 74 bytes. F16 `d` + 32 `u16` + 8
-/// scale bytes. Each `u16`: low 9 bits address the 512-entry
-/// [`IQ2XS_GRID`](iq_grid::IQ2XS_GRID), top 7 are the sign index. Scale
-/// bytes hold two 4-bit scales each, `(0.5 + s) * 0.25`.
 fn decode_gguf_iq2_xs_block_into(block: &[u8; 74], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let scales = &block[66..74];
@@ -576,9 +486,6 @@ fn decode_gguf_iq2_xs_block_into(block: &[u8; 74], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `IQ2_S` block: 256 elements in 82 bytes. F16 `d`, 32 quant bytes,
-/// 32 sign bytes, 8 high-bit bytes, 8 scale bytes. Grid is 1024 points (10
-/// bits: 8 from `qs`, 2 from `qh`); signs are stored outright, one byte per point.
 fn decode_gguf_iq2_s_block_into(block: &[u8; 82], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let qs = &block[2..34];
@@ -598,9 +505,6 @@ fn decode_gguf_iq2_s_block_into(block: &[u8; 82], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `IQ3_XXS` block: 256 elements in 98 bytes. F16 `d`, 64 quant
-/// bytes, 8 `u32`. Grid points are 4 components, so a `qs` byte covers 4
-/// elements; scale is `(0.5 + s) * 0.5` (twice `IQ2_XXS`'s factor).
 fn decode_gguf_iq3_xxs_block_into(block: &[u8; 98], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let qs = &block[2..66];
@@ -611,8 +515,6 @@ fn decode_gguf_iq3_xxs_block_into(block: &[u8; 98], values: &mut [f32; 256]) {
         for sub in 0..4 {
             let signs = iq_sign_byte(((aux >> (7 * sub)) & 0x7f) as u8);
             let out = group * 32 + sub * 8;
-            // Eight elements is two grid points here, where the IQ2 schemes
-            // get eight from one.
             for bit in 0..8 {
                 let point = usize::from(qs[(out + bit) / 4]);
                 let g = f32::from(iq_grid::IQ3XXS_GRID[point * 4 + (out + bit) % 4]);
@@ -622,9 +524,6 @@ fn decode_gguf_iq3_xxs_block_into(block: &[u8; 98], values: &mut [f32; 256]) {
     }
 }
 
-/// GGUF `IQ3_S` block: 256 elements in 110 bytes. F16 `d`, 64 quant bytes,
-/// 8 high-bit bytes, 32 sign bytes, 4 scale bytes. Grid is 512 4-component
-/// points (9 bits: 8 from `qs`, 1 from `qh`); scale is `1 + 2s`.
 fn decode_gguf_iq3_s_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
     let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
     let qs = &block[2..66];
@@ -642,9 +541,6 @@ fn decode_gguf_iq3_s_block_into(block: &[u8; 110], values: &mut [f32; 256]) {
     }
 }
 
-/// Decode one block of any GGUF scheme the loader knows into its `f32`
-/// values. `block`/`values` must match `scheme.block_layout()`'s lengths;
-/// a caller that breaks that panics here rather than reading a neighbouring block.
 fn decode_gguf_block_into(scheme: QuantScheme, block: &[u8], values: &mut [f32]) {
     let bad = "block and value lengths must match the scheme's layout";
     match scheme {
@@ -764,7 +660,6 @@ impl Walk<'_, '_> {
     fn execute(&mut self) -> Result<(), Error> {
         for (position, id) in self.plan.schedule.iter().enumerate() {
             let instr = instr_by_id(&self.plan.instrs, *id)?.clone();
-            // Counted before the match consumes the instruction.
             let consumed = match &instr {
                 StorageInstr::ExtentWrite { source, .. }
                 | StorageInstr::BulkExtentWrite { source, .. }
@@ -835,7 +730,6 @@ impl Walk<'_, '_> {
                 }
             }
             if self.stream {
-                // Drops buffers at their last use, bounding peak memory to the working set.
                 self.buffers
                     .retain(|buffer, _| self.last_use.get(buffer) != Some(&position));
             }
@@ -872,8 +766,6 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    /// Zero a buffer. An `Owned` buffer is already zero at allocation, but a
-    /// persistent one is a window into an arena that may hold anything.
     fn fill(&mut self, id: BufferId) -> Result<(), Error> {
         let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
         match root {
@@ -917,19 +809,12 @@ impl Walk<'_, '_> {
         let span = len;
         let len = checked_usize(len)?;
         let mut out = vec![0u8; len];
-        // **WRITABLE WHEN THE CALLER IS CONSUMING THE SOURCE**, and read-only
-        // otherwise. `F_PUNCHHOLE` and `fallocate` both need a descriptor they
-        // can write, and an execution that is not releasing anything should not
-        // be able to: a checkpoint the operator asked to KEEP is opened by this
-        // executor with no way to change it.
         let mut file = File::options()
             .read(true)
             .write(self.consume.is_some())
             .open(path)
             .map_err(|err| invalid(format!("open {}: {err}", path.display())))?;
 
-        // Splits a large read across threads on positioned reads (shared file
-        // handle, different offsets); result matches a serial read.
         #[cfg(unix)]
         {
             const PARALLEL_READ_MIN: usize = 64 << 20;
@@ -976,20 +861,6 @@ impl Walk<'_, '_> {
         Ok(out)
     }
 
-    /// **THE DECODE'S HALF OF `--consume-source`.** The bytes are in `out`; if
-    /// the ledger can prove no later read of this import wants them, the
-    /// filesystem gets them back now rather than when the file is deleted at
-    /// the end.
-    ///
-    /// AFTER the reads and never before: a punch is not undoable, and a read
-    /// that failed leaves an import that may still be retried against a source
-    /// that is whole where it was not read.
-    ///
-    /// Called at both returns of [`Walk::read_file`] rather than once at a
-    /// funnel, because the parallel arm returns early — and `read_file` is
-    /// itself the funnel every source read in this file passes through, which
-    /// is what makes the ledger's account of the read sites checkable by
-    /// reading one function.
     fn release_if_spent(&self, file: &File, path: &Path, offset: u64, len: u64) {
         let Some(ledger) = self.consume else { return };
         if ledger.last_read(path, offset, len) {
@@ -1041,9 +912,6 @@ impl Walk<'_, '_> {
         let (kind, max_tile_bytes) = (*kind, tile.max_tile_bytes);
         let (source, dest) = (source.as_ref(), dest.as_ref());
         let transform = transform.clone();
-        // Tried before staging to the host: only when the backing claims this
-        // kind and every operand is already an arena span. A backing offered
-        // an op must run it or error, never fail silently.
         if self.arena_runs_kernels
             && let Some(op) =
                 self.arena_tile_map_op(kind, source, dest, inputs, outputs, &transform)?
@@ -1077,12 +945,7 @@ impl Walk<'_, '_> {
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
-            // Repack has no device implementation; this is its only
-            // executor, run once per plane during import.
             TileMapKind::Repack => self.repack_bytes(&input, &transform)?,
-            // Encode publishes more than one output buffer (payload + scale
-            // metadata), so it writes directly and returns instead of using
-            // the single-output path below.
             TileMapKind::Encode if transform.to == Some(QuantScheme::MlxAffineU4) => {
                 let written =
                     self.encode_mlx_affine_u4(&input, source, inputs, outputs, &transform)?;
@@ -1114,18 +977,7 @@ impl Walk<'_, '_> {
         };
         if let Some(dest) = dest {
             let source_stride = source.map(|source| &source.stride).unwrap_or(&dest.stride);
-            // Per-group `Scale`/`Decode` change width by design (unpacking,
-            // GGUF blocks); `Cast` preserves element count, not byte count.
-            // Every other kind must move the same byte count it read.
             if kind == TileMapKind::Cast {
-                // What a cast must fill is the DESTINATION's bytes, and the
-                // conversion above has already produced them. Comparing the
-                // two extents' dim products instead holds only while the
-                // SOURCE extent is element-shaped: a source the walk
-                // collapsed into RUNS — a gather or a concatenation that
-                // reads one contiguous block of its source more than once,
-                // which is how a family states `[x | x]` — carries its
-                // elements in `element_bytes` and not in `dims`.
                 let _ = source_stride;
                 require_cast_output_fits(output.len(), &dest.stride)?;
             } else if transform.scale_blocks.is_empty()
@@ -1162,10 +1014,6 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    /// The operands of a `TileMap`, as arena spans, or `None` when this
-    /// instruction isn't eligible for the device path (no kernel named, a
-    /// host-resident operand, or an owned output with no arena address).
-    /// `None` is not an error; it just runs on the host path.
     fn arena_tile_map_op<'t>(
         &self,
         kind: TileMapKind,
@@ -1175,11 +1023,9 @@ impl Walk<'_, '_> {
         outputs: &[BufferId],
         transform: &'t TransformSpec,
     ) -> Result<Option<TileMapOp<'t>>, Error> {
-        // No row, no delegation: the plan says the host runs this one.
         let Some(kernel) = transform.kernel.as_deref() else {
             return Ok(None);
         };
-        // A checkpoint source means host bytes; nothing to delegate.
         if source.is_some() {
             return Ok(None);
         }
@@ -1189,23 +1035,17 @@ impl Walk<'_, '_> {
         let Some(src) = self.arena_span(input)? else {
             return Ok(None);
         };
-        // Encode's payload and scales must both be in the arena, or neither
-        // is delegated.
         let dst_scales = if kind == TileMapKind::Encode {
             match outputs.get(1) {
                 Some(&scales) => match self.arena_span(scales)? {
                     Some(span) => Some(span),
                     None => return Ok(None),
                 },
-                // A single-output Encode plan is invalid; the host path gives
-                // the clearer error.
                 None => return Ok(None),
             }
         } else {
             None
         };
-        // Destination is either an extent naming a buffer, or the whole
-        // first output buffer; both must land in the arena.
         let (dst, dst_buffer) = match dest {
             Some(dest) => {
                 if !dest.stride.has_dense_destination() {
@@ -1240,9 +1080,6 @@ impl Walk<'_, '_> {
                 (span, output)
             }
         };
-        // Per-block Scale reads factors from a second input; uniform Scale
-        // carries them in `scale_factor_bits`. A missing factor operand just
-        // means the host path runs this plan instead.
         let factors = if transform.scale_blocks.is_empty() {
             None
         } else {
@@ -1264,7 +1101,6 @@ impl Walk<'_, '_> {
         }))
     }
 
-    /// Where `id` lives in the arena, or `None` if it is a host-owned buffer.
     fn arena_span(&self, id: BufferId) -> Result<Option<ArenaSpan>, Error> {
         let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
         Ok(match root {
@@ -1273,17 +1109,11 @@ impl Walk<'_, '_> {
         })
     }
 
-    /// A buffer's declared shape as the (rows, cols) rectangle a transform
-    /// walks ([`crate::types::rectangle`]); `None` for any rank but 2.
     fn buffer_rectangle(&self, id: BufferId) -> Option<(u32, u32)> {
         let (rows, cols) = crate::types::rectangle(&self.plan.buffer(id).ok()?.ty.shape)?;
         Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
     }
 
-    /// Repack: the host-only tiled-layout permutation `pie model import`
-    /// applies once per plane (no device implementation exists). Pure
-    /// gather of codes/factors, no arithmetic, so it is an exact round trip.
-    /// The marlin layouts are the device MoE path's and unimplemented here.
     fn repack_bytes(&self, bytes: &[u8], transform: &TransformSpec) -> Result<Vec<u8>, Error> {
         let spec = transform
             .repack
@@ -1306,9 +1136,6 @@ impl Walk<'_, '_> {
                         bytes.len()
                     )));
                 }
-                // Word `lane` of tile (band, k tile) holds at nibble s+4h
-                // the code at k=16*kt+2*(lane%4)+8*(s&1)+h, n=16*band+lane/4+8*(s>=2);
-                // four k tiles form one lane's uint4: word order [band][k quad][lane][4].
                 let band = TILED_BAND as usize;
                 let quad = (TILED_STEP / TILED_BAND) as usize;
                 let bands = target_rows / band;
@@ -1356,9 +1183,6 @@ impl Walk<'_, '_> {
                          and a band's padding is rows and not groups"
                     )));
                 }
-                // [n][group] -> [n band][group][16]: transpose of the
-                // (column, group) rectangle within each band. Columns past
-                // `n` get a zero factor, zeroing the padded weight.
                 const FACTOR: usize = 2;
                 if bytes.len() < rows * cols * FACTOR {
                     return Err(invalid(format!(
@@ -1417,11 +1241,6 @@ impl Walk<'_, '_> {
         encode_values(&values, dtype)
     }
 
-    /// `Unary` applies one elementwise function, in `f64` and rounded
-    /// through `f32` the way `Bias` is. A value outside the function's
-    /// domain is refused rather than answered with a `NaN`: it means the
-    /// checkpoint does not hold what the contract said it holds, and a
-    /// silent `NaN` reaches the weights as fluent nonsense.
     fn unary_bytes(
         &self,
         source: Option<&SourceExtent>,
@@ -1453,9 +1272,6 @@ impl Walk<'_, '_> {
         encode_values(&values, dtype)
     }
 
-    /// `Scale` multiplies by a per-tensor constant, or by per-group factors
-    /// from a second operand (which also decodes quantized codes). The
-    /// multiply happens in `f32` to match the CUDA kernel bit-for-bit.
     fn scale_bytes(
         &self,
         source: Option<&SourceExtent>,
@@ -1481,8 +1297,6 @@ impl Walk<'_, '_> {
                 Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
                 Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
                 Some(QuantScheme::Fp8E4M3) => decode_fp8_e4m3_elements(bytes),
-                // Element count, not the payload, distinguishes MLX affine
-                // 4-bit vs 8-bit codes.
                 Some(QuantScheme::MlxAffineU4) => {
                     let total: i64 = self.buffer_shape(output)?.iter().product();
                     let total = usize::try_from(total)
@@ -1517,10 +1331,6 @@ impl Walk<'_, '_> {
         encode_values(&values, dtype)
     }
 
-    /// MLX affine-U4 encode: publishes weight + scales + zero-points
-    /// (affine metadata needs both). Every two-output scheme lives in
-    /// [`Self::encode_bytes`] instead. `outputs` order: weight, then
-    /// metadata as `quant_metadata_outputs` declared it.
     fn encode_mlx_affine_u4(
         &self,
         bytes: &[u8],
@@ -1545,16 +1355,12 @@ impl Walk<'_, '_> {
             )));
         };
         let shape = self.buffer_shape(*weight)?.to_vec();
-        // Groups are `group` consecutive elements of a row-major buffer, so
-        // the leading axis must be rows.
         let Some((rows, cols)) = crate::types::rectangle(&shape) else {
             return Err(invalid(format!(
                 "encoding to {scheme:?} scales a [rows, cols] rectangle, not \
                  {shape:?}"
             )));
         };
-        // The destination's own width and group: `MlxAffineU4` names the
-        // codec, and the buffer's spec says whether it is 2, 4 or 8 bits wide.
         let (bits, group) = match &self.plan.buffer(*weight)?.ty.encoding {
             Encoding::Quant(spec) => (u32::from(spec.bits_per_element), spec.group_size),
             Encoding::Raw(_) => (4, scheme.default_group_size()),
@@ -1574,8 +1380,6 @@ impl Walk<'_, '_> {
                  divide the {cols} of {shape:?}"
             )));
         }
-        // `decode_values` gives f64; the quantizer rounds in f32, matching
-        // MLX's own encoder. dtype comes from the operand, not a byte-count guess.
         let operand_dtype = if let Some(input) = inputs.first() {
             self.buffer_dtype(*input)?
         } else if let Some(source) = source {
@@ -1615,7 +1419,6 @@ impl Walk<'_, '_> {
         ])
     }
 
-    /// The multiply, as one spelling of [`Self::fold_per_block`].
     fn scale_per_block(
         &self,
         values: Vec<f64>,
@@ -1647,8 +1450,6 @@ impl Walk<'_, '_> {
             )));
         }
 
-        // Factor-tensor extents and row-major strides, folded in one pass
-        // so they can't be computed from different shapes.
         let mut counts = vec![0i64; shape.len()];
         let mut strides = vec![0i64; shape.len()];
         let mut running = 1i64;
@@ -1678,8 +1479,6 @@ impl Walk<'_, '_> {
             )));
         }
 
-        // One odometer over the logical shape; `index` (the factor's flat
-        // position) is carried alongside so division happens once per axis step.
         let mut coord = vec![0i64; shape.len()];
         for value in &mut values {
             let mut index = 0i64;
@@ -1721,10 +1520,6 @@ impl Walk<'_, '_> {
         cast_elements(bytes, from, to)
     }
 
-    /// Decode a self-contained blocked GGUF payload to logical BF16 (the
-    /// `Cast(Quant -> Raw)` direction, lowered to `Decode`). Only schemes
-    /// with in-block scales are admitted — exactly those with a
-    /// `block_layout()` and an arm in [`decode_gguf_block_into`].
     fn decode_bytes(
         &self,
         output: Option<BufferId>,
@@ -1756,8 +1551,6 @@ impl Walk<'_, '_> {
         let blocks = bytes.len() / block_bytes;
         let out_bytes = elements * 2;
         let mut out = vec![0u8; blocks * out_bytes];
-        // Blocks are independent, so decoding splits across workers into
-        // disjoint output slices.
         let workers = if blocks < (1 << 15) {
             1
         } else {
@@ -1792,11 +1585,6 @@ impl Walk<'_, '_> {
         Ok(out)
     }
 
-    /// Quantize on the host, matching the CUDA encode kernels arm for arm:
-    /// `Mxfp4E2M1E8M0` groups 32 elements by absmax -> E8M0 scale;
-    /// `Fp8E4M3`/`Int8Symmetric` scale per row by absmax/448 or /127 (dead
-    /// row -> factor 1.0). Operand is always BF16 rows; an FP8 block-scaled
-    /// source is dequantized first via its own block factors.
     fn encode_bytes(
         &mut self,
         source: Option<&SourceExtent>,
@@ -1813,8 +1601,6 @@ impl Walk<'_, '_> {
             return Err(invalid("host Encode expects weight and scale outputs"));
         };
         let shape = self.buffer_shape(payload)?.to_vec();
-        // [experts, rows, cols] folds to [experts*rows, cols] in the same
-        // byte order (see `types::rectangle`); every line below indexes row*cols+c.
         let Some((rows, cols)) = crate::types::rectangle(&shape) else {
             return Err(invalid(format!(
                 "host Encode scales a [rows, cols] rectangle, and {shape:?} has \
@@ -1823,8 +1609,6 @@ impl Walk<'_, '_> {
         };
         let (rows, cols) = (checked_usize_i64(rows)?, checked_usize_i64(cols)?);
         let scale_shape = self.buffer_shape(scales)?.to_vec();
-        // Compared whole rather than folded: the engine binds a scales plane
-        // at its declared rank.
         let lead = &shape[..shape.len() - 1];
 
         let dtype = if let Some(source) = source {
@@ -1912,7 +1696,6 @@ impl Walk<'_, '_> {
                             absmax = a;
                         }
                     }
-                    // A dead row (absmax 0) quantizes to all zeros via factor 1.0.
                     let (recip, factor) = if absmax > 0.0 {
                         (code_max / absmax, absmax / code_max)
                     } else {
@@ -1959,10 +1742,6 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    /// Resolves an FP8 block-scaled Encode operand (mirrors
-    /// `fp8_tile_scale`). Group size = on-disk weight shape / factor-tensor
-    /// shape (must be square); a shard's factor offset comes from the
-    /// extent's base offset, in elements (FP8 is one byte each).
     fn fp8_block_operand<'b>(
         &self,
         source: &SourceExtent,
@@ -2015,7 +1794,6 @@ impl Walk<'_, '_> {
         }
         let group = group_rows;
 
-        // The rank's corner within the full weight, then within the factors.
         let base = checked_usize(source.stride.base_offset)?;
         let scale_row_offset = (base / true_cols) / group;
         let scale_col_offset = (base % true_cols) / group;
@@ -2029,14 +1807,6 @@ impl Walk<'_, '_> {
             )));
         }
 
-        // **THE ONE READ THE PLAN'S INSTRUCTION LIST DOES NOT DESCRIBE**, and
-        // the reason `consume::SourceLedger` keeps a blocked list beside its
-        // read counts. This runs once per SHARD of the payload, over the whole
-        // of the factor tensor each time, so a ledger that only counted the
-        // extents instructions name would see one read of this span and release
-        // it — and the next shard would encode against zeros. The ledger blocks
-        // every `metadata_source` span for exactly this call. If a second
-        // out-of-band read is ever added to this file, it goes in that list too.
         let factor_bytes = self.read_extent(&SourceExtent {
             file_id: scale.file_id,
             tensor_id: scale.id,
@@ -2057,7 +1827,6 @@ impl Walk<'_, '_> {
             .chunks_exact(4)
             .map(|le| f32::from_le_bytes(le.try_into().unwrap()))
             .collect();
-        // Checks only the first element each row reads, since the last block may be short.
         let last_index = (scale_row_offset + (rows.saturating_sub(1)) / group) * scale_cols
             + scale_col_offset
             + (cols.saturating_sub(1)) / group;
@@ -2086,7 +1855,6 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// A buffer's declared shape.
     fn buffer_shape(&self, id: BufferId) -> Result<&[i64], Error> {
         Ok(self.plan.buffer(id)?.ty.shape.as_slice())
     }
@@ -2190,9 +1958,6 @@ fn resolve_range(
     Ok((root, base + extra_offset, len))
 }
 
-/// Walks a [`GatherSpec`]'s table over `bytes`, copying one block at a time.
-/// Rows share one table, so a large permutation is just the row count times
-/// a loop over it.
 fn permute(bytes: &[u8], gather: &GatherSpec) -> Result<Vec<u8>, Error> {
     let block = checked_usize(gather.block_bytes)?;
     let rows = checked_usize(gather.rows)?;
@@ -2243,9 +2008,6 @@ fn gather_strided(raw: Vec<u8>, extent: &Extent) -> Result<Vec<u8>, Error> {
     let elem = extent.element_bytes as usize;
     let total = elements.saturating_mul(elem);
 
-    // Folds trailing dense dimensions into one contiguous run, so the loop
-    // below moves a run per iteration, not an element; a fully dense extent
-    // collapses to one run.
     let mut run = elem;
     let mut outer = extent.dims.len();
     while outer > 0 {
@@ -2260,7 +2022,6 @@ fn gather_strided(raw: Vec<u8>, extent: &Extent) -> Result<Vec<u8>, Error> {
         outer -= 1;
     }
     if outer == 0 {
-        // One dense run: the physical bytes are already the compact bytes.
         if raw.len() < total {
             return Err(invalid("source extent is out of bounds"));
         }
@@ -2292,9 +2053,6 @@ fn gather_strided(raw: Vec<u8>, extent: &Extent) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// A copy is well-formed when both sides span the same byte count, not the
-/// same dimensions: source dims describe the checkpoint walk, dest dims a
-/// compact block, and the two decompositions need not match.
 fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> {
     let bytes = |extent: &Extent| -> Option<i64> {
         extent
@@ -2314,10 +2072,6 @@ fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> 
     Ok(())
 }
 
-/// A cast is well-formed when what it produced fills the destination
-/// exactly: the element counts agree on both sides and the widths differ by
-/// the representations' ratio, which is the same statement in BYTES — and
-/// the only one that holds however the source extent was shaped.
 fn require_cast_output_fits(produced: usize, dest: &Extent) -> Result<(), Error> {
     let wanted = dest
         .dims
@@ -2363,11 +2117,6 @@ fn extent_bytes(extent: &Extent) -> Result<usize, Error> {
         .ok_or_else(|| invalid("extent byte count overflow"))
 }
 
-/// The bytes a source extent physically spans, base offset excluded.
-///
-/// `pub(crate)` for [`consume::SourceLedger`](crate::consume::SourceLedger),
-/// which has to predict the ranges [`Walk::read_extent`] will ask for and would
-/// be predicting a different checkpoint if it measured them its own way.
 pub(crate) fn physical_source_bytes(extent: &Extent) -> Result<u64, Error> {
     physical_bytes(extent, true)
 }

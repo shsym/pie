@@ -1,5 +1,3 @@
-//! Pins that an adapter's weights are not a lane's per-fire scratch.
-
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_compiler::plan::compile_bound;
 use eta_exec::{Extents, describe, layout};
@@ -11,18 +9,12 @@ use eta_ir::validate::bind;
 
 use engine_cuda::program::{describe_values, scratch_bytes};
 
-// the fixture
-
-/// qwen35-d0.8b's adapter geometry.
 const LAYERS: u32 = 24;
 const HIDDEN: u32 = 1024;
 const RANK: u32 = 16;
 
-/// Site bits the placement constant carries.
 const SITES: u32 = 4;
 
-/// A prologue with one low-rank adapter: three peeked channels and the
-/// `lora` sink over them. `also_read` adds a launched op reading `A` too.
 fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceContainer {
     let chan = |shape| ChannelDecl {
         shape,
@@ -59,14 +51,12 @@ fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceC
     }
 }
 
-/// The package a container compiles to.
 fn package(container: TraceContainer) -> LaunchPackage {
     let bound = bind(container, ModelProfile::dummy()).expect("the lora prologue binds");
     let stages = compile_bound(&bound);
     eta_compiler::codegen::launch::build(&bound, &stages)
 }
 
-/// The stage whose plan declares the sink (`needs.lora`).
 fn adapter_stage(package: &LaunchPackage) -> &LaunchStagePlan {
     package
         .plans
@@ -75,8 +65,6 @@ fn adapter_stage(package: &LaunchPackage) -> &LaunchStagePlan {
         .expect("a prologue that states an adapter declares `needs.lora`")
 }
 
-/// What one lane's scratch would cost if every declared value materialised
-/// — the pre-fix budget.
 fn naive_bytes(plan: &LaunchStagePlan, extents: Extents) -> u64 {
     let descriptors: Vec<_> = plan
         .value_types
@@ -86,15 +74,19 @@ fn naive_bytes(plan: &LaunchStagePlan, extents: Extents) -> u64 {
     layout(&descriptors).expect("the naive budget fits").total
 }
 
-/// The per-lane scratch of an adapter prologue at one geometry.
 fn adapter_scratch(layers: u32, rank: u32, hidden: u32) -> u64 {
     let package = package(lora_prologue(layers, rank, hidden, false));
     scratch_bytes(adapter_stage(&package), Extents::default()).expect("the stage's scratch")
 }
 
-// the claims
+fn an_adapter_is_not_a_lanes_scratch_every_case() {
+    the_sinks_scratch_does_not_scale_with_layers_rank_hidden();
+    the_naive_budget_is_the_one_that_scales();
+    an_adapter_carrying_prologue_costs_a_lane_a_rounding_error();
+    the_planes_describe_as_empty();
+    a_plane_a_launched_op_also_reads_is_still_carried();
+}
 
-/// (a) The sink's scratch does not scale with the adapter's geometry.
 #[test]
 fn the_sinks_scratch_does_not_scale_with_layers_rank_hidden() {
     let served = adapter_scratch(LAYERS, RANK, HIDDEN);
@@ -111,8 +103,6 @@ fn the_sinks_scratch_does_not_scale_with_layers_rank_hidden() {
     );
 }
 
-/// (b) The naive budget does scale — which is what makes (a) a real gate.
-#[test]
 fn the_naive_budget_is_the_one_that_scales() {
     let extents = Extents::default();
     let served = package(lora_prologue(LAYERS, RANK, HIDDEN, false));
@@ -126,7 +116,6 @@ fn the_naive_budget_is_the_one_that_scales() {
          a 1x1x1 adapter's {trivial}; if these were equal, the claim above \
          would be about nothing"
     );
-    // Both planes, plus four temporaries an element off the widest of them.
     let planes = u64::from(LAYERS) * u64::from(RANK) * u64::from(HIDDEN) * 4;
     assert!(
         served >= planes * 2,
@@ -136,9 +125,6 @@ fn the_naive_budget_is_the_one_that_scales() {
     );
 }
 
-/// (c) An adapter-carrying prologue costs a lane a rounding error, in
-/// absolute bytes.
-#[test]
 fn an_adapter_carrying_prologue_costs_a_lane_a_rounding_error() {
     let bytes = adapter_scratch(LAYERS, RANK, HIDDEN);
     assert!(
@@ -148,8 +134,6 @@ fn an_adapter_carrying_prologue_costs_a_lane_a_rounding_error() {
     );
 }
 
-/// (d) The value descriptors say the adapter planes are empty.
-#[test]
 fn the_planes_describe_as_empty() {
     let package = package(lora_prologue(LAYERS, RANK, HIDDEN, false));
     let plan = adapter_stage(&package);
@@ -168,8 +152,6 @@ fn the_planes_describe_as_empty() {
     );
 }
 
-/// (e) A value the sink shares with a launched op is still carried.
-#[test]
 fn a_plane_a_launched_op_also_reads_is_still_carried() {
     let shared = package(lora_prologue(LAYERS, RANK, HIDDEN, true));
     let shared = scratch_bytes(adapter_stage(&shared), Extents::default()).expect("the scratch");

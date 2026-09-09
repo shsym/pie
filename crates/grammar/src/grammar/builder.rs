@@ -2,19 +2,6 @@ use anyhow::{Result, bail};
 
 use super::{Expr, ExprId, Grammar, Rule, RuleId};
 
-/// Programmatic grammar construction.
-///
-/// # Example
-/// ```ignore
-/// use ::grammar::grammar::builder::GrammarBuilder;
-///
-/// let mut b = GrammarBuilder::new();
-/// let root = b.add_rule("root");
-/// let hello = b.add_byte_string(b"hello");
-/// b.set_rule_body(root, hello);
-/// let grammar = b.build("root").unwrap();
-/// assert_eq!(grammar.num_rules(), 1);
-/// ```
 pub struct GrammarBuilder {
     pub(crate) rules: Vec<Rule>,
     pub(crate) exprs: Vec<Expr>,
@@ -28,13 +15,11 @@ impl GrammarBuilder {
         }
     }
 
-    /// Add a new rule with no body; the body must be set later with
-    /// `set_rule_body`.
     pub fn add_rule(&mut self, name: &str) -> RuleId {
         let id = RuleId(self.rules.len() as u32);
         self.rules.push(Rule {
             name: name.to_string(),
-            body: ExprId(u32::MAX), // sentinel, must be filled
+            body: ExprId(u32::MAX),
         });
         id
     }
@@ -61,7 +46,6 @@ impl GrammarBuilder {
         self.add_expr(Expr::CharacterClass { negated, ranges })
     }
 
-    /// `[...]*`.
     pub fn add_character_class_star(&mut self, negated: bool, ranges: Vec<(u32, u32)>) -> ExprId {
         self.add_expr(Expr::CharacterClassStar { negated, ranges })
     }
@@ -129,6 +113,12 @@ impl Default for GrammarBuilder {
 mod tests {
     use super::*;
 
+    fn builder_every_case() {
+        test_build_simple_grammar();
+        test_build_missing_root();
+        test_build_missing_body();
+    }
+
     #[test]
     fn test_build_simple_grammar() {
         let mut b = GrammarBuilder::new();
@@ -147,7 +137,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn test_build_missing_root() {
         let mut b = GrammarBuilder::new();
         let root = b.add_rule("main");
@@ -158,7 +147,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
     fn test_build_missing_body() {
         let mut b = GrammarBuilder::new();
         b.add_rule("root"); // no body set

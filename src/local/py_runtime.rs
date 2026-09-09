@@ -1,16 +1,3 @@
-//! Python WASM runtime install — fetches the
-//! `componentize-py-runtime` core module and unpacks it under
-//! `$PIE_HOME/py-runtime/` so Python inferlets have something to
-//! link against.
-//!
-//! Mirrors `sdk/inferlet/tools/bakery/src/bakery/py_runtime.py` (the canonical
-//! installer used by the Python `pie config init` and `Server.__aenter__`
-//! paths). Both call paths land at the same on-disk layout, so a tarball
-//! pulled by either is reused by the other.
-//!
-//! Pinned `RUNTIME_URL` matches bakery's; bumping requires a coordinated
-//! change with `runtime/program/python` on the Rust side.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -18,14 +5,10 @@ use anyhow::{Result, anyhow, bail};
 const RUNTIME_URL: &str =
     "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.4.0/download";
 
-/// Where the host loader expects to find the runtime tree.
 pub fn runtime_dir() -> PathBuf {
     bootstrap::paths::pie_home().join("py-runtime")
 }
 
-/// Sentinel file the host loader links against. Its presence is what
-/// `is_installed` checks for — if it's there, the rest of the tree is
-/// almost certainly intact.
 fn sentinel() -> PathBuf {
     runtime_dir()
         .join("shared")
@@ -36,13 +19,6 @@ pub fn is_installed() -> bool {
     sentinel().is_file()
 }
 
-/// Install the runtime if it isn't already. Returns the runtime
-/// directory either way.
-///
-/// `quiet` suppresses the progress line on the engine bootstrap path
-/// where the user shouldn't be asked to read a download bar. When
-/// invoked manually via `pie config init`, callers pass `quiet=false`
-/// so the user sees the progress.
 pub fn ensure_installed(quiet: bool) -> Result<PathBuf> {
     let dir = runtime_dir();
     if is_installed() {
@@ -72,13 +48,6 @@ pub fn ensure_installed(quiet: bool) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Best-effort install for the engine bootstrap path.
-///
-/// `enabled` is the effective `[sandbox] python_runtime` flag: when it is
-/// off the caller has said it wants nothing to do with the Python runtime,
-/// so we neither fetch nor warn. Otherwise a missing runtime is fetched and
-/// failures are logged, not fatal — a firewalled machine still serves Rust
-/// inferlets.
 pub fn ensure_installed_best_effort(enabled: bool) {
     let dir = runtime_dir();
     if !enabled {
@@ -104,15 +73,6 @@ pub fn ensure_installed_best_effort(enabled: bool) {
     }
 }
 
-/// Synchronous tarball download, via `reqwest::blocking`.
-///
-/// **Every caller must already be on a blocking thread.** `main` is
-/// `#[tokio::main]`, so there is no non-async context in this binary — the
-/// client here builds a tokio runtime of its own and dropping that inside an
-/// async one is an error tokio reports at runtime rather than a compile error.
-/// Reaching it from an async context prints "Cannot drop a runtime in a
-/// context where blocking is not allowed", so every caller goes through
-/// `spawn_blocking`.
 fn fetch() -> Result<Vec<u8>> {
     let resp = reqwest::blocking::Client::new()
         .get(RUNTIME_URL)
@@ -125,8 +85,6 @@ fn fetch() -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("read response body: {e}"))
 }
 
-/// xz-decompress + untar into `dest`. Mirrors what bakery's Python
-/// equivalent does via `lzma.decompress` + `tarfile.extractall`.
 fn extract(blob: &[u8], dest: &Path) -> Result<()> {
     let mut decoder = xz2::read::XzDecoder::new(blob);
     let mut tar = tar::Archive::new(&mut decoder);

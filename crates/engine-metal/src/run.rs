@@ -1,5 +1,3 @@
-//! One fire's dispatch state: resolves plan ids to device handles. Integrity failures panic rather than returning backend errors.
-
 use kernels_metal::attn::mla::MlaPlan;
 use kernels_metal::linear::moe::RoutedScratch;
 use kernels_metal::{
@@ -12,247 +10,147 @@ use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
 use crate::window::{At, Window, Windows};
 
-/// One loader-resolved weight: most rows are a single dense handle; a quantized weight is 2-3
-/// device planes under one `Def::Weight` id, with group size and bit width traveling per-bank
-/// rather than model-wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRow {
-    /// One dense handle, resolved by [`Run::tensor`].
     Dense(Tensor),
 
-    /// A split-plane quantized bank, resolved by [`Run::planes`] or asked
-    /// after by [`Run::banked`] — never as one tensor.
     Planes(Bank),
 }
 
-/// Loader-resolved weights, one row per `Trace::params` entry —
-/// `Def::Weight(i)` resolves to row `i`.
-/// `None` marks an unbound param; resolving it is a binding bug and panics.
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-/// Arena slots at the compiler's offsets, `ValueId`-indexed. A merge aliases onto its op's slot,
-/// so both resolve the same row. `None` for ids with no arena slot (inputs, weights, caches,
-/// structs).
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
 
-/// One resolved cache space: the storage pointer only; geometry rides in [`FireBindings`].
 #[derive(Clone, Copy, Debug)]
 pub enum CachePool {
-    /// A paged kv space (`CacheRow::Kv`).
     Kv(KvPool),
-    /// A recurrent state space (`CacheRow::State`).
     Recurrent(RecurrentPool),
 }
 
-/// Cache-index-indexed pools, aligned with `Trace::caches`.
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>);
 
-/// The geometry vectors one cache space declared. Only what the plan names gets bound, so every
-/// seat is optional; resolving an unbound seat is a binding bug and panics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheGeometry {
-    /// `RuntimeInput::Geometry { kind: Indptr }`.
     pub indptr: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: Indices }`.
     pub indices: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: SeqLens }`.
     pub seq_lens: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: LastPageLen }`.
     pub last_page_len: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: KvLen }`.
     pub kv_len: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: RowValid }`.
     pub row_valid: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: RequestOfToken }`.
     pub request_of_token: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: WritePage }`.
     pub write_page: Option<Tensor>,
 
-    /// `RuntimeInput::Geometry { kind: WriteOffset }`.
     pub write_offset: Option<Tensor>,
 }
 
-/// Per-fire tables the sdpa shaders read alongside the pool; positions live in
-/// [`FireBindings::positions`].
 #[derive(Clone, Copy, Debug)]
 pub struct FireTables {
-    /// `i32`, one per token: the owning request.
     pub request_of_token: Tensor,
 
-    /// `u8` packed mask planes, one row per request — shared with `RuntimeInput::Mask`'s
-    /// resolution.
     pub mask: Tensor,
 
-    /// `u8`, one per request: whether its mask row is live.
     pub mask_enabled: Tensor,
 
-    /// Elements from one request's mask row to the next.
     pub mask_stride: u32,
 }
 
-/// The dsv4 compressor state `attention.pool_gather` reads beside its cache. Reserved only when
-/// the trace has a pooled layer, so a fire with none pays no bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct PoolSlabs {
-    /// The rolling kv window: `[the source pool's cells, coff * head_dim]`,
-    /// in the pooled entry's element.
     pub state_kv: Tensor,
 
-    /// The rolling gate logits, at `state_kv`'s shape and element.
     pub state_score: Tensor,
 }
 
-/// What the engine binds each fire, owned by the [`Run`] for its lifetime.
-///
-/// `tokens`, `positions`, and `geometry` are op-visible (`RuntimeInput` routes onto them in
-/// [`Run::tensor`]); `tables` are ambient — read by the plan builders without an op naming them.
 #[derive(Clone, Debug)]
 pub struct FireBindings {
-    /// `RuntimeInput::Tokens`: ragged `i32`, one id per token.
     pub tokens: Tensor,
 
-    /// `RuntimeInput::Positions`: ragged `i32`, one absolute position per
-    /// token — also the plan builders' causal-bound table.
     pub positions: Tensor,
 
-    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row, `-1` for a row whose
-    /// lane routes nowhere. `None` for a fire no lane carried an adapter into — costs zero bytes
-    /// and zero launches.
     pub adapter_routes: Option<Tensor>,
 
-    /// `RuntimeInput::Patches`: `[patch rows, C·T·P²]` in the plan's element.
+    pub readout_rows: Tensor,
+
+    pub nan_flags: Option<Tensor>,
+
     pub patches: Option<Tensor>,
 
-    /// `RuntimeInput::PatchSegments`: `i32`, `[images + 1]` — the patch
-    /// axis's own indptr, which `attention.dense` reads its image boundaries
-    /// out of.
     pub patch_segments: Option<Tensor>,
 
-    /// `RuntimeInput::PatchRoutes`: `i32`, `[patch rows]`, one destination token row per tower
-    /// row, `-1` for a row the fold spends. Host-checked: an out-of-range entry is an OOB device
-    /// write the arena doesn't catch.
     pub patch_routes: Option<Tensor>,
 
-    /// `RuntimeInput::PatchPositions`: `i32`, `[patch rows, 3]`.
     pub patch_positions: Option<Tensor>,
 
-    /// `RuntimeInput::PatchEmbedRows`: `i32`, `[patch rows, taps]`, `None`
-    /// for a plan that reads the learned position table on its native grid.
     pub patch_embed_rows: Option<Tensor>,
 
-    /// `RuntimeInput::PatchEmbedWeights`: `f32`, `[patch rows, taps]`.
     pub patch_embed_weights: Option<Tensor>,
 
-    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]` — staged for every fire of a plan that
-    /// declares the rotation, image or no image; a lane with no stream of its own reads the
-    /// scalar `(p, p, p)`.
     pub mrope_positions: Option<Tensor>,
 
-    /// `RuntimeInput::SelfCondRows` / `SelfCondWeights`: `i32` and `f32`, `[rows, taps]` — a
-    /// denoiser's self-conditioning taps, staged for every fire of a plan that declares them
-    /// (zeros for a lane carrying none).
     pub self_cond_rows: Option<Tensor>,
     pub self_cond_weights: Option<Tensor>,
 
-    /// Per cache space, aligned with `Trace::caches`:
-    /// `RuntimeInput::Geometry { space, kind }` routes to that space.
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<(model_ir::Selection, crate::inputs::PackingHandles)>,
+
+    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
+
+    pub voxels: Option<crate::inputs::VoxelHandles>,
+
     pub geometry: Vec<CacheGeometry>,
 
-    /// The fire tables the attention plan builders consume.
     pub tables: FireTables,
 
-    /// Score-capture output slab. `None` unless the plan
-    /// declares an `attn.scores` export and a lane in this fire asks for it.
     pub scores: Option<crate::scores::ScoreSeat>,
 
-    /// **The recurrent-state seat** (`crate::rs`): `Some` only for a fire in which a lane
-    /// buffers or replays recurrent state, and then the SSM and hasher ops take the committed
-    /// arm (`crate::dispatch::rs`). `None` is every fire that folds in the forward, whose walk
-    /// is byte for byte what it was before the seat existed.
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 }
 
-/// One built plan payload — closed enum over the three kinds this plane builds; a wrong kind is
-/// a named panic.
 #[derive(Clone, Copy, Debug)]
 pub enum StructSlot {
-    /// `StructKind::AttnDecodePlan`.
     Decode(DecodePlan),
 
-    /// `StructKind::AttnPrefillPlan`.
     Prefill(PrefillPlan),
 
-    /// `StructKind::MlaPlan` — empty: this engine reads the fire's position/owning-request
-    /// tables and the pool page walk directly at each attention op, so no payload is needed.
     Mla(MlaPlan),
 }
 
-/// One fire's dispatch state: encode sink, resolution tables, fire bindings and plan payloads.
-/// Constructed once per fire; the walk runs prepare phase first so every plan payload exists
-/// before its consumers encode.
 pub struct Run<'c> {
-    /// The encode sink; everything device-facing goes through it — nothing here names Metal
-    /// directly.
     ctx: &'c Ctx<'c>,
 
-    /// Handle table every carve is minted into and every argument resolves through. A windowed
-    /// cut is a new row here (Metal binds a buffer and an offset, so there is no address to add
-    /// a stride to).
     handles: &'c Handles,
 
-    /// The routing: `Trace::values`, read by [`Run::tensor`] to send each id to its table.
     values: &'c [ValueDecl],
 
-    /// `Trace::nodes` — read only by `crate::dispatch::copy`, which walks a copied region's node
-    /// range.
     nodes: &'c [Node],
 
-    /// `Def::Weight` rows, loader-resolved.
     weights: &'c WeightTable,
 
-    /// `Def::Op` / `Def::Merge` rows, carved at the compiler's offsets.
     arena: &'c SlotTable,
 
-    /// `Def::Cache` rows — pool pointers, resolved through [`Run::pool`] and
-    /// [`Run::recurrent`], never through [`Run::tensor`].
     caches: &'c CacheTable,
 
-    /// Plan payloads, filled in the prepare phase and read in the capture phase. Keyed by
-    /// `(run, value)` — flat at `run * values_wide + value` — since a region split into multiple
-    /// window-runs needs one slot per run, not per value.
     structs: Vec<Option<StructSlot>>,
-    /// How many values one run's slice of [`structs`](Run::structs) holds.
     values_wide: usize,
 
-    /// This fire's bindings.
     fire: FireBindings,
 
-    /// Every region's windows, resolved once per fire from the composition's
-    /// class table. Indexed by [`place`](Run::place).
     windows: &'c Windows,
 
-    /// Which region/run the walk is currently on, written by [`Cursor`](crate::window::Cursor)
-    /// before each region's dispatch and before each encode within it.
     place: &'c At,
 
-    /// The copied region the walk is inside, or the default when none is active. Carries the
-    /// region index it was built for, so a stale plan (built for a different region) panics
-    /// rather than reading the wrong offsets.
     copy: CopyPlan,
 
-    /// Load-time scratch reservation: working rectangles no op names, plus arena slot capacities
-    /// and router expert counts. Borrowed, not owned — built once at load; each fire mints its
-    /// own handle row into it, like every other arena row.
     scratch: &'c Scratch,
 }
 
@@ -290,36 +188,28 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The window of the region the walk is inside, cut at the run it is on.
     pub(crate) fn window(&self) -> &'c Window {
         self.windows.at(self.place.region.get(), self.place.run.get())
     }
 
-    /// Where this run's payload for `id` sits in [`structs`](Run::structs); same run/window
-    /// pairing as [`window`](Run::window).
     fn struct_at(&self, id: ValueId) -> usize {
         self.place.run.get() as usize * self.values_wide + id.0 as usize
     }
 
-    /// This window's own qo boundaries, rebased to start at zero.
     pub(crate) fn qo_indptr(&self) -> Tensor {
         self.window().indptr
     }
 
-    /// Host-side copy of the qo boundaries, for an arm that needs to read rather than bind them.
     #[allow(dead_code)]
     pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
     }
 
-    /// How many token rows this window covers.
     #[allow(dead_code)]
     pub(crate) fn total_tokens(&self) -> u32 {
         self.window().span.rows
     }
 
-    /// Whether any lane of this window carries more than one row — the
-    /// question a chunked linear-attention entry asks to choose its arm.
     #[allow(dead_code)]
     pub(crate) fn multi_token(&self) -> bool {
         self.qo_indptr_host()
@@ -327,9 +217,6 @@ impl<'c> Run<'c> {
             .any(|pair| pair[1] - pair[0] > 1)
     }
 
-    /// A raw ambient table (not a `ValueId`), cut to this window's rows. For a
-    /// gathered window, `positions`/`request_of_token` are permuted rather
-    /// than sliced (a gather's rows aren't contiguous); the mask is never permuted.
     pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
         if let Some(gathered) = &self.window().gathered {
             if handle.buf == self.fire.positions.buf {
@@ -343,52 +230,77 @@ impl<'c> Run<'c> {
         self.slice(handle, span.row_offset, span.rows)
     }
 
-    /// Which region of the template the walk is inside — the cursor's own
-    /// index, read by `crate::dispatch::copy` so that a copy plan built for
-    /// one region cannot be read inside another.
     pub(crate) fn at_region(&self) -> u32 {
         self.place.region.get()
     }
 
-    /// `Trace::nodes`, for the one caller that walks a region's node range.
     pub(crate) fn nodes(&self) -> &'c [Node] {
         self.nodes
     }
 
-    /// `Trace::values`, for the same caller: what a node's operand ids are
-    /// declared as.
     pub(crate) fn values(&self) -> &'c [ValueDecl] {
         self.values
     }
 
-    /// One value's fire-wide rectangle, uncut — what a copy plan compacts from, and what a
-    /// scatter puts back.
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
+    }
+
+    fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
+        self.fire.voxels.unwrap_or_else(|| {
+            panic!(
+                "value {at} reads the voxel axis, and no lane of this fire submitted a clip"
+            )
+        })
+    }
+
+    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+        self.fire
+            .ports
+            .iter()
+            .find(|(have, index, _)| *have == kind && *index == port)
+            .map(|(_, _, plane)| *plane)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads the {kind:?} port {port}, and this load carved \
+                     {} float port(s)",
+                    self.fire.ports.len()
+                )
+            })
+    }
+
+    fn packing(&self, at: usize, select: model_ir::Selection) -> crate::inputs::PackingHandles {
+        self.fire
+            .packings
+            .iter()
+            .find(|(have, _)| *have == select)
+            .map(|(_, tables)| *tables)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads a packing table keyed by {select:?}, and this load \
+                     carved {} selection(s)",
+                    self.fire.packings.len()
+                )
+            })
+    }
+
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
     }
 
-    /// Where a handle actually points: `(reservation, offset)` — the copy
-    /// plan's key, since two values aliased onto one arena slot get
-    /// different handle rows at the same offset. `None` for an unminted row.
     pub(crate) fn address(&self, handle: u32) -> Option<(u64, u64)> {
         let row = self.handles.get(handle)?;
         Some((crate::device::alloc::slab_id(row.slab()), row.offset()))
     }
 
-    /// Seat the plan a copied region's gather just built — read back by
-    /// [`Run::compacted`] for every operand until the region's scatter.
     pub(crate) fn set_copy(&mut self, plan: CopyPlan) {
         self.copy = plan;
     }
 
-    /// The plan the current region's gather seated, for the scatter that
-    /// closes the bracket.
     pub(crate) fn staged_copy(&self) -> &CopyPlan {
         &self.copy
     }
 
-    /// One rectangle of the copy role, minted for this fire. `None` means the load reserved too
-    /// little for it; a panic means the handle table itself is full.
     pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Option<u32> {
         Some(
             self.scratch
@@ -399,14 +311,10 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The encode sink, for the arms.
-    /// The fire's handle table, for an arm that mints its own cuts.
     pub(crate) fn handles(&self) -> &'c Handles {
         self.handles
     }
 
-    /// This fire's recurrent seat (`crate::rs`), or `None` for a fire every
-    /// lane of which folds in the forward — the ordinary path, untouched.
     pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
         self.fire.rs.clone()
     }
@@ -415,14 +323,10 @@ impl<'c> Run<'c> {
         self.ctx
     }
 
-    /// The fire bindings, for the plan-building arms' seam.
     pub(crate) fn bindings(&self) -> &FireBindings {
         &self.fire
     }
 
-    /// One rectangle, sliced to `keep` rows starting at `skip`; minted into
-    /// [`Handles`], which bounds-checks it. A failing cut is an integrity
-    /// failure (compiler carve vs. window table disagreement), and panics.
     fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
         if skip == 0 && keep >= handle.rows {
             return handle;
@@ -448,14 +352,8 @@ impl<'c> Run<'c> {
         Tensor::new(cut, rows, handle.width, handle.dtype)
     }
 
-    /// One value's rectangle, cut to the window of the node asking for it.
-    /// Row-shaped values are indexed by absolute fire row; a `Dim::Const`
-    /// column is handed over whole. `GeomKind::Indices` and
-    /// `RuntimeInput::Mask` are never fire-row-indexed and are never sliced here.
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
-        // A gathered window's rows were compacted into scratch by the gather; resolve
-        // through `compacted` instead of slicing the fire-wide column.
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }
@@ -474,33 +372,25 @@ impl<'c> Run<'c> {
         };
         let seated = self.window();
         let window = seated.span;
-        // The patch axis has its own window (`Window::patch`), cut separately from the
-        // token axis's `span` — needed because the embed merge is a token region that also
-        // reads a patch column.
         let patch = seated.patch;
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            // Gathered across every lane: handed over whole.
             Some(Dim::Readouts) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
-            // M0: the voxel axis (D8) is CUDA-only; this shell seats no voxel rectangle.
-            Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                panic!("value {} lives on the voxel axis, which this shell does not seat", id.0)
-            }
+            Some(Dim::Voxels) => (seated.voxel.row_offset, seated.voxel.rows),
+            Some(Dim::VoxelsTimes(k)) => (seated.voxel.row_offset * k, seated.voxel.rows * k),
+            Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
+            Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };
         self.slice(handle, skip, keep)
     }
 
-    /// [`Run::cut`]'s counterpart for a gathered window: resolves to the
-    /// gather's staging rectangle, a re-cut kv-geometry twin, or the value
-    /// unchanged. The kv pool itself is never re-cut here — sdpa indexes it
-    /// via the permuted `request_of_token`.
     fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
         let gathered = self
@@ -517,8 +407,6 @@ impl<'c> Run<'c> {
                 GeomKind::Indices => space.page_indices,
                 GeomKind::LastPageLen => space.last_page_lens,
                 GeomKind::KvLen => space.kv_len,
-                // Unreachable in practice; falls back to the fire-wide vector rather than
-                // guessing a window.
                 _ => handle,
             };
         }
@@ -554,27 +442,28 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// One plan id in, one device handle out. Cache ids and split-plane
-    /// weights don't resolve to a tensor here; they panic (use
-    /// [`Run::pool`]/[`Run::recurrent`]/[`Run::planes`] instead).
+    pub(crate) fn resolvable(&self, id: ValueId) -> bool {
+        matches!(
+            self.values.get(id.0 as usize).map(|decl| &decl.def),
+            Some(Def::Op(_) | Def::Merge(_))
+        ) && self.arena.0.get(id.0 as usize).copied().flatten().is_some()
+    }
+
+    pub(crate) fn clip_slots(&self) -> Option<Tensor> {
+        self.fire.voxels.map(|voxels| voxels.slots)
+    }
+
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
     }
 
-    /// The same resolution, uncut — the fire-wide rectangle a value names.
     fn whole(&self, id: ValueId) -> Tensor {
         let at = id.0 as usize;
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
-            // This shell dispatches no `layout.gather_rows`, so nothing reads it.
-            Def::Input(RuntimeInput::ReadoutRows) => self.fire.tokens,
+            Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
-            // One mask per fire; the op-named mask resolves onto the same seat the plan
-            // builders use.
             Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
-            // Bound only if a lane carried an adapter; otherwise the correction's window is
-            // empty and this arm is never reached, so the panic below is unreachable rather
-            // than a real gap.
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
@@ -583,8 +472,6 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // Bound only when a lane carried an image; named per-input so a panic message
-            // says which one is missing.
             Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
             }),
@@ -642,8 +529,6 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // Staged for every fire of a plan that declares rotation, image or not; a
-            // text-only lane reads the scalar (p, p, p).
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -652,18 +537,55 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // M0: the float ports (D3) and the row-packing table (D2) are
-            // CUDA-first; this shell stages none of them in this phase.
-            Def::Input(
-                which @ (RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::Grid
-                | RuntimeInput::Voxels { .. }
-                | RuntimeInput::TokenGrid { .. }),
-            ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
+            Def::Input(RuntimeInput::Latents { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Latents, *port)
+            }
+            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
+                self.port(at, engine::fire::PortKind::LaneVector, *port)
+            }
+            Def::Input(RuntimeInput::Context { port, .. }) => {
+                self.port(at, engine::fire::PortKind::Context, *port)
+            }
+            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
+                self.port(at, engine::fire::PortKind::AxisPositions, *port)
+            }
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
+            }
+            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
+            Def::Input(RuntimeInput::TokenGrid { .. }) => {
+                self.voxel_seat(at).token_grid.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads the token side of the patchify pair, which this \
+                         load carved none of"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupOfLane,
+                ..
+            }) => self.fire.group_of_lane.unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads the group-of-lane table, which this load carved none of"
+                )
+            }),
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            }) => self.packing(at, *select).group_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::LaneIndptr { select },
+                ..
+            }) => self.packing(at, *select).lane_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::ReferenceTag { select },
+                ..
+            }) => self.packing(at, *select).reference_tag,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::RequestOfToken,
+                ..
+            }) => self.fire.tables.request_of_token,
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -680,12 +602,10 @@ impl<'c> Run<'c> {
                     GeomKind::LastPageLen => seat.last_page_len,
                     GeomKind::KvLen => seat.kv_len,
                     GeomKind::RowValid => seat.row_valid,
-                    GeomKind::RequestOfToken => seat.request_of_token,
                     GeomKind::WritePage => seat.write_page,
                     GeomKind::WriteOffset => seat.write_offset,
-                    // M0: the group tables (D2) are CUDA-first; this shell
-                    // stages none of them in this phase.
-                    GeomKind::GroupOfLane
+                    GeomKind::RequestOfToken
+                    | GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
                     | GeomKind::LaneIndptr { .. }
                     | GeomKind::ReferenceTag { .. } => None,
@@ -708,8 +628,6 @@ impl<'c> Run<'c> {
                     None => panic!("value {at} is weight {row}, which the shell has not bound"),
                 }
             }
-            // A merge aliases onto its op's arena slot, so it resolves the same way as an
-            // op output.
             Def::Op(_) | Def::Merge(_) => self
                 .arena
                 .0
@@ -726,8 +644,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// A fire-aligned value viewed through this window's boundaries; the indptr is rebased to
-    /// start at zero, since a fire-wide indptr would run past a windowed rectangle's end.
     pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {
         RaggedTensor {
             data: self.tensor(id),
@@ -735,8 +651,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The planes of a split-plane bank. For ops whose IR variant unconditionally names a bank;
-    /// an op serving both forms uses [`Run::banked`] instead.
     pub(crate) fn planes(&self, id: ValueId) -> Bank {
         self.banked(id).unwrap_or_else(|| {
             panic!(
@@ -747,8 +661,6 @@ impl<'c> Run<'c> {
         })
     }
 
-    /// The bank behind a weight id, or `None` when the row is one dense handle. An unbound row
-    /// is still a binding bug and still panics.
     pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -762,15 +674,10 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// How many experts the router that wrote `routes` declared; resolved once at load into a
-    /// table indexed by `routes`. `0` if no router in this artifact wrote it.
     pub(crate) fn experts(&self, routes: ValueId) -> u32 {
         self.scratch.experts(routes)
     }
 
-    /// The sorted MoE arm's working rectangles, minted into this fire. `None` if the load
-    /// reserved none (no mixture, or one with no stated expert count); the matvec arm is used
-    /// instead.
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
         Some(
             self.scratch
@@ -781,8 +688,6 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The NSA indexer's score slab, minted into this fire. `None` if the trace has no
-    /// `attention.index_topk`.
     pub(crate) fn index_scores(&self) -> Option<Tensor> {
         Some(
             self.scratch
@@ -793,8 +698,6 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The pooled-compressor rolling state for cache space `pages`, minted into this fire.
-    /// `None` if the trace has no `attention.pool_gather` over that space.
     pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
         let at = pages.0 as usize;
         let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
@@ -809,8 +712,6 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// qwen4's PLE hash constants, minted into this fire. `None` if the trace has no
-    /// `attention.ple_ngram_ids`.
     pub(crate) fn ple_hash(
         &self,
         mults: &[u64],
@@ -826,17 +727,10 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// Rows the arena slot behind `id` can hold at the budget's ceiling (not this fire's
-    /// extent) — used by the dense quantized linear arms as launch capacity, so padding never
-    /// overruns into the next value's slot.
     pub(crate) fn capacity(&self, id: ValueId) -> u32 {
         self.scratch.capacity(id)
     }
 
-    /// The FP16 staging plane at `rows x contraction`, minted for the quantized linear pre-cast
-    /// path. `None` if the load-time reservation doesn't hold that shape.
-    ///
-    /// On a mixture, this aliases the routed plane's bytes rather than costing extra.
     pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
         Some(
             self.scratch
@@ -847,8 +741,16 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The split-K partials plane at `rows x width` f32, for the sparse `bm = 8` tile. `None`
-    /// if the load-time reservation doesn't hold that shape.
+    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+        Some(
+            self.scratch
+                .spatial_moments(self.handles, clips, groups)?
+                .unwrap_or_else(|fault| {
+                    panic!("the moment planes this load reserved do not mint: {fault}")
+                }),
+        )
+    }
+
     pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
         Some(
             self.scratch
@@ -859,8 +761,6 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The `StructKind` a plan op's output value declares, checked by the plan-building arms
-    /// against the trace.
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,
@@ -871,9 +771,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The paged kv pool a cache id names. Never sliced to the window: sdpa
-    /// shaders index it via `request_of_token`'s absolute lane ids, so the
-    /// fire-wide table is always correct.
     pub(crate) fn pool(&self, id: ValueId) -> &KvPool {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
@@ -884,8 +781,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The recurrent state pool a cache id names, with its slot map cut to the asking node's
-    /// window — banks are addressed by slot, read as `slots[r]` from the launch's own zero.
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => RecurrentPool {
@@ -915,13 +810,11 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// Store a plan payload a prepare-phase arm just built.
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
         let at = self.struct_at(id);
         self.structs[at] = Some(built);
     }
 
-    /// The decode plan a consuming arm names.
     pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
@@ -937,7 +830,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The prefill plan a consuming arm names.
     pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
         match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,

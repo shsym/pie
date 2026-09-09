@@ -1,5 +1,3 @@
-//! Host channel cells: the host endpoint of a guest-constructed channel (Writer = host-puts/pass-consumes, Reader = pass-puts/host-takes; cells are dtype-native, only the wire packs bool to bits).
-
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,54 +6,35 @@ use crate::engine::{ChannelBinding, ChannelEndpoint};
 use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use eta_ir::types::Dtype;
 
-/// Sentinel: a run-ahead ticket that neither consumes nor publishes.
 pub const TICKET_NONE: u64 = u64::MAX;
 
-/// Process-wide monotonic channel id source (0 is a null sentinel). A
-/// channel keeps its id across every pass it binds into.
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Mint the next process-wide global channel identity.
 pub fn next_channel_id() -> u64 {
     NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The shared host state behind one guest `channel` resource.
 #[derive(Clone, Debug)]
 pub struct ChannelCell {
-    /// Engine device channel-registry key, stable across every bound pass.
     pub global_id: u64,
-    /// Declared dims; checked against the container decl at bind.
     pub shape: Vec<u32>,
     pub dtype: Dtype,
     pub capacity: u32,
-    /// Stamped at bind; `None` = not yet bound to a forward pass.
     pub role: Option<HostRole>,
     pub seeded: bool,
-    /// Whether this cell's seed was consumed by a first fire.
     pub seed_taken: bool,
     endpoint: Option<Arc<ChannelEndpoint>>,
     declared_dtype: Option<ChanDType>,
     extern_name: Option<String>,
     attachments: Vec<ChannelAttachment>,
-    /// Host-staged cells (seeds pre-first-fire, Writer cells otherwise), FIFO.
     staged: VecDeque<Vec<u8>>,
-    /// Host copies of Writer ring entries not yet claimed by a submitted
-    /// fire; the runtime's only record of post-bind Writer puts.
     ring_host_copies: VecDeque<Vec<u8>>,
     writer_tail: u64,
-    /// Device-produced cells awaiting host `take`/`read`, FIFO.
     produced: VecDeque<Vec<u8>>,
-    /// Device-ring sequences assigned to submitted fires; immutable tickets.
     device_reserved_head: u64,
     device_reserved_tail: u64,
-    /// Engine-owned mirror for every pass bound to this Reader channel.
     reader: Option<ReaderMirror>,
-    /// `Some(reason)` once a fire feeding this channel failed; every later
-    /// `take`/`read` errors with it.
     poisoned: Option<String>,
-    /// Host replacement for the current committed front, so `set` changes
-    /// the standing cell without displacing a value queued for next fire.
     front_override: Option<Vec<u8>>,
 }
 
@@ -69,7 +48,6 @@ struct ReaderMirror {
     tail_word_index: usize,
     poison_word_index: usize,
     closed_word_index: usize,
-    /// Sequences already copied out of the mirror (reader-side cursor).
     copied_tail: u64,
 }
 
@@ -79,7 +57,6 @@ struct ChannelAttachment {
     extern_dir: Option<ExternDir>,
 }
 
-/// A channel host-op failure (surfaced to the guest as a WIT `result` error).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelError {
     WrongRole { role: HostRole, op: &'static str },
@@ -87,10 +64,8 @@ pub enum ChannelError {
     Poisoned(String),
     BadLength { expected: usize, got: usize },
     MissingSeed,
-    /// A second `put` on a seeded non-Writer channel before its first fire.
     SeedAlreadyStaged,
     Full,
-    /// The committed front is currently claimed by a submitted fire.
     InFlight,
     Closed,
 }
@@ -116,7 +91,6 @@ impl std::fmt::Display for ChannelError {
 impl std::error::Error for ChannelError {}
 
 impl ChannelCell {
-    /// A fresh, unbound cell (the guest `channel` constructor).
     pub fn new(shape: Vec<u32>, dtype: Dtype, capacity: u32) -> Self {
         ChannelCell {
             global_id: next_channel_id(),
@@ -146,13 +120,10 @@ impl ChannelCell {
         self.shape.iter().map(|&d| d as usize).product()
     }
 
-    /// Native (unpacked) bytes per cell: `numel` for bool, `numel*4` otherwise.
     pub fn native_len(&self) -> usize {
         self.numel() * container::const_elem_size(self.dtype)
     }
 
-    /// Whether the cell's constructor-declared geometry matches a container
-    /// channel declaration (bind-time validation).
     #[cfg(test)]
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
         self.validate_attachment(decl, None)
@@ -190,9 +161,6 @@ impl ChannelCell {
         }
         if !self.attachments.is_empty() {
             let Some((name, dir)) = extern_binding else {
-                // Same-guest cross-pass chaining: a device-only channel (no
-                // host role, never seeded) may attach to multiple passes.
-                // Host-visible or seeded channels keep the one-pass rule.
                 if decl.host_role != HostRole::None
                     || decl.seeded
                     || self.role != Some(HostRole::None)
@@ -359,8 +327,6 @@ impl ChannelCell {
             )?;
         }
         self.endpoint = Some(endpoint);
-        // Flush any pre-endpoint staged Writer cells into the shared ring
-        // (a seeded Writer flushes only after its seed settles).
         if self.role == Some(HostRole::Writer)
             && let Err(error) = self.flush_writer_staging()
         {
@@ -372,10 +338,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Host `put` a dtype-native cell. Pre-bind this stages freely; post-bind
-    /// it must be a Writer stage cell or the one seed on a not-yet-fired
-    /// `seeded` channel. Once the Writer endpoint exists, a put writes
-    /// directly into the pinned ring cell and release-publishes the tail word.
     pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.put_ref(&native)
     }
@@ -425,11 +387,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Atomically replace the committed front cell. Queue cursors and
-    /// occupancy are unchanged. A front already claimed by a fire is
-    /// immutable until that fire advances the device head. A front already
-    /// delivered (a seed, which crossed at bind and left this ring empty) is
-    /// replaced in `front_override` instead of in the ring.
     pub fn set(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.set_ref(&native)
     }
@@ -458,8 +415,6 @@ impl ChannelCell {
                 return Err(ChannelError::Closed);
             }
 
-            // Pull visible Reader cells into the host queue before replacing
-            // its front copy.
             if self.role == Some(HostRole::Reader) {
                 self.refresh_reader_mirrors()?;
             }
@@ -471,18 +426,12 @@ impl ChannelCell {
                 tail
             };
             if committed_tail <= head {
-                // A delivered seed rode `InstanceBinding::seeds` straight
-                // into the shell's ring, so `committed_tail` is 0 even
-                // though the seed is the front for the whole run. It can't
-                // be rewritten in the ring (already full at capacity 1), so
-                // the replacement is recorded in `front_override` instead.
                 if self.role == Some(HostRole::Writer)
                     && self.seeded
                     && self.seed_taken
                     && head == tail
                     && self.ring_host_copies.is_empty()
                 {
-                    // A submitted fire that already claimed the seed owns it.
                     if self.device_reserved_head >= self.writer_tail {
                         return Err(ChannelError::InFlight);
                     }
@@ -535,8 +484,6 @@ impl ChannelCell {
         } else {
             cell.copy_from_slice(native);
         }
-        // Re-publish the unchanged tail so the replacement happens-before
-        // the next consumer's acquire.
         let tail = load_word(binding.word_base, binding.tail_word_index as usize);
         store_word(binding.word_base, binding.tail_word_index as usize, tail);
         Ok(())
@@ -550,9 +497,6 @@ impl ChannelCell {
         self.front_override = None;
     }
 
-    /// Write one cell into the engine-shared Writer ring at `tail % cap1`,
-    /// then release-publish the incremented tail word. The spare `+1` ring
-    /// cell distinguishes full from empty.
     fn write_writer_ring(
         &mut self,
         binding: ChannelBinding,
@@ -606,7 +550,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Flush pre-endpoint staged Writer cells into the shared ring, FIFO.
     pub fn flush_writer_staging(&mut self) -> Result<(), ChannelError> {
         if self.role != Some(HostRole::Writer) || (self.seeded && !self.seed_taken) {
             return Ok(());
@@ -624,21 +567,16 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Number of host-staged cells.
     pub fn staged_len(&self) -> usize {
         self.staged.len()
     }
 
-    /// Frame validation: host-known cells a Writer channel can still feed to
-    /// future fires.
     pub fn writer_available_cells(&self) -> u64 {
         self.writer_tail
             .saturating_add(self.staged.len() as u64)
             .saturating_sub(self.device_reserved_head)
     }
 
-    /// Frame validation: the Reader ring's (reserved publications, consumed)
-    /// pressure pair.
     pub fn reader_ring_pressure(&self) -> (u64, u64) {
         let consumed = self
             .reader
@@ -648,15 +586,11 @@ impl ChannelCell {
         (self.device_reserved_tail, consumed)
     }
 
-    /// Frame validation: a device-only ring's structural backlog (reserved
-    /// publish tickets minus reserved consume tickets).
     pub fn device_ring_backlog(&self) -> u64 {
         self.device_reserved_tail
             .saturating_sub(self.device_reserved_head)
     }
 
-    /// Frame validation: whether the host side knows a committed value
-    /// exists for a latest-value (read-only-bound) channel.
     pub fn has_committed_front(&self) -> bool {
         self.seeded
             || !self.staged.is_empty()
@@ -665,7 +599,6 @@ impl ChannelCell {
             || self.device_reserved_tail > 0
     }
 
-    /// Host `take` a produced cell (Reader), FIFO.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
         self.refresh_reader_mirrors()?;
         if let Some(reason) = &self.poisoned {
@@ -685,7 +618,6 @@ impl ChannelCell {
         Ok(value)
     }
 
-    /// Host `read` (peek, non-consuming) a produced cell (Reader).
     pub fn read(&mut self) -> Result<Vec<u8>, ChannelError> {
         self.refresh_reader_mirrors()?;
         if let Some(reason) = &self.poisoned {
@@ -699,15 +631,12 @@ impl ChannelCell {
         self.produced.front().cloned().ok_or(ChannelError::Empty)
     }
 
-    /// Poison the cell with the failed fire's error. First poison wins.
     pub fn poison(&mut self, reason: &str) {
         if self.poisoned.is_none() {
             self.poisoned = Some(reason.to_string());
         }
     }
 
-    /// Pop this `seeded` channel's staged seed for the first fire. Errors if
-    /// nothing was staged.
     #[cfg(test)]
     pub fn take_seed(&mut self) -> Result<Vec<u8>, ChannelError> {
         let seed = self.staged.pop_front().ok_or(ChannelError::MissingSeed)?;
@@ -722,14 +651,6 @@ impl ChannelCell {
             .ok_or(ChannelError::MissingSeed)
     }
 
-    /// The seed has landed in the engine. Drop the host copy and reconcile
-    /// this cell's ring: a seed rides `InstanceBinding::seeds` straight into
-    /// the shell's ring (never through this host ring), so this ring's words
-    /// are still zero at bind even though `bind` already charged
-    /// `writer_tail`. Unreconciled, the next put would see
-    /// `writer_tail - head >= capacity` and answer `Full` forever; this sets
-    /// `head == tail == writer_tail`. No-op for an *adopted* ring, where the
-    /// engine already wrote the seed at bind and owns the head cursor.
     pub fn commit_seed(&mut self) {
         let _ = self.staged.pop_front();
         self.seed_taken = true;
@@ -743,8 +664,6 @@ impl ChannelCell {
             return;
         }
         let binding = endpoint.registered().binding;
-        // Only when the ring is untouched, so this never rewinds cursors a
-        // fire has already moved.
         if load_word(binding.word_base, binding.tail_word_index as usize) == 0
             && load_word(binding.word_base, binding.head_word_index as usize) == 0
         {
@@ -817,8 +736,6 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Peek the most recently release-published mirror cell without
-    /// touching the take cursor.
     pub fn latest_reader_value(
         &mut self,
         _instance_id: u64,
@@ -880,25 +797,13 @@ impl ChannelCell {
     }
 }
 
-/// A forward pass's bound cells, dense declaration order (`cells[i]` backs the
-/// container's channel `i`).
 pub type BoundCells = Vec<Arc<Mutex<ChannelCell>>>;
 
-/// A first-class, guest-constructed channel — the WIT
-/// `pie:inferlet/forward.channel` resource. The shared [`ChannelCell`] is
-/// Arc'd so a pass that bound it survives the guest dropping the handle.
 pub struct Channel {
     pub cell: Arc<Mutex<ChannelCell>>,
-    /// Set at submit: the feeding pipeline's in-flight fire queue.
-    /// `None` until first submit.
     pub fires: Option<crate::pipeline::fire::PendingFires>,
 }
 
-/// Process-teardown close batching: walks the process's resource table,
-/// takes over the engine close notification from every guest channel
-/// endpoint still holding one, and returns the channel ids grouped by
-/// owning engine. The caller posts one batched close per engine, preserving
-/// the engine's instance-before-channel close order.
 pub fn detach_channel_close_notifications(
     resources: &mut wasmtime::component::ResourceTable,
 ) -> Vec<(usize, Vec<u64>)> {
@@ -922,9 +827,6 @@ pub fn detach_channel_close_notifications(
     by_engine.into_iter().collect()
 }
 
-/// The next host-known Writer value on `cell` — the native value the engine
-/// will pull for the next submitted fire (`None`: not a Writer channel, or
-/// nothing pending).
 pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
     let c = cell.lock().unwrap();
     if c.role != Some(HostRole::Writer) {
@@ -936,8 +838,6 @@ pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
         .or_else(|| c.ring_host_copies.front().cloned())
 }
 
-/// A submitted fire consumed one Writer entry: drop the ring host copy
-/// backing [`staged_put_bytes`]'s front so the next fire sees the next value.
 pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
     let mut c = cell.lock().unwrap();
     c.consume_front_override();
@@ -989,7 +889,6 @@ fn decode_reader_cell(
     Ok(native)
 }
 
-/// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first).
 #[cfg(test)]
 pub fn pack_bool(native: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; native.len().div_ceil(8)];
@@ -997,8 +896,6 @@ pub fn pack_bool(native: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Pack directly into `out` (e.g. the pinned ring cell), no intermediate
-/// allocation. `out` must hold `native.len().div_ceil(8)` bytes.
 pub fn pack_bool_into(native: &[u8], out: &mut [u8]) {
     out.fill(0);
     for (i, &b) in native.iter().enumerate() {
@@ -1008,7 +905,6 @@ pub fn pack_bool_into(native: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Unpack `numel` bits (LSB-first) from the wire into a 1-byte-per-bool cell.
 pub fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
     (0..numel)
         .map(|i| {
@@ -1034,7 +930,6 @@ mod tests {
         }
     }
 
-    // mask (bool[8], host Writer), out (i32[1], host Reader), tok (device-private, seeded)
     fn bound() -> BoundCells {
         let mk = |shape: Vec<u32>, dtype, d: &ChannelDecl| {
             let mut c = ChannelCell::new(shape, dtype, 1);
@@ -1094,6 +989,14 @@ mod tests {
         let _ = instance_id;
     }
 
+    fn channel_every_case() {
+        prebind_put_stages_and_seed_pops();
+        set_empty_and_errors_without_changing_staging();
+        bind_validates_constructor_geometry();
+        writer_put_reader_take_roundtrip();
+        packed_bool_mirror_decodes_to_native_bytes();
+    }
+
     #[test]
     fn prebind_put_stages_and_seed_pops() {
         let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
@@ -1101,7 +1004,6 @@ mod tests {
         c.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(c.take_seed().unwrap(), 7i32.to_le_bytes().to_vec());
         assert!(c.seed_taken);
-        // A second put on the fired device-private channel is illegal.
         assert_eq!(
             c.put(9i32.to_le_bytes().to_vec()).unwrap_err(),
             ChannelError::WrongRole {
@@ -1109,13 +1011,11 @@ mod tests {
                 op: "put"
             }
         );
-        // A missing seed is a first-fire error.
         let mut m = ChannelCell::new(vec![1], Dtype::I32, 1);
         m.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(m.take_seed().unwrap_err(), ChannelError::MissingSeed);
     }
 
-    #[test]
     fn set_empty_and_errors_without_changing_staging() {
         let mut cell = ChannelCell::new(vec![1], Dtype::I32, 2);
         assert_eq!(
@@ -1151,7 +1051,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn bind_validates_constructor_geometry() {
         let c = ChannelCell::new(vec![2, 3], Dtype::U32, 1);
         assert!(
@@ -1178,11 +1077,9 @@ mod tests {
         );
     }
 
-    #[test]
     fn writer_put_reader_take_roundtrip() {
         let cells = bound();
         let out_id = cells[1].lock().unwrap().global_id;
-        // out (Reader) is empty until its bound mirror publishes.
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Empty
@@ -1204,7 +1101,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn packed_bool_mirror_decodes_to_native_bytes() {
         let mut cell = ChannelCell::new(vec![10], Dtype::Bool, 1);
         cell.bind(&decl(

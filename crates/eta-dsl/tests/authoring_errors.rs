@@ -1,11 +1,3 @@
-//! Shape and dtype mistakes made while writing a trace are reported, not
-//! trapped.
-//!
-//! `eta-dsl` runs inside a `wasm32-wasip2` guest, where a panic is a trap: the
-//! host sees an aborted instance with no stack, no file and no line. Every
-//! mistake an author can make therefore has to arrive through
-//! [`Builder::build`]'s `Err`, carrying the span of the call that made it.
-
 use eta_dsl::builder::Builder;
 use eta_dsl::error::TraceError;
 use eta_dsl::prelude::*;
@@ -26,6 +18,11 @@ fn detail(error: &TraceError) -> &str {
     }
 }
 
+fn authoring_errors_every_case() {
+    a_dtype_mismatch_is_reported_with_a_span();
+    every_mistake_in_one_trace_is_reported_together();
+}
+
 #[test]
 fn a_dtype_mismatch_is_reported_with_a_span() {
     let rows = Channel::seeded([2, 3], dtype::u32);
@@ -44,15 +41,12 @@ fn a_dtype_mismatch_is_reported_with_a_span() {
         "{}",
         detail(authoring[0])
     );
-    // The span is what makes the report actionable in a guest: it names this
-    // file, not a frame inside the tracer.
     let TraceError::Authoring { span, .. } = authoring[0] else {
         unreachable!()
     };
     assert!(span.to_string().contains("authoring_errors.rs"), "{span}");
 }
 
-#[test]
 fn every_mistake_in_one_trace_is_reported_together() {
     let rows = Channel::seeded([2, 3], dtype::u32);
     let keys = Channel::seeded([2, 2], dtype::u32);
@@ -61,7 +55,6 @@ fn every_mistake_in_one_trace_is_reported_together() {
     let output = Channel::new([2, 4], dtype::bool);
     let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
-        // Two independent mistakes: rank-2 keys, then one index too many.
         let _ = row_membership(rows.take(), keys.take());
         let _ = scalar_gather(matrix.take(), index.take());
         output.put(Channel::seeded([2, 4], dtype::bool).take());
@@ -80,4 +73,3 @@ fn every_mistake_in_one_trace_is_reported_together() {
         "{errors}"
     );
 }
-

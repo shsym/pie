@@ -49,8 +49,6 @@ STEPS = 8
 GUIDANCE = 0.0
 SIZE = 1024
 
-# miniature: 2 noise-refiner + 2 context-refiner + 2 joint layers, dim 256.
-# head_dim must equal sum(axes_dims) and dim must stay >= 256 (adaLN width trap, study D.2).
 MINI_CFG = dict(
     all_patch_size=(2,), all_f_patch_size=(1,),
     in_channels=16, dim=256, n_layers=2, n_refiner_layers=2,
@@ -59,7 +57,6 @@ MINI_CFG = dict(
     rope_theta=256.0, t_scale=1000.0,
     axes_dims=[16, 24, 24], axes_lens=[256, 64, 64],
 )
-
 
 def run_full(d: str, dtype=torch.bfloat16):
     from diffusers import ZImagePipeline
@@ -74,7 +71,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     with open(os.path.join(d, "zimage_config.json"), "w") as f:
         json.dump(cfgs, f, indent=2, default=str)
 
-    # ---- text stage: Qwen3 hidden_states[-2], unpadded, one tensor per prompt --------
     with torch.no_grad():
         embeds = pipe.encode_prompt(PROMPT, device=torch.device("cuda"),
                                     do_classifier_free_guidance=False,
@@ -85,7 +81,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     tap.put("prompt_embeds.lengths", lens)
     print(f"  prompt embeds: {lens} x {pos[0].shape[-1] if isinstance(pos, list) else pos.shape[-1]}")
 
-    # ---- denoise --------------------------------------------------------------------
     r1 = hook_prepare_latents(pipe, tap)
     r2 = hook_transformer(pipe.transformer, tap, "dit", steps=(0,))
     r3 = hook_scheduler(pipe, tap)
@@ -106,7 +101,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     tap.save(os.path.join(d, "zimage_golden.npz"))
     print("  keys:"); npz_keys(tap)
 
-
 def run_mini(d: str, device="cpu", dtype=torch.float32):
     from diffusers import ZImageTransformer2DModel
     from safetensors.torch import save_file
@@ -125,7 +119,7 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
 
     tap = Tap()
     gi = torch.Generator().manual_seed(1234)
-    x = [torch.randn(16, 1, 16, 16, generator=gi).to(device=device, dtype=dtype)]     # C,F,H,W
+    x = [torch.randn(16, 1, 16, 16, generator=gi).to(device=device, dtype=dtype)]
     cap = [torch.randn(8, MINI_CFG["cap_feat_dim"], generator=gi).to(device=device, dtype=dtype)]
     t = torch.tensor([500.0], device=device, dtype=dtype)
     tap.put_tree("mini.in.x", x); tap.put_tree("mini.in.cap", cap); tap.put("mini.in.t", t)
@@ -136,9 +130,7 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     print(f"  mini params: {sum(v.numel() for v in sd.values())}")
     npz_keys(tap)
 
-
-VAE_LATENT = 64  # a 64x64 latent: the 512x512 image the Rust parity gate decodes
-
+VAE_LATENT = 64
 
 def run_vae(d: str, device="cuda"):
     """The VAE alone, fp32 (`force_upcast`), on one 64x64 latent.
@@ -158,7 +150,7 @@ def run_vae(d: str, device="cuda"):
     n = VAE_LATENT
     if os.path.exists(full):
         z = np.load(full)["latent.final"]
-        z = z.reshape(z.shape[-3:])  # [16, H/8, W/8]
+        z = z.reshape(z.shape[-3:])
         h0 = (z.shape[1] - n) // 2
         w0 = (z.shape[2] - n) // 2
         z = z[:, h0:h0 + n, w0:w0 + n]
@@ -169,8 +161,8 @@ def run_vae(d: str, device="cuda"):
         source = "seed 7 normal"
     z = torch.from_numpy(np.ascontiguousarray(z)).to(device=device, dtype=torch.float32)[None]
     with torch.no_grad():
-        x = vae.decode(z / cfg.scaling_factor + cfg.shift_factor, return_dict=False)[0]  # [1, 3, 8n, 8n]
-        mean = vae.encode(x, return_dict=False)[0].mean  # [1, 16, n, n]
+        x = vae.decode(z / cfg.scaling_factor + cfg.shift_factor, return_dict=False)[0]
+        mean = vae.encode(x, return_dict=False)[0].mean
 
     tap = Tap()
     tap.put("vae.latent", z[0])
@@ -185,7 +177,7 @@ def run_vae(d: str, device="cuda"):
     shapes = {}
     for key, t in (("latent", z[0]), ("pixels", x[0]), ("mean", mean[0])):
         chw = t.detach().float().cpu().numpy()
-        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")  # [h, w, C] -> rows of C
+        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")
         hwc.tofile(os.path.join(raw, f"{key}.f32"))
         shapes[key] = {"t": 1, "h": int(chw.shape[1]), "w": int(chw.shape[2]), "channels": int(chw.shape[0])}
     shapes["scaling_factor"] = float(cfg.scaling_factor)
@@ -212,7 +204,7 @@ def run_mini_pad(d: str, device="cpu", dtype=torch.float32):
     m.load_state_dict(load_file(os.path.join(d, "zimage_mini.safetensors")))
     tap = Tap()
     gi = torch.Generator().manual_seed(4321)
-    x = [torch.randn(16, 1, 12, 16, generator=gi).to(device=device, dtype=dtype)]     # C,F,H,W
+    x = [torch.randn(16, 1, 12, 16, generator=gi).to(device=device, dtype=dtype)]
     cap = [torch.randn(40, MINI_CFG["cap_feat_dim"], generator=gi).to(device=device, dtype=dtype)]
     t = torch.tensor([0.5], device=device, dtype=dtype)
     tap.put_tree("mini_pad.in.x", x); tap.put_tree("mini_pad.in.cap", cap); tap.put("mini_pad.in.t", t)
@@ -221,7 +213,6 @@ def run_mini_pad(d: str, device="cpu", dtype=torch.float32):
     tap.put_tree("mini_pad.out", out)
     tap.save(os.path.join(d, "zimage_mini_pad.npz"))
     npz_keys(tap)
-
 
 def run_taps(d: str, dtype=torch.bfloat16):
     """The Turbo transformer ALONE (bf16, CUDA) over the step-0 inputs the full
@@ -254,11 +245,9 @@ def run_taps(d: str, dtype=torch.bfloat16):
         on(m.all_x_embedder["2-1"], "x.embed")
         on(m.noise_refiner[-1], "x.refined")
         for i, layer in enumerate(m.layers):
-            # every joint block on the crop; the full case (63 MB a tap) keeps three
             if case != "full" or i in (0, len(m.layers) // 2, len(m.layers) - 1):
                 on(layer, f"layer{i}.out")
         if case == "tiny":
-            # inside the first noise-refiner block: the sublayer boundaries
             b0 = m.noise_refiner[0]
             on(b0.attention_norm1, "b0.norm1")
             handles.append(b0.attention.to_out[0].register_forward_pre_hook(
@@ -280,12 +269,9 @@ def run_taps(d: str, dtype=torch.bfloat16):
     t = torch.from_numpy(src["dit.step0.in.arg1"]).to("cuda", dtype)
     forward("full", x, cap, t)
     forward("crop", x[:, :, :32, :32].contiguous(), cap, t)
-    # 32 image rows: small enough that a 3840-wide tap reads back through
-    # the worker link (its frame ceiling is around a megabyte)
     forward("tiny", x[:, :, :8, :16].contiguous(), cap, t)
     tap.save(os.path.join(d, "zimage_taps.npz"))
     npz_keys(tap)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -315,7 +301,6 @@ def main():
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED,
                  "steps": STEPS, "guidance": GUIDANCE, "size": SIZE,
                  "mini_config": MINI_CFG})
-
 
 if __name__ == "__main__":
     main()

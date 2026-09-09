@@ -121,7 +121,6 @@ impl Run<'_> {
             Linear::MlpGeluTanh { x, y } => {
                 linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
-            // Fused by the CUDA load only (`model_ir::fuse::gemm_epilogues`).
             Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
             | Linear::RelBias { .. }

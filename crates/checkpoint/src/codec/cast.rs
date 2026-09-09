@@ -1,5 +1,3 @@
-//! Between a dtype's bytes and `f64`. Every element passes through `f64`, which holds every value of every dtype here exactly (including `I32`/`U32`, unlike `f32`), so a cast is lossless except where the destination is lossy.
-
 use half::{bf16, f16};
 
 use crate::error::Error;
@@ -8,7 +6,6 @@ use crate::types::DType;
 use super::invalid;
 
 pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
-    // asked before the width is: a quantization term has no element width, and chunks_exact(0) panics rather than refusing.
     if dtype.elem().is_none() {
         return Err(invalid(
             "host Cast does not implement a quantization term: a block decodes \
@@ -40,11 +37,9 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 DType::E4m3 | DType::E5m2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
-                // I64/U64 tensors are index tables that move byte-for-byte, not through the f64 pivot.
                 DType::I64 | DType::U64 => {
                     return Err(invalid("host Cast does not implement 64-bit integers"));
                 }
-                // sub-byte codes have no element to chunk on; packing/unpacking is codec::mxfp4's, not a cast's.
                 DType::E2m1
                 | DType::Mxfp4
                 | DType::U4g64
@@ -63,7 +58,6 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 | DType::U2g128 => {
                     return Err(invalid("host Cast does not implement the sub-byte codes"));
                 }
-                // an U8g64 byte is an affine code, meaningless without its group's scale and offset.
                 DType::U8g64 => {
                     return Err(invalid(
                         "host Cast does not implement affine codes: an U8g64 byte means \
@@ -99,7 +93,6 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             DType::E4m3 | DType::E5m2 => {
                 return Err(invalid("host Cast does not implement FP8"));
             }
-            // sub-byte code is packed, not cast; see decode_values.
             DType::E2m1
             | DType::Mxfp4
             | DType::U4g64
@@ -118,7 +111,6 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             | DType::U2g128 => {
                 return Err(invalid("host Cast does not implement the sub-byte codes"));
             }
-            // affine code is quantized, not cast — see decode_values.
             DType::U8g64 => {
                 return Err(invalid(
                     "host Cast does not encode to affine codes: choosing an U8g64 byte \
@@ -133,8 +125,6 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// A `Cast`, dispatched on its dtype pair once and run across every core, threaded for large inputs.
-/// The float pairs are bit-identical to the generic `decode_values`/`encode_values` pivot they replace (`f32 -> f64 -> f32` is the identity); every other pair still goes through the pivot, one chunk at a time.
 pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Error> {
     let in_width = from.bytes_ceil() as usize;
     let out_width = to.bytes_ceil() as usize;
@@ -143,7 +133,6 @@ pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Er
     }
     let elements = bytes.len() / in_width;
     let mut out = vec![0u8; elements * out_width];
-    // below about a megabyte the threads cost more than they carry.
     let workers = if bytes.len() < (1 << 20) || elements == 0 {
         1
     } else {
@@ -178,8 +167,6 @@ pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Er
     }
 }
 
-/// One chunk of a cast: `src.len() / from.bytes_ceil()` elements, converted into `dst`.
-/// The match is on the pair, once, so each arm is a loop over two known widths the compiler can vectorize; arms cover the float conversions the loader performs, everything else keeps the general implementation.
 fn cast_chunk(src: &[u8], dst: &mut [u8], from: DType, to: DType) -> Result<(), Error> {
     use DType::{Bf16, F16, F32};
     match (from, to) {
@@ -225,8 +212,6 @@ fn cast_chunk(src: &[u8], dst: &mut [u8], from: DType, to: DType) -> Result<(), 
     }
 }
 
-/// Element-wise `[u8; IN] -> [u8; OUT]` over two slices, with the widths in
-/// the type so the loop carries neither a stride nor a bounds check.
 fn map_elements<const IN: usize, const OUT: usize>(
     src: &[u8],
     dst: &mut [u8],
@@ -240,4 +225,3 @@ fn map_elements<const IN: usize, const OUT: usize>(
     }
     Ok(())
 }
-

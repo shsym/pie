@@ -4,12 +4,6 @@
 
 namespace pie::linear {
 
-// The learned relative-position profile (Inkling's `rel_logits_proj`): for
-// every (row, head), `d_rel` features mixed through a `[d_rel, extent]` bank
-// into one bias per backward distance, landed f32 as
-// `bias[(row * heads + h) * extent + d]`. One thread per distance; the
-// `d_rel` features of a (row, head) are re-read by every thread of its
-// block, which the cache absorbs (sixteen bf16 values).
 template <class T>
 __global__ void rel_bias(
     const T* __restrict__ r,
@@ -19,8 +13,7 @@ __global__ void rel_bias(
     const u32* __restrict__ win)
 {
     const int row = blockIdx.z;
-    // The staged-geometry seat: padded rows retire off the fire's live count,
-    // and `win[1]` is where the live rows start on the planes.
+
     if (win != nullptr && row >= static_cast<int>(win[0])) return;
     if (row >= rows) return;
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
@@ -36,4 +29,4 @@ __global__ void rel_bias(
     bias[(static_cast<long long>(plane_row) * heads + h) * extent + d] = acc;
 }
 
-}  // namespace pie::linear
+}

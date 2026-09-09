@@ -1,6 +1,3 @@
-//! The `Elementwise` family: the norms and residual algebra, rope, the sigmoid
-//! gate, and the hyper-connection stream ops.
-
 use super::*;
 
 pub use model_ir::ops::elemwise::Yarn;
@@ -84,10 +81,6 @@ pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
     y
 }
 
-/// The centred norm: mean-subtract, then rms-normalize, no scale or bias.
-/// The vision towers' `nn.LayerNorm` minus its two learned vectors, which
-/// bake into the GEMM that reads the norm at import. Whole rows, no head
-/// grouping.
 pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -102,11 +95,6 @@ pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     y
 }
 
-/// The whole `nn.LayerNorm` in one node: centred, scaled by `weight`, biased
-/// by `bias`. `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`. One node
-/// rather than three, saving two device rectangles per norm.
-///
-/// [`layernorm_no_scale`] stays for the text whose scale genuinely bakes.
 pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -123,14 +111,6 @@ pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
     y
 }
 
-/// The clipped linear's clamp: `min(max(x, lo), hi)`, in place, both bounds
-/// trace constants. gemma4's `use_clipped_linears` publishes
-/// `{input,output}_{min,max}` beside every vision projection.
-/// The same clamp, with the bounds the checkpoint ships as `[1]` weight
-/// planes rather than trace constants — gemma4's per-projection scalars are
-/// too many and too checkpoint-specific to state as a `const`.
-///
-/// [`clamp`] stays for a bound the config states, like [`mul_scalar`]/[`scale`].
 pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -203,8 +183,6 @@ pub fn rmsnorm_gated_by(x: &Value, gate: &Value, weight: &Weight, heads: u32, ep
     y
 }
 
-/// The hyper-connection norm: moments per `group`-wide slice, `weight + 1`
-/// over the row's full width ([`Elementwise::RmsnormGroupedPlusOne`]).
 pub fn rmsnorm_grouped_plus_one(x: &Value, weight: &Weight, group: u32, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -235,21 +213,6 @@ pub fn residual_add(x: &Value, y: &Value) -> Value {
     y_out
 }
 
-/// A fresh rectangle holding what `x` holds.
-///
-/// **WHY A MODEL EVER WANTS ONE.** The in-place ops ([`add_bias`],
-/// [`mul_scalar`], [`clamp_learned`], [`standardize`], …) declare an alias
-/// `(out, in)`, and the arena folds every one of them onto its operand
-/// unconditionally — no copy is minted for an operand something else still
-/// reads. So a value read more than once may be folded over at most once, and
-/// the second reader must be handed a copy. `check`'s `FoldThenRead` refuses a
-/// plan that forgets; this is what it is asking for.
-///
-/// `2x · ½`, both steps exact in every float format this IR carries — the
-/// doubling and the halving are exponent arithmetic. Two launches, one fresh
-/// rectangle. A family that has a scale or a fold to do to the copy anyway
-/// should fold the ½ into that instead of calling this (z-image's `2z` then
-/// `z / scale` is the pattern).
 pub fn copy(x: &Value) -> Value {
     mul_scalar(0.5, &add(x, x))
 }
@@ -268,10 +231,6 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     out_out
 }
 
-/// The tower's output standardization (`vision_config.standardize`):
-/// `y = (x − bias) · scale`, per column, in place. The last thing
-/// `Gemma4VisionModel.forward` does to a pooled soft token before the
-/// multimodal embedder projects it into trunk space.
 pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -301,8 +260,6 @@ pub fn mul_scalar(s: f32, x: &Value) -> Value {
     x_out
 }
 
-/// `silu(s · x)`, in place — the scalar sits inside the activation, which is
-/// why this is not [`mul_scalar`] followed by anything.
 pub fn silu_scaled(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -445,10 +402,6 @@ pub fn rope_partial_last(
     rope_partial_last_yarn(q, positions, rotary_dim, head_dim, theta, interleaved, false, None)
 }
 
-/// [`rope_partial_last`] with the two facts a layer may state beside its
-/// theta: `inverse` (un-rotate — the attention output of an MLA whose latent
-/// is both key and value) and a YaRN ramp (`Some` on the layers whose
-/// checkpoint states one).
 #[allow(clippy::too_many_arguments)]
 pub fn rope_partial_last_yarn(
     q: &Value,
@@ -530,10 +483,6 @@ pub fn gate_sigmoid_mul(x: &Value, gate: &Value) -> Value {
     x_out
 }
 
-/// The per-HEAD sigmoid gate: `x[:, h·head_dim + j] *= scale · sigmoid(
-/// gate[:, h])`, in place. LTX-2's gated attention multiplies its answer by
-/// `2σ(W·x_norm)` with one logit per head, which is this at `scale = 2`.
-/// `gate` is `[rows, heads]` at `x`'s dtype.
 pub fn gate_sigmoid_mul_heads(x: &Value, gate: &Value, head_dim: u32, scale: f32) -> Value {
     assert!(head_dim > 0, "a head is at least one channel wide");
     assert!(
@@ -595,16 +544,10 @@ pub fn hc_rmsnorm_f32(streams: &Value, eps: f32) -> Value {
     y
 }
 
-/// The per-token mix row: the normed stream row projected through the layer's
-/// dynamic hyper plane (`{attn,ffn}_hc.fn`, `[2M + M², M·hidden]`) into the
-/// `2M + M²` numbers [`hc_gates`] splits.
 pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value {
     let r = normed.rec();
     let count = u64::from(stream_count);
     let mix_hc = 2 * count + count * count;
-    // The row is as wide as the plane says: a layer's plane lands the
-    // `2M + M²` row `hc_gates` splits, the trunk's lands the `M` gates
-    // `hc_collapse` folds under. Anything else is nobody's mixing function.
     assert!(
         dynamic.dim(0) == mix_hc || dynamic.dim(0) == count,
         "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide and a trunk \
@@ -663,9 +606,6 @@ pub fn hc_gates(
     (x, post_mix, comb_mix)
 }
 
-/// **THE TRUNK COLLAPSE**: the `M` streams folded into the one `hidden`-wide
-/// row the final norm reads, under the `M` sigmoid gates `mixes` (the
-/// `[N, M]` row [`hc_project`] lands through `hc_head.fn`) state.
 pub fn hc_collapse(
     mixes: &Value,
     streams: &Value,
@@ -712,9 +652,6 @@ pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -
     y
 }
 
-/// The gated-residual mix ([`Elementwise::HcMix`]): one `hidden`-wide layer
-/// input averaged out of `streams` normed residual streams under per-element
-/// sigmoid gates. `gates` and `normed` are both `[rows, streams · hidden]`.
 pub fn hc_mix(gates: &Value, normed: &Value, streams: u32) -> Value {
     let r = gates.rec();
     let y = r.fresh(tensor(
@@ -734,9 +671,6 @@ pub fn hc_mix(gates: &Value, normed: &Value, streams: u32) -> Value {
     y
 }
 
-/// The gated-residual injection ([`Elementwise::HcInject`]): `hyper[s·H+h] +=
-/// 2·σ(gates[s]/streams)·o[h]`, in place on the wide residual. `gates` is
-/// `[rows, streams]` of raw logits.
 pub fn hc_inject(o: &Value, gates: &Value, streams: u32, hyper: &Value) -> Value {
     let r = o.rec();
     let hyper_out = r.fresh(hyper.ty().clone());
@@ -753,10 +687,6 @@ pub fn hc_inject(o: &Value, gates: &Value, streams: u32, hyper: &Value) -> Value
     hyper_out
 }
 
-/// The PLE gate ([`Elementwise::PleGate`]): per stream, the n-gram key row
-/// dotted with the normed residual stream, signed-square-root damped,
-/// squashed, scaling the shared value row. `key` and `query` are
-/// `[rows, streams · hidden]`, `value` is `[rows, hidden]`.
 pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Value {
     let r = key.rec();
     let y = r.fresh(key.ty().clone());
@@ -773,13 +703,6 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
     y
 }
 
-/// The multimodal rotary: [`rope_partial`] over a position that is a triple.
-/// `positions` is `[rows, 3]` `i32`, one `(t, h, w)` per rotated row;
-/// `sections` is the checkpoint's `mrope_section` trace constant. Rotates in
-/// place, like every rope arm beside it.
-///
-/// `form` is the section layout: the trunk states [`MropeForm::Interleaved`],
-/// the tower states [`MropeForm::Blocked`].
 pub fn rope_mrope(
     q: &Value,
     k: &Value,
@@ -811,12 +734,6 @@ pub fn rope_mrope(
     (q_out, k_out)
 }
 
-/// Adaptive modulation (D6): `y = form(x, m)`. `m` is either `[Lanes,
-/// k·width]` with `lane_of_row` the fire's `Input::request_of_token` (one
-/// vector per lane, broadcast over its rows), or `[Tokens, k·width]` with
-/// `lane_of_row: None` (a vector per row — Wan TI2V's per-token timestep).
-/// `k` is the form's: `[s | b]` for [`ModulateForm::ScaleShift`], one slice
-/// for the others. Fresh output of `x`'s type.
 pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: ModulateForm) -> Value {
     let r = x.rec();
     assert_eq!(
@@ -850,10 +767,6 @@ pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: Modulat
     y
 }
 
-/// The gated residual fold: `r += g · y`, in place on `r`. `g` is `[Lanes,
-/// width]` broadcast through `lane_of_row` (`Input::request_of_token`), or
-/// `[Tokens, width]` per row with `lane_of_row: None`. Returns the fresh
-/// value aliased onto `r`'s slot.
 pub fn gated_residual_add(r_in: &Value, g: &Value, y: &Value, lane_of_row: Option<&Value>) -> Value {
     let r = r_in.rec();
     assert_eq!(r_in.ty(), y.ty(), "the stream and what joins it share a type");
@@ -881,10 +794,6 @@ pub fn gated_residual_add(r_in: &Value, g: &Value, y: &Value, lane_of_row: Optio
     r_out
 }
 
-/// The sinusoidal timestep embedding: `t` is `[rows, 1]` f32 (per lane or
-/// per token), the answer `[rows, dim]` f32 — `[sin | cos]` of `scale · t ·
-/// exp(-ln(max_period) · i / (dim/2))`, or `[cos | sin]` under
-/// `flip_sin_cos`. `dim` is even.
 pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale: f32) -> Value {
     let r = t.rec();
     assert_eq!(t.width(), 1, "a timestep is one scalar per row");
@@ -905,18 +814,6 @@ pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale:
     y
 }
 
-/// The dense relative-position bias table a bidirectional encoder layer's
-/// attention adds to its logits: `[heads, 2·max_len − 1]` f32, column
-/// `d + max_len − 1` holding `embedding[bucket(d)][h]` for the signed
-/// distance `d = kj − qi`, `bucket` being the T5 relative-position bucket
-/// function (Hugging Face's `_relative_position_bucket`; the exact
-/// statement is on [`Elementwise::RelativeBucketBias`]). `embedding` is the
-/// checkpoint's `[num_buckets, heads]` plane (`relative_attention_bias.weight`).
-/// A constant of the plan — it reads no activation, so it takes the
-/// recorder ([`Input::recorder`](crate::Input::recorder)) rather than a
-/// value — traced once per layer that owns an embedding and handed to
-/// [`attn::relative_bias`](super::attn::relative_bias). `max_len` is the
-/// longest segment the table answers exactly.
 pub fn relative_bucket_bias(
     r: &Recorder,
     embedding: &Weight,
@@ -971,7 +868,6 @@ pub fn relative_bucket_bias(
     y
 }
 
-/// `x · sigmoid(x)`, in place.
 pub fn silu(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -985,7 +881,6 @@ pub fn silu(x: &Value) -> Value {
     x_out
 }
 
-/// `gelu(x)`, in place: erf, or the tanh approximation when `tanh` is set.
 pub fn gelu(x: &Value, tanh: bool) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -1000,7 +895,6 @@ pub fn gelu(x: &Value, tanh: bool) -> Value {
     x_out
 }
 
-/// `tanh(x)`, in place.
 pub fn tanh(x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -1014,7 +908,6 @@ pub fn tanh(x: &Value) -> Value {
     x_out
 }
 
-/// `x · y`, two activations of one type, fresh output.
 pub fn mul(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
@@ -1030,8 +923,6 @@ pub fn mul(x: &Value, y: &Value) -> Value {
     z
 }
 
-/// `x + y`, two activations of one type, fresh output — [`residual_add`]
-/// when the sum may land in place on `y`.
 pub fn add(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
@@ -1047,12 +938,6 @@ pub fn add(x: &Value, y: &Value) -> Value {
     z
 }
 
-/// Rotary embedding over up to four position axes with a theta per axis
-/// (D7), in place on `x` (`[rows, heads·head_dim]`), over the guest's
-/// `Input::axis_positions` (`[rows, axes]` f32). `dims[a]` is axis `a`'s
-/// channel count, zero past the last axis; their sum is `rotary_dim`, at
-/// most `head_dim`, the rest of each head passing through. `form` says
-/// which channels pair. Called once each for `q` and `k`.
 pub fn rope_axes(
     x: &Value,
     positions: &Value,
@@ -1087,9 +972,6 @@ pub fn rope_axes(
         x.width()
     );
     if form == RopeForm::SplitLadder {
-        // One ladder across the row: `dims[a]` counts the ROW's channels,
-        // whatever is left over is the identity pad in front of it, and the
-        // pairing is rotate-half within a whole head.
         assert_eq!(
             rotary_dim, head_dim,
             "the ladder pairs (i, i + head_dim/2), so it turns the whole head"

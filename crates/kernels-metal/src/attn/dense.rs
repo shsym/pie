@@ -1,9 +1,3 @@
-//! `Dense`: bidirectional attention over the patch window — the vision
-//! towers' one real kernel, mirroring `kernels_cuda::attn_dense`. Shares
-//! nothing with the paged family (no kv pool, no plan, no mask ladder); one
-//! entry, one stamp ladder, no workspace (online softmax needs no scratch).
-//! Unverified on device: what the tests below pin is the host half only.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -12,35 +6,22 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "attn/dense.metal";
 
-/// Simdgroups per threadgroup. Keys are split across them and folded once at
-/// the end, so this is the kernel's only parallelism knob above the head. The
-/// shader bakes it into its instantiations; the two agree here or nowhere.
 const SIMDS: u32 = 4;
 
-/// Threads per threadgroup — one Apple simdgroup is 32 lanes wide.
 const THREADS: u32 = SIMDS * 32;
 
-/// The accumulator stamps, tightest first. A stamp is register footprint and
-/// threadgroup allocation, not a shape: the live head width may be anything
-/// at or below it. Ladder shared with the CUDA twin; a head past the last
-/// stamp is refused by name rather than truncated.
 const STAMPS: [u32; 3] = [64, 128, 256];
 
-/// The shipped point per stamp, in [`STAMPS`] order.
 const DENSE: [&str; 3] = [
     "dense_bidirectional_bfloat16_d_64",
     "dense_bidirectional_bfloat16_d_128",
     "dense_bidirectional_bfloat16_d_256",
 ];
 
-/// The tightest stamp that holds this head, as an index into [`STAMPS`] —
-/// or nothing, because a head wider than the last stamp is refused rather
-/// than silently truncated.
 fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
-/// The head count a row's width spells at a stated head width.
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
     if width == 0 || width % head_dim != 0 {
         return Err(refuse(
@@ -51,12 +32,6 @@ fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<
     Ok(width / head_dim)
 }
 
-/// The image count this patch window's indptr spells.
-///
-/// The segment list is a fire table the shell assembles, not a value any op
-/// names, so the trace-time validator never sees it — which is why its dtype
-/// and its length are refused here rather than asserted (the boundary rule at
-/// [`refuse`](crate::encode::refuse)).
 fn images_of(op: &'static str, segments: Tensor) -> Result<i32, Error> {
     if segments.dtype != Dtype::I32 {
         return Err(refuse(
@@ -75,19 +50,6 @@ fn images_of(op: &'static str, segments: Tensor) -> Result<i32, Error> {
     stated(op, images)
 }
 
-/// Bidirectional dense attention, block-diagonal per image. `q`, `k`, `v` are
-/// patch rows (`[patch_rows, heads * head_dim]`, bf16); `o` lands one row per
-/// query row. `segments` is the patch axis's indptr (`i32`, `[images + 1]`):
-/// row `n` attends to the rows of the image whose span contains it, both
-/// directions. Grouped heads supported by reading, not expanding.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16; a refusal for a row
-/// width that does not divide by the stated head width, a head wider than the
-/// widest stamp, query heads that do not divide by kv heads, a segment list
-/// that is not an `i32` indptr of at least one image, or a grid that will not
-/// launch.
 #[allow(clippy::too_many_arguments)]
 pub fn bidirectional(
     ctx: &Ctx<'_>,
@@ -122,8 +84,6 @@ pub fn bidirectional(
             format!("{num_q_heads} query heads do not group over {num_kv_heads} kv heads"),
         ));
     }
-    // The named refusals above judge the plan-visible geometry; these two are
-    // the landing contract, checked only once the plan itself is admissible.
     debug_assert!(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
         "`{OP}` lands one output row per query row"
@@ -176,9 +136,15 @@ mod tests {
         Tensor::new(2, images + 1, 1, Dtype::I32)
     }
 
-    /// The one property a stamp ladder has to have: the head lands on the
-    /// tightest point that holds it, and the widths the CUDA goldens
-    /// exercise all land somewhere.
+    fn dense_every_case() {
+        the_head_lands_on_the_tightest_stamp_that_holds_it();
+        a_head_past_the_last_stamp_is_refused_by_name();
+        a_row_that_is_no_whole_number_of_heads_is_refused_by_name();
+        query_heads_that_do_not_group_are_refused_by_name();
+        a_segment_list_that_is_not_an_indptr_is_refused_by_name();
+        an_element_this_plane_has_no_point_for_is_refused_by_dtype();
+    }
+
     #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
@@ -189,12 +155,10 @@ mod tests {
         assert_eq!(stamp_for(128), Some(1));
         assert_eq!(stamp_for(129), Some(2));
         assert_eq!(stamp_for(256), Some(2));
-        // Past the last stamp is not a wider point, it is no point.
         assert_eq!(stamp_for(257), None);
         assert_eq!(STAMPS.len(), DENSE.len());
     }
 
-    #[test]
     fn a_head_past_the_last_stamp_is_refused_by_name() {
         let probe = Probe::default();
         let why = bidirectional(
@@ -212,7 +176,6 @@ mod tests {
         assert!(probe.fires().is_empty(), "a refused plan launched anyway");
     }
 
-    #[test]
     fn a_row_that_is_no_whole_number_of_heads_is_refused_by_name() {
         let probe = Probe::default();
         let why = bidirectional(
@@ -229,7 +192,6 @@ mod tests {
         assert!(format!("{why}").contains("query"), "{why}");
     }
 
-    #[test]
     fn query_heads_that_do_not_group_are_refused_by_name() {
         let probe = Probe::default();
         let why = bidirectional(
@@ -246,7 +208,6 @@ mod tests {
         assert!(format!("{why}").contains("group over"), "{why}");
     }
 
-    #[test]
     fn a_segment_list_that_is_not_an_indptr_is_refused_by_name() {
         let probe = Probe::default();
         let wrong_dtype = bidirectional(
@@ -276,7 +237,6 @@ mod tests {
         assert!(format!("{no_images}").contains("no images"), "{no_images}");
     }
 
-    #[test]
     fn an_element_this_plane_has_no_point_for_is_refused_by_dtype() {
         let probe = Probe::default();
         let why = bidirectional(

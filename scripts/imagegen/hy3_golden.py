@@ -60,16 +60,12 @@ from golden_common import Tap, manifest, npz_keys, outdir
 
 MODEL = "hy3"
 
-# The GitHub package (byte-identical to the Instruct repo's modeling file); the
-# base HF repo ships the same classes under `hunyuan.py`.
 HY3_SRC = os.environ.get(
     "HY3_SRC",
     "/tmp/claude-0/-root-Workspace-pie/85b561db-ffb2-4c11-af67-9e924fa46755/scratchpad/hy3/gh",
 )
 HY3_CONFIG = os.environ.get("HY3_CONFIG", os.path.join(HY3_SRC, "..", "config.json"))
 
-# The miniature: two layers, eight experts top-2 plus the shared one, a 64-wide
-# head (the 2-D rope wants head_dim % 4 == 0), the image head's waist at 64.
 MINI = dict(
     hidden_size=256,
     num_hidden_layers=2,
@@ -86,25 +82,16 @@ MINI = dict(
     patch_embed_hidden_dim=64,
     image_base_size=256,
 )
-# 128 x 128 pixels at stride 16 and patch 1 — small enough that the
-# whole case fits argv (the sandbox's `/scratch` is per-process, so a
-# harness cannot place a file in it).
 TOKEN_H, TOKEN_W = 8, 8
-# `<bos>` + five text ids + `<boi> <img_size> <img_ratio>` then `<timestep>`.
-# `<|startoftext|>` + five ordinary pieces + `<boi> <img_size_1024> <img_ratio_0>`.
 TEXT_IDS = [127958, 100, 200, 300, 400, 500, 128000, 128037, 128044]
-# `<timestep>` in the base repo's tokenizer (128 010 is `<cfg>`).
 TIMESTEP_ID = 128017
 IMG_ID = 128006
 EOI_ID = 128001
-# `<cfg>`: what the unconditional branch writes over every prompt token.
 CFG_ID = 128010
-# `sigma' * 1000` at the first of eight shifted steps (shift 3).
 TIMESTEP = 750.0
 SEED = 0
 
 DROP = ("vae.", "vision_model.", "vision_aligner.")
-
 
 def build(device: str, dtype: torch.dtype):
     sys.path.insert(0, HY3_SRC)
@@ -114,7 +101,6 @@ def build(device: str, dtype: torch.dtype):
     base = json.load(open(HY3_CONFIG))
     cfg = dict(base)
     cfg.update(MINI)
-    # Toy VAE / ViT: built and never called, dropped from the dump.
     cfg["vae"] = dict(
         cfg["vae"],
         block_out_channels=[32, 64, 64, 64, 64],
@@ -137,9 +123,6 @@ def build(device: str, dtype: torch.dtype):
 
     torch.manual_seed(SEED)
     model = M.HunyuanImage3ForCausalMM(config)
-    # Small, well-conditioned weights: the reference's `_init_weights` only
-    # touches Linear/Embedding, and a random-init GroupNorm/Conv stack at
-    # PyTorch defaults is fine to diff but noisy to read.
     gen = torch.Generator().manual_seed(SEED + 1)
     for name, p in sorted(model.named_parameters()):
         if name.startswith(DROP):
@@ -151,7 +134,6 @@ def build(device: str, dtype: torch.dtype):
     model = model.to(device=device, dtype=dtype).eval()
     return M, config, model
 
-
 def sequence():
     """The T2I pretrain layout, by hand.
 
@@ -159,10 +141,9 @@ def sequence():
     """
     n = TOKEN_H * TOKEN_W
     ids = list(TEXT_IDS) + [TIMESTEP_ID] + [IMG_ID] * n + [EOI_ID]
-    t_at = len(TEXT_IDS)          # the `<timestep>` row
-    img_at = t_at + 1             # the first `<img>` row
+    t_at = len(TEXT_IDS)
+    img_at = t_at + 1
     return ids, t_at, img_at, n
-
 
 def run_mini(d: str, device: str, dtype: torch.dtype):
     M, config, model = build(device, dtype)
@@ -172,12 +153,10 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
     seq = len(ids)
     head_dim = config.attention_head_dim
 
-    # ---- the generalized causal mask (model:2859-2884) --------------------
     mask = torch.tril(torch.ones(seq, seq, dtype=torch.bool))
     mask[img_at : img_at + n, img_at : img_at + n] = True
     tap.put("mask", mask.to(torch.float32))
 
-    # ---- the 2-D rope, and the (y, x) grid it is built from ---------------
     cos, sin, pos = M.build_2d_rope(
         seq,
         head_dim,
@@ -185,15 +164,12 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
         base=config.rope_theta,
         return_all_pos=True,
     )
-    # `apply_rotary_pos_emb` unsqueezes at dim 1, so cos/sin arrive `[B, S, d]`
-    # (what `build_batch_2d_rope` stacks).
     cos = cos[None].to(device=device, dtype=dtype)
     sin = sin[None].to(device=device, dtype=dtype)
     tap.put("rope.cos", cos)
     tap.put("rope.sin", sin)
-    tap.put("rope.positions", pos.reshape(seq, 2))   # (y, x), integer
+    tap.put("rope.positions", pos.reshape(seq, 2))
 
-    # ---- the noisy latent -------------------------------------------------
     g = torch.Generator().manual_seed(SEED + 2)
     x = torch.randn(1, config.vae["latent_channels"], TOKEN_H, TOKEN_W, generator=g)
     x = x.to(device=device, dtype=dtype)
@@ -204,7 +180,6 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
     tap.put("layout", torch.tensor([seq, t_at, img_at, n, TOKEN_H, TOKEN_W], dtype=torch.int32))
 
     with torch.no_grad():
-        # ---- image.in: patch_embed(x_t, time_embed(t)) --------------------
         t_freq = M.timestep_embedding(t, config.patch_embed_hidden_dim * 0 + 256).to(dtype)
         temb_in = model.time_embed(t)
         temb_out = model.time_embed_2(t)
@@ -216,16 +191,14 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
 
         rows, th, tw = model.patch_embed(x, temb_in)
         assert (th, tw) == (TOKEN_H, TOKEN_W), (th, tw)
-        tap.put("image_in.rows", rows[0])            # [n, hidden]
+        tap.put("image_in.rows", rows[0])
 
-        # ---- the sequence's input rows ------------------------------------
         h = model.model.wte(torch.tensor([ids], device=device))
         h = h.to(dtype).clone()
         h[:, img_at : img_at + n] = rows
         h[:, t_at] = temb_tok
         tap.put("trunk.in", h[0])
 
-        # ---- denoise: the trunk over the whole sequence --------------------
         out = model.model(
             inputs_embeds=h,
             attention_mask=mask[None, None].to(device),
@@ -241,24 +214,13 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
         for i, layer in enumerate(out.hidden_states):
             tap.put(f"denoise.layer{i}", layer[0])
 
-        # ---- image.out: final_layer(rows, time_embed_2(t)) ------------------
         v = model.final_layer(hs[:, img_at : img_at + n], temb_out, th, tw)
-        tap.put("image_out.velocity", v[0])          # [C, h, w]
+        tap.put("image_out.velocity", v[0])
         tap.put(
             "image_out.velocity.rows",
-            v[0].reshape(v.shape[1], -1).transpose(0, 1),   # [n, C], raster order
+            v[0].reshape(v.shape[1], -1).transpose(0, 1),
         )
 
-        # ---- THE UNCONDITIONAL BRANCH -------------------------------------
-        # The same denoise step over the reference's own uncond prefix:
-        # every PROMPT token replaced by `<cfg>`, the `<bos>` and the three
-        # image-meta tokens kept, so the length, the mask and the rotary
-        # positions are identical (`tokenization:738-739`). This is the
-        # reference's own measurement of how much the canvas is
-        # CONDITIONED, and the parity gate reads it rather than guessing a
-        # constant: a denoise fire whose image rows attended only
-        # themselves would match the conditional dump inside tolerance on a
-        # random-init miniature.
         alt = list(ids)
         for i in range(1, t_at - 3):
             alt[i] = CFG_ID
@@ -280,7 +242,6 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
         tap.put("uncond.moved", float(moved))
         print(f"  the prefix conditions the canvas: <cfg> moves it rel {float(moved):.4f}")
 
-        # ---- encode: the causal text pass and its logits --------------------
         text_ids = torch.tensor([ids[: t_at]], device=device)
         tmask = torch.tril(torch.ones(t_at, t_at, dtype=torch.bool))
         tcos, tsin, tpos = M.build_2d_rope(
@@ -301,7 +262,6 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
         tap.put("encode.logits", model.lm_head(normed)[0])
         tap.put("encode.positions", tpos.reshape(t_at, 2))
 
-    # ---- the artifact pie imports -----------------------------------------
     from safetensors.torch import save_file
 
     sd = {
@@ -338,7 +298,6 @@ def run_mini(d: str, device: str, dtype: torch.dtype):
     tap.save(os.path.join(d, "hy3_mini.npz"))
     npz_keys(tap, limit=64)
 
-
 def stage(d: str, weights: str, config) -> str:
     """The directory `pie model import` reads: the weights, a `config.json`
     (the artifact carries it as `model/config`, and boot refuses one without),
@@ -366,7 +325,6 @@ def stage(d: str, weights: str, config) -> str:
         print("    serving needs one: set $HY3_TOKENIZER to a HunyuanImage-3 snapshot")
     return out
 
-
 def tokenizer_dir() -> str | None:
     """The base repo's snapshot in the HF cache, if it is there."""
     root = os.path.expanduser(
@@ -379,7 +337,6 @@ def tokenizer_dir() -> str | None:
         if os.path.exists(os.path.join(at, "tokenizer.json")):
             return at
     return None
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -394,7 +351,6 @@ def main():
     print(f"== mini == device={device} dtype={dtype}")
     run_mini(d, device, dtype)
     manifest(d, {"source": HY3_SRC, "mini": MINI, "timestep": TIMESTEP, "seed": SEED})
-
 
 if __name__ == "__main__":
     main()

@@ -1,39 +1,18 @@
-//! Finite State Machine construction and conversion: mutable `NfaGraph` for
-//! building, immutable `DfaTable` for matching, and NFA→DFA/minimization.
-
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::grammar::{Expr, ExprId, Grammar, RuleId};
 use anyhow::{Result, bail};
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// A state index in an FSM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StateId(pub u32);
 
-/// An edge in the FSM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsmEdge {
-    /// Transition on a byte in `[min, max]` (inclusive).
     CharRange { min: u8, max: u8, target: StateId },
-    /// Free (epsilon) transition.
     Epsilon(StateId),
-    /// Reference to another grammar rule.  After that rule matches,
-    /// transition to `target`.
     RuleRef { rule: RuleId, target: StateId },
 }
 
-// ---------------------------------------------------------------------------
-// Mutable FSM (adjacency list)
-// ---------------------------------------------------------------------------
-
-/// A mutable finite state machine (adjacency list representation).
-///
-/// States are numbered 0..n-1 and stored as `Vec<Vec<FsmEdge>>`.
-/// Used during construction; convert to `DfaTable` for matching.
 #[derive(Debug, Clone)]
 pub struct NfaGraph {
     edges: Vec<Vec<FsmEdge>>,
@@ -44,44 +23,36 @@ impl NfaGraph {
         Self { edges: Vec::new() }
     }
 
-    /// Add a new state and return its id.
     pub fn add_state(&mut self) -> StateId {
         let id = StateId(self.edges.len() as u32);
         self.edges.push(Vec::new());
         id
     }
 
-    /// Number of states.
     pub fn num_states(&self) -> usize {
         self.edges.len()
     }
 
-    /// Add an edge from `from`.
     pub fn add_edge(&mut self, from: StateId, edge: FsmEdge) {
         self.edges[from.0 as usize].push(edge);
     }
 
-    /// Shorthand: add a char-range edge.
     pub fn add_char_edge(&mut self, from: StateId, min: u8, max: u8, target: StateId) {
         self.add_edge(from, FsmEdge::CharRange { min, max, target });
     }
 
-    /// Shorthand: add an epsilon edge.
     pub fn add_epsilon(&mut self, from: StateId, target: StateId) {
         self.add_edge(from, FsmEdge::Epsilon(target));
     }
 
-    /// Shorthand: add a rule-ref edge.
     pub fn add_rule_ref(&mut self, from: StateId, rule: RuleId, target: StateId) {
         self.add_edge(from, FsmEdge::RuleRef { rule, target });
     }
 
-    /// Get all edges from a state.
     pub fn edges(&self, state: StateId) -> &[FsmEdge] {
         &self.edges[state.0 as usize]
     }
 
-    /// Compute the epsilon closure of a set of states (BFS).
     pub fn epsilon_closure(&self, states: &BTreeSet<StateId>) -> BTreeSet<StateId> {
         let mut closure = states.clone();
         let mut queue: VecDeque<StateId> = states.iter().copied().collect();
@@ -98,17 +69,14 @@ impl NfaGraph {
         closure
     }
 
-    /// Convert to compact (immutable) representation.
     pub fn to_compact(&self) -> DfaTable {
         let mut all_edges = Vec::new();
         let mut state_offsets = Vec::with_capacity(self.edges.len() + 1);
 
         for state_edges in &self.edges {
             state_offsets.push(all_edges.len() as u32);
-            // Sort char-range edges by min for binary search
             let mut sorted = state_edges.clone();
             sorted.sort_by(|a, b| {
-                // CharRange edges first (sorted by min), then others
                 match (a, b) {
                     (
                         FsmEdge::CharRange { min: a_min, .. },
@@ -123,7 +91,6 @@ impl NfaGraph {
         }
         state_offsets.push(all_edges.len() as u32);
 
-        // Build byte transition table for O(1) lookups
         let num_states = self.edges.len();
         let mut byte_table = vec![0xFFFFu16; num_states * 256];
         for s in 0..num_states {
@@ -152,30 +119,18 @@ impl Default for NfaGraph {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Compact FSM (flat array)
-// ---------------------------------------------------------------------------
-
-/// Immutable compact FSM. Edges stored in a flat array, indexed by state offsets.
-/// Optimized for cache-friendly traversal during matching.
-///
-/// Includes a 256-byte transition table per state for O(1) byte lookups.
 #[derive(Debug, Clone)]
 pub struct DfaTable {
     edges: Vec<FsmEdge>,
     state_offsets: Vec<u32>,
-    /// For each state, a 256-entry table mapping byte → target state.
-    /// `0xFFFF` = no transition. Indexed as `byte_table[state * 256 + byte]`.
     byte_table: Vec<u16>,
 }
 
 impl DfaTable {
-    /// Number of states.
     pub fn num_states(&self) -> usize {
         self.state_offsets.len() - 1
     }
 
-    /// Get all edges from a state.
     pub fn edges(&self, state: StateId) -> &[FsmEdge] {
         let s = state.0 as usize;
         let start = self.state_offsets[s] as usize;
@@ -183,14 +138,11 @@ impl DfaTable {
         &self.edges[start..end]
     }
 
-    /// Raw byte transition table: `byte_table[state * 256 + byte] → target_state`.
-    /// `0xFFFF` = no transition.
     #[inline(always)]
     pub fn byte_table(&self) -> &[u16] {
         &self.byte_table
     }
 
-    /// Get the next state for a given byte value (DFA: O(1) table lookup).
     #[inline(always)]
     pub fn next_state(&self, from: StateId, value: u8) -> Option<StateId> {
         let target = self.byte_table[from.0 as usize * 256 + value as usize];
@@ -203,21 +155,14 @@ impl DfaTable {
 
 }
 
-// ---------------------------------------------------------------------------
-// FSM with start/end states
-// ---------------------------------------------------------------------------
-
-/// An FSM with designated start and end (accepting) states.
 #[derive(Debug, Clone)]
 pub struct Automaton<F> {
     pub fsm: F,
     pub start: StateId,
-    /// `ends[i]` is true if state `i` is an accepting state.
     pub ends: Vec<bool>,
 }
 
 impl Automaton<NfaGraph> {
-    /// Check if a state is accepting.
     pub fn is_end(&self, state: StateId) -> bool {
         self.ends.get(state.0 as usize).copied().unwrap_or(false)
     }
@@ -226,11 +171,9 @@ impl Automaton<NfaGraph> {
         let mut dfa = NfaGraph::new();
         let mut dfa_ends = Vec::new();
 
-        // Map from NFA state sets → DFA state id
         let mut state_map: HashMap<BTreeSet<StateId>, StateId> = HashMap::new();
         let mut worklist: VecDeque<BTreeSet<StateId>> = VecDeque::new();
 
-        // Look up or create a DFA state for an NFA state set.
         let get_or_create = |target_set: BTreeSet<StateId>,
                              ends: &Vec<bool>,
                              dfa: &mut NfaGraph,
@@ -321,10 +264,6 @@ impl Automaton<NfaGraph> {
         })
     }
 
-    /// Collect distinct byte intervals and their target NFA states from a set of NFA states.
-    ///
-    /// Splits overlapping char-range edges into non-overlapping intervals,
-    /// each mapped to the union of target states reachable on that interval.
     fn collect_intervals(
         &self,
         nfa_states: &BTreeSet<StateId>,
@@ -387,7 +326,6 @@ impl Automaton<NfaGraph> {
         merged
     }
 
-    /// Compact the FSM into an immutable representation.
     pub fn to_compact(&self) -> Automaton<DfaTable> {
         Automaton {
             fsm: self.fsm.to_compact(),
@@ -400,18 +338,6 @@ impl Automaton<NfaGraph> {
 impl Automaton<DfaTable> {
 }
 
-// ---------------------------------------------------------------------------
-// Grammar → per-rule FSMs
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// UTF-8 byte-level NFA construction for character classes
-// ---------------------------------------------------------------------------
-
-/// Build NFA transitions for a character class, properly handling multi-byte UTF-8.
-///
-/// Creates byte-level NFA paths from `start` to `end` that match exactly the
-/// codepoints specified by the (negated, ranges) character class.
 fn build_char_class_nfa(
     fsm: &mut NfaGraph,
     negated: bool,
@@ -430,8 +356,6 @@ fn build_char_class_nfa(
     }
 }
 
-/// Compute the complement of codepoint ranges (all Unicode codepoints NOT in ranges).
-/// Excludes surrogates (U+D800-U+DFFF).
 fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut sorted = ranges.to_vec();
     sorted.sort_by_key(|&(lo, _)| lo);
@@ -474,38 +398,31 @@ fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     result
 }
 
-/// Add NFA paths for a contiguous codepoint range [lo, hi].
-/// Creates proper multi-byte UTF-8 byte-sequence transitions.
 fn add_codepoint_range_nfa(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId, end: StateId) {
-    // ASCII range (1-byte UTF-8)
     let ascii_lo = lo;
     let ascii_hi = hi.min(0x7F);
     if ascii_lo <= ascii_hi {
         fsm.add_char_edge(start, ascii_lo as u8, ascii_hi as u8, end);
     }
 
-    // 2-byte range: U+0080 - U+07FF
     let two_lo = lo.max(0x80);
     let two_hi = hi.min(0x7FF);
     if two_lo <= two_hi {
         add_utf8_nfa_range(fsm, two_lo, two_hi, start, end);
     }
 
-    // 3-byte range: U+0800 - U+D7FF (before surrogates)
     let three_lo = lo.max(0x800);
     let three_hi = hi.min(0xD7FF);
     if three_lo <= three_hi {
         add_utf8_nfa_range(fsm, three_lo, three_hi, start, end);
     }
 
-    // 3-byte range: U+E000 - U+FFFF (after surrogates)
     let three_lo2 = lo.max(0xE000);
     let three_hi2 = hi.min(0xFFFF);
     if three_lo2 <= three_hi2 {
         add_utf8_nfa_range(fsm, three_lo2, three_hi2, start, end);
     }
 
-    // 4-byte range: U+10000 - U+10FFFF
     let four_lo = lo.max(0x10000);
     let four_hi = hi.min(0x10FFFF);
     if four_lo <= four_hi {
@@ -513,7 +430,6 @@ fn add_codepoint_range_nfa(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId,
     }
 }
 
-/// Encode a codepoint to UTF-8 bytes.
 fn encode_codepoint_utf8(cp: u32) -> Vec<u8> {
     let c = char::from_u32(cp).expect("valid codepoint");
     let mut buf = [0u8; 4];
@@ -521,8 +437,6 @@ fn encode_codepoint_utf8(cp: u32) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
-/// Add NFA transitions for a range of codepoints that all have the same UTF-8 byte length.
-/// Uses recursive splitting by byte position for efficient construction.
 fn add_utf8_nfa_range(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId, end: StateId) {
     let lo_bytes = encode_codepoint_utf8(lo);
     let hi_bytes = encode_codepoint_utf8(hi);
@@ -530,8 +444,6 @@ fn add_utf8_nfa_range(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId, end:
     add_utf8_byte_range(fsm, &lo_bytes, &hi_bytes, 0, start, end);
 }
 
-/// Recursive helper: add NFA transitions for UTF-8 byte sequences.
-/// `depth` is the current byte position being processed.
 fn add_utf8_byte_range(
     fsm: &mut NfaGraph,
     lo: &[u8],
@@ -552,8 +464,6 @@ fn add_utf8_byte_range(
         return;
     }
 
-    // Different bytes: split into up to 3 sub-ranges
-    // Part 1: lo[depth] with suffix lo[depth+1..] to max (0xBF...)
     {
         let s = fsm.add_state();
         fsm.add_char_edge(start, lo[depth], lo[depth], s);
@@ -562,7 +472,6 @@ fn add_utf8_byte_range(
         add_utf8_byte_range(fsm, lo, &hi_full, depth + 1, s, end);
     }
 
-    // Part 2: intermediate bytes with full continuation range
     if lo[depth] < hi[depth].saturating_sub(1) {
         let s = fsm.add_state();
         fsm.add_char_edge(start, lo[depth] + 1, hi[depth] - 1, s);
@@ -573,7 +482,6 @@ fn add_utf8_byte_range(
         add_utf8_byte_range(fsm, &lo_min, &hi_max, depth + 1, s, end);
     }
 
-    // Part 3: hi[depth] with suffix min (0x80...) to hi[depth+1..]
     {
         let s = fsm.add_state();
         fsm.add_char_edge(start, hi[depth], hi[depth], s);
@@ -583,12 +491,6 @@ fn add_utf8_byte_range(
     }
 }
 
-// ---------------------------------------------------------------------------
-// NFA-level rule inlining
-// ---------------------------------------------------------------------------
-
-/// Check whether an expression tree is "inlineable" — contains only byte-level
-/// operations and references to already-known inlineable rules.
 fn is_inlineable(grammar: &Grammar, expr_id: ExprId, known: &HashSet<RuleId>) -> bool {
     match grammar.get_expr(expr_id) {
         Expr::EmptyString
@@ -602,11 +504,6 @@ fn is_inlineable(grammar: &Grammar, expr_id: ExprId, known: &HashSet<RuleId>) ->
     }
 }
 
-/// Compute the set of rules that can be inlined at the NFA level.
-///
-/// A rule is inlineable if its body only contains byte-level operations
-/// (ByteString, CharacterClass, etc.) and references to other inlineable rules.
-/// Self-referencing and mutually-recursive rules are never inlineable.
 fn find_inlineable_rules(grammar: &Grammar) -> HashSet<RuleId> {
     let mut inlineable = HashSet::new();
     loop {
@@ -625,11 +522,6 @@ fn find_inlineable_rules(grammar: &Grammar) -> HashSet<RuleId> {
     inlineable
 }
 
-/// Build an NFA from a grammar expression, inlining leaf rules.
-///
-/// When encountering RuleRef or Repeat for an inlineable rule, the referenced
-/// rule's body is built directly into the current NFA instead of creating a
-/// RuleRef edge. This eliminates rule boundary overhead at runtime.
 fn build_expr_nfa_inlining(
     grammar: &Grammar,
     fsm: &mut NfaGraph,
@@ -666,7 +558,6 @@ fn build_expr_nfa_inlining(
 
         Expr::CharacterClassStar { negated, ranges } => {
             fsm.add_epsilon(start, end);
-            // Build char class transitions looping back to start
             let effective_ranges = if *negated {
                 complement_codepoint_ranges(ranges)
             } else {
@@ -751,7 +642,6 @@ fn build_expr_nfa_inlining(
     }
 }
 
-/// Build an inlined repeat NFA: wire the rule body directly instead of RuleRef edges.
 #[allow(
     clippy::too_many_arguments,
     reason = "grammar, graph, body, bounds and endpoints are each independent \
@@ -769,7 +659,6 @@ fn build_inlined_repeat(
 ) {
     let mut prev = start;
 
-    // Mandatory repetitions
     for i in 0..min {
         let next = if max == Some(min) && i + 1 == min {
             end
@@ -781,7 +670,6 @@ fn build_inlined_repeat(
     }
 
     if let Some(max) = max {
-        // Optional repetitions up to max
         for i in min..max {
             if prev != end {
                 fsm.add_epsilon(prev, end);
@@ -791,16 +679,11 @@ fn build_inlined_repeat(
             prev = next;
         }
     } else {
-        // Unbounded: epsilon to end + self-loop via inlined body
         fsm.add_epsilon(prev, end);
         build_expr_nfa_inlining(grammar, fsm, body, prev, prev, inlineable);
     }
 }
 
-/// Build per-rule NFAs from a grammar, with NFA-level rule inlining.
-///
-/// Returns a Vec indexed by rule id. Each entry is an `Automaton<NfaGraph>`
-/// representing the NFA for that rule.
 pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
     let inlineable = find_inlineable_rules(grammar);
     let mut result = Vec::new();
@@ -820,8 +703,3 @@ pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
 
     result
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-

@@ -1,15 +1,9 @@
-//! The readers every format shares: plain text up to a stop token, and a
-//! thinking block delimited by markers.
-
 use std::sync::Arc;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::{ChatDecoder, ChatEvent, ReasoningDecoder, ReasoningEvent, ToolDecoder, ToolEvent};
 
-/// Accumulates generated text and closes the turn on any stop token. A batch
-/// may carry the stop token mid-batch; what follows it is the next turn's
-/// opening, so the reader closes, resets, and keeps going through the batch.
 pub struct GenericChatDecoder {
     decoder: TokenizerDecoder,
     stop_ids: Vec<u32>,
@@ -56,9 +50,6 @@ impl ChatDecoder for GenericChatDecoder {
     }
 }
 
-/// Watches for a thinking block: a marker sequence that opens it, one token
-/// that closes it. The close is a single token by construction; the
-/// constructor asserts it.
 pub struct ThinkingDecoder {
     decoder: TokenizerDecoder,
     open: Vec<u32>,
@@ -85,8 +76,6 @@ impl ThinkingDecoder {
         }
     }
 
-    /// The same decoder for a cue that already opened the block: decoding
-    /// starts inside it and ends at the first `close`.
     #[must_use]
     pub fn opened(tokenizer: Arc<Tokenizer>, open: Vec<u32>, close: u32) -> Self {
         Self {
@@ -142,7 +131,6 @@ impl ReasoningDecoder for ThinkingDecoder {
     }
 }
 
-/// For a format whose model does not think out loud.
 pub struct NoopReasoningDecoder;
 
 impl ReasoningDecoder for NoopReasoningDecoder {
@@ -153,7 +141,6 @@ impl ReasoningDecoder for NoopReasoningDecoder {
     fn reset(&mut self) {}
 }
 
-/// For a format with no tool grammar to detect.
 pub struct NoopToolDecoder;
 
 impl ToolDecoder for NoopToolDecoder {

@@ -1,7 +1,3 @@
-//! Program repository: two-tier program storage, a disk index (manifest with
-//! path/hash info) plus a binary cache (WASM bytes for user-registered
-//! programs).
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -10,8 +6,6 @@ use std::collections::HashMap;
 use super::ProgramName;
 use super::manifest::{Manifest, manifest_url};
 
-/// `programs_dir` is the directory this repository owns outright, so the
-/// wasm and manifest paths below cannot disagree about a "programs" prefix.
 fn wasm_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
     programs_dir
         .join(&name.name)
@@ -33,13 +27,10 @@ fn wasm_url(registry_url: &str, name: &ProgramName) -> String {
     )
 }
 
-/// Two-tier program repository: disk index + binary cache.
 pub struct Repository {
     index: HashMap<ProgramName, Manifest>,
-    /// WASM bytes staged for immediate first-use, consumed on fetch.
     preloaded_binaries: HashMap<ProgramName, Vec<u8>>,
     registry_url: String,
-    /// The directory holding `<name>/<version>.{wasm,toml}`.
     programs_dir: PathBuf,
 }
 
@@ -72,9 +63,6 @@ impl Repository {
         bail!("Program not found: {}", name)
     }
 
-    /// Every program on disk, name-then-version ordered, with the bytes each
-    /// one occupies. Exists so `pie inferlet list` can enumerate the cache
-    /// without knowing the `<name>/<version>.wasm` layout itself.
     pub fn cached(&self) -> Vec<(ProgramName, Manifest, u64)> {
         let mut out: Vec<(ProgramName, Manifest, u64)> = self
             .index
@@ -90,11 +78,6 @@ impl Repository {
         out
     }
 
-    /// Delete a cached program. Returns whether it was there to delete.
-    ///
-    /// Removes the manifest before the wasm: a program whose manifest is gone
-    /// is skipped by `load_program_cache`, so an interrupted removal leaves
-    /// something invisible rather than something half-loadable.
     pub fn remove(&mut self, name: &ProgramName) -> Result<bool> {
         if self.index.remove(name).is_none() && !wasm_path(&self.programs_dir, name).exists() {
             return Ok(false);
@@ -110,8 +93,6 @@ impl Repository {
                 Err(e) => return Err(anyhow!("removing {:?}: {}", path, e)),
             }
         }
-        // Prune the name directory once its last version goes; failure isn't
-        // an error, since it just means another version is still there.
         let _ = std::fs::remove_dir(self.programs_dir.join(&name.name));
         Ok(true)
     }
@@ -191,7 +172,6 @@ impl Repository {
         Ok(())
     }
 
-    /// Scans `programs_dir` for `<name>/<version>.wasm` + its sibling manifest.
     pub fn load_program_cache(&mut self) {
         self.lift_doubled_programs_dir();
         let dir = self.programs_dir.clone();
@@ -243,7 +223,6 @@ impl Repository {
                     Err(_) => continue,
                 };
 
-                // Parse manifest
                 let manifest = match Manifest::parse(&manifest_content) {
                     Ok(m) => m,
                     Err(_) => continue,
@@ -254,10 +233,6 @@ impl Repository {
         }
     }
 
-    /// Move programs out of the `programs/programs/` directory the old
-    /// `cache_dir` doubling wrote them to.
-    ///
-    /// Temporary: migrates the old doubled `programs/programs/` layout.
     fn lift_doubled_programs_dir(&self) {
         let nested = self.programs_dir.join("programs");
         let Ok(entries) = std::fs::read_dir(&nested) else {
@@ -265,12 +240,10 @@ impl Repository {
         };
         for entry in entries.flatten() {
             let destination = self.programs_dir.join(entry.file_name());
-            // Never over a live one.
             if !destination.exists() {
                 let _ = std::fs::rename(entry.path(), destination);
             }
         }
-        // Only when empty, so anything left behind stays findable.
         let _ = std::fs::remove_dir(&nested);
     }
 
@@ -306,4 +279,3 @@ impl std::fmt::Debug for Repository {
             .finish()
     }
 }
-

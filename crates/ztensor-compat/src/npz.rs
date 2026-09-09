@@ -1,14 +1,3 @@
-//! NumPy `.npz` (and single `.npy`) → zTensor object model projection.
-//!
-//! An `.npz` is a ZIP of `.npy` entries. A stored (uncompressed) entry is a
-//! plain range of the file, so it gets an address and a borrow like any other.
-//! A deflated entry has neither, since its bytes do not exist until something
-//! inflates them. It becomes an opaque payload: readable, and honest that
-//! reading costs a decompression.
-//!
-//! Refusals (never reinterpret): big-endian descrs, `fortran_order: True`
-//! (reversing the shape would silently transpose the data), object dtypes.
-
 use std::fs::File;
 use std::io::Read;
 
@@ -22,7 +11,6 @@ fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("npz: {}", detail.into()))
 }
 
-/// numpy descr → leaf. Little-endian or byte-order-free only.
 fn map_descr(descr: &str) -> Result<Leaf> {
     Ok(match descr {
         "<f8" | "=f8" => Leaf::F64,
@@ -48,11 +36,9 @@ fn map_descr(descr: &str) -> Result<Leaf> {
 pub(crate) struct NpyHeader {
     pub leaf: Leaf,
     pub shape: Vec<u64>,
-    /// Offset of raw data relative to the start of the `.npy` bytes.
     pub data_offset: usize,
 }
 
-/// Parses a `.npy` header (magic, version, header dict).
 pub(crate) fn parse_npy_header(data: &[u8]) -> Result<NpyHeader> {
     if data.len() < 10 || &data[..6] != b"\x93NUMPY" {
         return Err(bad("not a .npy entry"));
@@ -139,23 +125,16 @@ fn find_shape(header: &str) -> Result<Vec<u64>> {
     Ok(dims)
 }
 
-/// Where one entry's bytes are, before they become a payload.
 enum Where {
-    /// Stored entry: an absolute range of the file.
     Stored { offset: u64, length: u64 },
-    /// Deflated entry: the zip entry to inflate, and how much of the result to
-    /// drop (the `.npy` header) before the tensor starts.
     Deflated {
         zip_index: usize,
         data_offset: usize,
     },
 }
 
-/// Inflates deflated entries on demand. Keeps the archive open because the
-/// bytes cannot be addressed, because there is nowhere to point at.
 struct Deflated {
     archive: std::sync::Mutex<zip::ZipArchive<File>>,
-    /// Keyed by the `key` in [`Payload::Opaque`]: (zip index, header length).
     entries: Vec<(usize, usize)>,
 }
 
@@ -165,9 +144,6 @@ impl Decode for Deflated {
             .entries
             .get(key as usize)
             .ok_or_else(|| bad(format!("no deflated entry {key}")))?;
-        // The expected size is the *validated* one (shape x width plus the
-        // header), never the ZIP's declared size: reading with a hard limit
-        // keeps a lying entry from driving the allocation.
         let expected = crate::safe::add("npz entry", data_offset as u64, decoded_len)?;
         let cap = crate::safe::alloc_size("npz entry", expected)?;
         let mut archive = self.archive.lock().expect("npz archive lock");
@@ -206,8 +182,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
             if crate::safe::add("npz entry", start, size)? > store.len() {
                 return Err(bad(format!("entry {name:?} extends past file")));
             }
-            // The header is at most a few hundred bytes; read what a v2 header
-            // can reach rather than the whole entry.
             let probe = store.read(start, size.min(4096))?;
             let header = parse_npy_header(&probe)?;
             let data_off = crate::safe::add("npz entry", start, header.data_offset as u64)?;
@@ -220,7 +194,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
                 },
             )
         } else {
-            // Parse only the header now; the payload inflates on demand.
             let mut head = vec![0u8; 4096.min(entry.size() as usize)];
             entry
                 .read_exact(&mut head)
@@ -238,7 +211,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         let entry_size = entry.size();
         drop(entry);
 
-        // Size equation: never trust the header blindly.
         let elems = crate::safe::product("npz shape", &header.shape)?;
         let expected = header
             .leaf
@@ -292,9 +264,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         }
     }
 
-    // A ZIP packs entries back to back behind local headers, so this file
-    // cannot say which bytes are free, so occupancy stays unknown and page
-    // exclusivity is never claimed.
     let projection = Projection::new(catalog);
     Ok(if deflated.is_empty() {
         projection

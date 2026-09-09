@@ -4,8 +4,6 @@ typedef unsigned short m1_u16;
 typedef unsigned int m1_u32;
 typedef unsigned long long m1_u64;
 
-// A 16-byte load, spelled without depending on NVRTC providing CUDA's built-in
-// vector types: these headers are compiled with no include path at all.
 struct alignas(16) M1U32x4 {
   unsigned int x, y, z, w;
 };
@@ -100,13 +98,9 @@ __device__ __forceinline__ float m1_bits_f32(m1_u32 value) {
   return __uint_as_float(value);
 }
 
-// Monotone map float -> m1_u32 that REVERSES value order: a larger float yields
-// a smaller key, so a plain unsigned radix select over the keys walks the values
-// in descending order. NaN maps to the maximum key (sorts last), and no finite
-// float can collide with that sentinel.
 __device__ __forceinline__ m1_u32 m1_desc_key(float value) {
   if (m1_isnan(value)) return 0xFFFFFFFFu;
-  if (value == 0.0f) value = 0.0f;   // -0.0 compares equal to +0.0
+  if (value == 0.0f) value = 0.0f;
   const m1_u32 u = __float_as_uint(value);
   const m1_u32 ascending = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
   return ~ascending;
@@ -327,12 +321,6 @@ __device__ __forceinline__ float m1_intrinsic_row_load(
   return __uint_as_float((m1_u32)value << 16);
 }
 
-// ── four elements at once ─────────────────────────────────────────────
-// The stream emitter's vector path: a thread takes four consecutive
-// elements a step, read and written as one 16-byte access when the row's
-// pointers are 16-byte aligned and its width is a multiple of four (the
-// emitter checks both per block and falls back to the scalar loop). The
-// arithmetic per element is the scalar helpers', component by component.
 __device__ __forceinline__ bool m1_aligned16(const void* p) {
   return (reinterpret_cast<m1_u64>(p) & 15u) == 0u;
 }
@@ -440,7 +428,6 @@ __device__ __forceinline__ void m1_store4_b(m1_u8* data, m1_u32 index4, uchar4 v
   reinterpret_cast<uchar4*>(data)[index4] = v;
 }
 
-// Four consecutive columns of an intrinsic row, `column` a multiple of four.
 __device__ __forceinline__ float4 m1_intrinsic_row_load4(
     const m1_u8* input, m1_u64 row, m1_u32 column, m1_u32 stride, m1_u32 mode) {
   if (mode == 0u) {
@@ -458,9 +445,6 @@ __device__ __forceinline__ float4 m1_intrinsic_row_load4(
                      __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
 }
 
-// Whether `row` of an intrinsic can be read four at a time: its first
-// element 16-byte aligned (f32) or 8-byte aligned (bf16) and the stride a
-// multiple of four.
 __device__ __forceinline__ bool m1_intrinsic_row_vectorable(
     const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
   if ((stride & 3u) != 0u) return false;
@@ -473,17 +457,6 @@ __device__ __forceinline__ bool m1_intrinsic_row_vectorable(
   return (address & (mode == 0u ? 15u : 7u)) == 0u;
 }
 
-// Resolve a row once, then read columns off it.
-//
-// `mode == 2` keeps a table of row pointers, so calling `m1_intrinsic_row_load`
-// per column put a dependent global load in front of every element: the greedy
-// argmax over a 154k vocabulary read its logits at 37 GB/s. The row is loop
-// invariant and the dtype branch is block-uniform, so both belong outside the
-// column loop.
-//
-// `mode == 3` (pre-reduced, see `ptir_fast_argmax_intrinsic`) never reaches
-// here: there are no columns to address, so its only reader returns before
-// resolving a row.
 __device__ __forceinline__ const m1_u8* m1_intrinsic_row_base(
     const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
   if (mode == 2u) {

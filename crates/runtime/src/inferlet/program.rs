@@ -1,6 +1,3 @@
-//! Program Manager Service: a singleton actor for managing program
-//! (inferlet) metadata, caching, downloading from registry, and compilation.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -20,17 +17,11 @@ pub use repository::Repository;
 use super::python::runtime as py_runtime;
 use super::python::snapshot;
 
-// =============================================================================
-// Public API
-// =============================================================================
-
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the program manager service.
 pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, programs_dir: PathBuf) {
     let mut repository = Repository::new(registry_url, programs_dir);
 
-    // Scan disk on bootstrap: load existing programs into index
     repository.load_program_cache();
 
     SERVICE
@@ -38,7 +29,6 @@ pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, programs_dir: PathB
         .expect("Program manager already spawned");
 }
 
-/// Add a program with WASM binary and manifest. Stores in repository + disk (does NOT install).
 pub async fn add(wasm_binary: Vec<u8>, manifest: Manifest, force_overwrite: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Add {
@@ -50,7 +40,6 @@ pub async fn add(wasm_binary: Vec<u8>, manifest: Manifest, force_overwrite: bool
     rx.await?
 }
 
-/// Add a program from registry by name. Downloads and stores in repository + disk (does NOT install).
 pub async fn add_from_registry(name: &ProgramName, force_overwrite: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::AddFromRegistry {
@@ -61,7 +50,6 @@ pub async fn add_from_registry(name: &ProgramName, force_overwrite: bool) -> Res
     rx.await?
 }
 
-/// Check if a program is registered in repository.
 pub async fn is_registered(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -73,7 +61,6 @@ pub async fn is_registered(name: &ProgramName) -> bool {
     rx.await.unwrap_or(false)
 }
 
-/// Check if a program is installed (JIT compiled and ready to run).
 pub async fn is_installed(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -85,7 +72,6 @@ pub async fn is_installed(name: &ProgramName) -> bool {
     rx.await.unwrap_or(false)
 }
 
-/// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies.
 pub async fn install(name: &ProgramName) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Install {
@@ -95,7 +81,6 @@ pub async fn install(name: &ProgramName) -> Result<()> {
     rx.await?
 }
 
-/// Uninstall a program and invalidate its linker cache entry.
 pub async fn uninstall(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -107,7 +92,6 @@ pub async fn uninstall(name: &ProgramName) -> bool {
     rx.await.unwrap_or(false)
 }
 
-/// Get program metadata by name.
 pub async fn fetch_manifest(name: &ProgramName) -> Option<Manifest> {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -119,9 +103,6 @@ pub async fn fetch_manifest(name: &ProgramName) -> Option<Manifest> {
     rx.await.ok().flatten()
 }
 
-/// Get the compiled component for an installed program, bundled with metadata
-/// the linker needs to instantiate it correctly (snapshot status and declared
-/// python-runtime version).
 pub async fn get_wasm_component(name: &ProgramName) -> Option<InstalledComponent> {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -133,11 +114,6 @@ pub async fn get_wasm_component(name: &ProgramName) -> Option<InstalledComponent
     rx.await.ok().flatten()
 }
 
-// =============================================================================
-// Program Metadata Types
-// =============================================================================
-
-/// Identifier for an inferlet (name, version).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramName {
     pub name: String,
@@ -145,10 +121,6 @@ pub struct ProgramName {
 }
 
 impl ProgramName {
-    /// Parses an inferlet identifier from a `name@major.minor.patch` string.
-    ///
-    /// The name must contain only alphanumeric characters, hyphens, and underscores.
-    /// The version must be valid semver (e.g., `1.0.0`).
     pub fn parse(s: &str) -> Result<Self> {
         static RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
             fancy_regex::Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
@@ -173,41 +145,25 @@ impl std::fmt::Display for ProgramName {
         write!(f, "{}@{}", self.name, self.version)
     }
 }
-// =============================================================================
-// Program Service
-// =============================================================================
 
-/// Program service: caching, installation, and loading of inferlet programs.
 struct ProgramService {
     wasm_engine: WasmEngine,
     repository: Repository,
-    /// Installed (JIT compiled) programs, keyed by program name
     installed: HashMap<ProgramName, InstalledProgram>,
-    /// Programs that were explicitly installed (not pulled as dependencies)
     explicit_installs: std::collections::HashSet<ProgramName>,
-    /// Monotonic generation for installed-program state. Consumers use this
-    /// as a cheap cache invalidation guard for resolved launch plans.
     generation: u64,
 }
 
-/// Cached state for an installed program.
 #[derive(Clone)]
 struct InstalledProgram {
     component: Component,
-    /// True if transformed by the host-side snapshot pipeline (pick the
-    /// stripped shared-module variant at instantiate time).
     snapshotted: bool,
-    /// Declared python-runtime version, cached so linker consumers don't
-    /// need to re-read the manifest.
     python_runtime: Option<String>,
 }
 
-/// Public handle for an installed component, returned to consumers that need
-/// to instantiate it (e.g. the linker service).
 #[derive(Clone)]
 pub struct InstalledComponent {
     pub component: Component,
-    /// Current installed-program generation for cache invalidation.
     pub generation: u64,
     pub snapshotted: bool,
     pub python_runtime: Option<String>,
@@ -245,7 +201,6 @@ impl ProgramService {
         self.repository.exists(name)
     }
 
-    /// Uninstall a program and cascade remove orphaned dependencies.
     fn uninstall(&mut self, name: &ProgramName) -> bool {
         if self.installed.remove(name).is_none() {
             return false;
@@ -253,7 +208,6 @@ impl ProgramService {
         super::linker::invalidate(name);
         self.explicit_installs.remove(name);
 
-        // Cascade: find and remove orphaned dependencies
         loop {
             let orphans = self.find_orphaned_dependencies();
             if orphans.is_empty() {
@@ -273,7 +227,6 @@ impl ProgramService {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install).
     async fn add(
         &mut self,
         wasm_binary: Vec<u8>,
@@ -290,7 +243,6 @@ impl ProgramService {
         Ok(())
     }
 
-    /// Add a program from registry by name: download and store in repository + disk (does NOT install).
     async fn add_from_registry(&mut self, name: &ProgramName, force_overwrite: bool) -> Result<()> {
         self.repository
             .add_from_registry(name, force_overwrite)
@@ -301,23 +253,18 @@ impl ProgramService {
         Ok(())
     }
 
-    /// Install a program: JIT compile + link, resolves transitive dependencies.
     async fn install(&mut self, name: &ProgramName) -> Result<()> {
-        // Step 0: Check if already installed (mark as explicit and exit)
         if self.installed.contains_key(name) {
             self.explicit_installs.insert(name.clone());
             return Ok(());
         }
 
-        // Step 1: Ensure program is in repository (downloads from registry if needed)
         if !self.repository.exists(name) {
             self.repository.add_from_registry(name, false).await?;
         }
 
-        // Step 2: Resolve all transitive dependencies (flattened, deduplicated, topological order)
         let dependencies = self.resolve_dependencies(name).await?;
 
-        // Step 3: Install each dependency in order
         for dep_name in &dependencies {
             if !self.installed.contains_key(dep_name) {
                 let dep_wasm = self.repository.fetch_wasm_binary(dep_name).await?;
@@ -337,8 +284,6 @@ impl ProgramService {
             }
         }
 
-        // Step 4: fetch WASM bytes; snapshot only if py_runtime is installed,
-        // snapshot is enabled, and the manifest declares python-runtime.
         let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
 
         let python_runtime = self
@@ -351,7 +296,6 @@ impl ProgramService {
             && py_runtime::is_snapshot_enabled();
 
         let (component, snapshotted) = if should_snapshot {
-            // Gather direct dep components (from self.installed, populated in Step 3).
             let manifest = self
                 .repository
                 .fetch_manifest(name)
@@ -397,7 +341,6 @@ impl ProgramService {
             )
         };
 
-        // Step 5: Track as installed and mark as explicitly installed
         self.installed.insert(
             name.clone(),
             InstalledProgram {
@@ -412,44 +355,35 @@ impl ProgramService {
         Ok(())
     }
 
-    /// Resolve transitive dependencies iteratively and return flattened, deduplicated list.
-    /// Dependencies are returned in topological order (dependencies before dependents).
     async fn resolve_dependencies(&mut self, name: &ProgramName) -> Result<Vec<ProgramName>> {
         use std::collections::HashSet;
 
         let mut resolved: Vec<ProgramName> = Vec::new();
         let mut visited: HashSet<ProgramName> = HashSet::new();
-        // Stack entries: (program_name, children_processed)
         let mut stack: Vec<(ProgramName, bool)> = vec![(name.clone(), false)];
 
         while let Some((current, children_processed)) = stack.pop() {
             if children_processed {
-                // Second visit: all children processed, add to resolved
                 resolved.push(current);
                 continue;
             }
 
-            // Skip if already visited (handles cycles and duplicates)
             if visited.contains(&current) {
                 continue;
             }
             visited.insert(current.clone());
 
-            // Ensure program is in repository (downloads from registry if needed)
             if !self.repository.exists(&current) {
                 self.repository.add_from_registry(&current, false).await?;
             }
 
-            // Get manifest to find direct dependencies
             let manifest = self
                 .repository
                 .fetch_manifest(&current)
                 .ok_or_else(|| anyhow!("Manifest not found for program: {}", current))?;
 
-            // Push current back with children_processed=true (for post-order)
             stack.push((current, true));
 
-            // Push children (dependencies) to process first
             for dep_name in manifest.dependency_names() {
                 if !visited.contains(&dep_name) {
                     stack.push((dep_name, false));
@@ -457,17 +391,12 @@ impl ProgramService {
             }
         }
 
-        // Remove the root program itself from the dependency list
         resolved.retain(|dep| dep != name);
 
         Ok(resolved)
     }
 
-    /// Find dependencies that are no longer needed:
-    /// - Not explicitly installed
-    /// - No other installed program depends on them
     fn find_orphaned_dependencies(&self) -> Vec<ProgramName> {
-        // Build reverse dependency map: program -> installed programs that depend on it
         let mut reverse_deps: HashMap<ProgramName, Vec<ProgramName>> = HashMap::new();
         for name in self.installed.keys() {
             if let Some(manifest) = self.repository.fetch_manifest(name) {
@@ -480,9 +409,7 @@ impl ProgramService {
         self.installed
             .keys()
             .filter(|name| {
-                // Not explicitly installed
                 !self.explicit_installs.contains(*name) &&
-                // No other installed program depends on it
                 reverse_deps.get(*name).is_none_or(|dependents| dependents.is_empty())
             })
             .cloned()
@@ -490,18 +417,12 @@ impl ProgramService {
     }
 }
 
-// =============================================================================
-// ServiceHandler
-// =============================================================================
-
 enum Message {
-    /// Get program metadata by name
     GetMetadata {
         name: ProgramName,
         response: oneshot::Sender<Option<Manifest>>,
     },
 
-    /// Add a program with WASM binary and manifest: store in repository + disk (does NOT install)
     Add {
         wasm_binary: Vec<u8>,
         manifest: Manifest,
@@ -509,39 +430,32 @@ enum Message {
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Add a program from registry by name: download and store in repository + disk (does NOT install)
     AddFromRegistry {
         name: ProgramName,
         force_overwrite: bool,
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Check if a program exists in repository
     Exists {
         name: ProgramName,
         response: oneshot::Sender<bool>,
     },
 
-    /// Check if a program is installed (JIT compiled and ready to run)
     IsInstalled {
         name: ProgramName,
         response: oneshot::Sender<bool>,
     },
 
-    /// Install a program: JIT compile + link, auto-downloads from registry if needed, resolves dependencies
     Install {
         name: ProgramName,
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Uninstall a program and invalidate its linker cache entry.
     Uninstall {
         name: ProgramName,
         response: oneshot::Sender<bool>,
     },
 
-    /// Get the compiled component for an installed program, with snapshot
-    /// status and declared python-runtime version.
     GetWasmComponent {
         name: ProgramName,
         response: oneshot::Sender<Option<InstalledComponent>>,
@@ -590,11 +504,6 @@ impl ServiceHandler for ProgramService {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Compiles WASM bytes to a Component in a blocking thread.
 pub async fn compile_wasm_component(
     engine: &WasmEngine,
     wasm_binary: Vec<u8>,
@@ -606,4 +515,3 @@ pub async fn compile_wasm_component(
         Err(e) => Err(anyhow!("Compilation task failed: {}", e)),
     }
 }
-

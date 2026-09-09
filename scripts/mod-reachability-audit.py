@@ -39,18 +39,11 @@ import re, sys, pathlib, tomllib
 
 ROOT = pathlib.Path(".")
 
-# `mod x;` — the trailing semicolon is what distinguishes a declaration
-# that names a FILE from an inline `mod x {` that does not.
-# `r#` because a module may be named with a raw identifier, and
-# `waker/src/lib.rs` writes `mod r#loom;`. The `r#` is not part of the
-# FILE name — the file is `loom.rs` — so it is matched and dropped.
 MOD = re.compile(
     r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;",
     re.M,
 )
-# `#[path = "..."]` on the line(s) before a declaration.
 PATH_ATTR = re.compile(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]')
-
 
 def roots(crate: pathlib.Path):
     """Every file Cargo itself names as an entry point."""
@@ -73,9 +66,6 @@ def roots(crate: pathlib.Path):
                 add(t["path"])
             elif "name" in t and target == "bin":
                 add(f"src/bin/{t['name']}.rs")
-    # Cargo's autodiscovery: `src/main.rs`, `src/bin/*.rs`, and the test,
-    # bench and example directories are targets whether or not the
-    # manifest says so. Each is a root, not a module of anything.
     add("src/main.rs")
     for d, pat in (("src/bin", "*.rs"), ("tests", "*.rs"),
                    ("benches", "*.rs"), ("examples", "*.rs")):
@@ -85,12 +75,10 @@ def roots(crate: pathlib.Path):
             out.append(p)
     return out
 
-
 def declared(text):
     """The module names this file declares, with any `#[path]` override."""
     out = []
     for m in MOD.finditer(text):
-        # Look back over the attributes immediately above the declaration.
         head = text[max(0, m.start() - 400):m.start()]
         over = None
         tail = head.rsplit("\n", 12)[-12:]
@@ -106,7 +94,6 @@ def declared(text):
         out.append((m.group(1), over))
     return out
 
-
 def walk(root: pathlib.Path, seen: set):
     """Follow declarations from `root`, marking every file reached."""
     stack = [root]
@@ -119,8 +106,6 @@ def walk(root: pathlib.Path, seen: set):
             text = f.read_text(errors="replace")
         except OSError:
             continue
-        # A declaration in `a/mod.rs` or in the crate root resolves
-        # beside it; one in `a.rs` resolves under `a/`.
         base = f.parent if f.name in ("mod.rs", "lib.rs", "main.rs") else f.parent / f.stem
         for name, over in declared(text):
             if over:
@@ -130,7 +115,6 @@ def walk(root: pathlib.Path, seen: set):
                 if cand.is_file():
                     stack.append(cand)
                     break
-
 
 def main():
     crates = sorted(p for p in (ROOT / "crates").iterdir() if (p / "Cargo.toml").is_file())
@@ -145,10 +129,6 @@ def main():
             if f.resolve() not in seen:
                 orphans.append(f)
 
-    # THE SELF-VACUITY CHECK, and it is not optional. A walk that resolved
-    # nothing would report zero orphans and look exactly like a clean tree
-    # -- which is the failure mode of the audit this file replaces, and of
-    # the kernel-vocabulary audit before it was fixed.
     if walked < 400:
         print(f"mod audit: only reached {walked} files, so the walk broke "
               f"rather than the tree being clean", file=sys.stderr)
@@ -166,7 +146,6 @@ def main():
 
     print(f"mod audit: {walked} files reachable, 0 orphans")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -92,7 +92,7 @@ __global__ void update_appended(
 {
     const int slot = blockIdx.x;
     const int kh = blockIdx.y;
-    // `num_requests` may be the key's lane ceiling; `win[2]` is the live count.
+
     if (win != nullptr && static_cast<int>(win[2]) < num_requests) num_requests = static_cast<int>(win[2]);
 
     int seen = 0;

@@ -1,4 +1,3 @@
-/// Loads a contract fixture stored next to the test that compiles it.
 fn stored_contract(name: &str) -> ModelContract {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/contracts")
@@ -15,6 +14,65 @@ use checkpoint::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
     QuantSpec, RepackLayout, ScaleForm, TensorId,
 };
+
+fn storage_compiler_every_case() {
+    metal_qwen35_schema_emits_canonical_affine_u4_arena();
+    buffer_join_tile_maps_carry_destination_offsets();
+    direct_copy_lowers_to_identity_extent_write();
+    packed_quant_row_select_uses_byte_exact_offsets();
+    an_expression_may_not_outgrow_the_tensor_it_is_declared_for();
+    target_support_rejects_cuda_decode_at_compile_time();
+    a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate();
+    a_serving_target_refuses_the_encode_a_conversion_target_runs();
+    a_quantized_tensor_may_not_be_cast_straight_to_another_scheme();
+    packed_quant_source_requires_exact_affine_size();
+    gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps();
+    a_repack_declaration_is_checked_against_its_transform();
+    gpt_oss_native_mxfp4_reads_each_interleaved_half_once();
+    gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target();
+    nemotron_h_default_abi_packs_experts_and_exposes_views();
+    a_contract_that_declares_a_name_twice_is_rejected();
+    a_contract_whose_declared_shape_is_wrong_is_rejected();
+    a_head_boundary_shard_is_one_contiguous_run();
+    a_head_boundary_shard_rejects_an_indivisible_world();
+    a_scale_by_zero_is_rejected_at_compile_time();
+    a_scale_by_a_non_finite_factor_is_rejected_at_compile_time();
+    a_scale_over_integer_elements_is_rejected_at_compile_time();
+    a_scale_over_quantized_elements_is_rejected_at_compile_time();
+    a_scale_whose_declared_shape_is_wrong_is_rejected();
+    every_path_names_the_contract_its_error_came_from();
+    a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand();
+    a_sharded_block_scaled_dequant_scales_only_its_own_rank();
+    a_scale_by_a_tensor_no_contract_declares_is_rejected();
+    a_scale_blocks_every_axis_the_factors_divide();
+    a_scale_by_factors_of_a_different_rank_is_rejected();
+    a_scale_by_factors_that_do_not_divide_the_payload_is_rejected();
+    a_scale_by_one_factor_per_element_is_rejected();
+    a_scale_by_an_undeclared_expression_is_rejected();
+    mla_q_kv_a_fusion_produces_joined_tensor();
+    a_block_scaled_fp8_source_carries_its_scale_tensor();
+    a_source_without_a_scale_sibling_names_none();
+    a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows();
+    a_padded_head_dim_materializes_zeros_where_no_source_covers();
+    an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast();
+    scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0();
+    scales_the_loader_writes_while_encoding_fp8_are_f32_factors();
+    scales_the_checkpoint_shipped_are_paired_by_the_contract();
+    scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error();
+    scales_naming_an_undeclared_tensor_are_a_contract_error();
+    scales_may_name_a_tensor_declared_after_them();
+    a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis();
+    an_encode_that_cannot_place_its_scales_is_refused();
+    an_encode_whose_columns_do_not_fill_a_block_is_refused();
+    an_encode_into_a_scheme_no_kernel_writes_is_refused();
+    re_encoding_one_quantized_scheme_as_another_is_refused();
+    a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel();
+    the_same_pair_with_the_cast_written_down_encodes();
+    a_unary_takes_the_logarithm_of_a_negated_plane();
+    a_unary_refuses_an_element_outside_its_domain();
+    a_serving_target_refuses_the_unary_a_conversion_target_runs();
+    the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape();
+}
 
 #[test]
 fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
@@ -81,8 +139,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         preferred_alignment: 256,
         ..StorageTarget::default()
     };
-    // 4-bit weights packed eight to a u32 word: bitcast to logical shape,
-    // affine-U4 encoding, scales/biases as named tensors.
     let affine_u4 = |group_size: u32| {
         Encoding::Quant(
             QuantSpec {
@@ -147,7 +203,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     assert_eq!(program.sources.len(), metadata.tensors.len());
 }
 
-#[test]
 fn buffer_join_tile_maps_carry_destination_offsets() {
     let contract = ModelContract {
         alignment: 1,
@@ -194,13 +249,10 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
     assert_eq!(reblocks[0].stride.element_bytes, 2);
     assert_eq!(reblocks[1].stride.element_bytes, 2);
     assert_eq!(program.memory.device_write_bytes, 16);
-    // No ephemeral declarations, so the two cast inputs count toward
-    // persistent memory instead of temporary peak.
     assert_eq!(program.memory.persistent_bytes, 16);
     assert_eq!(program.memory.temporary_peak_bytes, 0);
 }
 
-#[test]
 fn direct_copy_lowers_to_identity_extent_write() {
     let metadata = Metadata {
         files: vec![File {
@@ -261,9 +313,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
     assert_eq!(program.memory.persistent_bytes, 8);
 }
 
-#[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
-    // Row 2 of a [4, 8] int4 tensor: 8 elements at 4 bits is 4 bytes a row.
     let contract = ModelContract {
         alignment: 1,
         tensors: vec![TensorContract::new(
@@ -292,9 +342,6 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
     assert_eq!(program.memory.device_write_bytes, 4);
 }
 
-/// An expression bigger than the tensor it is declared for is refused at
-/// the declaration, before any offset is produced.
-#[test]
 fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
     let contract = ModelContract {
         alignment: 1,
@@ -314,7 +361,6 @@ fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
     assert!(err.contains("yields [1, 8]"), "{err}");
 }
 
-#[test]
 fn target_support_rejects_cuda_decode_at_compile_time() {
     let contract = ModelContract {
         alignment: 1,
@@ -341,9 +387,6 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
     assert!(err.contains("does not support Decode"), "{err}");
 }
 
-/// A quantized tensor can't cast straight to another scheme, so the route
-/// is decode (a per-group `Scale`) then `Cast` over the intermediate.
-#[test]
 fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
     let int8 = Encoding::Quant(QuantSpec {
         scheme: QuantScheme::Int8Symmetric,
@@ -353,7 +396,6 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         channel_axis: Some(Axis(1)),
     });
     let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
-    // `w` is the decoded BF16 tensor the fixture publishes.
     contract.tensors[1] = contract.tensors[1].clone().internal();
     contract.tensors.push(TensorContract::new(
         "w_int8",
@@ -383,10 +425,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         "decode then encode, each its own kernel"
     );
 
-    // 64 payload + 4 exponents, read once.
     assert_eq!(plan.memory.checkpoint_read_bytes, 68);
-    // `Finalize` puts a name in the engine's bind table; internal
-    // declarations get none.
     let bound: Vec<&str> = plan
         .instrs
         .iter()
@@ -397,16 +436,11 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         .collect();
     assert_eq!(
         bound,
-        // `w`, the decoded intermediate, is the one name missing.
         vec!["scales", "w_int8_scale_inv", "w_int8"],
         "the intermediate is not bound"
     );
 }
 
-/// A serving target refuses the encode a conversion target runs: the stored
-/// form is the served form, so quantizing on the way in is refused, naming
-/// `pie model import` as the fix.
-#[test]
 fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
     let int8 = Encoding::Quant(QuantSpec {
         scheme: QuantScheme::Int8Symmetric,
@@ -474,9 +508,6 @@ fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
     );
 }
 
-/// Casting one quantization scheme straight to another stays refused — the
-/// two-step exists because the one-step does not.
-#[test]
 fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
     let err = compile_load_plan(
         &quant_metadata(),
@@ -497,7 +528,6 @@ fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
     assert!(err.contains("no kernel does that in one step"), "{err}");
 }
 
-#[test]
 fn packed_quant_source_requires_exact_affine_size() {
     let mut metadata = quant_metadata();
     metadata.tensors.push(RawTensor {
@@ -527,12 +557,9 @@ fn packed_quant_source_requires_exact_affine_size() {
     assert!(err.contains("non-affine physical size"));
 }
 
-#[test]
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM must also claim the Marlin
-        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -553,8 +580,6 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
             _ => None,
         })
         .collect();
-    // Six, not eight: the two biases are a row selection, affine, never
-    // reaching a kernel.
     assert_eq!(repacks.len(), 6);
     assert!(repacks.iter().any(|spec| {
         spec.repack
@@ -576,14 +601,9 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
-/// A repack declaration that disagrees with its transform must be refused,
-/// not silently replaced by the transform's own shape.
-#[test]
 fn a_repack_declaration_is_checked_against_its_transform() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM must also claim the Marlin
-        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -607,14 +627,9 @@ fn a_repack_declaration_is_checked_against_its_transform() {
     assert!(error.contains("declares shape"), "{error}");
 }
 
-/// GPT-OSS's gate and up halves are the even and odd rows of one block:
-/// each repack reads only the rows it wants, covering the block once.
-#[test]
 fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM must also claim the Marlin
-        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -626,8 +641,6 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     )
     .unwrap();
 
-    // `gate_up_proj_blocks` is [2, 128, 2, 16] u8: a row is 32 bytes, the
-    // whole tensor is 8192.
     let blocks = TensorId(10);
     let mut halves: Vec<(u64, u64)> = program
         .instrs
@@ -647,9 +660,6 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     assert_eq!(halves[0].1 + halves[1].1, 8192, "the block, once");
 }
 
-/// The repack's source selection is an `Expr::Shard`, so one contract serves
-/// every rank: compiling it at two ranks reads two different bands.
-#[test]
 fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
     let contract = stored_contract("gpt_oss_native_mxfp4_tp1_of_2");
@@ -705,8 +715,6 @@ fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     );
     assert_eq!(bytes0, bytes1, "and each rank must read the same volume");
 
-    // The gate/up block is [2, 256, 2, 16]: a row is 32 bytes, an expert is
-    // 8192. Rank one's band starts halfway into each expert.
     let band_start = |reads: &[(u32, u64, u64)]| {
         reads
             .iter()
@@ -719,7 +727,6 @@ fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     assert_eq!(band_start(&rank1), 128 * 32);
 }
 
-#[test]
 fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -736,8 +743,6 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
             && contract.shape.as_deref() == Some(&[4, 3][..])
     }));
-    // The packed bank declares the whole `[6, 4]`; the `Shard` on axis 1
-    // says this rank binds `[6, 2]` of it.
     assert!(contract.tensors.iter().any(|contract| {
         contract.name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
@@ -778,8 +783,6 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    // Experts are packed contiguously within their backing buffer (tight
-    // 0/12 offsets), so the exposed `*.packed.weight` view is contiguous.
     assert!(
         writes
             .iter()
@@ -791,8 +794,6 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             .any(|(_, bytes, off)| *bytes == 12 && *off == 12)
     );
 
-    // Each expert pack is one persistent backing buffer (2 experts x 12 B =
-    // 24 B), 256-byte aligned for cuBLAS(Lt)'s fast `align8` kernels.
     let backings = program
         .buffers
         .iter()
@@ -804,14 +805,11 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         assert_eq!(*offset % 256, 0, "operand base must be 256-aligned");
     }
 
-    // Raw data moved is unchanged (4 experts x 12 B); persistent arena grows
-    // only by the per-backing alignment padding (2nd backing at offset 256).
     assert_eq!(program.memory.checkpoint_read_bytes, 48);
     assert_eq!(program.memory.device_write_bytes, 48);
     assert_eq!(program.memory.persistent_bytes, 280);
 }
 
-#[test]
 fn a_contract_that_declares_a_name_twice_is_rejected() {
     let one = |name: &str| {
         checkpoint::contract::TensorContract::new(
@@ -832,7 +830,6 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
     assert!(error.contains("declares 'dup' twice"), "{error}");
 }
 
-#[test]
 fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     let contract = checkpoint::contract::ModelContract {
         alignment: 256,
@@ -851,13 +848,7 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("yields [2]"), "{error}");
 }
 
-/// A shard that must land on a unit boundary is said by reshaping the axis
-/// first, sharding, then reshaping back — a byte identity that still
-/// compiles to one contiguous run.
-#[test]
 fn a_head_boundary_shard_is_one_contiguous_run() {
-    // 4 heads of 2 rows, 2 columns; rank 1 of 2 takes heads 2 and 3, which is
-    // rows 4..8, which is bytes 32..64 of an F32 tensor.
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -876,8 +867,6 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
         tensors: vec![TensorContract::new(
             "local",
             expr,
-            // The whole tensor: this rank binds `[4, 2]`, and the `Shard`
-            // is what says so.
             vec![8, 2],
             Encoding::Raw(DType::F32),
         )],
@@ -903,8 +892,6 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
     assert_eq!(reads[0].span_bytes, 32);
 }
 
-/// A `tp_size` that does not divide the unit count is rejected, not rounded.
-#[test]
 fn a_head_boundary_shard_rejects_an_indivisible_world() {
     let metadata = Metadata {
         files: vec![File {
@@ -913,7 +900,6 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
             size_bytes: 48,
             format: CheckpointFormat::Safetensors,
         }],
-        // 3 heads of 2 rows: 6 rows divides by 2, 3 heads does not.
         tensors: vec![sized_raw(0, "w", 0, 48, &[6, 2], DType::F32)],
     };
     let contract = ModelContract {
@@ -924,8 +910,6 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
                 .transmute(TensorType::raw(vec![3, 4], DType::F32))
                 .shard(0)
                 .transmute(TensorType::raw(vec![-1, 2], DType::F32)),
-            // The whole tensor's shape, so what this pins is the shard being
-            // refused and not a declaration mismatch.
             vec![6, 2],
             Encoding::Raw(DType::F32),
         )],
@@ -957,8 +941,6 @@ fn metadata() -> Metadata {
     }
 }
 
-/// A contract that scales `source` by `factor`, for pinning `compile`
-/// against `infer_scale`'s rules.
 fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
     ModelContract {
         alignment: 256,
@@ -972,7 +954,6 @@ fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
     }
 }
 
-#[test]
 fn a_scale_by_zero_is_rejected_at_compile_time() {
     let error = compile_load_plan(
         &metadata(),
@@ -984,7 +965,6 @@ fn a_scale_by_zero_is_rejected_at_compile_time() {
     assert!(error.contains("zero"), "{error}");
 }
 
-#[test]
 fn a_scale_by_a_non_finite_factor_is_rejected_at_compile_time() {
     let error = compile_load_plan(
         &metadata(),
@@ -996,7 +976,6 @@ fn a_scale_by_a_non_finite_factor_is_rejected_at_compile_time() {
     assert!(error.contains("finite"), "{error}");
 }
 
-#[test]
 fn a_scale_over_integer_elements_is_rejected_at_compile_time() {
     let metadata = Metadata {
         tensors: vec![raw(0, "ids", 0, &[2], DType::I32)],
@@ -1012,7 +991,6 @@ fn a_scale_over_integer_elements_is_rejected_at_compile_time() {
     assert!(error.contains("I32"), "{error}");
 }
 
-#[test]
 fn a_scale_over_quantized_elements_is_rejected_at_compile_time() {
     let contract = ModelContract {
         alignment: 256,
@@ -1030,7 +1008,6 @@ fn a_scale_over_quantized_elements_is_rejected_at_compile_time() {
     assert!(error.contains("quantized"), "{error}");
 }
 
-#[test]
 fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
     let contract = ModelContract {
         alignment: 256,
@@ -1048,9 +1025,6 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("declares shape [4]"), "{error}");
 }
 
-/// Every path through the compiler names the contract its error came from —
-/// annotated once, at the boundary, for every path (affine and kernel alike).
-#[test]
 fn every_path_names_the_contract_its_error_came_from() {
     for expr in [
         Expr::src("a"),
@@ -1075,8 +1049,6 @@ fn every_path_names_the_contract_its_error_came_from() {
     }
 }
 
-/// A checkpoint holding one block-scaled MXFP4 tensor (4 rows of 32
-/// elements) and its factors (one E8M0 exponent per row), both raw `U8`.
 fn block_scaled_metadata() -> Metadata {
     Metadata {
         files: vec![File {
@@ -1088,8 +1060,6 @@ fn block_scaled_metadata() -> Metadata {
         tensors: vec![
             sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
             sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
-            // Rejection-test factors: 3 exponents don't divide 4 rows; 128
-            // give one per element.
             sized_raw(2, "s3", 68, 3, &[3, 1], DType::U8),
             sized_raw(3, "s128", 71, 128, &[128], DType::U8),
         ],
@@ -1103,9 +1073,6 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
     }
 }
 
-/// A block-scaled dequant: the factors' shape is the whole statement of how
-/// the payload is blocked — `[4, 1]` over `[4, 32]` is one factor per row,
-/// `[2, 2]` is 2x16 tiles.
 fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelContract {
     ModelContract {
         alignment: 256,
@@ -1135,7 +1102,6 @@ fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelCon
     }
 }
 
-#[test]
 fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     let plan = compile_load_plan(
         &block_scaled_metadata(),
@@ -1172,10 +1138,6 @@ fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     );
 }
 
-/// Each rank dequantizes only the shard it will compute with: `infer`
-/// compares the sharded factors and sharded payload after both are
-/// specialized for the rank.
-#[test]
 fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
     let contract = ModelContract {
         alignment: 256,
@@ -1188,8 +1150,6 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Raw(DType::E8m0),
                     })
                     .shard(0),
-                // Both declarations are the whole tensor's; rank 1 binds
-                // half of each, per the two `Shard`s.
                 vec![4, 1],
                 Encoding::Raw(DType::E8m0),
             ),
@@ -1250,7 +1210,6 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
     );
 }
 
-#[test]
 fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1262,9 +1221,6 @@ fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     assert!(error.contains("is declared before this one"), "{error}");
 }
 
-/// Blocks on two axes at once: `[2, 2]` factors over a `[4, 32]` payload is
-/// a 2x16 tile, neither number named in the contract.
-#[test]
 fn a_scale_blocks_every_axis_the_factors_divide() {
     let plan = compile_load_plan(
         &block_scaled_metadata(),
@@ -1288,7 +1244,6 @@ fn a_scale_blocks_every_axis_the_factors_divide() {
     assert_eq!(blocks, vec![vec![2, 16]]);
 }
 
-#[test]
 fn a_scale_by_factors_of_a_different_rank_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1303,7 +1258,6 @@ fn a_scale_by_factors_of_a_different_rank_is_rejected() {
     );
 }
 
-#[test]
 fn a_scale_by_factors_that_do_not_divide_the_payload_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1318,9 +1272,6 @@ fn a_scale_by_factors_that_do_not_divide_the_payload_is_rejected() {
     );
 }
 
-/// One factor per element groups nothing, so it is an elementwise product and
-/// not a block scale. Symmetry rule A: a node may not denote its operand.
-#[test]
 fn a_scale_by_one_factor_per_element_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1332,9 +1283,6 @@ fn a_scale_by_one_factor_per_element_is_rejected() {
     assert!(error.contains("they group nothing"), "{error}");
 }
 
-/// Scaling by an expression, rather than a published tensor, is refused —
-/// the engine reads factors by name.
-#[test]
 fn a_scale_by_an_undeclared_expression_is_rejected() {
     let contract = ModelContract {
         alignment: 256,
@@ -1568,9 +1516,6 @@ fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
         .fold(dtype.bytes_ceil(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
-// ── MLA weight fusion tests ─────────────────────────────────────────
-
-#[test]
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
     let h = 128i64;
     let q_lora = 32i64;
@@ -1642,7 +1587,6 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     let program = compile_load_plan(&meta, &contract, target).unwrap();
     let summary = checkpoint::dump::describe(&program);
 
-    // The fusion should have joined q_a_proj + kv_a_proj into one tensor
     let has_fused = program
         .tensors
         .iter()
@@ -1653,7 +1597,6 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
         program.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
-    // The fused tensor should have rows = q_lora + kv_lora_rope
     let fused = program
         .tensors
         .iter()
@@ -1662,7 +1605,6 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     assert_eq!(fused.shape[0], q_lora + kv_lora_rope);
     assert_eq!(fused.shape[1], h);
 
-    // Summary should show the plan compiled successfully
     assert!(!program.tensors.is_empty());
     assert!(
         program
@@ -1686,9 +1628,6 @@ fn instr_id(instr: &StorageInstr) -> checkpoint::types::InstrId {
     }
 }
 
-/// A block-scaled FP8 source names its scale tensor on the instruction,
-/// rather than the executor reconstructing it by appending `_scale_inv`.
-#[test]
 fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
     let metadata = Metadata {
         files: vec![File {
@@ -1737,8 +1676,6 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
     assert_eq!(encodes, vec![Some(TensorId(1))]);
 }
 
-/// ...and a source with no such sibling says so, rather than naming tensor 0.
-#[test]
 fn a_source_without_a_scale_sibling_names_none() {
     let metadata = Metadata {
         files: vec![File {
@@ -1775,9 +1712,7 @@ fn a_source_without_a_scale_sibling_names_none() {
     }
 }
 
-#[test]
 fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
-    // Pads Q/K/V up to a head_dim the attention kernel takes.
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -1826,8 +1761,6 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(fills.len(), 1, "one fill, not one per band");
     let (fill_id, filled) = fills[0];
 
-    // Four rows: the destination stride is wider than the row and `fold`
-    // will not skip in the destination.
     let writes: Vec<_> = program
         .instrs
         .iter()
@@ -1840,31 +1773,23 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
         .collect();
     assert_eq!(writes.len(), 4);
 
-    // The fill has to run before every one of them, or it erases what they wrote.
     let at = |want| program.schedule.iter().position(|id| *id == want).unwrap();
     let fill_at = at(fill_id);
     for write in &writes {
         assert!(fill_at < at(instr_id(write)), "the fill must come first");
     }
 
-    // The padded column is real memory that no source covers.
     assert_eq!(program.memory.checkpoint_read_bytes, 32);
     assert_eq!(program.memory.device_write_bytes, 32);
     assert_eq!(program.memory.persistent_bytes, 40);
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
 }
 
-/// The padding is actually zero when the plan runs — the test above only
-/// proves the plan says `Fill`, not that executing it produces zeros.
-#[test]
 fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     let dir = std::env::temp_dir().join(format!("pie_fill_replay_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let snapshot = dir.join("model.safetensors");
 
-    // Every byte non-zero, so an uninitialised pad cannot pass by
-    // coincidence and a pad written from the wrong offset shows up as
-    // source bytes rather than zeros.
     let source: Vec<u8> = (0..32).map(|i| (i as u8) | 0x80).collect();
     std::fs::write(&snapshot, &source).unwrap();
 
@@ -1926,9 +1851,6 @@ fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Reading raw bytes as `E8m0` and declaring `F32` hits the ordinary
-/// dtype-mismatch rule, which inserts the cast.
-#[test]
 fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
     let metadata = Metadata {
         files: vec![File {
@@ -1973,10 +1895,6 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
     assert_eq!(casts, 1, "expected exactly one Cast, got plan {program:#?}");
 }
 
-// ── quant attachments ──────────────────────────────────
-// A quantized weight and its scales are two runtime tensors, paired by
-// whoever declares the scale tensor.
-
 fn scale_target() -> StorageTarget {
     StorageTarget {
         backend: BackendKind::Cuda,
@@ -1985,9 +1903,6 @@ fn scale_target() -> StorageTarget {
     }
 }
 
-/// The MXFP4 GEMM asserts its scale operand is U8, so a plan that asks the
-/// engine to expand these to F32 makes the kernel reject the load.
-#[test]
 fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     let metadata = Metadata {
         files: vec![File {
@@ -2017,18 +1932,13 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     assert_eq!(attach.scale_form, ScaleForm::RawE8M0);
     assert_eq!(attach.granularity, QuantGranularity::PerGroup);
     assert_eq!(attach.group_size, 32);
-    // Both halves name real entries.
     assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
-    // `.scales` is the one spelling: an encoded plane binds under the same
-    // name as a shipped one, `<w>.scales`. See `ScaleLayout::for_encode`.
     assert_eq!(
         program.tensors[attach.scale_tensor.0 as usize].name,
         "runtime.w.scales"
     );
 }
 
-/// The same, for the per-channel schemes: one F32 factor per output row.
-#[test]
 fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
     let metadata = Metadata {
         files: vec![File {
@@ -2058,9 +1968,6 @@ fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
     );
 }
 
-/// Block-scaled FP8 arrives already quantized: the loader writes no
-/// scales, so the contract states the pairing.
-#[test]
 fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
     let metadata = Metadata {
         files: vec![File {
@@ -2111,12 +2018,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
     );
 }
 
-/// A contract that names a tensor no earlier entry declares is rejected,
-/// rather than silently producing a plan with no attachment.
-#[test]
 fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
-    // The loader writes this weight's scales itself while encoding it. A
-    // contract naming a second set would attach quant metadata twice.
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -2161,7 +2063,6 @@ fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
     assert!(err.contains("already has scales"), "{err}");
 }
 
-#[test]
 fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
     let metadata = Metadata {
         files: vec![File {
@@ -2198,8 +2099,6 @@ fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
     assert!(error.contains("the contract does not declare"), "{error}");
 }
 
-/// Scales may be declared before the tensor they scale.
-#[test]
 fn scales_may_name_a_tensor_declared_after_them() {
     let metadata = Metadata {
         files: vec![File {
@@ -2248,8 +2147,6 @@ fn scales_may_name_a_tensor_declared_after_them() {
     );
 }
 
-/// A quantized weight without its scales is not a smaller weight, it is an
-/// unreadable one.
 fn encode_to(
     name: &str,
     shape: &[i64],
@@ -2284,9 +2181,6 @@ fn encode_to(
     compile_load_plan(&metadata, &contract, scale_target())
 }
 
-/// A rank-3 expert bank encodes, and its scales keep the leading (expert)
-/// axis, since the engine binds the plane at its declared rank.
-#[test]
 fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
     let plan = encode_to("runtime.w", &[2, 64, 64], QuantScheme::Mxfp4E2M1E8M0).unwrap();
     assert_eq!(plan.attachments.len(), 1, "{:#?}", plan.attachments);
@@ -2294,38 +2188,26 @@ fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
     let scales = &plan.tensors[attach.scale_tensor.0 as usize];
     assert_eq!(scales.name, "runtime.w.scales");
     assert_eq!(scales.shape, vec![2, 64, 2]);
-    // The blocked axis is the last one, whatever rank the bank has.
     assert_eq!(attach.channel_axis, 2);
     assert_eq!(attach.group_size, 32);
 }
 
-/// A rank-1 declaration has no axis left to hold one scale per row, so it
-/// is refused rather than folded into a plausible one-row weight.
-#[test]
 fn an_encode_that_cannot_place_its_scales_is_refused() {
     let err = encode_to("runtime.w", &[64], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
     assert!(err.to_string().contains("rank-1"), "{err}");
     assert!(err.to_string().contains("runtime.w"), "{err}");
 }
 
-/// The column count is part of the scale layout, not just of the payload.
-#[test]
 fn an_encode_whose_columns_do_not_fill_a_block_is_refused() {
     let err = encode_to("runtime.w", &[64, 48], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
     assert!(err.to_string().contains("blocks 32 columns"), "{err}");
 }
 
-/// `QuantScheme` names every format the loader can *read*; only three have
-/// an encoder.
-#[test]
 fn an_encode_into_a_scheme_no_kernel_writes_is_refused() {
     let err = encode_to("runtime.w", &[64, 64], QuantScheme::AwqInt4).unwrap_err();
     assert!(err.to_string().contains("no encode kernel writes"), "{err}");
 }
 
-/// Re-encoding one quantized scheme as another is refused — no backend
-/// implements a `Transcode`.
-#[test]
 fn re_encoding_one_quantized_scheme_as_another_is_refused() {
     let metadata = Metadata {
         files: vec![File {
@@ -2365,9 +2247,6 @@ fn re_encoding_one_quantized_scheme_as_another_is_refused() {
     );
 }
 
-/// A declaration that disagrees with its expression is a compile error, not
-/// something that silently triggers a conversion kernel.
-#[test]
 fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() {
     let metadata = Metadata {
         files: vec![File {
@@ -2395,9 +2274,6 @@ fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() 
     assert!(err.contains("explicit cast"), "{err}");
 }
 
-/// With the cast written down, the same pair compiles and publishes the
-/// scales the encoder needs.
-#[test]
 fn the_same_pair_with_the_cast_written_down_encodes() {
     let plan = encode_to("runtime.w", &[64, 64], QuantScheme::Fp8E4M3).unwrap();
     let names: Vec<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
@@ -2405,7 +2281,6 @@ fn the_same_pair_with_the_cast_written_down_encodes() {
     assert!(names.contains(&"runtime.w_scale_inv"), "{names:?}");
 }
 
-/// The one f32 plane a `Unary` test needs, written to a temporary snapshot.
 fn negative_plane(dir: &std::path::Path, values: &[f32]) -> Metadata {
     let mut bytes = Vec::new();
     for value in values {
@@ -2445,11 +2320,6 @@ fn neg_ln_contract() -> ModelContract {
     }
 }
 
-/// `ln(-x)` over the plane, run by the host executor. The values are the
-/// first four of a `Qwen3.5-0.8B-Q4_K_M`'s `blk.0.ssm_a`, and the answers
-/// are that model's safetensors `A_log` — so this pins the arithmetic
-/// against a real pair rather than against itself.
-#[test]
 fn a_unary_takes_the_logarithm_of_a_negated_plane() {
     let dir = std::env::temp_dir().join(format!("pie_unary_{}", std::process::id()));
     let stored = [-1.294_096_f32, -0.131_171, -0.119_433, -0.567_561];
@@ -2479,10 +2349,6 @@ fn a_unary_takes_the_logarithm_of_a_negated_plane() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A value outside the function's domain is a wrong checkpoint, not a
-/// wrong number: `ln(-x)` of a positive element would be `NaN`, which
-/// reaches the weights as fluent nonsense rather than as a failure.
-#[test]
 fn a_unary_refuses_an_element_outside_its_domain() {
     let dir = std::env::temp_dir().join(format!("pie_unary_bad_{}", std::process::id()));
     let metadata = negative_plane(&dir, &[-1.0, -2.0, 0.5, -4.0]);
@@ -2497,10 +2363,6 @@ fn a_unary_refuses_an_element_outside_its_domain() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The transform is import-time only: no device mask carries its bit, so a
-/// serving plan naming one is refused at compile time rather than failing
-/// at boot. That is what keeps the answer in the artifact.
-#[test]
 fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
     let dir = std::env::temp_dir().join(format!("pie_unary_mask_{}", std::process::id()));
     let metadata = negative_plane(&dir, &[-1.0, -2.0, -3.0, -4.0]);
@@ -2526,7 +2388,6 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
         assert!(err.contains("would apply Some(NegLn) on the way in"), "{backend:?}: {err}");
     }
 
-    // And the conversion mask, which is where it belongs, does run it.
     compile_load_plan(
         &metadata,
         &contract,
@@ -2539,26 +2400,13 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// The tiled affine repack, at the shapes a shipped row actually has
-// ─────────────────────────────────────────────────────────────────────────
-
-/// The projection rectangles `qwen35-d0.8b-u4g64-kv-bf16` declares
-/// `U4g64tiled`, read off its own artifact.
-///
-/// **`in_ba` is the one that matters.** Thirty-two rows is two whole bands
-/// and narrower than the column tile the kernel carves, and every other
-/// statement of this layout in the tree is exercised at 512 rows or more —
-/// so a map that folded the row axis into the tile would pass everywhere
-/// else and fail here.
 const TILED_ROWS: [(usize, usize); 4] = [
-    (32, 1024),   // in_ba
-    (1024, 2048), // out_proj
-    (7168, 1024), // gate_up
-    (1024, 3584), // down
+    (32, 1024),
+    (1024, 2048),
+    (7168, 1024),
+    (1024, 3584),
 ];
 
-/// One `[rows, k]` plane of pseudo-random four-bit codes, two to a byte.
 fn tiled_codes(dir: &std::path::Path, rows: usize, k: usize) -> Metadata {
     let mut bytes = vec![0u8; rows * k / 2];
     let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ (rows as u64) << 32 ^ k as u64;
@@ -2602,26 +2450,6 @@ fn tiled_u4() -> Encoding {
     )
 }
 
-/// **THE PRODUCTION REPACK IS EXACTLY THE FRAGMENT MAP, AND LOSES NOTHING.**
-///
-/// The layout is written down in four places — `executor::walk`'s
-/// `repack_bytes`, `kernels_cuda`'s `linear/tiled.cuh`, that kernel's own
-/// host repack, and a transcription in `engine-cuda`'s tiled test — and
-/// until this test nothing compared any two of them over the executor. The
-/// gap was not theoretical: a road that published canonical bytes under a
-/// `U4g64tiled` declaration shipped, and every existing test passed, because
-/// each checked a copy of the map against itself rather than against what
-/// the executor writes.
-///
-/// So this reads the map the OTHER way. It runs the real `Expr::Repack`
-/// through `Execution`, then walks the output word by word and scatters each
-/// nibble back to the `(n, k)` the kernel's comment says it came from —
-/// `k = 16*kt + 2*(lane%4) + 8*(s&1) + h`, `n = 16*band + lane/4 + 8*(s>=2)`,
-/// nibble `4*(s + 4*h)`, word order `[band][k quad][lane][4]`. Recovering
-/// the source exactly, with every code written exactly once, is a statement
-/// no self-comparison can make: a permutation that dropped, duplicated or
-/// displaced a nibble fails, and so does one that reads a shape wrong.
-#[test]
 fn the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape() {
     const BAND: usize = 16;
     const STEP: usize = 64;
@@ -2667,16 +2495,12 @@ fn the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape() {
             banded * row_bytes,
             "{rows}x{k}: the placed plane is the banded rectangle"
         );
-        // The bug this test exists for: a road that published canonical
-        // bytes under a placed declaration. The map moves every one of
-        // these shapes, so landing the source unchanged is that bug.
         assert_ne!(
             &got[..source.len()],
             &source[..],
             "{rows}x{k}: the placed plane is the source verbatim -- no repack ran"
         );
 
-        // Scatter every nibble back to where the kernel says it came from.
         let mut seen = vec![0u8; rows * k];
         let mut back = vec![0u8; rows * k];
         let quad = STEP / BAND;

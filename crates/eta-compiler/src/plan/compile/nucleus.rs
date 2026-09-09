@@ -1,9 +1,3 @@
-//! Recognizes the `softmax -> top-p mask -> Gumbel noise -> argmax` dataflow
-//! and reports it as a [`LibraryMatch`]; [`super::region`] decides what to do
-//! with one. Four independent conditions gate a match (right ops, recoverable
-//! inputs, exclusive chain, types agree), each its own function returning
-//! `None` — refusing to match is always safe, matching wrongly is not.
-
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -15,8 +9,6 @@ use super::normalize::{NodeIndex, NormalizedStage};
 use super::region::{LibraryOp, StageIndex};
 use super::symbolic::{Dimension, symbolic_dims_match_expected, symbolic_shape_matches_static};
 
-/// One recognized library dataflow: which library, which nodes it consumes,
-/// and the values crossing its boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LibraryMatch {
     pub(crate) library: LibraryOp,
@@ -61,8 +53,6 @@ fn match_nucleus_dataflow(
         .or_else(|| match_nucleus_add_order(stage, final_node, perturbed, right, left, index))
 }
 
-/// The seven ops [`eta_ir::expand::softmax`] emits, recovered by walking back
-/// from the probabilities they produce.
 struct Softmax {
     maximum_node: NodeIndex,
     maximum_broadcast_node: NodeIndex,
@@ -77,12 +67,9 @@ struct Softmax {
     exponentials: ValueId,
     sum: ValueId,
     sum_broadcast: ValueId,
-    /// The shape both broadcasts were given, which they have to agree on.
     shape: Shape,
 }
 
-/// Invert [`eta_ir::expand::softmax`], checking that both reductions read the
-/// same `logits` the caller already found.
 fn match_softmax(
     stage: &NormalizedStage,
     probabilities: ValueId,
@@ -164,11 +151,6 @@ fn match_softmax(
     })
 }
 
-/// The chain [`eta_ir::expand::nucleus_sample`] emits, read backwards.
-/// [`match_chain`] does recovery only; three named predicates judge it:
-/// which values enter the library call ([`nucleus_library_inputs`]), whether
-/// the chain is exclusively its own ([`chain_is_exclusive`]), and whether
-/// types line up ([`chain_types_agree`]).
 struct Chain {
     softmax: Softmax,
     pivot_node: NodeIndex,
@@ -177,9 +159,6 @@ struct Chain {
     rng_node: NodeIndex,
     add_node: NodeIndex,
     final_node: NodeIndex,
-    /// What the chain reduces, centers and selects from. A temperature divide
-    /// feeding it is folded in by [`nucleus_library_inputs`], so this is not
-    /// necessarily what the library ends up reading.
     logits: ValueId,
     probabilities: ValueId,
     keep: ValueId,
@@ -190,12 +169,10 @@ struct Chain {
     token: ValueId,
     top_p: ValueId,
     rng_state: ValueId,
-    /// The shape the gumbel draw was given, which the softmax has to match.
     rng_shape: Shape,
 }
 
 impl Chain {
-    /// Every node the library call would consume, in emission order.
     fn nodes(&self) -> [NodeIndex; 13] {
         let s = &self.softmax;
         [
@@ -215,9 +192,6 @@ impl Chain {
         ]
     }
 
-    /// Each intermediate and the nodes the chain expects to read it — the
-    /// chain's fan-out, which is what makes a match exclusive rather than
-    /// merely present.
     fn expected_consumers(&self) -> [(ValueId, Vec<NodeIndex>); 12] {
         let s = &self.softmax;
         [
@@ -237,10 +211,6 @@ impl Chain {
     }
 }
 
-/// Walk back from an `argmax(masked + noise)` over the shape
-/// [`eta_ir::expand::nucleus_sample`] emits: `mask_apply`, then `gumbel`,
-/// then the pivot, then the softmax it ranks. Only checks wiring, not types
-/// or other readers.
 fn match_chain(
     stage: &NormalizedStage,
     final_node: NodeIndex,
@@ -318,18 +288,11 @@ fn match_chain(
     })
 }
 
-/// What the library call reads.
 struct LibraryInputs {
-    /// The region's inputs, in the order the kernel takes them.
     values: Vec<ValueId>,
-    /// The `(logits, divisor)` of a temperature divide the kernel absorbed.
     scaled: Option<(ValueId, ValueId)>,
 }
 
-/// The values the library call reads, and the temperature divide it absorbs.
-/// A `logits / t` feeding the chain is folded in when the chain is the only
-/// reader of the scaled result (a `reshape` in between is seen through);
-/// when the divide is shared, the fold is dropped rather than the match.
 fn nucleus_library_inputs(
     stage: &NormalizedStage,
     chain: &Chain,
@@ -374,12 +337,6 @@ fn nucleus_library_inputs(
     })
 }
 
-/// Whether the chain is the library call's alone to take, and the nodes it
-/// would take. Three ways it is not: a node appears twice (the "chain"
-/// folded back on itself); an input is produced inside (replacing the nodes
-/// would delete its own argument); or an intermediate is read from outside
-/// (it outlives the ops that made it). The result must also escape (a chain
-/// nothing reads is dead code, not a library call).
 fn chain_is_exclusive(
     chain: &Chain,
     library_inputs: &[ValueId],
@@ -418,10 +375,6 @@ fn chain_is_exclusive(
     Some(ordered_nodes)
 }
 
-/// Whether every value in the chain has the type the library kernel assumes:
-/// f32 logits over rows, one `u32[2]` rng state, an f32 `top_p` scalar or
-/// per-row, and one i32 per row out. Everything else is logits-shaped,
-/// row-shaped or scalar.
 fn chain_types_agree(
     stage: &NormalizedStage,
     chain: &Chain,
@@ -508,11 +461,6 @@ fn chain_types_agree(
     Some(())
 }
 
-/// Match one operand order of the `masked + noise` add.
-///
-/// Four independent questions, asked in the only order that works: what the
-/// ops are, what the library would read, whether the chain is exclusively
-/// its own, and whether the types agree.
 fn match_nucleus_add_order(
     stage: &NormalizedStage,
     final_node: NodeIndex,

@@ -1,14 +1,8 @@
-//! `emit_singleton_region_msl` — the tier-1 kernel: one dispatch runs exactly
-//! one op through the runtime's `ptir_m1_execute` switch.
-
 use alloc::string::String;
 use core::fmt::Write as _;
 
 use super::preamble::RUNTIME_TEMPLATE;
 
-/// `emit_singleton_region_msl`. Total: the tag is passed straight through to
-/// the runtime switch, which faults at run time on anything it does not
-/// implement.
 pub fn emit_singleton_region(function_name: &str, op_tag: u8) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);

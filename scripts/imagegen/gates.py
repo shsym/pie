@@ -67,11 +67,6 @@ VENV = "/root/.venv/imagegen/bin/python"
 
 PASS, FAIL, SKIP, ERROR = "pass", "FAIL", "skip", "ERROR"
 
-
-# ----------------------------------------------------------------------------
-# the shape of a gate
-# ----------------------------------------------------------------------------
-
 class Gate:
     """One row of the table.
 
@@ -90,14 +85,9 @@ class Gate:
         self.needs = needs
         self.steps = steps
         self.readout = readout
-        self.config = config          # None, or the kwargs for `write_config`
+        self.config = config
         self.timeout = timeout
         self.note = note
-
-
-# ----------------------------------------------------------------------------
-# configs: one file, one port, one scratch dir, per gate
-# ----------------------------------------------------------------------------
 
 CONFIG = """\
 # Written by `scripts/imagegen/gates.py` for the `{name}` gate. PRIVATE to this
@@ -134,7 +124,6 @@ allow_network = false
 fs_scratch_dir = "{scratch}"
 """
 
-
 def port_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -144,18 +133,12 @@ def port_free(port: int) -> bool:
         except OSError:
             return False
 
-
 def write_config(ctx, gate) -> str:
     """The gate's own config file, at the first free port from its base."""
     spec = dict(gate.config)
     port = spec.pop("port")
     while not port_free(port):
         port += 1
-    # The sandbox's scratch root is a directory of its OWN, never the gate's
-    # `--out`. `flux2_klein_parity.py` hands its case to the running instance
-    # by watching this root for the per-process directory pie makes and taking
-    # the newest entry; sharing the root with `--out` makes the harness's own
-    # `pie.stdout` the newest entry and it copies the case into a file.
     scratch = os.path.join(ctx.out, gate.name, "scratch")
     os.makedirs(scratch, exist_ok=True)
     text = CONFIG.format(
@@ -165,9 +148,6 @@ def write_config(ctx, gate) -> str:
         mem=spec.pop("mem", 0.90),
         rows=spec.pop("rows", 32768),
         timeout=spec.pop("timeout", "600s"),
-        # `[model] max_voxels`: the third row axis's PORT ceiling. Stated
-        # only by a gate that needs more than the derived 65 536 — a
-        # `vae.encode` of a 1024^2 picture takes 1 048 576 pixel voxels in.
         voxels=("max_voxels = {}".format(spec.pop("voxels"))
                 if "voxels" in spec else ""),
     )
@@ -176,11 +156,6 @@ def write_config(ctx, gate) -> str:
     with open(path, "w") as f:
         f.write(text)
     return path
-
-
-# ----------------------------------------------------------------------------
-# running a step, and reaping what it leaves
-# ----------------------------------------------------------------------------
 
 def stray_pies(marker: str) -> list[tuple[int, str]]:
     """Every live `pie` whose command line carries `marker`.
@@ -207,7 +182,6 @@ def stray_pies(marker: str) -> list[tuple[int, str]]:
         found.append((int(entry), " ".join(argv)[:160]))
     return found
 
-
 def reap(pid: int | None, marker: str, log) -> None:
     """Kill the step's whole session, then sweep for a pie it orphaned."""
     if pid is not None:
@@ -230,7 +204,6 @@ def reap(pid: int | None, marker: str, log) -> None:
     if left:
         log(f"[reap] WARNING {len(left)} pie process(es) survived SIGKILL: "
             f"{[pid for pid, _ in left]}")
-
 
 def step(ctx, argv, cwd, timeout, marker, log) -> tuple[int, str]:
     """One command, in its own session, reaped whatever happens."""
@@ -261,21 +234,14 @@ def step(ctx, argv, cwd, timeout, marker, log) -> tuple[int, str]:
         log("  " + line)
     return code, text
 
-
-# ----------------------------------------------------------------------------
-# readouts: the numbers the harnesses print, lifted out
-# ----------------------------------------------------------------------------
-
 COS = re.compile(r"worst cos ([0-9]*\.?[0-9]+)")
 PSNR = re.compile(r"PSNR\(([^)]*)\)\s*=\s*(-?[0-9.]+|inf|nan) dB")
 CLAIM = re.compile(r"\[claim\] (PASS|FAIL) (.+)")
 SECTION = re.compile(r"=+ ([a-z_0-9]+): ")
 
-
 def worst_cos(text: str) -> str:
     hits = [float(m) for m in COS.findall(text)]
     return f"cos {min(hits):.6f}" if hits else "cos ?"
-
 
 def psnrs(text: str, keep: str = "") -> list[tuple[str, float]]:
     out = []
@@ -285,18 +251,15 @@ def psnrs(text: str, keep: str = "") -> list[tuple[str, float]]:
         out.append((what.strip(), float(value)))
     return out
 
-
 def row_cos(text: str, key: str) -> float | None:
     """The cosine column of one `compare.py` row (its last field)."""
     hit = re.search(rf"^\s*{re.escape(key)}\s+\(.*?([0-9]\.[0-9]+)(?:\s+FAIL:\S*)?\s*$",
                     text, re.M)
     return float(hit.group(1)) if hit else None
 
-
 def claims(text: str) -> list[str]:
     return [f"{verdict.lower()}: {what.split(':')[0].strip()}"
             for verdict, what in CLAIM.findall(text)]
-
 
 def sectioned_cos(text: str) -> str:
     """`zimage_parity.py gate` banners each mode; report each mode's own cos."""
@@ -313,10 +276,8 @@ def sectioned_cos(text: str) -> str:
         return worst_cos(text)
     return "  ".join(f"{k} {v:.6f}" for k, v in parts.items())
 
-
 def plain(text: str) -> str:
     return worst_cos(text)
-
 
 def guidance_readout(text: str) -> str:
     """`mini_dit_parity.py guidance`: the three claims, worst case each."""
@@ -341,7 +302,6 @@ def guidance_readout(text: str) -> str:
         bits.append(f"moves {moved.group(1)}")
     return "  ".join(bits) or "no guidance lines"
 
-
 def step_cache_readout(text: str) -> str:
     """`mini_dit_cache.py`: the three claims, worst case each."""
     def verdict(pattern: str, label: str) -> str | None:
@@ -364,17 +324,13 @@ def step_cache_readout(text: str) -> str:
         bits.append(f"middle {partial.group(1)}/{partial.group(2)} {partial.group(3)}")
     return "  ".join(bits) or "no cache lines"
 
-
 def zimage_turbo_readout(text: str) -> str:
     bits = [sectioned_cos(text)]
     for _, value in psnrs(text, keep="golden latent decode"):
         bits.append(f"PSNR {value:.2f} dB")
     return "  ".join(bits)
 
-
 def klein_readout(text: str) -> str:
-    # `worst cos` here is the minimum over the GATED readings: `text.hidden`,
-    # `dit.step0.out` and `probe.step{0..3}.out`, all at --cos-tol 0.999.
     bits = [worst_cos(text)]
     walk = re.search(r"latent\.final\s+cos ([0-9.]+)", text)
     if walk:
@@ -382,7 +338,6 @@ def klein_readout(text: str) -> str:
     for _, value in psnrs(text, keep="pie.png"):
         bits.append(f"PSNR {value:.2f} dB")
     return "  ".join(bits)
-
 
 def rust_cos_readout(text: str) -> str:
     bits = []
@@ -394,7 +349,6 @@ def rust_cos_readout(text: str) -> str:
         return worst_cos(text)
     return "  ".join(bits)
 
-
 def zimage_vae_readout(text: str) -> str:
     bits = []
     guest = re.search(r"\[compare\] cos ([0-9.]+)", text)
@@ -405,14 +359,12 @@ def zimage_vae_readout(text: str) -> str:
         bits.append(f"host {host}")
     return "  ".join(bits) or "cos ?"
 
-
 def wan_readout(text: str) -> str:
     bits = [worst_cos(text)]
     move = re.search(r"moves the velocity by ([0-9.]+)", text)
     if move:
         bits.append(f"prompt moves {float(move.group(1)):.4f}")
     return "  ".join(bits)
-
 
 def hy3_readout(text: str) -> str:
     velocity = row_cos(text, "image_out.velocity.rows")
@@ -421,7 +373,6 @@ def hy3_readout(text: str) -> str:
     bits += claims(text)
     return "  ".join(bits)
 
-
 def ltx_readout(text: str) -> str:
     bits = [worst_cos(text)]
     if "MUST MOVE" in text:
@@ -429,15 +380,11 @@ def ltx_readout(text: str) -> str:
                     else "conditioning DID NOT move")
     return "  ".join(bits)
 
-
 def wan_video_readout(text: str) -> str:
     bits = []
     host = rust_cos_readout(text)
     if host != "cos ?":
         bits.append(f"vae {host}")
-    # Both directions' cache claim: the decoder prints `cacheless frame k`,
-    # the encoder `cacheless chunk k`, and each is the same statement —
-    # zeroing the frame caches must move the answer.
     cold = re.findall(r"cacheless (?:frame|chunk) \d+: cos ([0-9.]+)", text)
     if cold:
         bits.append("cacheless " + "/".join(f"{float(v):.4f}" for v in cold))
@@ -445,10 +392,6 @@ def wan_video_readout(text: str) -> str:
     size = re.search(r"\[gates\] (\d+)x(\d+) mp4, (\d+) frames", text)
     if size:
         bits.append(f"{size.group(1)}x{size.group(2)}x{size.group(3)} mp4")
-    # The ungated run and the guided one, in step order. Guidance must MOVE
-    # the latent, or the second branch conditioned nothing: `s = 5` on an
-    # undistilled row widens the distribution, and a std that did not budge
-    # is a guided run that was not guided.
     stds = [float(v) for v in re.findall(r'"std":([0-9.]+)', text)]
     guided = re.findall(r'"cfg":(true|false)', text)
     if len(stds) >= 2 and guided[:2] == ["false", "true"]:
@@ -461,7 +404,6 @@ def wan_video_readout(text: str) -> str:
     if clips:
         bits.append(clips[-1])
     return "  ".join(bits) or "no clip"
-
 
 def v2v_claims(text: str) -> list[str]:
     """VIDEO2VIDEO's two identities, measured on the decoded pixels.
@@ -516,8 +458,6 @@ def v2v_claims(text: str) -> list[str]:
         def apart(a, b):
             return float(np.abs(clips[a] - clips[b]).mean())
 
-        # The three runs that OUGHT to be one clip, and how far the row's own
-        # irreproducibility actually spreads them.
         spread = max(apart(a, b) for a, b in itertools.combinations(same_run, 2))
         nearest = min(apart(a, b) for a in same_run for b in others)
         lo, hi = apart("v2v-02", "v2v-src"), apart("v2v-04", "v2v-src")
@@ -528,18 +468,10 @@ def v2v_claims(text: str) -> list[str]:
                 f"strength 1.0 IS txt2vid: the trio spans {spread:.5f}, the nearest "
                 f"other clip is {nearest:.4f} "
                 f"({'pass' if spread < nearest else 'FAIL'})"]
-    except Exception as why:  # noqa: BLE001 — a readout never fails the gate silently
+    except Exception as why:
         return [f"video2video claims unread: {why}"]
 
-
-# A reference has to move the picture by MORE than a fire's own bf16 noise.
-# A four-lane fire and a three-lane one give the same lane different answers
-# (measured elsewhere in this file's roster: rel 0.0056), so "the picture
-# changed" is only evidence at a margin well past that. 0.02 mean absolute
-# error over [0, 1] channels is ~5/255 a channel: a picture that visibly
-# changed, not one that drifted.
 REF_MOVES = 0.02
-
 
 def t2i_readout(text: str) -> str:
     """The picture, the img2img claims, and the reference-lane claims.
@@ -597,7 +529,7 @@ def t2i_readout(text: str) -> str:
             bits.append(f"i2i 0.4 is {near:.4f} from the input, txt2img {far:.4f} "
                         f"({'pass' if near < far else 'FAIL'})")
             bits.append(f"strength 1.0 IS txt2img ({'pass' if same else 'FAIL'})")
-        except Exception as why:  # noqa: BLE001 — a readout never fails the gate silently
+        except Exception as why:
             bits.append(f"img2img claims unread: {why}")
     if {"ref-none", "ref-a", "ref-b", "ref-ab"} <= named.keys():
         try:
@@ -619,27 +551,19 @@ def t2i_readout(text: str) -> str:
             bits.append(f"two references differ {differ:.4f} ({ok})")
             ok = "pass" if both >= REF_MOVES else "FAIL"
             bits.append(f"both-at-once differs from either {both:.4f} ({ok})")
-        except Exception as why:  # noqa: BLE001 — a readout never fails the gate silently
+        except Exception as why:
             bits.append(f"reference claims unread: {why}")
     if pngs:
         bits.append(named.get("picture", pngs[0]))
     return "  ".join(bits) or "no picture"
 
-
-# ----------------------------------------------------------------------------
-# the roster
-# ----------------------------------------------------------------------------
-
 def g(*parts) -> str:
     return os.path.join(GOLDEN, *parts)
-
 
 def a(name) -> str:
     return os.path.join(ARTIFACTS, name)
 
-
 IMPORT = "pie model import"
-
 
 def harness(script, *args):
     """A step that runs one of this directory's harnesses."""
@@ -650,17 +574,13 @@ def harness(script, *args):
         return argv, REPO
     return build
 
-
 def cargo_test(name):
     def build(ctx, gate):
         return ([ctx.cargo, "test", "-p", "engine-cuda", "--features", "cuda",
                  "--test", name, "--", "--nocapture"], REPO)
     return build
 
-
-# Well under `MAX_ARG_STRLEN` (128 KiB), with room for the flag beside it.
 PIECE = 96 * 1024
-
 
 def b64_pieces(path: str) -> list[str]:
     """One picture as base64, split into argv-sized pieces.
@@ -681,7 +601,6 @@ def b64_pieces(path: str) -> list[str]:
     step = -(-len(text) // n)
     return [text[i * step:(i + 1) * step] for i in range(n)]
 
-
 def t2v_step(prompt_ids, width, height, frames, steps, seed,
              negative_ids=None, guidance=None, out_name="clip",
              init_from=None, strength=None, fmt=None):
@@ -701,13 +620,10 @@ def t2v_step(prompt_ids, width, height, frames, steps, seed,
         if fmt is not None:
             argv += ["--clip-format", fmt]
         if init_from is not None:
-            # VIDEO2VIDEO: the FRAMES an earlier `rgb8` step of this gate
-            # unpacked, which is where the clip a run starts from comes from.
             argv += ["--init-clip", os.path.join(ctx.out, gate.name, init_from, "frames"),
                      "--strength", str(strength)]
         return (argv, REPO)
     return build
-
 
 def t2i_step(prompt, width, height, steps, seed,
              init_from=None, strength=None, refs_from=None, out_name="picture"):
@@ -720,17 +636,12 @@ def t2i_step(prompt, width, height, steps, seed,
                 "--width", str(width), "--height", str(height),
                 "--steps", str(steps), "--seed", str(seed)]
         if init_from is not None:
-            # The picture an earlier step of this same gate wrote.
             argv += ["--init-image", os.path.join(ctx.out, gate.name, init_from, "image.png"),
                      "--strength", str(strength)]
         for name in refs_from or []:
-            # REFERENCE PICTURES, also written by earlier steps of this gate:
-            # not where the trajectory starts, but a second set of image
-            # tokens the target grid attends.
             argv += ["--ref-image", os.path.join(ctx.out, gate.name, name, "image.png")]
         return (argv, REPO)
     return build
-
 
 def roster() -> list[Gate]:
     return [
@@ -957,9 +868,6 @@ def roster() -> list[Gate]:
             name="ltx2-vae",
             wraps="cargo test -p engine-cuda --test the_ltx_2_vae_answers_the_reference",
             expected="decode cos >= 0.9999 per frame and clip (landed 0.999985, mean |err| 0.0019)",
-            # The snapshot's `vae/` folder is read directly (no artifact): the
-            # decoder's 86 planes and one stated zero row, none of the 19 B
-            # transformer beside them.
             needs=[(g("ltx25", "ltx2_vae", "shapes.json"),
                     "CUDA_VISIBLE_DEVICES=<n> python scripts/imagegen/ltx2_golden.py --vae"),
                    (os.path.expanduser("~/.cache/huggingface/hub/models--Lightricks--LTX-2.5-Diffusers/"
@@ -989,77 +897,22 @@ def roster() -> list[Gate]:
                     f"{IMPORT} <Wan2.2-TI2V-5B-Diffusers snapshot, with a tokenizer.json "
                     f"pie can compile beside it> --sku wan22-ti2v-5b-bf16-kv-bf16 "
                     f"--out {a('wan22-ti2v-5b.zt')}")],
-            # 1950 latent rows plus a 512-row context lane, times the submit
-            # depth: a video job wants far more headroom than an image one.
-            # `mem` 0.95, not the usual 0.90: this row's VAE carries a frame
-            # cache per causal convolution and now carries the ENCODER's 24
-            # beside the decoder's 32 — 4.1 GiB a slot where it was 3.1 —
-            # and every fire is charged that watermark whether or not it
-            # ever enters the VAE (the state-accounting hole, prototype.md
-            # §3). At 0.90 the elastic pool refused the first fire by name
-            # ("wants 17 622 368 256 bytes ... the load reserved
-            # 16 502 489 088"), which is the refusal's own advice taken.
             config=dict(port=8612, model=a("wan22-ti2v-5b.zt"), rows=131072, mem=0.95,
                         timeout="1800s"),
             steps=[("the VAE against the reference",
                     cargo_test("the_wan_2_vae_answers_the_reference")),
-                   # The other direction, over the same clip: the decode's
-                   # own pixels back in through `vae.encode`, chunk by
-                   # chunk down one slot, against the reference encoder's
-                   # posterior mean normalised into the denoiser's space.
-                   # This is what makes video2video reachable.
                    ("the VAE encoder against the reference",
                     cargo_test("the_wan_2_vae_encodes_the_reference")),
-                   # umT5's SentencePiece Unigram tokenizer does not compile
-                   # in pie (`models::wan_2::tokenizer`), so the prompt goes
-                   # in as ids: the reference tokenizer's encoding of
-                   # "a red bicycle leaning on a blue wall", the golden's
-                   # own prompt.
                    ("prompt -> clip",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              832, 480, 17, 20, 0)),
-                   # THE SAME CLIP, GUIDED. Four lanes — two attention
-                   # groups of a context and a video lane — in one fire,
-                   # combining `u + s(c - u)` in the epilogue off
-                   # `intrinsics::peer_velocity`. This is the undistilled
-                   # row, so guidance is the setting the reference actually
-                   # uses; the readout reports both latents' std, and they
-                   # must differ or the second branch changed nothing.
                    ("the same prompt, guided at 5.0",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              832, 480, 17, 20, 0,
                              negative_ids="1", guidance=5.0, out_name="guided")),
-                   # VIDEO2VIDEO, five runs at 64^2. Two claims, and
-                   # neither needs a golden.
-                   #
-                   # WHY 64^2 AND NOT MORE. A `vae.encode` port carries one
-                   # row per PIXEL, so a 4-frame chunk is `4*h*w` port
-                   # voxels: 16 384 here, against the derived ceiling of
-                   # 65 536, which 128^2 would hit exactly. 128^2 is not the
-                   # size that fires, though — the ceiling that bites first
-                   # is the STATE watermark, not the voxel ladder. This
-                   # row's `vae.encode` fire is charged 1 384 120 320 bytes
-                   # of elastic device memory for the encoder's 24 frame
-                   # caches and the load reserves 671 088 640 for them, so
-                   # 128^2 is refused by name ("this fire wants ... and the
-                   # load reserved ..."). It is the same state-accounting
-                   # hole this gate's `mem = 0.95` already answers
-                   # (prototype.md section 3), and 480x832 -- 1 597 440
-                   # voxels a chunk -- is far past both ceilings: a
-                   # full-size video2video wants a TILED encode, which
-                   # nothing has written.
-                   #
-                   # 8 steps, not 20: both claims are IDENTITIES and neither
-                   # asks the clip to be good.
                    ("a 64^2 clip to start from",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 1, out_name="v2v-src", fmt="rgb8")),
-                   # The SAME prompt at a DIFFERENT seed from here on, which
-                   # is what makes "nearer the input" mean anything: at the
-                   # source's own seed the unseeded run would BE the source.
-                   # Two strengths, so the claim is a LADDER -- lower
-                   # strength, nearer the input -- and not one comparison
-                   # that could fall either way.
                    ("that clip back in at 0.2",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 2, out_name="v2v-02", fmt="rgb8",
@@ -1068,8 +921,6 @@ def roster() -> list[Gate]:
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 2, out_name="v2v-04", fmt="rgb8",
                              init_from="v2v-src", strength=0.4)),
-                   # `(1 - 1)*x0 + 1*eps` IS the keyed draw, so this must
-                   # land the same clip as the run below, bit for bit.
                    ("and at 1.0, which is no init at all",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 2, out_name="v2v-washed", fmt="rgb8",
@@ -1077,12 +928,6 @@ def roster() -> list[Gate]:
                    ("the same prompt and seed with no init",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 2, out_name="txt2vid", fmt="rgb8")),
-                   # THE YARDSTICK. This row is not bit-reproducible run to
-                   # run, so "the same clip" is not `array_equal` and the
-                   # gate must not pretend it is: the SAME run again is what
-                   # says how far apart two clips that ought to be identical
-                   # actually land, and every claim above is read against
-                   # that number rather than against zero.
                    ("and once more, which is what the floor is",
                     t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
                              64, 64, 17, 8, 2, out_name="txt2vid-rep", fmt="rgb8"))],
@@ -1122,27 +967,9 @@ def roster() -> list[Gate]:
             needs=[(a("flux2-klein-4b.zt"),
                     f"{IMPORT} <FLUX.2-klein-4B snapshot> --sku flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
-            # No `voxels` here, and the reason is worth stating: the img2img
-            # steps encode at 256^2, which is 65 536 pixel voxels — exactly
-            # the derived ceiling. Raising it to a 1024^2 picture's
-            # 1 048 576 asks for a 343 GiB arena on this box, because a
-            # ladder is PROVISIONED and not merely capped. Encoding a large
-            # picture wants a tiled encode, which nothing has written.
             config=dict(port=8611, model=a("flux2-klein-4b.zt"), rows=32768, mem=0.90),
             steps=[("prompt -> picture",
                     t2i_step("a red bicycle leaning on a blue wall", 1024, 1024, 4, 0)),
-                   # IMG2IMG, twice. The picture the step above wrote goes
-                   # back in through `vae.encode`, is noised to the strength
-                   # point and integrated from there. `strength = 1.0` noises
-                   # it all the way, which washes the picture out entirely —
-                   # so that run must land the SAME image as the one with no
-                   # init at all, and the 0.4 run must land nearer the input
-                   # than either. Two claims that cannot both hold by
-                   # accident, and neither needs a golden.
-                   # The img2img trio runs at 256^2 — 65 536 pixel voxels,
-                   # exactly what a `vae.encode` port carries at the derived
-                   # ceiling. All three share a size so the readout can
-                   # compare them pixel for pixel.
                    ("a 256^2 picture to start from",
                     t2i_step("a red bicycle leaning on a blue wall", 256, 256, 4, 0,
                              out_name="small")),
@@ -1155,14 +982,6 @@ def roster() -> list[Gate]:
                    ("the same prompt with no init",
                     t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
                              out_name="txt2img")),
-                   # REFERENCE-IMAGE EDITING, four runs at one prompt and one
-                   # seed. A reference is not a starting point: it is a
-                   # second set of image tokens on a Reference lane of the
-                   # target's own attention group, at the family's rotary
-                   # offset (`T = 10*(i + 1)` for FLUX.2), read by the
-                   # target and reading nothing back. The two pictures the
-                   # img2img steps already wrote are the two references, so
-                   # the claims cost four runs and no new artifact.
                    ("a picture with no reference at all",
                     t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
                              out_name="ref-none")),
@@ -1172,9 +991,6 @@ def roster() -> list[Gate]:
                    ("and with the green-hedge picture instead",
                     t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
                              refs_from=["txt2img"], out_name="ref-b")),
-                   # BOTH at once, on ONE lane: `cat(refs)`, the second block
-                   # at twice the first's offset. This is what says the
-                   # stride is a stride and not a flag.
                    ("and both at once, on one lane",
                     t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
                              refs_from=["small", "txt2img"], out_name="ref-ab"))],
@@ -1182,11 +998,6 @@ def roster() -> list[Gate]:
             timeout=5400,
         ),
     ]
-
-
-# ----------------------------------------------------------------------------
-# the text-to-image gate, which is a `pie run` and then maybe a VAE decode
-# ----------------------------------------------------------------------------
 
 def text_to_image(args) -> int:
     """`--text-to-image`: drive the generic guest and end with a real PNG.
@@ -1219,21 +1030,10 @@ def text_to_image(args) -> int:
            "--prompt", args.prompt, "--width", str(args.width),
            "--height", str(args.height), "--steps", str(args.steps),
            "--seed", str(args.seed), "--out", "image"]
-    # IMG2IMG: the picture goes as base64 in PIECES. One argv argument is
-    # capped at `MAX_ARG_STRLEN` (128 KiB on Linux) and an encoded still is
-    # bigger, so it is split the way a parity case is. The sandbox scratch is
-    # not a door for this: it is mounted per PROCESS and removed at teardown,
-    # so nothing outside can place a file there.
     if args.init_image:
-        # An init image is a STARTING POINT, not a reference the output is
-        # scored against, so the JPEG round trip `b64_pieces` does costs it
-        # nothing.
         for i, piece in enumerate(b64_pieces(args.init_image)):
             cmd += [f"--init_image_{i}", piece]
         cmd += ["--strength", str(args.strength)]
-    # REFERENCE PICTURES: `--ref_<i>_<n>` is reference `i`'s piece `n`, which
-    # is the two dimensions a reference SET needs — several pictures, each
-    # too big for one argv argument.
     for i, path in enumerate(args.ref_images or []):
         for n, piece in enumerate(b64_pieces(path)):
             cmd += [f"--ref_{i}_{n}", piece]
@@ -1253,7 +1053,6 @@ def text_to_image(args) -> int:
             print(f"[gates] neither {png} nor {latent} exists")
             return 1
         if not os.path.exists(sidecar):
-            # the report is the guest's stdout; keep it as the sidecar
             body = [line for line in done.stdout.splitlines() if line.startswith("{")]
             if not body:
                 print("[gates] no sidecar and no JSON report on stdout")
@@ -1276,7 +1075,6 @@ def text_to_image(args) -> int:
             print(f"[gates] decode_latent.py failed ({done.returncode})")
             return 1
 
-    # A real PNG: the magic, a plausible size, and more than one colour.
     with open(png, "rb") as f:
         head = f.read(33)
     if head[:8] != b"\x89PNG\r\n\x1a\n":
@@ -1291,11 +1089,6 @@ def text_to_image(args) -> int:
         print(f"[gates] suspiciously small for a {w}x{h} photograph")
         return 1
     return 0
-
-
-# ----------------------------------------------------------------------------
-# the text-to-video gate, which is a `pie run` and then a real mp4
-# ----------------------------------------------------------------------------
 
 def text_to_video(args) -> int:
     """`--text-to-video`: drive the generic video guest and end with an mp4.
@@ -1338,12 +1131,6 @@ def text_to_video(args) -> int:
     fmt = args.clip_format or "mp4"
     if fmt != "mp4":
         cmd += ["--format", fmt]
-    # VIDEO2VIDEO: the init clip goes in FRAME BY FRAME, each frame's base64
-    # in argv-sized pieces. Two indices because a clip is a list of pictures
-    # and one argv argument is capped at `MAX_ARG_STRLEN` (128 KiB) well
-    # below a single still. The sandbox scratch is not a door for this: it is
-    # mounted per PROCESS and removed at teardown, so nothing outside can
-    # place a file there.
     if args.init_clip:
         stills = sorted(glob.glob(os.path.join(args.init_clip, "frame_*.png")))
         if not stills:
@@ -1353,14 +1140,9 @@ def text_to_video(args) -> int:
             for n, piece in enumerate(b64_pieces(still)):
                 cmd += [f"--init_frame_{f}_{n}", piece]
         cmd += ["--strength", str(args.strength)]
-    # Real guidance: a negative prompt at a scale above 1 runs the second
-    # lane pair and the combine happens in the epilogue.
     if args.guidance is not None:
         cmd += ["--guidance", str(args.guidance)]
     if args.negative_ids:
-        # The guest names this one `negative_prompt_ids`, and takes it as a
-        # comma-separated STRING. A single id needs a trailing comma, or the
-        # argv parser hands it over as a JSON integer and the guest refuses.
         ids = args.negative_ids if "," in args.negative_ids else f"{args.negative_ids},"
         cmd += ["--negative_prompt_ids", ids]
     print("$ " + " ".join(cmd), flush=True)
@@ -1372,12 +1154,6 @@ def text_to_video(args) -> int:
         return 1
 
     if fmt in ("rgb8", "raw-rgb8"):
-        # THE PARITY FORMAT: exactly `count*height*width*3` bytes, no header
-        # and no codec, which is what a pixel-for-pixel claim between two
-        # runs has to be made on. Unpacked into stills beside it, so a later
-        # step of the same gate can hand this clip back in.
-        # `.rgb` is the host's own extension for `raw-rgb8`
-        # (`image_extension`), and the guest names the file to match.
         raw = os.path.join(args.out, "clip.rgb")
         want = args.frames * args.height * args.width * 3
         if not os.path.exists(raw):
@@ -1399,7 +1175,7 @@ def text_to_video(args) -> int:
             for f in range(args.frames):
                 Image.fromarray(pixels[f]).save(
                     os.path.join(frames_dir, f"frame_{f:03d}.png"))
-        except Exception as why:  # noqa: BLE001
+        except Exception as why:
             print(f"[gates] could not unpack {raw}: {why}")
             return 1
         print(f"[gates] {args.width}x{args.height} rgb8, {args.frames} frames, {size} bytes")
@@ -1411,8 +1187,6 @@ def text_to_video(args) -> int:
     if not os.path.exists(mp4):
         print(f"[gates] {mp4} does not exist")
         return 1
-    # A real mp4: the ISO-BMFF brand, a plausible size, and the frame count
-    # the guest reported.
     with open(mp4, "rb") as f:
         head = f.read(12)
     if head[4:8] != b"ftyp":
@@ -1426,11 +1200,6 @@ def text_to_video(args) -> int:
         return 1
     return 0
 
-
-# ----------------------------------------------------------------------------
-# the run
-# ----------------------------------------------------------------------------
-
 class Context:
     def __init__(self, args):
         self.out = args.out
@@ -1440,14 +1209,12 @@ class Context:
         self.cargo = args.cargo
         self.configs: dict[str, str] = {}
 
-
 def missing(gate) -> tuple[str, str] | None:
     for path, how in gate.needs:
         if glob.glob(path):
             continue
         return path, how
     return None
-
 
 def run_gate(ctx, gate, log) -> tuple[str, str, str]:
     """-> (status, measured, note).  Never raises: a gate's own explosion is
@@ -1472,17 +1239,9 @@ def run_gate(ctx, gate, log) -> tuple[str, str, str]:
         return SKIP, measured, why.group(1) if why else "the host gate skipped itself"
     if code == 124:
         return ERROR, measured, f"timed out after {gate.timeout}s"
-    # A READOUT'S OWN VERDICT COUNTS. Several readouts compare a gate's
-    # steps against each other — img2img's two identities, wan-video's
-    # guided move, the reference claims, the step-cache rules — and report
-    # `pass`/`FAIL` in the measured column. Those claims cannot be a step's
-    # exit code, because no single step knows about the others. Reading only
-    # `code` let a gate say `pass` with a FAIL written in its own row, which
-    # is how `strength 1.0 IS txt2img (FAIL)` sat unread for a whole roster.
     if code == 0 and FAIL in measured:
         return FAIL, measured, gate.note
     return (PASS if code == 0 else FAIL), measured, gate.note
-
 
 def render(rows) -> str:
     head = ("gate", "status", "measured", "expected", "note")
@@ -1494,7 +1253,6 @@ def render(rows) -> str:
     for row in body[1:]:
         lines.append("  ".join(str(cell).ljust(width[i]) for i, cell in enumerate(row)))
     return "\n".join(lines)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -1511,7 +1269,6 @@ def main() -> int:
     ap.add_argument("--cargo", default="cargo")
     ap.add_argument("--json", default=None, help="also write the table here as JSON")
     ap.add_argument("--log", default=None, help="the full transcript (default: <out>/gates.log)")
-    # the text-to-image / text-to-video gates re-enter this file as a step
     ap.add_argument("--text-to-image", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--text-to-video", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--config", default=None, help=argparse.SUPPRESS)
@@ -1586,7 +1343,7 @@ def main() -> int:
         print(f"[gates] {gate.name} ...", end=" ", flush=True)
         try:
             status, measured, note = run_gate(ctx, gate, log)
-        except Exception as why:                      # a gate never kills the table
+        except Exception as why:
             status, measured, note = ERROR, "", f"{type(why).__name__}: {why}"
             log(f"[gates] {gate.name} raised: {why!r}")
         finally:
@@ -1617,7 +1374,6 @@ def main() -> int:
         with open(args.json, "w") as f:
             json.dump(dict(verdict=verdict, tally=tally, gates=rows), f, indent=2)
     return 1 if bad else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

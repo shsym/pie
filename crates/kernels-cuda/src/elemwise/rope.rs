@@ -1,8 +1,3 @@
-//! `Rope`: rotations in place on the projection they turn. One entry per IR
-//! variant; interleaved layouts reach the unit as a stated flag, never as a
-//! different loop. The frequency-pair cache and the heads-per-block packing
-//! are the only geometry decisions, and they live here.
-
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::Error;
@@ -17,7 +12,6 @@ pub const ROTATE_BLOCK: u32 = 256;
 
 pub const MAX_CACHED_PAIRS: u32 = 4096;
 
-/// No YaRN: the unit interpolation factor.
 const UNSCALED: f32 = 1.0;
 
 #[must_use]
@@ -29,7 +23,6 @@ const fn heads_per_block(half: u32) -> u32 {
     }
 }
 
-/// How many frequency pairs fit the shared-memory cache; 0 means uncached.
 #[must_use]
 const fn cache_pairs(half: u32) -> u32 {
     if half <= MAX_CACHED_PAIRS { half } else { 0 }
@@ -44,7 +37,6 @@ const fn rotate_launch(num_tokens: u32, total_heads: u32, per_block: u32, smem: 
     .smem(smem)
 }
 
-/// The YaRN interpolation ramp, precomputed host-side.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn ramp_bounds(
@@ -132,8 +124,6 @@ pub fn full(
             per_block,
             pairs * 2 * 4,
         )),
-        // The trailing null block is the fused-append variant's optional
-        // slots (kv pages, page geometry, mask), absent on the plain rotate.
         &[
             q.arg(),
             k.arg(),
@@ -155,7 +145,6 @@ pub fn full(
             ArgValue::ABSENT,
             0_i32.arg(),
             0_i32.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -188,18 +177,10 @@ pub fn partial_q(
     const OP: &str = "elementwise.rope_partial_q";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
-    // k rides as q with a zero width: the unit reads zero kv heads.
     let k = Tensor::new(q.ptr, q.rows, 0, q.dtype);
     rope_partial(ctx, OP, *q, k, positions, rotary_dim, head_dim, theta)
 }
 
-/// `y = rope_partial_q(rmsnorm_per_head(x, weight))`, one launch per fire:
-/// the KV-sharing layers' q path (`model_ir::fuse::q_norm_rope`).
-///
-/// # Errors
-///
-/// [`Error::Refused`] for a row that is not whole heads of `head_dim`, a
-/// `rotary_dim` past the head or odd, or a launch the runtime refused.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_rope_partial_q(
     ctx: &Ctx,
@@ -248,15 +229,11 @@ pub fn rmsnorm_rope_partial_q(
             stated(OP, rotary_dim)?.arg(),
             theta.arg(),
             eps.arg(),
-            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Partial rope over the last `rotary_dim` lanes of each head.
-/// The YaRN ramp a partial rope states beside its theta (the IR's
-/// `elemwise::Yarn`, restated here because this crate names no IR).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Yarn {
     pub factor: f32,
@@ -265,10 +242,6 @@ pub struct Yarn {
     pub original_max_position: u32,
 }
 
-/// `inverse` negates the angle (the MLA attention output, whose latent was
-/// both key and value, un-rotated at the query's position); `yarn` is the
-/// layer's ramp, derived over the ROTATED width as the reference's
-/// `precompute_freqs(dim = rotary, ...)` derives it, or `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn partial_last(
     ctx: &Ctx,
@@ -330,7 +303,6 @@ pub fn partial_last(
             factor.arg(),
             low_dim.arg(),
             high_dim.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -397,7 +369,6 @@ pub fn yarn(
             interleaved.arg(),
             stated(OP, per_block)?.arg(),
             stated(OP, pairs)?.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -429,7 +400,6 @@ fn rope_partial(
             stated(op, head_dim)?.arg(),
             stated(op, rotary_dim)?.arg(),
             theta.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

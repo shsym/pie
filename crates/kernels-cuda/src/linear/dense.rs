@@ -1,8 +1,3 @@
-//! Dense host programs: `cublasGemmEx`, the `cublasLtMatmul` plan cache, and
-//! the per-shape autotuner (gemv/GemmEx/Lt heuristics), cached in memory and
-//! on disk by device and cuBLAS version. Every shape takes its own fastest
-//! tactic: a row's bits may differ between two fire widths.
-
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
@@ -50,8 +45,6 @@ fn current_device() -> i32 {
     device
 }
 
-/// One projection call: `y = act x w^T`, addresses and extents together so
-/// the tuner can re-aim the same call at its synthetic operands.
 #[derive(Clone, Copy, Debug)]
 struct Call {
     act: u64,
@@ -62,8 +55,6 @@ struct Call {
     k: i32,
 }
 
-/// One way to run the projection, in ladder order: the skinny jit kernel,
-/// plain GemmEx, or one of the Lt heuristics by index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tactic {
     Gemv,
@@ -72,7 +63,6 @@ enum Tactic {
 }
 
 impl Tactic {
-    /// The two-int disk spelling.
     fn encode(self) -> (i32, i32) {
         match self {
             Self::GemmEx => (0, 0),
@@ -91,11 +81,6 @@ impl Tactic {
     }
 }
 
-// ─── the entry and its ladder ───────────────────────────────────────────────
-
-/// `y = act x w^T`, bf16 throughout. An empty projection (any extent zero)
-/// is a silent no-op — a conditioned batch may legitimately land nothing,
-/// and a refusal here would kill the whole fire under graph capture.
 pub(crate) fn act_x_wt(
     ctx: &Ctx,
     op: &'static str,
@@ -119,22 +104,10 @@ pub(crate) fn act_x_wt(
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    // The Lt workspace is a per-(arena, name, stream) slab, not a
-    // per-device buffer: two concurrent matmuls sharing one workspace would
-    // silently corrupt each other. Absent is not fatal — Lt takes a null
-    // workspace at zero bytes.
     let (ws, ws_bytes) = match ctx.scratch(op, LT_WORKSPACE, want) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
-    // The same slab is cuBLAS's workspace too. Left to its own, cuBLAS takes
-    // one from its pool eagerly but under stream capture allocates a graph
-    // node — and once that is refused, falls back to a 16 KiB entry — and its
-    // heuristic follows the bytes it has: the eager walk and the capture of
-    // ONE GEMM could land on different kernels (split-K vs not), whose sums
-    // round differently. The golden reads a replay bit for bit against its
-    // walk, so both arms must see the same workspace. A null slab binds a
-    // zero-byte workspace, which is the same answer both ways.
     // SAFETY: `handle` is this context's live cuBLAS handle, bound to
     // `stream`; `ws` is a device slab of `ws_bytes` the context owns.
     unsafe {
@@ -156,11 +129,6 @@ pub(crate) fn act_x_wt(
     }
     clear_error();
 
-    // The untuned ladder: the skinny kernel for a single row, GemmEx in its
-    // tensor-op then plain spelling, then any Lt heuristic. First success
-    // wins. A shape reaches this only where the tuner cannot pin one — under
-    // capture, past the shape ceiling, or on an output too big to bench —
-    // and then it walks the same rungs every fire.
     if m == 1 && gemv_bf16(&unsafe { Ctx::on(stream) }, w, act, y, n, k).is_ok() {
         return Ok(());
     }
@@ -200,9 +168,6 @@ pub(crate) fn act_x_wt(
     ))
 }
 
-/// One attempt under a chosen tactic; `false` sends the caller down the
-/// ladder. `stream` must be the stream `handle` is bound to — the tuner
-/// rebinds both to its private bench.
 fn run_tactic(
     handle: cublasHandle_t,
     stream: *mut c_void,
@@ -273,15 +238,8 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
     }
 }
 
-// ─── the cuBLASLt plumbing ──────────────────────────────────────────────────
-
-/// The name the Lt workspace slab is keyed by, in the same namespace every
-/// other scratch entry uses.
 const LT_WORKSPACE: &str = "linear.lt_workspace";
 
-/// The Lt handle (created on first use) and the workspace byte count — the
-/// single source the heuristic preference, tuner and fire path all read. The
-/// buffer itself lives in a per-`(arena, stream)` slab, not here.
 struct LtCtx {
     handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
@@ -301,8 +259,6 @@ impl LtCtx {
     }
 }
 
-/// One shape's Lt descriptors and the heuristics Lt offered for it, best
-/// first by Lt's own estimate. Cached per shape, shared out under `Arc`.
 struct LtPlan {
     op_desc: lt::cublasLtMatmulDesc_t,
     a_desc: lt::cublasLtMatrixLayout_t,
@@ -334,8 +290,6 @@ impl Drop for LtPlan {
     }
 }
 
-/// How many heuristics a plan keeps by default: the ladder's last rungs, and
-/// the tuner's `Tactic::Lt` indices, which the disk cache spells by position.
 const HEURISTICS: usize = 8;
 
 fn build_lt_plan(
@@ -394,8 +348,6 @@ fn build_lt_plan(
             return None;
         }
     }
-    // In cuBLAS's column-major eyes: w^T is A (k x n), act is B (k x m),
-    // y is C (n x m).
     for (desc, rows, cols, ld) in [
         (&raw mut plan.a_desc, k, n, k),
         (&raw mut plan.b_desc, k, m, k),
@@ -451,13 +403,6 @@ fn build_lt_plan(
         return None;
     }
     heuristics.truncate((returned as usize).min(HEURISTICS));
-    // The heuristic rarely offers split-K for a skinny decode GEMM, and a
-    // 64-row `[20480 x 2560]` runs at 78% of the card's bandwidth as one
-    // wave and a half of 128x64 tiles. So every heuristic that supports it
-    // is also offered split 2, 4 and 8 ways (reduced in the compute type),
-    // each checked by cuBLASLt for this shape and workspace; the tuner races
-    // them with the rest. Fixed order behind the heuristics, since the disk
-    // cache names a tactic by its index here.
     let mut augmented: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
     for heuristic in &heuristics {
         let mut supports: i32 = 0;
@@ -522,10 +467,6 @@ fn build_lt_plan(
     Some(plan)
 }
 
-// ─── the Lt call ────────────────────────────────────────────────────────────
-
-/// One `cublasLtMatmul` under a chosen algorithm; `false` sends the caller
-/// down the ladder.
 fn run_lt(
     lt_handle: lt::cublasLtHandle_t,
     plan: &LtPlan,
@@ -560,10 +501,6 @@ fn run_lt(
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
 
-// ─── the per-device state ───────────────────────────────────────────────────
-
-/// One device's whole memory: the Lt context, the plan cache, and what the
-/// tuner has chosen or seen.
 struct Device {
     lt: LtCtx,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
@@ -573,11 +510,6 @@ struct Device {
 }
 
 fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
-    // One lock per device, not one over the table: the tuner's bench
-    // synchronizes the caller's stream while holding its device, and under
-    // tensor parallelism that stream can be waiting on a collective from a
-    // rank that is itself waiting for this table. The table lock is held
-    // only long enough to find the device's own.
     static DEVICES: OnceLock<Mutex<HashMap<i32, Arc<Mutex<Device>>>>> = OnceLock::new();
     let device = {
         let mut map = DEVICES
@@ -588,13 +520,6 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
             Arc::new(Mutex::new(Device {
                 lt: LtCtx {
                     handle: std::ptr::null_mut(),
-                    // Eight MiB, not sixty-four: the slab is cut once per
-                    // recorded region (`jit::device` keys scratch by region
-                    // so a captured graph's address stays put), and a
-                    // deployment arms a hundred-odd bodies — at 64 MiB that
-                    // was 7.5 GB of workspace on a 46 GB card, the memory
-                    // that refused an eighth diffusion canvas. Ada's Lt
-                    // heuristics want a few MiB for these shapes.
                     workspace_bytes: 8 * 1024 * 1024,
                 },
                 plans: HashMap::new(),
@@ -624,9 +549,6 @@ impl Device {
         Some(plan)
     }
 
-    /// The remembered tactic for this shape, tuning it on the second eager
-    /// sighting. `None` while the shape is unknown — the caller walks the
-    /// ladder.
     fn tactic_for(
         &mut self,
         handle: cublasHandle_t,
@@ -639,8 +561,6 @@ impl Device {
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
-        // A runaway shape population would make the bench the workload; a
-        // thousand tuned shapes is already generous.
         if self.chosen.len() >= 1024 {
             return None;
         }
@@ -652,25 +572,12 @@ impl Device {
             self.chosen.insert(key, tactic);
             return Some(tactic);
         }
-        // A capturing stream never reaches the bench's host syncs: this
-        // fire walks the ladder, and a later eager fire tunes the shape.
         if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone {
             return None;
         }
-        // A bench output past this size is not worth the synthetic malloc.
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
-        // **TUNED ON THE FIRST SIGHTING, AND THAT IS A REPRODUCIBILITY
-        // RULE.** This used to wait for the second (`if *seen < 2`), so a
-        // shape's FIRST gemm ran the untuned ladder below and every one after
-        // it ran the tuned tactic — two different kernels, whose sums round
-        // differently. The seam was visible from outside: a deployment's
-        // first fires answered ~1 bf16 ulp off its later ones, which is
-        // enough to flip a near-tie token, and whether it showed depended on
-        // whether this machine's disk cache already held the shape. Tuning
-        // here costs the bench one sighting earlier and buys one kernel per
-        // shape for the life of the process.
         let seen = self.seen.entry(key).or_insert(0);
         *seen += 1;
         let tactic = tune(handle, stream, &self.lt, plan, call);
@@ -695,12 +602,6 @@ fn shape_key(call: Call) -> u64 {
     crate::source::fnv1a64(&bytes)
 }
 
-// ─── the autotuner ──────────────────────────────────────────────────────────
-
-/// Race every candidate on the bench, DRAM-cold, and keep the first within 2%
-/// of the fastest — ties go to the earlier, simpler tactic, and the Lt candidates
-/// come in Lt's own estimated order. Falls back to the first candidate
-/// untimed when the bench will not build.
 fn tune(
     handle: cublasHandle_t,
     caller_stream: *mut c_void,
@@ -708,14 +609,6 @@ fn tune(
     plan: Option<&LtPlan>,
     call: Call,
 ) -> Tactic {
-    // Ties go to the earlier candidate, so the order is a preference:
-    // `GemmEx` LAST. Under stream capture `cublasGemmEx` records a memory
-    // node for its own workspace (~10 MiB a body on gemma-4-E4B), and the
-    // arming pass pays that off the ceiling's spare — 173 bodies took
-    // 1.8 GiB and left the wide compositions unarmed. An explicit Lt
-    // algorithm runs in the slab the handle was given and records nothing,
-    // so `GemmEx` wins only where it is more than 2% faster than every
-    // explicit form.
     let mut candidates = Vec::new();
     if call.m == 1 {
         candidates.push(Tactic::Gemv);
@@ -758,11 +651,6 @@ fn tune(
     candidates[0]
 }
 
-/// The autotuner's private bench: a non-blocking stream of its own, timing
-/// events, and synthetic operands to race the tactics over. `init`/`time`
-/// block the host, guarded by the `cudaStreamIsCapturing` check in
-/// [`Device::tactic_for`]: a captured fire never tunes, an eager fire may
-/// block once per untuned shape (then cached in memory and on disk).
 struct TuneArena {
     stream: *mut c_void,
     start: cudaEvent_t,
@@ -773,8 +661,6 @@ struct TuneArena {
     y: *mut c_void,
     workspace: *mut c_void,
     workspace_bytes: usize,
-    /// Written before every timed fire so the weight arrives from DRAM, as
-    /// it does in a decode step, rather than from the warm-up's L2.
     flush: *mut c_void,
     flush_bytes: usize,
 }
@@ -828,9 +714,6 @@ impl TuneArena {
         }
     }
 
-    /// Builds the bench: synthetic operands, the caller's handle rebound to
-    /// the private stream (the drop restores it), and one sync of the
-    /// caller's stream so the timings do not race its queued work.
     fn init(
         &mut self,
         caller: cublasHandle_t,
@@ -870,7 +753,6 @@ impl TuneArena {
             return false;
         }
         self.handle = caller;
-        // 0x3C bytes spell a small positive bf16: real work, no NaNs.
         let filled = unsafe {
             cudaMemsetAsync(self.act, 0x3C, act_bytes, self.stream.cast()) == cudaError::cudaSuccess
                 && cudaMemsetAsync(self.y, 0x3C, y_bytes, self.stream.cast())
@@ -884,20 +766,6 @@ impl TuneArena {
         true
     }
 
-    /// Times one tactic on the bench **as a graph replays it**: the flush,
-    /// a timing event, the fire and a second timing event are captured into
-    /// one graph, instantiated, replayed to warm up, then replayed timed;
-    /// the best of the timed replays is the answer.
-    ///
-    /// Captured, not streamed, because that is how a decode step runs it.
-    /// A cuBLASLt split-K algorithm that reduces in-kernel zeroes its
-    /// semaphores with a `cudaMemsetAsync` first, which a stream absorbs
-    /// for ~2 µs and a graph turns into a memset NODE costing ~6 µs of
-    /// dependency latency in front of the kernel (56 of them a step on
-    /// gemma-4-E4B at 64 lanes, 0.34 ms of a 17 ms step). Stream timing
-    /// could not see that; the graph pays exactly what the body will.
-    ///
-    /// Blocks the host between phases.
     fn time(
         &self,
         tactic: Tactic,
@@ -923,8 +791,6 @@ impl TuneArena {
             )
         };
         let stream = self.stream.cast();
-        // One eager fire first: a tactic the backend refuses outright fails
-        // here, with nothing captured to unwind.
         if !fire() {
             let _ = unsafe { cudaStreamSynchronize(stream) };
             clear_error();
@@ -935,8 +801,6 @@ impl TuneArena {
             return None;
         }
 
-        // Capture: flush, start, fire, stop — a linear chain, so the stop
-        // event lands behind every node the fire recorded.
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
         let captured = unsafe {
@@ -949,8 +813,6 @@ impl TuneArena {
                 && cudaEventRecordWithFlags(self.stop, stream, cudaEventRecordExternal)
                     == cudaError::cudaSuccess
         };
-        // End the capture whatever happened inside it, or the stream stays
-        // in capture and every later call on it is refused.
         let ended =
             unsafe { cudaStreamEndCapture(stream, &raw mut graph) } == cudaError::cudaSuccess;
         if !captured || !ended || graph.is_null() {
@@ -970,7 +832,6 @@ impl TuneArena {
         }
 
         let mut best: Option<f32> = None;
-        // Three warm replays, then seven timed.
         for round in 0..10 {
             if unsafe { cudaGraphLaunch(exec, stream) } != cudaError::cudaSuccess
                 || unsafe { cudaEventSynchronize(self.stop) } != cudaError::cudaSuccess
@@ -1001,8 +862,6 @@ impl TuneArena {
     }
 }
 
-/// Three times the device's L2, so one write evicts every line the warm-up
-/// left; 64 MB when the size is unknown.
 fn flush_bytes() -> usize {
     const FALLBACK: usize = 64 << 20;
     let mut device: i32 = 0;
@@ -1016,10 +875,6 @@ fn flush_bytes() -> usize {
         .map_or(FALLBACK, |l2| (3 * l2).max(FALLBACK))
 }
 
-// ─── the disk cache ─────────────────────────────────────────────────────────
-
-/// The tuner's on-disk memory: one line per shape under a signature naming
-/// everything able to invalidate a timing — device, arch, cuBLAS version.
 struct DiskCache {
     signature: String,
     path: Option<PathBuf>,
@@ -1098,14 +953,10 @@ impl DiskCache {
     }
 }
 
-/// The measured table, under the deployment's stated cache root. `None` is a
-/// process that stated none: the disk half is off, the in-memory half still
-/// works.
 fn cache_path() -> Option<PathBuf> {
     Some(crate::disk::dir(crate::disk::GEMM_ALGOS)?.join("dense.txt"))
 }
 
-/// An empty answer disables the disk half of the cache.
 fn signature() -> String {
     let mut device: i32 = 0;
     if unsafe { cudaGetDevice(&raw mut device) } != cudaError::cudaSuccess {

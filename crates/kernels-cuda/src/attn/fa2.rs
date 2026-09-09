@@ -1,5 +1,3 @@
-//! The fa2 plane: FlashInfer's decode/prefill kernels, fired one parameter block at a time. The instantiation a fire resolves is derived, not tabulated: [`decode_symbol`]/[`prefill_symbol`] spell the template arguments from the same [`DecodeGeometry`]/[`PrefillGeometry`] that size the launch, so the NVRTC name and the launch geometry cannot drift apart.
-
 use crate::error::Error;
 
 use crate::attn::fa2_abi::Partials;
@@ -8,7 +6,6 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
 pub const FILE: &str = "attn/attention.cuh";
 
-/// The decode variants an instantiation can be stamped with. Capture arms are unreached until a graph-capture consumer exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {
     Full,
@@ -16,13 +13,10 @@ pub enum DecodeArm {
     Window,
     CaptureFull,
     CaptureWindow,
-    /// The learned relative-position bias, over the whole sequence.
     RelBiasFull,
-    /// The same bias inside a sliding window.
     RelBiasWindow,
 }
 
-/// The prefill variants, same bargain as [`DecodeArm`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillArm {
     CausalFullSoftcap,
@@ -39,7 +33,6 @@ pub enum PrefillArm {
     CausalRelBiasWindow,
 }
 
-/// One fa2 head width outside the stamped lattice, refused before NVRTC ever sees a name for it.
 fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     if crate::attn::plan::head_dim_instantiated(head_dim) {
         return Ok(());
@@ -52,7 +45,6 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     ))
 }
 
-/// The decode instantiation, spelled from the derived geometry: every template argument below restates a field [`DecodeGeometry::derive`] computes, so the NVRTC name and the launch shape are one derivation, not two.
 fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
@@ -82,7 +74,6 @@ fn decode_symbol(
     )))
 }
 
-/// The prefill instantiation, spelled from the derived geometry.
 fn prefill_symbol(
     op: &'static str,
     g: &PrefillGeometry,
@@ -118,31 +109,14 @@ fn prefill_symbol(
     )))
 }
 
-/// The ragged (unpaged) prefill's arms: non-causal, no window, no soft cap,
-/// with or without the per-group reference mask. Each names its mask mode,
-/// variant and parameter block together, since the block's width follows
-/// the variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedArm {
-    /// Every row of a group sees every key of the group.
     Full,
-    /// `RaggedMask::ReferenceSelfOnly`: rows past a group's `ref_start` see
-    /// only keys past it. `MaskMode::kCustom`, so the mask is asked on every
-    /// kv tile.
     ReferenceSelfOnly,
-    /// `RaggedMask::ReferenceTags`: a query tagged `t >= 0` sees only keys
-    /// tagged `t`, an untagged query every key — several reference lanes
-    /// per group, each to itself. `MaskMode::kCustom`, like the tail form.
     ReferenceTags,
-    /// `RaggedMask::RelativeBias`: every row sees every key of its group,
-    /// and `bias[h][kj − qi + max_len − 1]` is added to each scaled logit
-    /// through the variant's transform hook. `MaskMode::kNone`, like `Full`.
     RelativeBias,
 }
 
-/// The ragged prefill instantiation: the paged kernel's traits (the traits
-/// are storage-agnostic; the kernel picks `SharedStorage` itself) under
-/// `BatchPrefillWithRaggedKVCacheKernel` with the unpaged parameter block.
 fn prefill_ragged_symbol(
     op: &'static str,
     g: &PrefillGeometry,
@@ -190,9 +164,6 @@ pub struct PrefillPoint {
     pub device: Device,
 }
 
-/// The whole parameter block as the launch's one argument. The bytes are
-/// copied into the pinned slots before `ctx.fire` returns, so the borrow
-/// only has to outlive the call.
 pub(crate) fn block<P>(params: &P) -> ArgValue {
     ArgValue::Bytes {
         ptr: core::ptr::from_ref(params).cast::<u8>(),
@@ -259,12 +230,6 @@ pub struct RaggedPoint {
     pub device: Device,
 }
 
-/// The ragged prefill launch: one parameter block (`PrefillRaggedParams`
-/// or its reference-masked extension, whichever the arm names) at a
-/// [`RaggedPoint`], the grid being `[padded_batch_size, 1, num_kv_heads]`
-/// exactly as the paged kernel's. The shared storage is the paged formula's:
-/// `KernelTraits::SharedStorage` and `SharedStoragePaged` differ only past
-/// head width 256, which the ragged entry refuses.
 pub(crate) fn prefill_ragged<P>(
     ctx: &Ctx,
     op: &'static str,
@@ -324,8 +289,6 @@ pub fn prefill_arm(full_attention_variant: bool, causal: bool, logits_soft_cap: 
     }
 }
 
-/// The relative-bias arms carry no softcap and no custom mask: the one
-/// choice left is whether the schedule windows.
 #[must_use]
 pub fn decode_rel_arm(full_attention_variant: bool, window_left: i32) -> DecodeArm {
     if full_attention_variant && window_left < 0 {
@@ -353,8 +316,6 @@ pub fn prefill_custom_arm(logits_soft_cap: f32) -> PrefillArm {
     }
 }
 
-// ── the cascade merge that folds split-kv partials ──────────────────────────
-
 const NUM_THREADS: u32 = 128;
 
 const NUM_SMEM_STAGES: u32 = 4;
@@ -378,7 +339,6 @@ const fn merge_smem_bytes(head_dim: u32) -> Option<u32> {
     Some(NUM_SMEM_STAGES * bdy * head_dim * 2 + NUM_THREADS * 4)
 }
 
-/// The merge instantiation, spelled from [`merge_geometry`]'s `<vec, bdx, bdy, stages>` tuple, the same one that shapes the launch.
 fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
     let (vec_size, bdx, bdy) = merge_geometry(head_dim)?;
     Some(symbol(&format!(
@@ -435,7 +395,6 @@ fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
     1
 }
 
-/// Folds a split schedule's partial planes into the final output. Called only under `info.split_kv`.
 pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), Error> {
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
@@ -472,20 +431,14 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
             split.max_seq_len.arg(),
             ArgValue::Ptr(split.seq_len),
             split.num_heads.arg(),
-            // the fold is the one launch of this family that takes the seat: attention itself writes only the partial planes, and a region handed the unsliced output needs win[1] to find its rows.
             ctx.stage(),
         ],
     )
 }
 
-// ── occupancy probes the engine sizes plans with ────────────────────────────
-
-/// How many decode blocks one SM holds at this lattice point. Resolves (and so may compile) the instantiation; host work for the prepare phase, never for an entry.
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
-    // Three driver calls a query, and every decode plan asks: memoised per
-    // instantiation and device.
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), Option<u32>>>,
     > = std::sync::OnceLock::new();
@@ -544,8 +497,6 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
     None
 }
 
-/// The `max_grid_size` fact `plan_decode` takes as an argument: occupancy
-/// times SM count, floored at the SM count when the probe cannot answer.
 #[must_use]
 pub fn decode_max_grid_size(
     head_dim: u32,
@@ -568,9 +519,6 @@ pub fn decode_max_grid_size(
     }
 }
 
-// The fa2 launch geometry, derived host-side exactly as the device text derives it: block shapes, tile widths, and the shared-memory budget per instantiation. Every constant restates a formula in `attn/attention.cuh`.
-
-/// The kv element width in bytes; the lattice is stamped at bf16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvWidth(pub u32);
 
@@ -617,11 +565,6 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        // GQA group values the lattice is stamped for. 16 is Muse Glimmer's
-        // (32 query heads over 2 kv heads): `bdy` 16 by `bdx` 16 is a
-        // 256-thread block with `bdz` 1, inside what `decode.cuh` admits. 6
-        // is Qwen3.8-27B's (24 over 4 at head width 256): `bdy` 6 by `bdx`
-        // 32, a 192-thread block with `bdz` 1.
         if !matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16) {
             return Err(refuse(
                 op,
@@ -880,7 +823,6 @@ impl PrefillGeometry {
         })
     }
 
-    /// `sizeof(SharedStorage)` for the paged prefill traits, restated.
     #[must_use]
     pub const fn shared_storage_paged(
         cta_tile_q: u32,

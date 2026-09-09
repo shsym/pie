@@ -1,7 +1,3 @@
-//! Pure Metal kernel definitions — shader entry names, argument marshalling,
-//! and dispatch geometry; no IR types, no execution state. A driver `Run`
-//! resolves plan ids to handles and calls these entry functions.
-
 pub mod attn;
 pub mod collective;
 pub mod elemwise;
@@ -11,11 +7,12 @@ pub mod icb;
 pub mod layout;
 pub mod linear;
 
-/// A recording encode sink, so an entry's point selection and grid can be
-/// asserted on a box with no GPU. Test-only, and never compiled into the
-/// rlib a driver links.
 #[cfg(test)]
 pub(crate) mod probe;
+
+pub mod tripwire;
+
+pub mod spatial;
 
 pub mod sources;
 pub mod tensor;

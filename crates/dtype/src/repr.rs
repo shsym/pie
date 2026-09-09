@@ -1,39 +1,23 @@
-//! Repr algebra behind [`Dtype::repr`](crate::Dtype::repr): [`Fmt`] recursively covers element and composite formats.
-
 use core::fmt;
 
-/// A stored element — the bottom of a term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Elem {
-    /// Unsigned code of `b` bits: the stored code is the value.
     U(u8),
-    /// Signed code of `b` bits in excess-binary: decodes as `c − 2^(b−1)`.
     I(u8),
-    /// Token `e{e}m{m}`; `m == 0` is exponent-only and unsigned.
     E {
-        /// Exponent bits.
         e: u8,
-        /// Mantissa bits; `0` means exponent-only, hence unsigned.
         m: u8,
     },
-    /// IEEE-754 binary32.
     F32,
-    /// IEEE-754 binary16.
     F16,
-    /// bfloat16.
     Bf16,
-    /// The logical element: one byte per stored value.
     Bool,
-    /// bitsandbytes' NF4: a fixed sixteen-entry table, four bits per code.
     Nf4,
-    /// A ternary digit: eight bits per five elements.
     T3,
-    /// A codebook code of registry index `n`; rate is unknown until a registry exists.
     Cb(u16),
 }
 
 impl Elem {
-    /// Storage rate as `(bits, elements)`.
     #[must_use]
     pub const fn rate(self) -> Option<(u32, u32)> {
         match self {
@@ -69,16 +53,11 @@ impl fmt::Display for Elem {
     }
 }
 
-/// How many elements share one factor, along the reduction axis (k).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Group {
-    /// A run of `n` elements along k. Token `g{n}`.
     N(u32),
-    /// A `(rows, cols)` block of the `[n, k]` rectangle. Token `g{r}x{c}`.
     Tile(u32, u32),
-    /// One factor per output row — the whole k axis. Token `gr`.
     Row,
-    /// One factor for the whole tensor. Token `gt`.
     Tensor,
 }
 
@@ -120,17 +99,13 @@ impl fmt::Display for Group {
     }
 }
 
-/// Where an offset applies: subtract before the gain, or add after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Off<'a> {
-    /// gain·(codes−z). Token `z_…`.
     Pre(&'a Fmt<'a>),
-    /// gain·codes+b. Token `b_…`.
     Post(&'a Fmt<'a>),
 }
 
 impl<'a> Off<'a> {
-    /// The factor inside, whichever family it is.
     #[must_use]
     pub const fn factor(self) -> &'a Fmt<'a> {
         match self {
@@ -139,35 +114,24 @@ impl<'a> Off<'a> {
     }
 }
 
-/// A quantization format: element and composite in one recursive enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fmt<'a> {
-    /// A stored element, unquantized — the leaf.
     Elem(Elem),
-    /// Grouped codes with a gain and an optional offset.
     Q {
-        /// How many codes share one gain (and one offset, if any).
         g: Group,
-        /// What a code is — always an element; codes are stored, never computed.
         elem: Elem,
-        /// The multiplicative factor, itself a term.
         gain: &'a Fmt<'a>,
-        /// The additive or subtractive factor, and which of the two; no constant node exists.
         offset: Option<Off<'a>>,
     },
 }
 
-/// The minimal unit a row may be split into along k.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Quantum {
-    /// A split is legal at any multiple of this many elements.
     Elems(u32),
-    /// The row does not split: some factor on the tree spans all of k.
     WholeRow,
 }
 
 impl Quantum {
-    /// The quantum in elements, resolving [`WholeRow`](Quantum::WholeRow) against a known row width.
     #[must_use]
     pub const fn elems(self, k: u32) -> u32 {
         match self {
@@ -198,7 +162,6 @@ impl fmt::Display for Fmt<'_> {
     }
 }
 
-/// A mangled spelling in a fixed buffer — `no_std`'s answer to `String`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Mangled {
     bytes: [u8; Self::CAPACITY],
@@ -206,10 +169,8 @@ pub struct Mangled {
 }
 
 impl Mangled {
-    /// Bytes the buffer holds.
     pub const CAPACITY: usize = 160;
 
-    /// An empty buffer.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -218,7 +179,6 @@ impl Mangled {
         }
     }
 
-    /// What has been written, as a string.
     #[must_use]
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len]).expect("only &str was written")
@@ -258,7 +218,6 @@ impl core::ops::Deref for Mangled {
 }
 
 impl Fmt<'_> {
-    /// The mangled spelling, in a fixed buffer.
     #[must_use]
     pub fn mangle(&self) -> Mangled {
         use fmt::Write as _;
@@ -422,17 +381,14 @@ const fn walk(f: &Fmt<'_>, b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// Whether `f` mangles to exactly `spelling`, checked at compile time.
 #[must_use]
 pub const fn spells(f: &Fmt<'_>, spelling: &str) -> bool {
     let b = spelling.as_bytes();
     matches!(walk(f, b, 0), Some(end) if end == b.len())
 }
 
-/// The most planes [`Fmt::plane_widths`] will enumerate.
 pub const MAX_PLANES: usize = 8;
 
-/// Bytes per row of each plane of a leaf-per-plane container, in tree order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlaneWidths {
     bytes: [u32; MAX_PLANES],
@@ -440,19 +396,16 @@ pub struct PlaneWidths {
 }
 
 impl PlaneWidths {
-    /// The widths, in tree order.
     #[must_use]
     pub fn as_slice(&self) -> &[u32] {
         &self.bytes[..self.len]
     }
 
-    /// How many planes the container has.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
 
-    /// Whether there are no planes at all.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
@@ -538,7 +491,6 @@ fn quantum_walk(f: &Fmt<'_>, parent: u64, acc: &mut u64) -> Option<()> {
 }
 
 impl Fmt<'_> {
-    /// The stored element of the codes.
     #[must_use]
     pub const fn code(&self) -> Elem {
         match *self {
@@ -547,7 +499,6 @@ impl Fmt<'_> {
         }
     }
 
-    /// Bits per weight for a `k`-wide row; a tensor-wide factor is charged as zero.
     #[must_use]
     pub fn bpw(&self, k: u32) -> Option<f64> {
         if k == 0 {
@@ -557,7 +508,6 @@ impl Fmt<'_> {
         Some(cost(self, k)? / k)
     }
 
-    /// Bytes per row of every plane of the leaf-per-plane container, in tree order.
     #[must_use]
     pub fn plane_widths(&self, k: u32) -> Option<PlaneWidths> {
         let mut out = PlaneWidths::new();
@@ -565,11 +515,6 @@ impl Fmt<'_> {
         Some(out)
     }
 
-    /// The bytes one row of `k` elements occupies — every plane of the term,
-    /// summed.
-    ///
-    /// `None` for a `k` that is not a whole number of [`quantum`](Fmt::quantum):
-    /// a row cut mid-group owns a factor it does not fill.
     #[must_use]
     pub fn row_bytes(&self, k: u32) -> Option<u64> {
         if k == 0 || !k.is_multiple_of(self.quantum().elems(k)) {
@@ -583,7 +528,6 @@ impl Fmt<'_> {
         Some(total)
     }
 
-    /// The minimal unit a row splits into along k, as the lcm of every group's extent in elements.
     #[must_use]
     pub fn quantum(&self) -> Quantum {
         if matches!(self, Fmt::Elem(_)) {
@@ -613,7 +557,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-/// 4-bit codes in groups of 128 with an f16 gain and an integer zero point of the same width — GPTQ/AWQ/compressed-tensors' layout.
 pub const G128_U4_F16_Z_U4: Fmt<'static> = Fmt::Q {
     g: Group::N(128),
     elem: Elem::U(4),
@@ -622,7 +565,6 @@ pub const G128_U4_F16_Z_U4: Fmt<'static> = Fmt::Q {
 };
 const _: () = assert!(spells(&G128_U4_F16_Z_U4, "g128_u4_f16_z_u4"));
 
-/// 4-bit codes in groups of 64 with an f16 gain and a real pre-scale zero — HQQ's shape.
 pub const G64_U4_F16_Z_F16: Fmt<'static> = Fmt::Q {
     g: Group::N(64),
     elem: Elem::U(4),
@@ -631,7 +573,6 @@ pub const G64_U4_F16_Z_F16: Fmt<'static> = Fmt::Q {
 };
 const _: () = assert!(spells(&G64_U4_F16_Z_F16, "g64_u4_f16_z_f16"));
 
-/// Ternary weights with one f16 scale for the whole tensor — BitNet-class, eight bits per five weights.
 pub const GT_T3_F16_N: Fmt<'static> = Fmt::Q {
     g: Group::Tensor,
     elem: Elem::T3,
@@ -644,7 +585,11 @@ const _: () = assert!(spells(&GT_T3_F16_N, "gt_t3_f16_n"));
 mod tests {
     use super::*;
 
-    /// A structured sweep: every term Display writes, the walker accepts.
+    fn repr_every_case() {
+        display_and_the_walker_agree_over_a_sweep();
+        bpw_matches_the_published_tables();
+    }
+
     #[test]
     fn display_and_the_walker_agree_over_a_sweep() {
         const GAINS: &[Fmt<'static>] = &[
@@ -708,8 +653,6 @@ mod tests {
         assert!(count > 200, "the sweep should be broad: {count}");
     }
 
-    /// The bits-per-weight numbers the design doc pins.
-    #[test]
     fn bpw_matches_the_published_tables() {
         let k = 4096;
         assert_eq!(G128_U4_F16_Z_U4.bpw(k), Some(4.15625));

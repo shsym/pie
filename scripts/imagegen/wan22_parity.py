@@ -76,24 +76,6 @@ DEFAULT_GOLDEN = os.path.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# What a row's golden holds, and how close pie must come to it.
-#
-# `stem` names the dump's keys (`<stem>.in.<name>` in, `out` / `out_pertoken`
-# back); `cos` is the gate. The miniature golden is fp32 (`wan22_golden.py
-# --mini` runs on CPU in float32) and pie runs the same weights cast to bf16
-# with bf16 activations: the bf16 drift of a two-block trunk, the same order
-# as mini-dit's gate (README §3). The flagship's golden is itself a bf16
-# diffusers forward, but thirty blocks deep over 1950 rows, so it gates one
-# decade looser. The flagship's timestep is ALREADY per token (`[B, S]`,
-# TI2V's `expand_timesteps`), uniform 999 at step 0 for a pure T2V prompt --
-# `--pertoken` is the miniatures' switch and this row needs none.
-#
-# `move` is the `conditioning` claim's floor: how far dropping the prompt must
-# take the velocity. It is a ROW's number because a miniature's random 0.02
-# weights make its cross-attention nearly inert — the reference itself moves
-# only 0.0043 there, against 0.48 on the real row — so on a miniature the claim
-# separates "attended" from "not attended AT ALL" (lanes in different fires
-# answer the same bytes twice, a move of exactly zero) and nothing finer.
 ROWS = {
     "d128": dict(npz="wan22_mini.npz", stem="mini.d128", out="mini.d128.out.0",
                  out_pertoken="mini.d128.out_pertoken.0", cos="0.9999", move=0.002),
@@ -103,29 +85,16 @@ ROWS = {
                     out_pertoken=None, cos="0.999", move=0.05),
 }
 
-# How a case reaches the guest. Linux caps ONE argument at 128 KiB
-# (`MAX_ARG_STRLEN`, not a rlimit), and the whole argv at a quarter of
-# `RLIMIT_STACK` — so `run` cuts the case into 120 KiB `--case_N` pieces and
-# raises the child's stack limit to buy the room. Past `ARGV_CEILING` even
-# that is not enough and the case must be shrunk (`--compact`), which is why
-# a real row's case states its rectangles as base64.
 PIECE = 120 * 1024
 ARGV_CEILING = 3 * 1024 * 1024
 CHILD_STACK = 256 * 1024 * 1024
 
-
 def tolerances(args) -> list[str]:
     return ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
-
 
 def b64(a: np.ndarray) -> str:
     """A float rectangle as the guest's `*_b64`: little-endian f32."""
     return base64.b64encode(np.ascontiguousarray(a, dtype="<f4").tobytes()).decode()
-
-
-# ----------------------------------------------------------------------------
-# patchify / unpatchify -- (1, 2, 2) patches, feature order (c, ph, pw)
-# ----------------------------------------------------------------------------
 
 def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     """[B,C,T,H,W] -> [B, T*(H/p)*(W/p), C*p*p], feature order (c, ph, pw)."""
@@ -134,27 +103,19 @@ def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     x = x.transpose(0, 2, 3, 5, 1, 4, 6)
     return np.ascontiguousarray(x.reshape(b, t * (h // p) * (w // p), c * p * p))
 
-
 def unpatchify(tokens: np.ndarray, c: int, t: int, h: int, w: int, p: int) -> np.ndarray:
     b = tokens.shape[0]
     x = tokens.reshape(b, t, h // p, w // p, c, p, p)
     x = x.transpose(0, 4, 1, 2, 5, 3, 6)
     return np.ascontiguousarray(x.reshape(b, c, t, h, w))
 
-
 def positions(t: int, hp: int, wp: int) -> np.ndarray:
     """`(t, h, w)` per token, in token order."""
     tt, hh, ww = np.meshgrid(np.arange(t), np.arange(hp), np.arange(wp), indexing="ij")
     return np.stack([tt, hh, ww], axis=-1).reshape(-1, 3).astype(np.float32)
 
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
-
 def suffix(args) -> str:
     return "_pertoken" if args.pertoken else ""
-
 
 def numbered(out: str, stem: str, tail: str) -> list[str]:
     pattern = re.compile(rf"^{re.escape(stem)}{re.escape(tail)}_(\d+)\.json$")
@@ -165,14 +126,11 @@ def numbered(out: str, stem: str, tail: str) -> list[str]:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
 
-
 def row(args) -> dict:
     return ROWS[args.variant]
 
-
 def dump_of(args) -> np.lib.npyio.NpzFile:
     return np.load(os.path.join(args.golden, row(args)["npz"]))
-
 
 def out_key(args) -> str:
     """The golden key this run's answer stands against."""
@@ -183,14 +141,12 @@ def out_key(args) -> str:
         raise SystemExit(f"`{args.variant}` has no per-token forward in its golden")
     return r["out_pertoken"]
 
-
 def timesteps(args, dump) -> np.ndarray:
     """The golden's timestep for this run, `[B]` or `[B, S]` per token."""
     r = row(args)
     if args.pertoken:
         return dump[f"{r['stem']}.in.timestep_pertoken"]
     return dump[f"{r['stem']}.in.timestep"]
-
 
 def lane_cut(pt: np.ndarray) -> tuple[int, float]:
     """A per-token timestep as the two lanes `wan_2` takes: how many leading
@@ -202,14 +158,13 @@ def lane_cut(pt: np.ndarray) -> tuple[int, float]:
     assert rest.size and np.all(rest == rest[0]), "one timestep past the prefix"
     return cond_rows, float(rest[0])
 
-
 def cases(args) -> list[str]:
     """Write one `case[_pertoken]_{b}.json` per batch element; answer their paths."""
     r = row(args)
     dump = dump_of(args)
-    hs = dump[f"{r['stem']}.in.hidden_states"]           # [B, C, T, H, W]
-    ctx = dump[f"{r['stem']}.in.encoder_hidden_states"]  # [B, L, text_dim]
-    ts = timesteps(args, dump)                           # [B] or [B, S]
+    hs = dump[f"{r['stem']}.in.hidden_states"]
+    ctx = dump[f"{r['stem']}.in.encoder_hidden_states"]
+    ts = timesteps(args, dump)
     b, c, t, h, w = hs.shape
     tokens = patchify(hs, 2)
     pos = positions(t, h // 2, w // 2)
@@ -234,13 +189,8 @@ def cases(args) -> list[str]:
         }
         rows = {"latents": tokens[i], "context": ctx[i], "positions": pos}
         if args.zero_context:
-            # The `conditioning` claim's other half: the same step with the
-            # prompt gone. Its answer must MOVE (see `conditioning`).
             rows["context"] = np.zeros_like(ctx[i])
         if args.compact:
-            # Only the context rows the prompt filled travel: the reference
-            # truncates to the real length and ZERO-pads back to 512, and
-            # the pad is the guest's to write (`wan_2/forward.rs`).
             real = int(np.flatnonzero(np.abs(ctx[i]).sum(-1) > 0).max() + 1)
             rows["context"] = rows["context"][:real]
             case |= {f"{name}_b64": b64(a) for name, a in rows.items()}
@@ -256,11 +206,6 @@ def cases(args) -> list[str]:
     print(f"[case] {len(written)} batch element(s), {tokens.shape[1]} rows "
           f"({lanes}), {biggest / (1 << 20):.1f} MiB each -> {args.out}")
     return written
-
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
 
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
@@ -284,7 +229,6 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
-
 def roomy_argv() -> None:
     """The child's argv budget is a quarter of its stack limit; buy room for
     a real row's case. Runs between fork and exec (`preexec_fn`)."""
@@ -294,7 +238,6 @@ def roomy_argv() -> None:
         return
     resource.setrlimit(resource.RLIMIT_STACK, (want, hard))
 
-
 def scratch_dir(config: str | None) -> str | None:
     """The sandbox scratch a `--case_file` name resolves under, off the config."""
     if not config:
@@ -302,7 +245,6 @@ def scratch_dir(config: str | None) -> str | None:
     with open(os.path.expanduser(config)) as f:
         found = re.search(r'^\s*fs_scratch_dir\s*=\s*"([^"]*)"', f.read(), re.M)
     return found.group(1) if found else None
-
 
 def run(args) -> None:
     paths = numbered(args.out, "case", suffix(args))
@@ -325,9 +267,6 @@ def run(args) -> None:
         cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
         text = ""
         if args.case_file:
-            # `/scratch` is a FRESH directory per process (`<fs_scratch_dir>/
-            # <process id>`), so a file put there beforehand is not the one
-            # the guest sees. Kept for a guest that writes its own.
             if scratch and os.path.abspath(scratch) != os.path.abspath(args.out):
                 os.makedirs(scratch, exist_ok=True)
                 shutil.copyfile(case, os.path.join(scratch, os.path.basename(case)))
@@ -355,11 +294,6 @@ def run(args) -> None:
             f.write(done.stdout)
         print(f"[run] batch {b} -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -372,12 +306,10 @@ def document(path: str) -> dict:
         doc = json.loads(doc)
     return doc
 
-
 def answers(args) -> tuple[str, str]:
     """Where this run's answer and the golden it stands against are written."""
     stem = os.path.join(args.out, f"wan22_{args.variant}")
     return f"{stem}_pie{suffix(args)}.npz", f"{stem}_target{suffix(args)}.npz"
-
 
 def collect(args) -> str:
     dump = dump_of(args)
@@ -400,11 +332,6 @@ def collect(args) -> str:
     print(f"[collect] {mine.shape} from {len(docs)} batch element(s) -> {path}; golden -> {target}")
     return path
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
 def compare(args) -> int:
     mine, theirs = answers(args)
     for path in (mine, theirs):
@@ -416,7 +343,6 @@ def compare(args) -> int:
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def conditioning(args) -> int:
     """THE PROMPT MUST MATTER. Runs the same step twice — once with the
@@ -459,7 +385,6 @@ def conditioning(args) -> int:
               "scheduler never seats two of its passes in one step).")
         return 1
     return 0
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -504,7 +429,6 @@ def main() -> int:
         collect(args)
         gate = compare(args)
         return conditioning(args) or gate
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

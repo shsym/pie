@@ -1,19 +1,3 @@
-//! **A PLAN WITH TWO READINGS — one arm plants `seam::HIDDEN`, the other
-//! `seam::VELOCITY` — FIRED AS TWO LANES IN ONE FIRE READS EACH LANE BACK
-//! FROM ITS OWN ARM'S SEAM (`LaneReadout { seam: Hidden | Velocity, width }`
-//! per lane, and the epilogue's `hidden()` / `velocity()` intrinsic bound
-//! from the lane's own arm), while `ModelProfile { has_velocity,
-//! velocity_width }` stays plan-wide.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_two_reading_plan_reads_each_lane_back_from_its_own_seam
-//! ```
-//!
-//! The denoise arm also scales its f32 `[Lanes, FREQ]` timestep embedding
-//! with `mul_scalar` — the f32 arm of that entry on the lane axis. Skips
-//! when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -37,9 +21,6 @@ const HIDDEN: u32 = 48;
 const T_SCALE: f32 = 1000.0;
 const EMB_SCALE: f32 = 0.75;
 
-/// Text lanes run the encoder reading (a projection, `hidden` planted);
-/// image lanes the denoise reading (adaLN from a scaled timestep, a
-/// projection, `velocity` planted). Facts: the stream bit.
 struct TwoReadings;
 
 impl ForwardHybrid for TwoReadings {
@@ -49,12 +30,10 @@ impl ForwardHybrid for TwoReadings {
     }
     fn forward(&self, inputs: Input<StreamFacts>) -> Value {
         let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
-        // The encoder arm.
         let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
         let enc = Weight::sym("enc", [u64::from(HIDDEN), u64::from(WIDTH)], Dtype::Bf16);
         let h = ops::linear::matmul(&x_txt, &enc);
         seam::at(seam::HIDDEN, &[&h]);
-        // The denoise arm.
         let x_img = img.latents(1, WIDTH, Dtype::Bf16);
         let t = img.lane_vector(0, 1);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, T_SCALE));
@@ -139,9 +118,6 @@ fn velocity_reference(weights: &Weights, x: &[f32], rows: usize, timestep: f32) 
     out
 }
 
-/// An epilogue that puts the named intrinsic's rows on its reader channel.
-/// Channels: 0 latent (writer), 1 timestep (writer), 2 positions (writer,
-/// unused), 3 out (reader) — the rig's four, so the rig's lane binder serves.
 fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
     let decl = |shape: Shape, host_role: HostRole| ChannelDecl {
         shape,
@@ -196,7 +172,6 @@ fn each_lane_reads_back_its_own_arms_seam() {
     let want_hidden = hidden_reference(&weights, &text, text_rows);
     let want_velocity = velocity_reference(&weights, &image, image_rows, timestep);
 
-    // One instance per lane, each program reading its own arm's intrinsic.
     let text_program = rig.register(epilogue(text_rows as u32, IntrinsicId::Hidden, HIDDEN), 1);
     let image_program = rig.register(epilogue(image_rows as u32, IntrinsicId::Velocity, WIDTH), 2);
     let t = rig.lane_of(text_program, text_rows as u32, HIDDEN);
@@ -211,7 +186,6 @@ fn each_lane_reads_back_its_own_arms_seam() {
     for lane in [&mut text_lane, &mut image_lane] {
         lane.ports.retain(|f| f.kind != PortKind::AxisPositions);
     }
-    // The encoder arm reads no timestep.
     text_lane.ports.retain(|f| f.kind != PortKind::LaneVector);
     let mut ticket = rig
         .engine
@@ -239,7 +213,6 @@ fn each_lane_reads_back_its_own_arms_seam() {
         "image lane: its arm's velocity",
     );
 
-    // The epilogue road: each program's intrinsic came from its lane's arm.
     assert_close(
         &rig.take(t.instance, 3),
         &want_hidden,

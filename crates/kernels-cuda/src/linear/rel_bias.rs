@@ -1,7 +1,3 @@
-//! `Linear::RelBias`: Inkling's relative-position profile, one f32 bias per
-//! (row, head, backward distance) out of `d_rel` features and a
-//! `[d_rel, extent]` bank.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -12,7 +8,6 @@ const FILE: &str = "linear/rel_bias.cuh";
 
 const BLOCK: u32 = 256;
 
-/// `bias[row, h · extent + d] = Σ_j x[row, h · d_rel + j] · w[j, d]`.
 pub fn rel_bias(
     ctx: &Ctx,
     x: Tensor,
@@ -66,7 +61,6 @@ pub fn rel_bias(
             stated(OP, heads)?.arg(),
             stated(OP, d_rel)?.arg(),
             stated(OP, extent)?.arg(),
-            // The staged-geometry seat: live rows and their origin, or ABSENT.
             ctx.stage(),
         ],
     )

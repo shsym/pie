@@ -1,12 +1,3 @@
-//! `ScatterLive`: the embed merge for a rectangle whose tail has no
-//! destination. A separate entry rather than a guard inside
-//! `layout::scatter_rows`, so that op's existing contract (every route names
-//! a row) is not widened underneath its consumers.
-//!
-//! A compacting fold answers `rows / side²` rows and leaves the rest of the
-//! patch rectangle as whatever the arena held; those tail rows have route
-//! entries with no legal destination, hence the negative-route sentinel here.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -19,20 +10,6 @@ const WARP: u32 = 32;
 
 const MAX_BLOCK: u32 = 1024;
 
-/// The embed merge, with a drop sentinel: row `i` of `src` lands at token row
-/// `routes[i]` of `y`; any negative `routes[i]` places it nowhere (`-1` is
-/// the value a submission writes, but any negative is dropped).
-///
-/// The upper bound is still not this kernel's to check: the fire path
-/// validates the vector against the token row count before the launch, as
-/// for the unguarded twin.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16, f16 and f32; a refusal
-/// for a route vector that is not `i32`, one whose length is not `src.rows`,
-/// a width or element mismatch between the two rectangles, and an empty
-/// source.
 pub fn scatter_live_rows(
     ctx: &Ctx,
     src: Tensor,
@@ -93,7 +70,6 @@ pub fn scatter_live_rows(
             y.arg(),
             routes.arg(),
             units.arg(),
-            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )

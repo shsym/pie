@@ -51,35 +51,23 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from golden_common import Tap, manifest, npz_keys, outdir  # noqa: E402
-from vendor.minimax_h3 import MINI, MiniMaxH3DiT, interleave_qkv  # noqa: E402
+from golden_common import Tap, manifest, npz_keys, outdir
+from vendor.minimax_h3 import MINI, MiniMaxH3DiT, interleave_qkv
 
 MODEL = "minimax_h3"
 REPO = "MiniMaxAI/MiniMax-H3"
 SEED = 0
 
-# The miniature's job: a three-row prompt, a 2 x 4 x 4 video latent grid
-# under the (1, 2, 2) patch (2 x 2 x 2 = 8 video rows), three audio latent
-# ticks in stereo (6 rows), and one keyframe (4 rows: one latent frame of
-# the same 2 x 2 patch grid).
 TEXT_ROWS = 3
 LATENT_T, LATENT_H, LATENT_W = 2, 4, 4
 AUDIO_T = 3
 KEYFRAMES = 1
 
-# The four timesteps of one step, in the slot order pie's `timestep` port
-# states: video, the visual condition rows' pinned max(t, 0.999), audio,
-# and the ref2va audio-reference slot no FL2VA lane claims.
 UNIQUE_TIMESTEPS = [0.35, 0.999, 0.62, 1.0]
-# The modality tag of each row class (presentation.py:26-27): visual 0,
-# text 1, audio 2.
 TAGS = {"text": 1, "video": 0, "audio": 2, "reference": 0}
-# Which unique timestep each row class runs at (denoise_loop.py:369-418).
 SLOTS = {"text": 0, "video": 0, "audio": 2, "reference": 1}
-# pie's packed order; the reference's is `("text", "reference", "audio", "video")`.
 PIE_ORDER = ("text", "video", "audio", "reference")
 REF_ORDER = ("text", "reference", "audio", "video")
-
 
 def rows_of(arch) -> dict[str, int]:
     ph, pw = arch.patch_size[1], arch.patch_size[2]
@@ -90,7 +78,6 @@ def rows_of(arch) -> dict[str, int]:
         "audio": 2 * AUDIO_T,
         "reference": KEYFRAMES * (LATENT_H // ph) * (LATENT_W // pw),
     }
-
 
 def positions(arch) -> dict[str, np.ndarray]:
     """The `(t, h, w)` table, one block per row class.
@@ -119,8 +106,6 @@ def positions(arch) -> dict[str, np.ndarray]:
         [[spans[k], float(h), float(w)] for k in range(LATENT_T) for h in range(hg) for w in range(wg)],
         dtype=np.float32,
     )
-    # Channel-major stereo (packed_tokens.py:73-97): every left-channel row
-    # first, then every right-channel row; `w` is the pinned extreme.
     audio = np.array(
         [
             [float(TEXT_ROWS + i), 0.0, float(0 if c == 0 else wg - 1)]
@@ -135,10 +120,8 @@ def positions(arch) -> dict[str, np.ndarray]:
     )
     return {"text": text, "video": video, "audio": audio, "reference": reference}
 
-
 def table(order, per_class: dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate([per_class[name] for name in order], axis=0)
-
 
 def run_mini(d: str, device: str = "cpu", dtype: torch.dtype = torch.float32) -> None:
     arch = MINI
@@ -191,8 +174,6 @@ def run_mini(d: str, device: str = "cpu", dtype: torch.dtype = torch.float32) ->
             )
         answers[tag] = (video_v, audio_v, position_ids[0], tags, inverse)
 
-    # The claim `crates/models/src/minimax_h3/forward.rs` makes about the
-    # row order, checked rather than assumed.
     for which, index in (("video", 0), ("audio", 1)):
         a = answers["pie"][index].flatten().double()
         b = answers["ref"][index].flatten().double()
@@ -216,9 +197,6 @@ def run_mini(d: str, device: str = "cpu", dtype: torch.dtype = torch.float32) ->
     tap.save(os.path.join(d, "h3_mini.npz"))
     npz_keys(tap)
 
-    # The checkpoint, in the OFFICIAL spellings: `qkv_proj` re-interleaved
-    # per head so pie's import runs its de-interleave, everything else
-    # named as `FL2VA/transformer/`'s index names it.
     from safetensors.torch import save_file
 
     state = {}
@@ -262,7 +240,6 @@ def run_mini(d: str, device: str = "cpu", dtype: torch.dtype = torch.float32) ->
     total = sum(counts.values())
     print(f"  mini: {sum(v.numel() for v in state.values())} params, {total} packed rows {counts}")
 
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -284,7 +261,6 @@ def main() -> int:
         },
     )
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

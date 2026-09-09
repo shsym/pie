@@ -1,24 +1,61 @@
-//! Wan 2.2's prompt rendering: there is none. `WanPipeline` hands the raw
-//! prompt to `T5TokenizerFast`, whose post-processor appends `</s>` (id 1)
-//! and nothing else — no system turn, no role markers, no bos —
-//! `padding="max_length"` to 512 with `<pad>` (id 0), then truncates the
-//! encoder's output to the real length and zero-pads the EMBEDS to 512
-//! (study §C.6). The family's `text` reading runs the real-length ids
-//! (`forward.rs`); the 512-row zero pad is the context lane's.
-//!
-//! **The tokenizer cannot be bound today** (`tokenizer.rs`), so this row
-//! borrows `qwen_3`'s ChatML constructor the way `mini_dit` does — a
-//! column the catalog requires, load-bearing for nothing here. When the
-//! umT5 vocabulary loads, this becomes a raw-text template: `{prompt}` +
-//! `</s>`, no cue.
-
 use std::sync::Arc;
 
+use chat_template::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use chat_template::{ChatDecoder, ReasoningDecoder, ToolDecoder};
 use tokenizer::Tokenizer;
 
 use crate::template::Instruct;
 
+struct RawText {
+    tokenizer: Arc<Tokenizer>,
+    stop: Vec<u32>,
+}
+
+impl RawText {
+    fn text(&self, msg: &str) -> Vec<u32> {
+        self.tokenizer.encode(msg)
+    }
+}
+
+impl Instruct for RawText {
+    fn system(&self, msg: &str) -> Vec<u32> {
+        self.text(msg)
+    }
+
+    fn user(&self, msg: &str) -> Vec<u32> {
+        self.text(msg)
+    }
+
+    fn assistant(&self, msg: &str) -> Vec<u32> {
+        self.text(msg)
+    }
+
+    fn cue(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    fn seal(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
+        Box::new(GenericChatDecoder::new(
+            Arc::clone(&self.tokenizer),
+            self.stop.clone(),
+        ))
+    }
+
+    fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
+        Box::new(NoopReasoningDecoder)
+    }
+
+    fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
+        Box::new(NoopToolDecoder)
+    }
+}
+
 #[must_use]
 pub fn instruct(tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
-    crate::qwen_3::template::chatml(tokenizer)
+    let stop = tokenizer.token_to_id("</s>").into_iter().collect();
+    Arc::new(RawText { tokenizer, stop })
 }

@@ -15,7 +15,6 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// Rows routed to a registered adapter; an empty class dispatches nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -45,7 +44,6 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             let plane = u64::from(w.kv_heads) * u64::from(self.head_dim);
             c.kv(kv, w.kv.clone(), [plane, plane]);
-            // The four short convolutions' windows, `[taps, channels]` a slot.
             c.state(w.k_state.clone(), [taps, plane], Dtype::Bf16);
             c.state(w.v_state.clone(), [taps, plane], Dtype::Bf16);
             c.state(w.attn_state.clone(), [taps, hidden], Dtype::Bf16);
@@ -59,9 +57,6 @@ impl ForwardHybrid for Model {
         let d = m.head_dim;
         let one = Facts::qo_one();
 
-        // Two schedules per reading, `[local, global]` by `Reading as usize`,
-        // split by `qo_one`: the local reading windows, the global does not,
-        // and their kv head counts differ.
         let (input_d, input_p) = inputs.split(&one);
         let geometry = [
             (m.layers.iter().find(|w| w.reading as usize == 0).map_or(0, |w| w.kv_heads), Some(m.window)),
@@ -103,14 +98,11 @@ impl ForwardHybrid for Model {
             );
             seam::at(seam::ATTN_Q, &[&q]);
 
-            // One bias profile per (row, head) over backward distance, read
-            // by both arms of the attention.
             let bias = ops::linear::rel_bias(&r, &w.rel_proj, m.heads, m.d_rel, w.extent);
             let (dq, pq) = q.split(&one);
             let (db, pb) = bias.split(&one);
             let plan_d = plan_d[reading].as_ref().expect("a layer of this reading built its plan");
             let plan_p = plan_p[reading].as_ref().expect("a layer of this reading built its plan");
-            // Only the global reading scales past the floor.
             let log_scaling = match w.reading {
                 Reading::Local => None,
                 Reading::Global => Some(m.log_scaling),
@@ -197,23 +189,17 @@ impl ForwardHybrid for Model {
             y = ops::elemwise::residual_add(&f, &y);
         }
 
-        // `hidden / logits_mup_width_multiplier`, then the unpadded head.
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.norm_eps) * m.head_scale;
         ops::linear::lm_head(&x, &m.unembed)
     }
 }
 
 impl Layer {
-    /// Every norm in this text shares one epsilon; kept as a method so a
-    /// checkpoint that states another per site has one place to say so.
     fn attn_norm_eps_or(&self, eps: f32) -> f32 {
         eps
     }
 }
 
-/// The short convolution over a value's rows: the decode class one token a
-/// slot, the prefill class walking each request — the split the recurrent
-/// mixers make, merged in the split's order.
 fn conv(v: &Value, weight: &Weight, state: &str, inputs: &Input<Facts>, m: &Model) -> Value {
     let slab = inputs.state(state);
     let (vd, vp) = v.split(&Facts::qo_one());

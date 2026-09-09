@@ -1,37 +1,3 @@
-//! **THE FLUX.2 ROWS TRACE, CLASSIFY AND BAKE: THREE ARMS, THREE STREAMS
-//! IN ONE GROUP, ONE KV SPACE FOR THE ENCODER, A VELOCITY ON THE TARGET
-//! LANE, AND A VOXEL ARM BESIDE THEM.**
-//!
-//! ```text
-//! cargo test -p models --test the_flux_2_rows_bake
-//! ```
-//!
-//! `flux2-klein-4b` is the first catalog row whose one plan carries a text
-//! encoder with a kv space, an MM-DiT denoiser with a reference stream, and
-//! a conv decoder on the voxel axis (design D5, D8). What is asserted:
-//!
-//! ```text
-//! (a) both rows trace on every platform; the flagship declares exactly the
-//!     encoder's 27 kv rows and the miniature none
-//! (b) the flagship's seams are `hidden`, `velocity` and `pixels` and never
-//!     `out`; the miniature's is `velocity` alone
-//! (c) the denoise ports are the ones the facts declare, kind-relative
-//!     indices included, on both rows; the guidance port exists only where
-//!     `guidance_embeds` does
-//! (d) text, image and reference lanes of the denoise reading classify into
-//!     three distinct classes; the miniature's readings are dense from 0
-//! (e) every ragged read is self-paired over the denoise arm's group CSR at
-//!     128-wide heads, and there are as many as the trunk has attentions
-//! (f) every rope turns four 32-channel axes of the whole head at θ 2000,
-//!     interleaved, and the encoder's rope is the neox full-head one
-//! (g) the plan bakes on every platform under a voxel ladder, and the
-//!     flagship's bake refuses a budget with none
-//! (h) the schedule is the golden's: four pinned sigmas at 1024², and the
-//!     empirical mu fit reproduces them
-//! (i) the modulation is a per-lane f32 vector over a bf16 trunk, and
-//!     every gated fold aliases its residual
-//! ```
-
 use std::collections::BTreeSet;
 
 use model_dsl::{
@@ -67,7 +33,17 @@ fn seams(plan: &Trace) -> BTreeSet<&str> {
     plan.seams.iter().map(|s| s.seam.as_str()).collect()
 }
 
-/// (a), (b)
+fn the_flux_2_rows_bake_every_case() {
+    both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare();
+    the_denoise_ports_are_the_ones_the_facts_declare();
+    each_stream_of_the_denoise_reading_classifies_into_its_own_class();
+    every_ragged_read_is_self_paired_over_the_group_csr();
+    every_rope_turns_four_axes_of_the_whole_head_interleaved();
+    both_rows_bake_on_every_platform_under_a_voxel_ladder();
+    the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it();
+    the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
+}
+
 #[test]
 fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
     for platform in PLATFORMS {
@@ -133,9 +109,6 @@ fn traced_ports(plan: &Trace) -> Vec<(PortKind, u8, u32)> {
     traced
 }
 
-/// (c) — the facts a guest binds by and the inputs the plan reads are one
-/// list, on both rows.
-#[test]
 fn the_denoise_ports_are_the_ones_the_facts_declare() {
     for (sku, guidance, context_width) in [
         (KLEIN, false, model::Dims::klein_4b().dim),
@@ -204,8 +177,6 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
         assert_eq!(traced_ports(&plan), declared, "{sku}");
 
-        // The sinusoids: the timestep unscaled (`[cos | sin]`), and with a
-        // guidance embedder a second one scaled by 1000.
         let mut sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -238,10 +209,6 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         assert_eq!(sinusoids, want, "{sku}");
     }
 
-    // The flagship's readings are `text`, `denoise` and the two voxel
-    // arms, dense from 0 (the VAE pair is
-    // `tests/the_flux_2_vae_bakes.rs`'s claim; here only its place in the
-    // order).
     let klein = row(KLEIN).generative.as_ref().unwrap();
     let names: Vec<(&str, u8)> = klein.readings.iter().map(|r| (r.name, r.index)).collect();
     assert_eq!(
@@ -272,8 +239,6 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
     );
 }
 
-/// (d)
-#[test]
 fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
     for sku in [KLEIN, MINI] {
         let plan = trace(sku, Platform::Cuda);
@@ -316,8 +281,6 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
     );
 }
 
-/// (e)
-#[test]
 fn every_ragged_read_is_self_paired_over_the_group_csr() {
     for (sku, dims) in [
         (KLEIN, model::Dims::klein_4b()),
@@ -378,8 +341,6 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
     }
 }
 
-/// (f)
-#[test]
 fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
     let plan = trace(KLEIN, Platform::Cuda);
     let dims = model::Dims::klein_4b();
@@ -399,7 +360,6 @@ fn every_rope_turns_four_axes_of_the_whole_head_interleaved() {
             _ => None,
         })
         .collect();
-    // q and k per side per double block, q and k per single block.
     assert_eq!(
         ropes.len(),
         (4 * dims.double_blocks + 2 * dims.single_blocks) as usize
@@ -446,8 +406,6 @@ fn budget() -> model_compiler::Budget {
     }
 }
 
-/// (g)
-#[test]
 fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
     for platform in PLATFORMS {
         for sku in [KLEIN, MINI] {
@@ -473,8 +431,6 @@ fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
             );
         }
     }
-    // The flagship states voxel rows, so a deployment admitting none
-    // refuses it at the door rather than sizing them at zero.
     let refused = model_compiler::compile(
         &trace(KLEIN, Platform::Cuda),
         &budget(),
@@ -486,8 +442,6 @@ fn both_rows_bake_on_every_platform_under_a_voxel_ladder() {
     );
 }
 
-/// (h)
-#[test]
 fn the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it() {
     let facts = row(KLEIN).generative.as_ref().unwrap();
     let schedule = facts
@@ -496,14 +450,12 @@ fn the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it() {
         .expect("a denoiser states its schedule");
     assert_eq!(schedule.kind, models::ScheduleKind::Flow);
     assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
-    // `flux2_golden.npz`'s `sigmas[:-1]` at 1024², four steps.
     let golden = [1.0f32, 0.967_384_04, 0.908_143_94, 0.767_199_93];
     assert_eq!(schedule.pinned_sigmas.len(), 4);
     for (mine, theirs) in schedule.pinned_sigmas.iter().zip(golden) {
         assert!((mine - theirs).abs() < 2e-6, "{mine} vs {theirs}");
     }
     assert_eq!(forward::sigmas(4096, 4), schedule.pinned_sigmas);
-    // Past 4300 tokens the fit ignores the step count.
     assert_eq!(
         forward::empirical_mu(8192, 4),
         forward::empirical_mu(8192, 50)
@@ -522,8 +474,6 @@ fn the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it() {
     );
 }
 
-/// (i)
-#[test]
 fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
     let plan = trace(MINI, Platform::Cuda);
     let dims = model::Dims::mini();
@@ -553,8 +503,6 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
         );
         assert!(lane_of_row.is_some(), "every modulation here is per lane");
     }
-    // Four per double block (two sublayers, two streams), one per single
-    // block, one at the head.
     assert_eq!(
         seen,
         (4 * dims.double_blocks + dims.single_blocks + 1) as usize

@@ -1,27 +1,3 @@
-//! **THE THIRD ROW AXIS BAKES AS ITS OWN UNIT, CARVES ITS OWN COLUMNS, AND
-//! THE PATCHIFY PAIR SITS AT THE UNIT BOUNDARY.** (design D8)
-//!
-//! ```text
-//! cargo test -p model-compiler --test the_third_row_axis_carves_its_own_arena
-//! ```
-//!
-//! Two plans traced through the real DSL:
-//!
-//! (a) an ENCODER — a voxel port convolved then patchified into tokens a
-//!     matmul reads — bakes to `units == [Voxels, Tokens]`: every voxel
-//!     region first, the patchify (writes tokens) opening the token unit,
-//!     the fold stood down, a voxel seriation beside the token one;
-//! (b) a DECODER — tokens unpatchified into voxels, convolved, upsampled,
-//!     shuffled into pixels — bakes to `units == [Tokens, Voxels]`, the
-//!     unpatchify (writes voxels) opening the voxel unit; its pixel plane is
-//!     carved at `RowExpr::VoxelsTimes(16)` — sixteen times the voxel
-//!     ceiling, three channels — and its grids at `RowExpr::Clips`, and no
-//!     voxel rectangle shares a column with a token one;
-//! (c) the same decoder against budgets that size no voxel ceiling is
-//!     refused by the axis's name, not carved at zero rows; a voxel ladder
-//!     is checked on its own terms (a rung past `max_voxels` is refused
-//!     where it would be legal against `max_tokens`).
-
 use model_compiler::{
     Budget, Budgets, DeviceProfile, Error, Placement, RowAxis, RowExpr, VoxelLadder, compile,
     compile_axes,
@@ -55,7 +31,6 @@ fn plane(name: &str, c: u32) -> Weight {
     Weight::sym(name, [u64::from(c)], Dtype::F32)
 }
 
-/// Voxels in, tokens out.
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
@@ -83,7 +58,6 @@ impl ForwardHybrid for Encoder {
     }
 }
 
-/// Tokens in, pixels out.
 struct Decoder;
 
 impl ForwardHybrid for Decoder {
@@ -131,6 +105,12 @@ fn unit_axes(trace: &Trace, compiled: &model_compiler::CompiledModel) -> Vec<(St
         .collect()
 }
 
+fn the_third_row_axis_carves_its_own_arena_every_case() {
+    an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one();
+    a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column();
+    a_voxel_plan_against_no_voxel_ceiling_is_refused_by_name();
+}
+
 #[test]
 fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
@@ -164,7 +144,6 @@ fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
     assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 }
 
-#[test]
 fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() {
     let trace = trace_hybrid("decoder", &Decoder, Platform::Cuda);
     let compiled = compile_axes(&trace, &budgets(), &DeviceProfile::default()).expect("bakes");
@@ -187,7 +166,6 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
         "the unpatchify writes voxel rows and opens the voxel unit: {placed:?}"
     );
 
-    // The pixel plane and its grid, off the seam.
     let pixels = trace
         .seams
         .iter()
@@ -198,7 +176,6 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
         panic!("the pixel plane is a rectangle of the arena")
     };
     assert_eq!(*rows, RowExpr::VoxelsTimes(16));
-    // 16 x 256 voxels x 3 channels x 2 bytes.
     assert_eq!(*bytes, 16 * 256 * 3 * 2);
     let Placement::Arena { rows, bytes, .. } = &compiled.arena.placements[grid.0 as usize] else {
         panic!("the grid is a rectangle of the arena")
@@ -206,8 +183,6 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
     assert_eq!(*rows, RowExpr::Clips);
     assert_eq!(*bytes, 4 * 4 * 4, "four clips of four i32");
 
-    // No voxel rectangle shares a column with a token one: `co_tenants`
-    // demands equal row symbols, and these are different axes.
     let token_values: Vec<_> = (0..trace.values.len() as u32)
         .map(model_ir::ValueId)
         .filter(|id| {
@@ -223,7 +198,6 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
     assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 }
 
-#[test]
 fn a_voxel_plan_against_no_voxel_ceiling_is_refused_by_name() {
     let trace = trace_hybrid("decoder", &Decoder, Platform::Cuda);
     let refusal = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
@@ -236,8 +210,6 @@ fn a_voxel_plan_against_no_voxel_ceiling_is_refused_by_name() {
     );
     assert!(refusal.to_string().contains("voxels"), "{refusal}");
 
-    // The voxel ladder is its own ladder: 48 is under `max_tokens` and over
-    // `max_voxels`.
     let past = Budgets::of(Budget::new(4, 64)).with_voxels(VoxelLadder {
         max_voxels: 32,
         buckets: vec![16, 48],

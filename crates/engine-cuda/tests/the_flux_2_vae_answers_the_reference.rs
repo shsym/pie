@@ -1,61 +1,3 @@
-//! **FLUX.2'S AUTOENCODER, LOADED OUT OF THE ROW'S OWN IMPORTED ARTIFACT,
-//! DECODES A 32x32 TOKEN GRID INTO THE REFERENCE'S 512x512 PIXELS AND
-//! ENCODES THOSE PIXELS BACK INTO THE REFERENCE'S NORMALISED POSTERIOR
-//! MEAN.** (design D8, milestone M2 parity)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_flux_2_vae_answers_the_reference -- --nocapture
-//! ```
-//!
-//! The golden is `scripts/imagegen/flux2_golden.py --vae`:
-//! `AutoencoderKLFlux2` in fp32 over the centre 32x32 tokens of the full
-//! run's final packed latent — `latent.f32` (`[32·32, 128]`, DiT space at
-//! `/16`), `pixels.f32` (`[512·512, 3]` in `[-1, 1]`) and `mean.f32`
-//! (`[32·32, 128]`, the BatchNorm-normalised posterior mean of those
-//! pixels), rows of voxels in `(h, w)` order under
-//! `$PIE_IMAGEGEN_GOLDEN/flux2/flux2_vae/`. Both sides cut at the 128-wide
-//! `/16` grid, which is where `models::flux_2::vae` puts its port: the 2x2
-//! pixel shuffle and the frozen `BatchNorm2d(128)` are INSIDE the plan, so
-//! this gate covers them too.
-//!
-//! The weights come from the row's IMPORTED ARTIFACT
-//! (`$PIE_IMAGEGEN_ARTIFACTS/flux2-klein-4b.zt`, default
-//! `/root/.cache/pie-imagegen/flux2-klein-4b.zt`), read plane-by-plane
-//! through `checkpoint_dsl::own_contract` — the same identity contract a
-//! server builds for a stamped artifact — and not from the HuggingFace
-//! snapshot directly. That is forced, not chosen: the family's BatchNorm
-//! planes are `√(var + eps)` and its reciprocal, and a SERVING load may
-//! not apply a `Unary` on the way in (`checkpoint::plan::passes::validate`
-//! — the function is of the checkpoint's values, so the artifact holds its
-//! answer). So the gate runs against what `pie model import` wrote, which
-//! makes it an end-to-end check of the import as well as of the arms:
-//!
-//! ```text
-//! pie model import <the FLUX.2-klein-4B snapshot>
-//!   --sku flux2-klein-4b-bf16-kv-bf16
-//!   --out ~/.cache/pie-imagegen/flux2-klein-4b.zt --force
-//! ```
-//!
-//! Only the VAE's own planes are read (the trace of one arm names no
-//! `dit.`/`te.` param), so a 14 GB artifact costs a few hundred megabytes
-//! here. Each reading is its own plan and load — the decoder against a
-//! 1 032-voxel ladder, the encoder against a 262 152-voxel one — so the
-//! arena is sized for the reading it serves.
-//!
-//! Gates (bf16 activations against an fp32 reference): decode `cos ≥
-//! 0.999`, `mean |err| ≤ 0.005` and at most one value in ten thousand past
-//! 0.05 (`max |err| ≤ 0.2`) on pixels in `[-1, 1]` — measured: cos
-//! 0.999994, mean 0.0017, max 0.040, not one value past 0.05, the worst
-//! scattered in the picture's interior and not on its border (a border
-//! run would be a padding fault); encode `cos ≥ 0.9995`, `mean |err| ≤
-//! 0.02` and `max |err| ≤ 0.5` on the normalised mean (range `[-6.1,
-//! 6.9]`) — measured: cos 0.999957, mean 0.0069, max 0.115 at two
-//! interior voxels. Both are tighter than Z-Image's same gate: this VAE's
-//! latent is BatchNorm-normalised rather than scaled by one factor, so
-//! the mean's rows sit in a narrower range and lose less to bf16. Skipped
-//! by name without a device, the artifact or the golden.
-
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -69,7 +11,6 @@ use models::flux_2::forward::Facts;
 use models::flux_2::model::{IN_CHANNELS, Model};
 use models::flux_2::vae;
 
-/// One VAE reading as a plan of its own: the whole input is that arm.
 struct OneArm {
     model: Model,
     decode: bool,
@@ -94,7 +35,6 @@ impl ForwardHybrid for OneArm {
     }
 }
 
-/// The row's imported artifact — what `pie model import` wrote.
 fn artifact() -> Option<PathBuf> {
     let path = std::env::var_os("PIE_IMAGEGEN_ARTIFACTS")
         .map(PathBuf::from)
@@ -155,7 +95,6 @@ fn score(got: &[f32], want: &[f32]) -> Score {
     }
 }
 
-/// Load one reading of the VAE out of the artifact and fire one clip through it.
 fn fire(
     root: &PathBuf,
     decode: bool,
@@ -174,9 +113,6 @@ fn fire(
         &arm,
         Platform::Cuda,
     );
-    // The artifact's own contract, over the params of THIS arm alone: the
-    // planes the other arm and the transformer hold are never named, so
-    // never read.
     let src = ztensor::Source::open(root).unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the artifact does not hold this arm's planes: {why}"));
@@ -231,7 +167,6 @@ fn fire(
         clips: &[clip],
         payload: &bytes,
     }];
-    // Once to warm the JIT, once for the clock.
     let _ = shell.fire_voxels(&lanes, &clips).expect("the first fire");
     let started = Instant::now();
     let mut answered = shell.fire_voxels(&lanes, &clips).expect("the second fire");
@@ -258,8 +193,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
         eprintln!("skipping the VAE parity gate: no flux2_golden.py --vae dump");
         return;
     };
-    // The golden's clips are square stills: the box is read off each
-    // plane's length (`shapes.json` beside them says the same).
     let latent = f32s(&gold.join("latent.f32"));
     let pixels = f32s(&gold.join("pixels.f32"));
     let mean = f32s(&gold.join("mean.f32"));
@@ -286,7 +219,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
         "one token is 16 pixels a side"
     );
 
-    // ---- decode ----------------------------------------------------------
     let (got, boxes, load_s, fire_s) = fire(
         &root,
         true,
@@ -296,8 +228,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     );
     assert_eq!(boxes, vec![pixel_box], "the clip comes back at 16x");
     let s = score(&got, &pixels);
-    // Where the worst pixels are: a border-only error would be a padding
-    // bug, a scattered one is bf16 through sixty convolutions.
     {
         let side = pixel_box[1] as usize;
         let mut worst: Vec<(f32, usize, usize, usize)> = got
@@ -334,7 +264,6 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
         s.max_abs
     );
 
-    // ---- encode ----------------------------------------------------------
     let (got, boxes, load_s, fire_s) = fire(
         &root,
         false,

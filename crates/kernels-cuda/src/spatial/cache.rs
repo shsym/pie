@@ -1,11 +1,3 @@
-//! The causal convolution's frame cache, between a recurrent slab and a
-//! launch: [`cache_gather`] lays each lane's slot out as the contiguous
-//! `[Σ frames·h·w, C_in]` rectangle `conv3d` reads, [`cache_store`] writes
-//! each lane's last `frames` input frames back into its slot. Both read
-//! the lane's slot through a `[lanes]` i32 slot table beside the grid.
-//!
-//! Numerics: copies, bf16 to bf16, no arithmetic.
-
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse};
 use crate::spatial::{flat_elements, lanes_of};
@@ -16,8 +8,6 @@ const FILE: &str = "spatial/cache.cuh";
 
 const BLOCK: u32 = 256;
 
-/// The cache rectangle's rows for these lanes: `Σ frames·h·w`, read off a
-/// host copy of the grid — what a caller sizes the scratch with.
 #[must_use]
 pub fn cache_rows(grid: &[i32], frames: u32) -> u64 {
     grid.chunks_exact(4)
@@ -54,10 +44,6 @@ fn check(
     Ok((lanes, frames, c, stride, total, blocks))
 }
 
-/// `cache[lane rows] = slab[slot_ids[lane]][..frames·h·w·C]` per lane.
-///
-/// `slab` is `[slots, stride]` bf16, `slot_ids` `[lanes]` i32, `grid`
-/// `[lanes, 4]` i32, `cache` `[Σ frames·h·w, C]` bf16.
 pub fn cache_gather(
     ctx: &Ctx,
     slab: Tensor,
@@ -87,8 +73,6 @@ pub fn cache_gather(
     )
 }
 
-/// `slab[slot_ids[lane]][..frames·h·w·C] = x`'s last `frames` frames of the
-/// lane (from `cache` where the clip is shorter than that).
 pub fn cache_store(
     ctx: &Ctx,
     x: Tensor,

@@ -11,9 +11,6 @@ pub enum Layout {
         vocab: u32,
         y: ValueId,
     },
-    /// The gather that interpolates: `y[r] = Σₜ weights[r, t] ·
-    /// table[ids[r, t]]`. `ids` and `weights` are both `[rows, taps]`; `taps`
-    /// is read off their width rather than stated separately.
     EmbedWeighted {
         ids: ValueId,
         weights: ValueId,
@@ -29,139 +26,69 @@ pub enum Layout {
         k: ValueId,
         v: ValueId,
     },
-    /// Deinterleaves per-head (q, gate) pairs from the packed projection.
     SplitQGate {
         packed: ValueId,
         head_dim: u32,
         q: ValueId,
         gate: ValueId,
     },
-    /// Splits each row at column `width`.
     SplitRows {
         x: ValueId,
         width: u32,
         left: ValueId,
         right: ValueId,
     },
-    /// The readout gather: `y[i] = x[rows[i]]`, `y` being
-    /// `[Dim::Readouts, width]` and `rows` the `[Dim::Readouts]` i32 row
-    /// indices ([`RuntimeInput::ReadoutRows`](crate::RuntimeInput::ReadoutRows)).
-    /// What puts the trunk head on the rows a reader takes.
     GatherRows {
         x: ValueId,
         rows: ValueId,
         y: ValueId,
     },
-    /// Views layer `layer`'s `width`-wide slice of a stacked table.
     Select {
         table: ValueId,
         layer: u32,
         width: u32,
         y: ValueId,
     },
-    /// The embed merge: the tower's rows written into the token rows the
-    /// image placeholders occupy. `src` is a patch rectangle, `y` a token
-    /// one, and `routes` (`i32`, one entry per `src` row) says which token
-    /// row each tower row lands in. `y_out` aliases `y` in place: unrouted
-    /// rows must keep the embedding `layout.embed` already wrote, not a
-    /// fresh rectangle's leftovers.
     ScatterRows {
         src: ValueId,
         routes: ValueId,
         y: ValueId,
         y_out: ValueId,
     },
-    /// The spatial pool: `y[j]` is the mean of rows `[j·side², (j+1)·side²)`
-    /// of `x`. `side` (not `side²`) because it is the checkpoint's own
-    /// number; `side == 1` is a real identity case.
-    ///
-    /// # The operand contract
-    ///
-    /// `x` and `y` are both `[Dim::Patches, hidden]`, same symbolic row
-    /// space; only the leading `x.rows / side²` rows of `y` are written, the
-    /// rest is the rung padding already there. No geometry is read: the
-    /// submission must already order each image's patches so that every
-    /// `side × side` square is contiguous, and images are padded to whole
-    /// blocks so no block straddles two.
     PoolRows {
         x: ValueId,
         side: u32,
         y: ValueId,
     },
-    /// The merging fold: `y[j]` is rows `[j·side², (j+1)·side²)` of `x` laid
-    /// end to end — `side²` rows of `width` becoming one row of
-    /// `side²·width`. On a dense row-major rectangle this is the identity
-    /// copy (`[rows, width]` and `[rows/side², side²·width]` hold the same
-    /// element at the same offset); it is a node because the IR gives one
-    /// value one type.
-    ///
-    /// # The operand contract
-    ///
-    /// `x` is `[Dim::Patches, width]`, `y` is `[Dim::Patches, side²·width]`.
-    /// Same row space; leading `x.rows / side²` rows written, tail handled
-    /// by [`ScatterLiveRows`](Layout::ScatterLiveRows).
     MergeRows {
         x: ValueId,
         side: u32,
         y: ValueId,
     },
-    /// [`ScatterRows`](Layout::ScatterRows) exactly, plus a negative
-    /// `routes` entry meaning "this row has no destination" (the compacting
-    /// fold leaves some patch rows with no legal route). A separate op from
-    /// the plain scatter, whose contract — every route names a row — some
-    /// consumers rely on. `y_out` aliases `y`.
     ScatterLiveRows {
         src: ValueId,
         routes: ValueId,
         y: ValueId,
         y_out: ValueId,
     },
-    /// The gather that concatenates: `y[r] = table[ids[r, 0]] ‖ … ‖
-    /// table[ids[r, heads−1]]` — one row assembled from `heads` table rows,
-    /// each landing in its own `width`-wide slice of the output. Unlike
-    /// [`Embed`](Layout::Embed) (one row per row) or
-    /// [`EmbedWeighted`](Layout::EmbedWeighted) (sums its taps), this keeps
-    /// every tap side by side. `heads` is read off `ids`' width.
     EmbedConcat {
         ids: ValueId,
         table: ValueId,
         vocab: u32,
         y: ValueId,
     },
-    /// The per-row argmax of each of `xs`, laid side by side: `y[r, j] =
-    /// argmax_c xs[j][r, c]`, `y` being `[rows, xs.len()]` i32. One value in
-    /// `xs` is the token a draft chain feeds its next step; every step's
-    /// logits together are the `[rows, depth]` drafts plane the `mtp.drafts`
-    /// seam exports. Ties go to the lowest column and a NaN never wins — the
-    /// same rule the epilogue's `reduce_argmax` states, so a draft the head
-    /// chained on is the token the verifier would have read.
     Argmax { xs: Vec<ValueId>, y: ValueId },
-    /// The `k` largest entries of every row of `x`, sorted descending, ties
-    /// to the LOWER column and a NaN never chosen (the argmax rule): `values`
-    /// is `[rows, k]` f32 and `indices` `[rows, k]` i32. What a candidate
-    /// selector reads off a draft's logits (DFlash2's sixteen a slot).
     TopK {
         x: ValueId,
         k: u32,
         values: ValueId,
         indices: ValueId,
     },
-    /// The gather that packs rows by attention group: `y[i] = x[perm[i]]`
-    /// for every `i` with `perm[i] >= 0`, and rows past the selection's
-    /// count (where `perm[i] < 0`) are left unwritten. `perm` is a
-    /// `RuntimeInput::RowPermutation` (`[Dim::Tokens]` i32); `x` and `y`
-    /// are token rectangles of one type — the row space is kept, only the
-    /// order changes. What lands a group's lanes (text and image, in two
-    /// class windows) contiguous for `attention.ragged`.
     PackRows {
         x: ValueId,
         perm: ValueId,
         y: ValueId,
     },
-    /// [`PackRows`](Layout::PackRows) undone: the scatter `y[perm[i]] =
-    /// x[i]` for every `i` with `perm[i] >= 0`. Rows of `y` no packed row
-    /// names are unwritten — the same fresh-rectangle rule as the gather,
-    /// since a selection writes only its own rows.
     UnpackRows {
         x: ValueId,
         perm: ValueId,
@@ -212,10 +139,6 @@ impl Operands for Layout {
             Self::UnpackRows { y, .. } => sink.push(*y),
         }
     }
-    /// The one aliasing row this family has, and it is the scatter's: every
-    /// other `Layout` variant either reads a table or cuts a packed row into
-    /// pieces that are views of it, and neither is an in-place edit the
-    /// compiler has to fold into one slot.
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
             Self::Embed { .. }
@@ -225,14 +148,11 @@ impl Operands for Layout {
             | Self::SplitRows { .. }
             | Self::GatherRows { .. }
             | Self::Select { .. }
-            // The pool writes a fresh rectangle, not `x` narrowed in place.
             | Self::PoolRows { .. }
             | Self::MergeRows { .. }
             | Self::EmbedConcat { .. }
             | Self::Argmax { .. }
             | Self::TopK { .. }
-            // The two permutations write fresh rectangles: a gather cannot
-            // run in place, and its inverse writes only the rows it names.
             | Self::PackRows { .. }
             | Self::UnpackRows { .. } => {}
             Self::ScatterRows { y_out, y, .. }

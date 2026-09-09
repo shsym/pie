@@ -1,25 +1,7 @@
-//! **THE WHOLE PIPE, PINNED — real bytes through the real codec into the
-//! family's own arithmetic.**
-//!
-//! ```text
-//! cargo test -p runtime --test media_pipe_is_the_pinned_preprocessing
-//! ```
-//!
-//! The arithmetic's goldens live beside the arithmetic
-//! (`model`'s `qwen3_5_media_is_the_pinned_arithmetic` /
-//! `gemma4_media_is_the_pinned_arithmetic`); THESE claims need the codec —
-//! decode and the Catmull-Rom resample, which are the host's
-//! (`runtime::inferlet::host::media::decode`, per `models::media`'s dependency
-//! rule) — so they run here, composed exactly the way `image.from-bytes`
-//! composes them in service. The digest claims ride here too, because the
-//! digest does ([`span_digest`]'s own doc says why).
-
 use models::media::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
 use runtime::inferlet::media_codec as decode;
 use runtime::inferlet::span_digest;
 
-/// The pipe as `image.from-bytes` runs it: the host decodes, the front-end
-/// does its family's arithmetic with the resample lent.
 fn encode_png(
     fe: &dyn VisionFrontEnd,
     bytes: &[u8],
@@ -29,25 +11,9 @@ fn encode_png(
 }
 
 mod png {
-    //! **A REAL PNG, WRITTEN BY HAND** — and the reason it is written by hand.
-    //!
-    //! Both front-end gates end with a whole-pipe claim: real encoded bytes in,
-    //! the right shapes out. Encoding those bytes with the same crate that decodes
-    //! them would make the claim circular — an encoder and a decoder from one
-    //! library agree with each other by construction, and a gate that only proves
-    //! that has proved nothing about the file format. So this module emits PNG
-    //! from the specification: IHDR, one IDAT of STORED (uncompressed) deflate
-    //! blocks under a zlib wrapper, IEND, with CRC-32 per chunk and Adler-32 over
-    //! the raw stream.
-    //!
-    //! Stored blocks rather than a compressor for the same reason the whole crate
-    //! prefers transcription to cleverness: there is exactly one byte sequence this
-    //! can emit for a given image, so two runs and two machines produce identical
-    //! bytes and the digest gate downstream means what it says.
 
     #![allow(dead_code)]
 
-    /// CRC-32 (IEEE), the polynomial PNG's chunk checksum names.
     fn crc32(bytes: &[u8]) -> u32 {
         let mut crc = 0xffff_ffffu32;
         for &b in bytes {
@@ -60,7 +26,6 @@ mod png {
         !crc
     }
 
-    /// Adler-32, zlib's own checksum over the UNCOMPRESSED stream.
     fn adler32(bytes: &[u8]) -> u32 {
         let (mut a, mut b) = (1u32, 0u32);
         for &x in bytes {
@@ -81,12 +46,7 @@ mod png {
         out.extend_from_slice(&crc32(&crc_over).to_be_bytes());
     }
 
-    /// **A DETERMINISTIC `w × h` 8-BIT RGB PNG.**
-    ///
-    /// `pixel(x, y)` names the colour; the caller picks a rule it can also assert
-    /// against, so a test can follow one source pixel all the way to a patch lane.
     pub fn png_rgb(w: u32, h: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
-        // Raw scanlines: PNG prefixes each with a filter byte, and 0 is "None".
         let mut raw = Vec::with_capacity((h * (1 + w * 3)) as usize);
         for y in 0..h {
             raw.push(0u8);
@@ -95,8 +55,6 @@ mod png {
             }
         }
 
-        // zlib: CMF/FLG, then stored deflate blocks of at most 65535 bytes, then
-        // Adler-32 of the raw stream.
         let mut z = vec![0x78u8, 0x01];
         let mut at = 0usize;
         while at < raw.len() {
@@ -116,15 +74,13 @@ mod png {
         let mut ihdr = Vec::with_capacity(13);
         ihdr.extend_from_slice(&w.to_be_bytes());
         ihdr.extend_from_slice(&h.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, colour type 2 (RGB)
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
         chunk(&mut out, b"IHDR", &ihdr);
         chunk(&mut out, b"IDAT", &z);
         chunk(&mut out, b"IEND", &[]);
         out
     }
 
-    /// A ramp that makes every pixel of a small image distinct, so a golden can
-    /// name which source pixel it expects in which patch lane.
     #[must_use]
     pub fn ramp(x: u32, y: u32) -> [u8; 3] {
         [
@@ -139,10 +95,14 @@ mod qwen {
     use super::*;
     use models::qwen_3::media::Qwen35Vision;
 
-    /// **THE WHOLE PIPE, ON A REAL PNG.** Bytes this test wrote from the PNG
-    /// specification (not from `image`'s encoder — see `common`), decoded,
-    /// resized, patchified, and every stream's length checked against the geometry
-    /// the same span reports.
+    fn media_pipe_is_the_pinned_preprocessing_every_case() {
+        a_real_png_goes_through_the_whole_pipe();
+        the_span_spells_itself_out_of_the_tokenizers_own_ids();
+        the_digest_is_stable_and_separates_two_images_one_run_cannot();
+        the_refusals_fire_by_name();
+        a_video_frame_is_the_same_preprocessing_as_a_still();
+    }
+
     #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Qwen35Vision::new();
@@ -182,7 +142,6 @@ mod qwen {
             span.payload.iter().all(|v| (-1.0..=1.0).contains(v)),
             "normalized pixels live in [-1, 1]"
         );
-        // Not a flat image: the ramp survived decode and resize.
         let first = span.payload[0];
         assert!(
             span.payload.iter().any(|v| (v - first).abs() > 1e-3),
@@ -190,10 +149,6 @@ mod qwen {
         );
     }
 
-    /// The delimiters are NAMED, not numbered, and `tokens()` is
-    /// prefix + pad × token_count + suffix in whatever ids the bound tokenizer
-    /// hands back (media-door §0, §2).
-    #[test]
     fn the_span_spells_itself_out_of_the_tokenizers_own_ids() {
         let fe = Qwen35Vision::new();
         let d = fe.delimiters();
@@ -203,8 +158,6 @@ mod qwen {
 
         let bytes = png::png_rgb(64, 64, png::ramp);
         let mut span = encode_png(&fe, &bytes, Budget::Still).expect("encodes");
-        // What the runtime does with `tokenizer.token_to_id` — two arbitrary
-        // checkpoint numberings, one of which is not the other.
         span.spell_with(vec![151_652], 151_655, vec![151_653]);
         let toks = span.tokens();
         assert_eq!(toks.len(), 1 + span.token_count as usize + 1);
@@ -222,11 +175,6 @@ mod qwen {
         );
     }
 
-    /// **THE CACHE STATUTE'S KEY** (media-door §5). Two different images produce
-    /// identical token lists; the digest is what tells them apart, and it is
-    /// stable across runs because everything it hashes is deterministic
-    /// arithmetic over deterministic bytes in a fixed byte order.
-    #[test]
     fn the_digest_is_stable_and_separates_two_images_one_run_cannot() {
         let fe = Qwen35Vision::new();
         let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
@@ -237,7 +185,6 @@ mod qwen {
             &fe,
                 &png::png_rgb(96, 96, |x, y| {
                     let mut p = png::ramp(x, y);
-                    // One pixel of one channel, moved by one.
                     if x == 5 && y == 7 {
                         p[1] = p[1].wrapping_add(1);
                     }
@@ -266,8 +213,6 @@ mod qwen {
         assert_ne!(span_digest(&a), span_digest(&b), "and the statute's key must");
     }
 
-    /// The refusals, by name.
-    #[test]
     fn the_refusals_fire_by_name() {
         let fe = Qwen35Vision::new();
         let empty = encode_png(&fe, &[], Budget::Still)
@@ -280,10 +225,6 @@ mod qwen {
         assert!(matches!(garbage, Fault::Decode(_)));
     }
 
-    /// `budget` is ignored here, and that is a fact about qwen rather than an
-    /// omission: its ceiling is `max_pixels`, and `Processor::for_arch_video`
-    /// already answered one config for both.
-    #[test]
     fn a_video_frame_is_the_same_preprocessing_as_a_still() {
         let fe = Qwen35Vision::new();
         let bytes = png::png_rgb(80, 60, png::ramp);
@@ -298,8 +239,14 @@ mod gemma {
     use super::*;
     use models::gemma_4::media::Gemma4Vision;
 
-    /// **THE WHOLE PIPE, ON A REAL PNG** written from the PNG specification rather
-    /// than by the decoder's own library.
+    fn media_pipe_is_the_pinned_preprocessing_1_every_case() {
+        a_real_png_goes_through_the_whole_pipe();
+        a_video_frame_gets_the_frame_budget();
+        the_span_spells_itself_out_of_the_tokenizers_own_ids();
+        the_digest_is_stable_and_separates_two_images_one_run_cannot();
+        the_refusals_fire_by_name();
+    }
+
     #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Gemma4Vision::new();
@@ -340,9 +287,6 @@ mod gemma {
         );
     }
 
-    /// A frame of a clip gets the smaller ceiling, which is the whole reason
-    /// [`Budget`] is an argument rather than a second trait method.
-    #[test]
     fn a_video_frame_gets_the_frame_budget() {
         let fe = Gemma4Vision::new();
         let bytes = png::png_rgb(200, 120, png::ramp);
@@ -364,12 +308,6 @@ mod gemma {
         );
     }
 
-    /// **GEMMA-4'S OWN DELIMITERS**, which are not gemma-3's. This vocabulary
-    /// spells markers `<|x>` … `<x|>` with `<|x|>` standalone — the same family as
-    /// the `<|turn>` / `<turn|>` pair `chat_template::gemma` already reads by name,
-    /// and the `<|audio>` / `<audio|>` pair the campaign pinned. Nothing here is a
-    /// number: the runtime resolves all three through `tokenizer.token_to_id`.
-    #[test]
     fn the_span_spells_itself_out_of_the_tokenizers_own_ids() {
         let fe = Gemma4Vision::new();
         let d = fe.delimiters();
@@ -391,9 +329,6 @@ mod gemma {
         assert!(toks[1..toks.len() - 1].iter().all(|&t| t == 262_145));
     }
 
-    /// The digest is stable across readings and content-addressed, and two images
-    /// the ledger cannot tell apart it can.
-    #[test]
     fn the_digest_is_stable_and_separates_two_images_one_run_cannot() {
         let fe = Gemma4Vision::new();
         let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
@@ -419,8 +354,6 @@ mod gemma {
         assert_ne!(span_digest(&one), span_digest(&other));
     }
 
-    /// The refusals, by name.
-    #[test]
     fn the_refusals_fire_by_name() {
         let fe = Gemma4Vision::new();
         assert_eq!(

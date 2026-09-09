@@ -1,10 +1,3 @@
-//! `moe_matmul_select_quant` over an MLX affine-U4 bank (group 64, a bf16
-//! scale and a bf16 zero point per group) lands, per route, the dot of the
-//! activation with the DEQUANTIZED expert rows — at gemma-4-26B-A4B's own
-//! shapes: 128 experts, top-8, a `[1408, 2816]` up leg read by token and a
-//! `[2816, 704]` down leg read by route (704 is eleven groups, not a power
-//! of two).
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -16,13 +9,10 @@ use kernels_cuda::tensor::Tensor;
 
 const GROUP: usize = 64;
 
-/// One affine-U4 bank of `experts x n x k`, in the kernel's plane layout,
-/// with the dequantized values it stands for.
 struct Bank {
     codes: Vec<u8>,
     scales: Vec<u16>,
     biases: Vec<u16>,
-    /// `[expert][row][col]`
     dequant: Vec<f32>,
 }
 
@@ -36,7 +26,6 @@ fn bank(lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> Bank {
     for e in 0..experts {
         for r in 0..n {
             for g in 0..groups {
-                // A group: 64 uniform values in [-1, 1), quantized min/max.
                 let values: Vec<f32> = (0..GROUP).map(|_| lcg.unit()).collect();
                 let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
                 let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -67,16 +56,6 @@ fn bank(lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> Bank {
     }
 }
 
-/// `by_token`: the activation holds one row per token (the up leg);
-/// otherwise one per route (the down leg).
-/// `bf16_weights`: the reference multiplies the dequantized weight ROUNDED
-/// TO BF16 — what the tensor-core kernel (and transformers, whose
-/// dequantized bank is a bf16 tensor) multiply; the per-route GEMV keeps
-/// the weight in f32.
-/// The reference rounds as the kernel the route count selects does: from
-/// sixteen routes on the grouped tensor-core kernel (`moe.rs`,
-/// `GROUPED_FROM`) multiplies bf16 weights; under it the per-route GEMV
-/// keeps f32.
 fn check(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, by_token: bool, seed: u64) {
     check_with(experts, n, k, tokens, top_k, by_token, seed, tokens * top_k >= 16);
 }
@@ -87,7 +66,6 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
     let bank = bank(&mut lcg, experts, n, k);
     let act_rows = if by_token { tokens } else { tokens * top_k };
     let (x_raw, x) = lcg.row(act_rows * k);
-    // Routes: distinct experts per token, spread over the whole bank.
     let mut routes: Vec<i32> = Vec::with_capacity(tokens * top_k);
     for t in 0..tokens {
         for s in 0..top_k {
@@ -153,47 +131,41 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
     eprintln!("ok: worst relative error {worst:.5}");
 }
 
-#[test]
-fn the_up_leg_read_by_token() {
-    // 128 x [1408, 2816] would take a while on the host reference; the
-    // layout and the kernel's group walk are the same at 16 experts.
-    // Three tokens' 24 routes: the grouped kernel.
-    check(16, 1408, 2816, 3, 8, true, 0x51);
+fn the_affine_u4_expert_select_answers_the_dequantized_dot_every_case() {
+    the_up_leg_read_by_token();
+    the_up_leg_read_by_token_at_one_token_takes_the_gemv();
+    the_down_leg_read_by_route_over_eleven_groups();
+    the_down_leg_read_by_route_at_one_token_takes_the_gemv();
+    every_expert_of_the_full_bank_is_addressed();
+    a_wide_fire_takes_the_grouped_kernel_on_the_up_leg();
+    a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles();
 }
 
 #[test]
+fn the_up_leg_read_by_token() {
+    check(16, 1408, 2816, 3, 8, true, 0x51);
+}
+
 fn the_up_leg_read_by_token_at_one_token_takes_the_gemv() {
     check(16, 1408, 2816, 1, 8, true, 0x54);
 }
 
-#[test]
 fn the_down_leg_read_by_route_over_eleven_groups() {
     check(16, 2816, 704, 3, 8, false, 0x52);
 }
 
-#[test]
 fn the_down_leg_read_by_route_at_one_token_takes_the_gemv() {
     check(16, 2816, 704, 1, 8, false, 0x55);
 }
 
-#[test]
 fn every_expert_of_the_full_bank_is_addressed() {
     check(128, 64, 704, 16, 8, true, 0x53);
 }
 
-// From sixteen routes on the select takes the GROUPED kernel (one block per
-// expert × 128 rows, the bank decoded once per expert to bf16 and the dot
-// on tensor cores — `moe.rs`, `GROUPED_FROM`); one token's eight routes
-// stay on the per-route GEMV. Same answer on both legs to bf16-weight
-// arithmetic, with rows past a 128-tile and a K that is not a whole number
-// of 128-chunks.
-
-#[test]
 fn a_wide_fire_takes_the_grouped_kernel_on_the_up_leg() {
     check_with(16, 1408, 2816, 40, 8, true, 0x61, true);
 }
 
-#[test]
 fn a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles() {
     check_with(16, 200, 704, 40, 8, false, 0x62, true);
 }

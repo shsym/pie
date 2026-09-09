@@ -1,58 +1,30 @@
-//! Wired-residency accounting on unified memory. A GPU-touched
-//! `StorageModeShared` page is wired and the pager never reclaims it, so a
-//! load whose weights plus kv pool exceed
-//! `recommendedMaxWorkingSetSize x utilization` does not page but
-//! watchdog-resets the box. Refuses with [`Fault::Residency`] when the
-//! ceiling, minus resident weights and the driver floor, can't cover the kv
-//! pool.
-
 use crate::error::{Fault, Result};
 
-/// Default fraction of the device's recommended working set pie may hold
-/// resident. Used when a boot document states no `[metal] gpu_mem_utilization`.
 pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 
-/// Bytes held back for the driver: `min(128 MiB, working_set / 10)`.
 #[must_use]
 pub fn safety_floor_bytes(working_set: u64) -> u64 {
     const CAP: u64 = 128 * 1024 * 1024;
     CAP.min(working_set / 10)
 }
 
-/// The numbers a residency refusal names, and the arithmetic that decides
-/// it. Pure, so a test can build it with no device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Accounting {
-    /// What the device holds resident without paging
-    /// (`recommendedMaxWorkingSetSize`).
     pub working_set: u64,
-    /// `working_set x utilization` — pie's whole wired allowance.
     pub ceiling: u64,
-    /// The resident weight tier's bytes: the slab plus every dense plane
-    /// ([`Plan::device_demand`](crate::experts::Plan::device_demand)).
     pub weights: u64,
-    /// The arena scratch the compiled axes reserve — wired like the
-    /// weights, sized by `max_forward_tokens`. Zero at planning time, when
-    /// the axes are not compiled yet; the load re-admits with it.
     pub scratch: u64,
-    /// `min(128 MiB, working_set / 10)`, held back for the driver.
     pub floor: u64,
-    /// `ceiling - weights - scratch - floor`: what is left for the kv pool.
     pub pool: u64,
-    /// The kv pool this load reserves at the declared context, across every
-    /// cache row ([`pool_demand`](crate::store::pool_demand)).
     pub minimum: u64,
 }
 
 impl Accounting {
-    /// Builds the accounting from the working set, the fraction, and the two
-    /// demands.
     #[must_use]
     pub fn of(working_set: u64, utilization: f64, weights: u64, minimum: u64) -> Accounting {
         Accounting::with_scratch(working_set, utilization, weights, 0, minimum)
     }
 
-    /// [`Accounting::of`] with the arena scratch counted beside the weights.
     #[must_use]
     pub fn with_scratch(
         working_set: u64,
@@ -89,8 +61,6 @@ impl Accounting {
         }
     }
 
-    /// The most a resident weight tier may occupy and still leave the kv
-    /// pool its minimum: `ceiling - floor - minimum`, saturating to zero.
     #[must_use]
     pub fn weight_headroom(&self) -> u64 {
         self.ceiling
@@ -98,13 +68,6 @@ impl Accounting {
             .saturating_sub(self.minimum)
     }
 
-    /// Does the device hold this deployment? Decision is `pool >= minimum`;
-    /// `budget` and `utilization` are carried only so the refusal can name them.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Residency`] when the ceiling, after weights and the floor,
-    /// doesn't leave the kv pool its bytes.
     pub fn admit(&self, budget: Option<u64>, utilization: f64) -> Result<()> {
         if self.pool >= self.minimum {
             return Ok(());
@@ -150,9 +113,12 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// The arena scratch is wired like the weights: a load that fits without
-    /// it and crosses the ceiling with it is refused, and the refusal names
-    /// the knob that sizes it.
+    fn accounting_every_case() {
+        the_arena_scratch_counts_against_the_ceiling();
+        a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
+        a_non_finite_fraction_is_read_as_the_whole_working_set();
+    }
+
     #[test]
     fn the_arena_scratch_counts_against_the_ceiling() {
         let ws = 21_800 * (GIB / 1000);
@@ -168,9 +134,7 @@ mod tests {
         assert_eq!(with.pool, without.pool - 6 * GIB);
     }
 
-    #[test]
     fn a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses() {
-        // 21.8 GiB working set; 0.90 leaves ~19.6 GiB.
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_GPU_MEM_UTILIZATION;
         let ok = Accounting::of(ws, util, 11 * GIB, 4 * GIB);
@@ -185,7 +149,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn a_non_finite_fraction_is_read_as_the_whole_working_set() {
         let acct = Accounting::of(20 * GIB, f64::NAN, GIB, GIB);
         assert_eq!(acct.ceiling, 20 * GIB, "NaN utilization means no fraction");

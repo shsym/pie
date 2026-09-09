@@ -1,14 +1,3 @@
-//! The three points the block drafter's readout runs on CUDA, each held
-//! against a host transcription of the rule the Metal kernels state: the
-//! row argmax into one column of an i32 plane (ties to the LOWEST column, a
-//! NaN never chosen), the sorted top-k with indices beside (the same rule),
-//! and the selector walk (`argmax_c unary[c] + ⟨pred[prev] (⊙ hp), succ[c]⟩`
-//! slot by slot from the anchor, ties to the lower candidate).
-//!
-//! ```text
-//! cargo test -p kernels-cuda --features cuda --test the_dspark_readout_points_answer_their_host_reference
-//! ```
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -19,7 +8,6 @@ use kernels_cuda::attn::selector;
 use kernels_cuda::layout;
 use kernels_cuda::tensor::{RaggedTensor, Tensor};
 
-/// `a` beats `b`: larger, or equal at a lower index.
 fn beats(av: f32, ai: usize, bv: f32, bi: usize) -> bool {
     av > bv || (av == bv && ai < bi)
 }
@@ -41,13 +29,11 @@ fn host_topk(row: &[f32], k: usize) -> Vec<(f32, usize)> {
     taken
 }
 
-/// Rows of bf16 values with many exact ties, a NaN and a -inf laid in.
 fn tied_rows(lcg: &mut Lcg, rows: usize, width: usize) -> (Vec<u16>, Vec<f32>) {
     let mut raw = Vec::with_capacity(rows * width);
     let mut f = Vec::with_capacity(rows * width);
     for r in 0..rows {
         for c in 0..width {
-            // Coarse values so ties are common; a NaN and a -inf per row.
             let v = if c == (r * 7 + 3) % width {
                 f32::NAN
             } else if c == (r * 11 + 5) % width {
@@ -63,12 +49,17 @@ fn tied_rows(lcg: &mut Lcg, rows: usize, width: usize) -> (Vec<u16>, Vec<f32>) {
     (raw, f)
 }
 
+fn the_dspark_readout_points_answer_their_host_reference_every_case() {
+    the_argmax_lands_the_lowest_tied_column_and_skips_a_nan();
+    the_topk_is_sorted_with_ties_to_the_lower_column();
+    the_selector_walk_follows_the_best_successor_from_the_anchor();
+}
+
 #[test]
 fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     let (rows, width, depth) = (5usize, 3000usize, 3usize);
     let mut lcg = Lcg::seeded(0x51);
     let (x_raw, x) = tied_rows(&mut lcg, rows, width);
-    // Make one row all NaN but one column, and one row's best a tie far apart.
     let mut x_raw = x_raw;
     let mut x = x;
     for c in 0..width {
@@ -101,7 +92,6 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     }
     assert_eq!(got[4 * depth], 2999, "the one finite entry of the NaN row");
 
-    // The f32 point, the same rows widened.
     let x32_at = gpu.up(&x);
     let y32_at = gpu.zeros(rows * 4);
     let mut y = Tensor::new(y32_at, rows as u32, 1, Dtype::I32);
@@ -119,7 +109,6 @@ fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     }
 }
 
-#[test]
 fn the_topk_is_sorted_with_ties_to_the_lower_column() {
     let (rows, width) = (6usize, 4097usize);
     let mut lcg = Lcg::seeded(0x7a);
@@ -159,10 +148,8 @@ fn the_topk_is_sorted_with_ties_to_the_lower_column() {
     }
 }
 
-#[test]
 fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     let (vocab, rank, k) = (64usize, 256usize, 16usize);
-    // Three requests: spans of 4, 1 and 6 rows.
     let indptr: [i32; 4] = [0, 4, 5, 11];
     let rows = 11usize;
     let mut lcg = Lcg::seeded(0x33);
@@ -171,7 +158,6 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
     let (hp_raw, hp) = lcg.row(rows * rank);
     let cand: Vec<i32> = (0..rows * k).map(|i| ((i * 37 + 11) % vocab) as i32).collect();
     let tokens: Vec<i32> = (0..rows).map(|r| ((r * 13 + 5) % vocab) as i32).collect();
-    // Coarse unary logits, so the bilinear term decides most slots.
     let unary: Vec<f32> = (0..rows * k).map(|_| (lcg.unit() * 4.0).floor() * 0.25).collect();
 
     let mut gpu = Gpu::open();
@@ -228,9 +214,6 @@ fn the_selector_walk_follows_the_best_successor_from_the_anchor() {
                     }
                 }
                 let want = cand[row * k + best];
-                // The device folds its 256 terms in another order; a pick
-                // that differs is admitted only across a near-tie, and the
-                // walk then continues from the device's own pick.
                 if got[row] != want {
                     let c = (0..k).find(|&c| cand[row * k + c] == got[row]).unwrap_or_else(|| {
                         panic!("hp={with_hp} first={first}: lane {lane} row {row} picked {}, not a candidate", got[row])

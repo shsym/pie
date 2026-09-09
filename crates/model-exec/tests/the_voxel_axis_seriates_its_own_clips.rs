@@ -1,24 +1,3 @@
-//! **THE THIRD SERIATION**: what `compose_axes` answers about a fire that
-//! carries clips on the voxel axis (design D8), and what the descriptor
-//! carries for it.
-//!
-//! ```text
-//! cargo test -p model-exec --test the_voxel_axis_seriates_its_own_clips
-//! ```
-//!
-//! The patch axis's finding one axis over: a lane's clip count varies
-//! independently of its token rows, so the voxel axis is seriated on its own
-//! terms — its rows are port voxels, ITS LANES ARE CLIPS, its order the
-//! artifact's own voxel `ClassOrder`, its ladder its own. Asserted here:
-//!
-//! * the token half of a fire that carries clips is bit-identical to the
-//!   same fire without them, and the patch half stays the zero seriation;
-//! * a class with token rows and no clips gets a zero voxel window while
-//!   keeping its token one; every lane record carries its clip place;
-//! * the ceilings refuse by name — voxels, clips, and the top rung;
-//! * ABI 3 packs a voxel trailer exactly when the fire carries clips, the
-//!   descriptor round-trips whole, and its voxel windows must add up.
-
 use model_compiler::{Budget, Budgets, DeviceProfile, VoxelLadder, compile_axes};
 use model_exec::fire::{Fault, FireDescriptor, Lane, compose_axes};
 use model_ir::ops::Elementwise;
@@ -90,9 +69,6 @@ impl Build {
     }
 }
 
-/// A token trunk (both classes), then a voxel decoder that only the class
-/// of word 1 runs — a `[Voxels, 8]` port grown to `[VoxelsTimes(4), 8]`
-/// pixels.
 fn trunk_and_decoder() -> Trace {
     let mut b = Build::new();
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
@@ -132,6 +108,12 @@ fn budgets() -> Budgets {
     })
 }
 
+fn the_voxel_axis_seriates_its_own_clips_every_case() {
+    a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window();
+    a_fire_past_the_voxel_ceilings_is_refused_by_name();
+    abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips();
+}
+
 #[test]
 fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     let trace = trunk_and_decoder();
@@ -156,7 +138,6 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     );
     assert_eq!(fire.patch_rows(), 0, "no patch axis was stated");
 
-    // The token half is the same fire without the clips.
     let plain = [
         Lane::new(1, 5),
         Lane::new(0, 3),
@@ -178,8 +159,6 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     assert_eq!(voxels.class(text_class).rows, 0);
     assert_eq!(voxels.class(text_class).lanes, 0);
 
-    // Every lane record carries its clip place; the two clip lanes are
-    // contiguous in submission order inside their class.
     let placed: Vec<(u32, u32, u32, u32, u32)> = fire
         .lanes()
         .iter()
@@ -198,7 +177,6 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     assert!(placed.contains(&(1, 0, 0, 0, 0)));
 }
 
-#[test]
 fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
     let trace = trunk_and_decoder();
     let budgets = budgets();
@@ -248,7 +226,6 @@ fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
         .into()
     );
 
-    // A clip with no voxels, or voxels with no clip, is inconsistent.
     let geometry = compose_axes(&compiled, &short, &[Lane::with_clips(1, 1, 1, 0)])
         .expect_err("a clip is at least one voxel");
     assert_eq!(
@@ -262,7 +239,6 @@ fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
     );
 }
 
-#[test]
 fn abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips() {
     let trace = trunk_and_decoder();
     let budgets = budgets();
@@ -312,7 +288,6 @@ fn abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips() {
         100
     );
 
-    // Voxel windows that do not add up to the header are refused by name.
     let mut wrong = bytes;
     wrong[32..36].copy_from_slice(&99u32.to_le_bytes());
     assert!(matches!(

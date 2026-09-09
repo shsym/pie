@@ -1,16 +1,6 @@
-//! Argument marshalling: every launch argument is one [`ArgValue`]; the
-//! [`Arg`] trait keeps call sites reading `eps.arg()`; [`Bound`] turns a
-//! marshalled list into the `void**` cells `cuLaunchKernelEx` takes.
-//!
-//! A [`ArgValue::Bytes`] argument copies a `#[repr(C)]` parameter block
-//! into its own pinned slot for a by-value aggregate.
-
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
-/// One marshalled launch argument. Device buffers travel as the `u64`
-/// addresses their handles carry; write intent is not recorded here — it
-/// lives in the entry's `&`/`&mut` signature (see `tensor`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArgValue {
     Ptr(u64),
@@ -20,10 +10,6 @@ pub enum ArgValue {
     I64(i64),
     Usize(u64),
     Bool(bool),
-    /// A by-value aggregate: `len` bytes at `ptr`, marshalled as ONE kernel
-    /// parameter. The bytes are copied into the launch's pinned slots
-    /// before `Ctx::fire` returns, so the pointee only has to outlive the
-    /// call that passes it.
     Bytes {
         ptr: *const u8,
         len: usize,
@@ -31,8 +17,6 @@ pub enum ArgValue {
 }
 
 impl ArgValue {
-    /// A null device pointer — the stand-in for an optional buffer a point
-    /// does not carry this fire.
     pub const ABSENT: Self = Self::Ptr(0);
 
     #[must_use]
@@ -49,9 +33,6 @@ impl ArgValue {
         }
     }
 
-    /// The 8-byte cell a launch slot points at. Every scalar the device text
-    /// reads is at most 8 bytes and little-endian, so one `u64` per argument
-    /// covers the ABI.
     #[must_use]
     pub const fn cell(self) -> u64 {
         match self {
@@ -69,7 +50,6 @@ impl ArgValue {
     }
 }
 
-/// Scalar-to-argument marshalling, so call sites read `eps.arg()`.
 pub trait Arg: Copy {
     fn arg(self) -> ArgValue;
 }
@@ -116,9 +96,6 @@ impl Arg for bool {
     }
 }
 
-/// The marshalled list pinned into launch slots: one boxed cell per scalar
-/// argument, one 8-byte-aligned blob per aggregate, one `void*` per slot —
-/// all alive until the launch call returns.
 #[cfg(feature = "cuda")]
 pub(crate) struct Bound {
     #[allow(dead_code, clippy::vec_box)]
@@ -137,8 +114,6 @@ impl Bound {
         for value in values {
             match *value {
                 ArgValue::Bytes { ptr, len } => {
-                    // Copied into u64 storage so the slot keeps the natural
-                    // alignment a parameter block's widest member wants.
                     let mut blob = vec![0u64; len.div_ceil(8).max(1)].into_boxed_slice();
                     // SAFETY: `Bytes` promises `len` live bytes at `ptr`
                     // for the duration of the fire; they are copied here,

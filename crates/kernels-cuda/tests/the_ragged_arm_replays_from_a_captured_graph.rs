@@ -1,13 +1,3 @@
-//! `attention.ragged` captures into a CUDA graph after one eager warm fire
-//! (which sizes its schedule slab) and replays correctly with new operand
-//! bytes and a rewritten group TABLE: the same body, recorded over three
-//! groups, serves a fire whose table leaves group 0 empty — the arm reads no
-//! seat word, every group it serves is in the table it was handed (the
-//! engine pads the table with empty segments), so a rewritten seat changes
-//! nothing and a rewritten table changes everything.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_replays_from_a_captured_graph`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -117,7 +107,6 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
         )
     };
 
-    // The warm fire: eager, sizes the schedule slab at this ceiling.
     let mut lcg = Lcg::seeded(0x9a);
     let (q0, _) = lcg.row(rows * qw);
     let (k0, _) = lcg.row(rows * kw);
@@ -129,7 +118,6 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     fire(&ctx, o_at).expect("the warm fire");
     gpu.sync();
 
-    // The capture.
     let stream = ctx.stream();
     let exec = unsafe {
         check(
@@ -154,8 +142,6 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
         exec
     };
 
-    // Replay one: new bytes, every group live. Compared to an eager fire on
-    // the same bytes.
     let (q1, _) = lcg.row(rows * qw);
     let (k1, _) = lcg.row(rows * kw);
     let (v1, _) = lcg.row(rows * kw);
@@ -178,11 +164,6 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
         );
     }
 
-    // Replay two: the table now leaves group 0 empty (its bound repeats
-    // group 1's start), the seat is rewritten to name groups 1 and 2 and is
-    // not read. Group 0's rows keep the bytes replay one left there; groups
-    // 1 and 2 are recomputed over fresh bytes, and the eager twin over the
-    // same table agrees.
     let (q2, _) = lcg.row(rows * qw);
     let (k2, _) = lcg.row(rows * kw);
     let (v2, _) = lcg.row(rows * kw);

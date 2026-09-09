@@ -1,7 +1,3 @@
-//! The served model: the runtime's global model/tokenizer cache, and the
-//! serving table ([`ROWS`], [`ModelMetadata`]) it is built from. Set once at
-//! bootstrap and read from everywhere after.
-
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -10,45 +6,21 @@ use anyhow::{Result, anyhow};
 use models::template::Instruct;
 use tokenizer::Tokenizer;
 
-/// The single model this runtime serves. Set once at bootstrap.
 static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 
-/// The compiled metadata a `.zt` artifact carries, lifted once by the worker.
-///
-/// The checkpoint's `config.json` bytes, verbatim, and — for an artifact,
-/// absent for a snapshot — the compiled tokenizer objects for `pie.tokenizer/1`.
 #[derive(Clone, Debug)]
 pub struct ModelMetadata {
-    /// `(name, bytes)` per compiled tokenizer object. `None` for a snapshot
-    /// (tokenizer is a file beside the weights) or when only some objects
-    /// were found.
     pub tokenizer: Option<Vec<(String, Vec<u8>)>>,
-    /// The checkpoint's `config.json`, verbatim.
     pub config: Vec<u8>,
 }
 
-/// One shipping SKU, as a *serving* runtime sees it.
-///
-/// `layers`/`vocab` size the sampler and ETA lowering at boot, before a plan
-/// is traced; `arch` is the label the vision/speech front-ends dispatch on.
 pub struct Row {
-    /// The SKU — a `models::skus()` row name and the id every part of the
-    /// tree spells.
     pub id: &'static str,
-    /// Transformer layers in the tower.
     pub layers: u32,
-    /// Logits width: the leading extent of the `embed` table. May exceed the
-    /// tokenizer's token count (qwen3: 151 936 logits vs 151 669 tokens) —
-    /// size a sampler from this, not the tokenizer vocab.
     pub vocab: u32,
-    /// Architecture label the vision/speech front-ends dispatch on.
     pub arch: &'static str,
 }
 
-/// Every SKU this build can serve, in `models::skus()` order.
-///
-/// The chat template is not a column here: it is
-/// [`models::template::template_of`], keyed by the same SKU string.
 pub const ROWS: &[Row] = &[
     Row {
         id: "dsv4-base-bf16-kv-bf16",
@@ -68,14 +40,12 @@ pub const ROWS: &[Row] = &[
         vocab: 129_280,
         arch: "deepseek_v4",
     },
-    // Mini snapshot: 5 layers (`num_hidden_layers: 5`, renumbered from 0,1,2,3,42).
     Row {
         id: "dsv4-flash-u4g64-u2g64-kv-bf16",
         layers: 5,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
-    // Full checkpoint the row above is a mini carve of, at its own 43 layers.
     Row {
         id: "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         layers: 5,
@@ -118,9 +88,6 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
-    // Gemma 4's 26B-A4B trunk under the diffusion checkpoint's spelling;
-    // its own arch label, since the front-ends and the pass kind will
-    // diverge from gemma4's.
     Row {
         id: "diffusiongemma-26b-a4b-u4g64-kv-bf16",
         layers: 30,
@@ -163,22 +130,18 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
-    // The same mixture with Google's assistant drafter overlaid.
     Row {
         id: "gemma4-26b-a4b-mtp-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
     },
-    // And with z-lab's DFlash block drafter overlaid.
     Row {
         id: "gemma4-26b-a4b-dflash-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
     },
-    // Same trunk as its already-listed twin; neither quant nor the vision
-    // tower moves layers, vocab or arch.
     Row {
         id: "gemma4-26b-a4b-vision-u4g64-kv-bf16",
         layers: 30,
@@ -191,7 +154,6 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
-    // mlx 4-bit: same trunk geometry as its bf16 sibling.
     Row {
         id: "gemma4-31b-mtp-u4g64-kv-bf16",
         layers: 60,
@@ -228,8 +190,6 @@ pub const ROWS: &[Row] = &[
         vocab: 151_552,
         arch: "glm_moe_dsa",
     },
-    // GLM-5.3-Flash: 45 layers, the KDA/DSA cadence under mHC, text only
-    // (`model.visual.*` and the one `mtp` block unread).
     Row {
         id: "glm53-flash-mtp-u8g64-u2g64-u4g64-kv-bf16",
         layers: 45,
@@ -266,14 +226,12 @@ pub const ROWS: &[Row] = &[
         vocab: 201_088,
         arch: "gptoss",
     },
-    // mlx 4-bit: same trunk geometry as its bf16 sibling.
     Row {
         id: "gptoss-20b-u4g64-mxfp4-kv-bf16",
         layers: 24,
         vocab: 201_088,
         arch: "gptoss",
     },
-    // And with z-lab's DFlash block drafter overlaid.
     Row {
         id: "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16",
         layers: 24,
@@ -304,31 +262,24 @@ pub const ROWS: &[Row] = &[
         vocab: 163_840,
         arch: "kimi_k3",
     },
-    // Ships a draft head (fifteen `mtp.*` tensors); arch stays qwen3_5 since
-    // the trunk is unchanged.
     Row {
         id: "qwen36-27b-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // 3.8 checkpoint is 3.6's artifact tensor-for-tensor; only the chat
-    // template and seven reserved specials differ, not these numbers.
     Row {
         id: "qwen38-27b-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // mlx 4-bit rows: same trunk geometry as their bf16 siblings.
     Row {
         id: "qwen36-27b-mtp-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The same trunk with a DFlash BLOCK drafter overlaid by `--aux`; the
-    // drafter's own five layers are not the trunk's and are not counted.
     Row {
         id: "qwen36-27b-dflash-u4g64-kv-bf16",
         layers: 64,
@@ -341,7 +292,6 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The same trunk with the DFlash2 block drafter overlaid by `--aux`.
     Row {
         id: "qwen38-27b-dflash2-u4g64-kv-bf16",
         layers: 64,
@@ -366,15 +316,12 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // From the 4-bit artifact's own text_config (num_hidden_layers: 40,
-    // vocab_size: 248320) — the qwen35-a3b geometry.
     Row {
         id: "qwen36-35b-a3b-mtp-u4g64-kv-bf16",
         layers: 40,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The same mixture with z-lab's DFlash block drafter overlaid.
     Row {
         id: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
         layers: 40,
@@ -387,15 +334,12 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // `mini-l5-e16-k8` carve of that artifact: 5 of its 40 layers, vocab whole.
     Row {
         id: "qwen36-35b-a3b-mini-u4g64-kv-bf16",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // `mini-l5-e64-k8` twin: differs only in routed-bank width, which this
-    // table doesn't carry, so it reads identically to the row above.
     Row {
         id: "qwen36-35b-a3b-mini64-u4g64-kv-bf16",
         layers: 5,
@@ -438,8 +382,6 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // qwen4 hybrid: geometry off `Model::flash`'s own Dims; arch is the
-    // checkpoint's `model_type: qwen4_exp`.
     Row {
         id: "qwen38-flash-next-u4g64-kv-bf16",
         layers: 48,
@@ -452,15 +394,12 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen4_exp",
     },
-    // Mini 2-bit snapshot: 4 layers (`num_hidden_layers: 4`,
-    // layer_types linear/linear/linear/full).
     Row {
         id: "qwen38-flash-next-u4g64-u2g128-kv-bf16",
         layers: 4,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
-    // Shipped 2-bit artifact: the mini's parent, 48 layers again.
     Row {
         id: "qwen38-flash-next-full-u4g64-u2g128-kv-bf16",
         layers: 48,
@@ -497,8 +436,6 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // Overlaid draft head: a second readout of the same 24 trunk layers, not
-    // a second model, so the numbers are the trunk's.
     Row {
         id: "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
         layers: 24,
@@ -547,45 +484,42 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // Z-Image (M1). `layers` is the encoder's depth the plan runs (its
-    // `hidden` tap is addressed by layer, at 34); `vocab` is the encoder's
-    // embedding width, which the `text` reading embeds by — nothing samples
-    // from it, since no reading of this family has logits.
     Row {
         id: "z-image-turbo-bf16-kv-bf16",
         layers: 35,
         vocab: 151_936,
         arch: "z_image",
     },
-    // The miniature: no encoder, so no vocabulary; six DiT blocks.
+    Row {
+        id: "z-image-turbo-u4g64-kv-bf16",
+        layers: 35,
+        vocab: 151_936,
+        arch: "z_image",
+    },
     Row {
         id: "z-image-mini-bf16-kv-bf16",
         layers: 6,
         vocab: 0,
         arch: "z_image",
     },
-    // FLUX.2 klein-4B (M2). `layers` is the encoder's depth the plan runs
-    // (the last of its three `hidden` taps is addressed by layer, at 26);
-    // `vocab` is Qwen3-4B's embedding width, which the `text` reading
-    // embeds by — no reading of this family has logits.
     Row {
         id: "flux2-klein-4b-bf16-kv-bf16",
         layers: 27,
         vocab: 151_936,
         arch: "flux_2",
     },
-    // The miniature: no encoder, so no vocabulary; two double-stream and
-    // two single-stream blocks.
+    Row {
+        id: "flux2-klein-4b-u4g64-kv-bf16",
+        layers: 27,
+        vocab: 151_936,
+        arch: "flux_2",
+    },
     Row {
         id: "flux2-mini-bf16-kv-bf16",
         layers: 4,
         vocab: 0,
         arch: "flux_2",
     },
-    // HunyuanImage 3 (M6). Its trunk IS its text model, so `vocab` is the
-    // real logits width the AR phases sample from and `layers` the trunk's
-    // depth. The `-tp4` rows serve the same plan across four ranks; the
-    // one-rank row is what `pie model import` converts through.
     Row {
         id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
         layers: 32,
@@ -604,18 +538,12 @@ pub const ROWS: &[Row] = &[
         vocab: 133_120,
         arch: "hunyuan_image_3_moe",
     },
-    // The miniature: two layers, the real vocabulary (the checkpoint's
-    // special ids live above 128 000, so `nn.Embedding` cannot shrink it).
     Row {
         id: "hunyuanimage3-mini-bf16-kv-bf16",
         layers: 2,
         vocab: 133_120,
         arch: "hunyuan_image_3_moe",
     },
-    // MiniMax H3 (M5), the `FL2VA/` partition. `layers` is the encoder's
-    // depth the plan runs (its `hidden` tap is addressed by layer, at 49);
-    // `vocab` is Qwen3-VL-32B's embedding width, which the `text` reading
-    // embeds by — no reading of this family has logits.
     Row {
         id: "minimax-h3-fl2va-bf16-kv-bf16",
         layers: 50,
@@ -634,25 +562,24 @@ pub const ROWS: &[Row] = &[
         vocab: 151_936,
         arch: "minimax_h3",
     },
-    // The miniature: no encoder, so no vocabulary; two DiT blocks and one
-    // token-refiner block.
     Row {
         id: "minimax-h3-mini-bf16-kv-bf16",
         layers: 3,
         vocab: 0,
         arch: "minimax_h3",
     },
-    // Wan 2.2 TI2V-5B (M3). `layers` is the umT5-xxl encoder's depth the
-    // `text` reading runs; `vocab` is that encoder's embedding width, which
-    // the reading embeds by — no reading of this family has logits.
     Row {
         id: "wan22-ti2v-5b-bf16-kv-bf16",
         layers: 24,
         vocab: 256_384,
         arch: "wan_2",
     },
-    // The miniatures: the transformer alone, two blocks, no encoder and so
-    // no vocabulary.
+    Row {
+        id: "wan22-ti2v-5b-u4g64-kv-bf16",
+        layers: 24,
+        vocab: 256_384,
+        arch: "wan_2",
+    },
     Row {
         id: "wan22-mini-d128-bf16-kv-bf16",
         layers: 2,
@@ -665,38 +592,30 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "wan_2",
     },
-    // LTX-2.5 (M4). `layers` is the DiT's dual-stream block count; `vocab`
-    // is zero because no reading of this family has logits — the denoise
-    // reading answers `seam::VELOCITY` and the two connector readings
-    // answer `seam::HIDDEN`, both sized off the plan. The Gemma-4 trunk
-    // that feeds the connectors is not a reading of this text yet
-    // (`models::ltx_2::model`), so nothing here embeds by a vocabulary.
     Row {
         id: "ltx25-bf16-kv-bf16",
         layers: 48,
         vocab: 0,
         arch: "ltx_2",
     },
-    // The miniature: two blocks a side, one connector layer.
+    Row {
+        id: "ltx25-u4g64-kv-bf16",
+        layers: 48,
+        vocab: 0,
+        arch: "ltx_2",
+    },
     Row {
         id: "ltx25-mini-bf16-kv-bf16",
         layers: 2,
         vocab: 0,
         arch: "ltx_2",
     },
-    // The synthetic generative row (M0). `layers` is its three blocks;
-    // `vocab` is zero because a denoise pass has no logits and nothing sizes
-    // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
-    // off the plan.
     Row {
         id: "mini-dit-bf16-kv-bf16",
         layers: 3,
         vocab: 0,
         arch: "mini_dit",
     },
-    // The same text two and four ranks wide (design D14's bring-up rows):
-    // two heads per rank, then one. `layers`/`vocab`/`arch` do not shard, so
-    // they are the one-rank row's.
     Row {
         id: "mini-dit-bf16-kv-bf16-tp2",
         layers: 3,
@@ -709,8 +628,6 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "mini_dit",
     },
-    // Muse Glimmer: the 30B text (`models::muse_glimmer`), 52 layers, its
-    // logits the head's 202 048 rows. No vision front-end reads the arch.
     Row {
         id: "muse-glimmer-30b-bf16-kv-bf16",
         layers: 52,
@@ -729,23 +646,18 @@ pub const ROWS: &[Row] = &[
         vocab: 202_048,
         arch: "muse_glimmer",
     },
-    // The parity miniature: layers 0-3 and 48-51 of the 30B.
     Row {
         id: "muse-glimmer-30b-mini-l8-bf16-kv-bf16",
         layers: 8,
         vocab: 202_048,
         arch: "muse_glimmer",
     },
-    // Inkling: the text (`models::inkling`), 66 layers; the logits are the
-    // UNPADDED head (200 058 of the 201 024 stored rows), which is what the
-    // sampler sees.
     Row {
         id: "inkling-bf16-kv-bf16",
         layers: 66,
         vocab: 200_058,
         arch: "inkling",
     },
-    // The parity miniature: layers 0-6, eight routed experts.
     Row {
         id: "inkling-mini-l7-e8-bf16-kv-bf16",
         layers: 7,
@@ -754,20 +666,16 @@ pub const ROWS: &[Row] = &[
     },
 ];
 
-/// The row with this id, or `None` if this build ships no such model.
 #[must_use]
 pub fn row(id: &str) -> Option<&'static Row> {
     ROWS.iter().find(|row| row.id == id)
 }
 
-/// Every shipping id, in table order.
 #[must_use]
 pub fn ids() -> Vec<&'static str> {
     ROWS.iter().map(|row| row.id).collect()
 }
 
-/// The `take` ids closest to `id` by edit distance — what a refusal names so
-/// a typo reads as a typo.
 #[must_use]
 pub fn nearest_ids(id: &str, take: usize) -> Vec<&'static str> {
     let mut scored: Vec<(usize, &'static str)> = ids()
@@ -793,8 +701,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Rebuild the compiled tokenizer an artifact carried, without touching the
-/// filesystem. `None` when the model is a snapshot, whose tokenizer is a file.
 fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     let objects = metadata.tokenizer.as_ref()?;
     Some((|| {
@@ -808,7 +714,6 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     })())
 }
 
-/// The row the engine loaded, or a refusal naming what is close.
 fn loaded_row(model_id: &str) -> Result<&'static Row> {
     row(model_id).ok_or_else(|| {
         anyhow!(
@@ -828,24 +733,14 @@ pub fn register(
     tokenizer_path: PathBuf,
     metadata: &ModelMetadata,
 ) -> Result<()> {
-    // Logits dim = the model's `vocab_size`, keyed by the engine's recognizer
-    // table — not the tokenizer token count, which may be smaller (qwen3:
-    // 151669 vs 151936).
     let row = loaded_row(model_id)?;
     let num_layers = row.layers;
-    // `vocab` is the logical width and does not shard, so one number answers
-    // it at any tensor-parallel width.
     let vocab_size = row.vocab;
-    // The tokenizer is the half that genuinely differs: compiled objects from
-    // an artifact, a file beside a snapshot.
     let tokenizer = match compiled_tokenizer(metadata) {
         Some(compiled) => compiled?,
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    // Verify the row's tokenizer contract (stop markers, media delimiters,
-    // pinned specials) against the artifact's tokenizer before the template
-    // resolves a marker, so a mismatched artifact refuses at boot.
     match models::tokenizer::contract_of(row.id) {
         Some(contract) => contract
             .verify(&tokenizer)
@@ -859,8 +754,6 @@ pub fn register(
             ));
         }
     }
-    // Chat template chosen by the row the engine loaded. No fallback to
-    // ChatML: an unrecognized SKU is refused above at `loaded_row`.
     let instruct = match models::template::template_of(row.id) {
         Some(make) => make(tokenizer.clone()),
         None => {
@@ -872,8 +765,6 @@ pub fn register(
         }
     };
 
-    // Classify column, off the same row: no fallback, since word 0 is the
-    // all-false class and would silently fire every decode lane as prefill.
     let catalog_row = models::sku(row.id).ok_or_else(|| {
         anyhow!(
             "this build serves {:?} but its model catalog states no classifier \
@@ -914,12 +805,6 @@ pub fn register(
     Ok(())
 }
 
-/// What a family's generative facts must satisfy for the host to resolve
-/// readings and ports by name: indices dense from 0 in declaration order,
-/// names unique, port names unique within a reading, widths non-zero, a
-/// velocity/hidden readout stating its width, at most four axes on a
-/// positions port, one velocity width across readings (the eta
-/// `ModelProfile` carries one).
 pub fn validate_generative(generative: &models::Generative) -> Result<(), String> {
     let mut velocity_width = None;
     for (at, reading) in generative.readings.iter().enumerate() {
@@ -984,10 +869,6 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 ));
             }
         }
-        // A stated position convention has to line up with the port it
-        // describes, or a family-blind guest builds a grid of the wrong
-        // width and the failure surfaces as a rope mismatch deep in a
-        // fire. Refused here, in the family's own vocabulary.
         if let Some(convention) = &reading.positions {
             let axes = reading
                 .ports
@@ -1016,12 +897,6 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
                 ));
             }
         }
-        // A `[rows, ·]` port states the lane's rows, and a CONTEXT port is
-        // one: `inferlet::host::forward::port_rows` takes a context lane's
-        // cell as its row count when it is the only row port the lane binds
-        // (MiniMax H3's `refine` reading binds the encoder's rows and
-        // nothing else). A lane vector or a positions table is not: the
-        // first is one row per lane, the second is sized BY the rows.
         if !reading.takes_tokens
             && !reading.ports.iter().any(|port| {
                 matches!(
@@ -1042,13 +917,6 @@ pub fn validate_generative(generative: &models::Generative) -> Result<(), String
     Ok(())
 }
 
-/// The `velocity()` intrinsic's gate and width, read off the family's
-/// readings (design D12): available iff some reading reads back a velocity,
-/// and as wide as that reading's readout row. `validate_generative` has
-/// already refused readings that disagree on the width, so the first one
-/// is the family's. The engine fills its side of the same profile from the
-/// plan's `seam::VELOCITY` rectangle; both must agree, and both come from
-/// the family's one statement.
 pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
     readings
         .iter()
@@ -1056,12 +924,6 @@ pub fn velocity_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
         .map_or((false, 0), |reading| (true, reading.readout_width))
 }
 
-/// The `pixels()` intrinsic's gate and width, read off the family's
-/// readings (design D8): available iff some reading reads back pixels, and
-/// as wide as that readout row when every such reading agrees — `0` when
-/// they do not (a VAE's decode lands RGB and its encode a 16-channel mean),
-/// which tells bind to check rank and rows alone. The engine fills its
-/// side of the same profile from the plan's `seam::PIXELS` plantings.
 pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
     let mut widths = readings
         .iter()
@@ -1080,23 +942,16 @@ pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
     )
 }
 
-/// Returns the single registered model. Panics if called before bootstrap
-/// registers the model.
 pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
-/// The reserved token id this model spells a media run's placeholder with,
-/// or `None` for a model with no media front-end. Cached once (one process
-/// serves one model).
 pub fn media_pad() -> Option<u32> {
     static PAD: OnceLock<Option<u32>> = OnceLock::new();
     *PAD.get_or_init(|| {
         use crate::inferlet::host::media::multimodal;
         let m = model();
         let arch = m.arch_name();
-        // The pad spelling is the front-end's own; read from it directly
-        // rather than a second table that can drift out of sync.
         let spelling = models::media::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
             .or_else(|| {
@@ -1104,8 +959,6 @@ pub fn media_pad() -> Option<u32> {
             })?;
         match m.tokenize(spelling)[..] {
             [id] => Some(id),
-            // Tokenizer can't spell the arch's pad as one token: nothing to
-            // look for.
             _ => None,
         }
     })
@@ -1113,77 +966,39 @@ pub fn media_pad() -> Option<u32> {
 
 pub struct Model {
     name: String,
-    /// Family label the vision/speech front-ends dispatch on (e.g. "gemma4",
-    /// "qwen3_5"). Taken from the row, matching what the engine advertises.
     arch_name: &'static str,
     instruct: Arc<dyn Instruct>,
-    /// How this SKU sorts a request into the fact word its lanes carry.
-    /// Taken from the row once at registration. See [`Model::word`].
     classify: models::ClassifyFn,
     kv_page_size: u32,
-    /// Recurrent-state (working-set) capabilities surfaced via model.wit
-    /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
-    /// 0/0/1 for pure-attention models.
     rs_caps: RsCaps,
     eta_caps: EtaCaps,
     tokenizer: Arc<Tokenizer>,
-    /// Token table, built lazily on first ask and kept: a model's tokenizer
-    /// never changes, and a deployment whose guests never ask should not pay
-    /// to build one.
     vocab: OnceLock<(Vec<u32>, Vec<Vec<u8>>)>,
-    /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
-    /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
-    /// THIS for sampler lowering / logits-shaped ops, NOT the tokenizer vocab.
     vocab_size: u32,
-    /// Transformer layer count from the model snapshot's config.json.
     num_layers: u32,
-    /// The canvas a block-diffusion row denoises; `None` for an
-    /// autoregressive row. Read off the catalog row at registration; what
-    /// `pass-kind() == diffusion` and `canvas()` answer from.
     diffusion: Option<models::Diffusion>,
-    /// A generative family's readings, latent space and schedule (design
-    /// D12); `None` for a text row. What `model.readings()` / `latent()` /
-    /// `schedule()` / `max-latent-rows()` answer from, and what
-    /// `forward-pass.reading` / `input` resolve against.
     generative: Option<models::Generative>,
 }
 
-/// RS (recurrent-state) working-set capabilities surfaced to inferlets via
-/// `model.wit`. Sourced from the engine handshake `EngineCapabilities` at
-/// registration (`rs_cache_slot_bytes` etc.). All 0/0/1 for pure-attention
-/// models (no folded recurrent state).
 #[derive(Debug, Clone, Copy)]
 pub struct RsCaps {
-    /// Bytes of one folded recurrent-state object (`rs-state-size`).
     pub state_size: u64,
-    /// Tokens per buffered RS page (`rs-buffer-page-size`; v1 = kv_page_size).
     pub buffer_page_size: u32,
-    /// Fold granularity in tokens (`rs-fold-granularity`; 1 = token-causal).
     pub fold_granularity: u32,
 }
 
-/// Model-gated values that a loaded backend can bind into ETA programs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EtaCaps {
     pub has_mtp_logits: bool,
-    /// The draft head's chain depth; zero without one (`mtp-depth`).
     pub mtp_depth: u32,
-    /// The block drafter's facts (`block-drafter`): rows a draft pass
-    /// carries (zero without one), the mask id, whether the block is
-    /// bidirectional.
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_bidirectional: bool,
     pub draft_proposals_from: u32,
     pub has_value_head: bool,
-    /// Backend can execute the `envelope_dot` second-party kernel (Quest).
     pub has_kv_envelopes: bool,
-    /// Backend can observe per-position softmax attention weights at an
-    /// `OnAttn` tap (`IntrinsicId::AttnScore`) -- H2O/TOVA.
     pub has_attn_score: bool,
-    /// Backend honours the `attn_page_mask` sink (page-granular eviction).
     pub has_attn_page_mask: bool,
-    /// Backend honours the `lora` sink (pass-wide low-rank adapter delta).
     pub has_lora: bool,
 }
 
@@ -1194,53 +1009,38 @@ impl std::fmt::Debug for Model {
 }
 
 impl Model {
-    /// Gets the model name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Gets the architecture identifier (e.g. "gemma4", "qwen3_5").
     pub fn arch_name(&self) -> &'static str {
         self.arch_name
     }
 
-    /// Gets the instruct implementation for this model.
     pub fn instruct(&self) -> &dyn Instruct {
         &*self.instruct
     }
 
-    /// Gets the tokenizer.
     pub fn tokenizer(&self) -> &Arc<Tokenizer> {
         &self.tokenizer
     }
 
-    /// Logits/output vocab dimension (= hf_config.vocab_size). May exceed the
-    /// tokenizer's vocab (qwen3: 151936 logits vs 151669 tokens) — use this
-    /// for sampler lowering / logits-shaped ops, not tokenizer vocab.
     pub fn vocab_size(&self) -> u32 {
         self.vocab_size
     }
 
-    /// Tokenizes text into token IDs.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
         self.tokenizer.encode(text)
     }
 
-    /// Detokenizes token IDs into text.
     pub fn detokenize(&self, tokens: &[u32]) -> String {
         self.tokenizer.decode(tokens, false)
     }
 
-    /// The whole vocabulary as parallel vectors of (token IDs, token bytes) —
-    /// a copy of the table built once by [`Model::vocab`]. Callers that want
-    /// a few tokens' bytes or a prefix match should use
-    /// [`token_bytes`](Model::token_bytes) or
-    /// [`tokens_with_prefix`](Model::tokens_with_prefix) instead.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         self.vocab().clone()
     }
 
-    /// The token table, built on first ask and kept.
     fn vocab(&self) -> &(Vec<u32>, Vec<Vec<u8>>) {
         self.vocab.get_or_init(|| {
             let size = self.tokenizer.vocab_size();
@@ -1256,8 +1056,6 @@ impl Model {
         })
     }
 
-    /// The raw bytes each of `tokens` stands for, in order; an empty vector
-    /// for an id the vocabulary does not hold.
     pub fn token_bytes(&self, tokens: &[u32]) -> Vec<Vec<u8>> {
         tokens
             .iter()
@@ -1265,33 +1063,18 @@ impl Model {
             .collect()
     }
 
-    /// Every token id whose bytes begin with `prefix`, ascending. Used for
-    /// token healing (mask of tokens that reproduce rolled-back bytes as a
-    /// prefix). An empty prefix matches the whole vocabulary. Scans the
-    /// tokenizer's own table directly, so this does not build
-    /// [`Model::vocab`]'s cache.
     pub fn tokens_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
         self.tokenizer.ids_with_prefix(prefix)
     }
 
-    /// Gets the split regex pattern.
     pub fn get_split_regex(&self) -> String {
         self.tokenizer.get_split_regex()
     }
 
-    /// Gets the special tokens.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         self.tokenizer.get_special_tokens()
     }
 
-    /// The fact word a lane carries: `query_len` rows, custom mask,
-    /// adapter routing, draft head, attention mass capture, media spans,
-    /// whether the rows are a block drafter's proposal rather than the
-    /// sequence's own, and the denoise reading. The engine turns this word
-    /// into a class, and the class into the row window every guarded node
-    /// runs over. This calls the family's `Classify::of(..).word()` through
-    /// the catalog pointer and never reads a bit itself; all eight facts are
-    /// stamped from one reading of the lane at one instant.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn word(
@@ -1320,29 +1103,20 @@ impl Model {
         )
     }
 
-    /// Gets the KV page size.
-    /// The canvas a block-diffusion row denoises, or `None` for an
-    /// autoregressive one.
     pub fn diffusion(&self) -> Option<models::Diffusion> {
         self.diffusion
     }
 
-    /// The generative facts the family states, or `None` for a text row.
     pub fn generative(&self) -> Option<&models::Generative> {
         self.generative.as_ref()
     }
 
-    /// The readings the family declares, in index order; empty for a text
-    /// row (one implicit reading).
     pub fn readings(&self) -> &[models::ReadingFact] {
         self.generative
             .as_ref()
             .map_or(&[], |generative| generative.readings.as_slice())
     }
 
-    /// The reading a pass runs when it names none: the family's only
-    /// reading, or `None` when it must choose (several) or there is
-    /// nothing to choose (a text row, whose implicit reading is index 0).
     pub fn sole_reading(&self) -> Option<&models::ReadingFact> {
         match self.readings() {
             [only] => Some(only),
@@ -1358,8 +1132,6 @@ impl Model {
         self.num_layers
     }
 
-    /// RS working-set capabilities (`rs-state-size`/`rs-buffer-page-size`/
-    /// `rs-fold-granularity`). 0/0/1 for pure-attention models.
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
     }

@@ -1,16 +1,12 @@
 use model_dsl::{Dtype, Weight};
 
-/// GLM-5.3-Flash (`glm5_next`): a hyper-connected tower whose mixers alternate
-/// Kimi-Delta linear attention with nope-only MLA behind a sparse indexer.
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
 
-    /// The element the pooled index entries are gathered as.
     pub act: Dtype,
 
-    /// The MLA reading every `deepseek_sparse_attention` layer shares.
     pub heads: u32,
     pub kv_lora_rank: u32,
 
@@ -24,26 +20,15 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
-    /// The draft head, or `None` for a row without one.
     pub mtp: Option<Mtp>,
-    /// The vision tower, or `None` for a text row.
     pub tower: Option<Tower>,
 }
 
-/// **THE VISION TOWER** (`model.visual.*`, `glm5_next_vision`): 24 prenorm
-/// bidirectional blocks of 1024 over 14-pixel patches, q/k RMS-normed per
-/// head under a 2-D rotary, a clamped SwiGLU MLP with biases, a post norm,
-/// a 2×2 `downsample` conv (read as a matmul over merged rows) into the
-/// trunk's width, and the merger (`proj`, LayerNorm, GELU, clamped SwiGLU).
-/// No learned position table.
 pub struct Tower {
     pub hidden: u32,
     pub heads: u32,
     pub head_dim: u32,
-    /// `spatial_merge_size`: `downsample` folds `merge²` consecutive patch
-    /// rows into one (`layout.merge_rows`).
     pub merge: u32,
-    /// `C · T · P²`: width of one pre-unfolded patch row.
     pub patch_width: u32,
     pub inter: u32,
     pub merger_inter: u32,
@@ -51,13 +36,10 @@ pub struct Tower {
     pub theta: f32,
     pub norm_eps: f32,
     pub sm_scale: f32,
-    /// `[hidden, patch_width]`: the Conv3d kernel as a matmul bank.
     pub patch_embed: Weight,
     pub patch_embed_bias: Weight,
     pub blocks: Vec<TowerBlock>,
     pub post_norm: Weight,
-    /// `[out, merge² · hidden]`: the Conv2d kernel over one merge block, its
-    /// columns in the merged rows' `(kh, kw, c)` order.
     pub downsample: Weight,
     pub downsample_bias: Weight,
     pub merger: Merger,
@@ -72,7 +54,6 @@ pub struct TowerBlock {
     pub proj: Weight,
     pub proj_bias: Weight,
     pub norm2: Weight,
-    /// `[2·inter, hidden]`, gate then up.
     pub gate_up: Weight,
     pub gate_up_bias: Weight,
     pub down: Weight,
@@ -89,19 +70,6 @@ pub struct Merger {
 
 pub use crate::adapter::Adapters;
 
-/// **THE DRAFT HEAD** — GLM-5.3-Flash's one `nextn` layer (`layers.45`, the
-/// DeepSeek-V3 `MTP` shape): the next token's embedding and the trunk's
-/// collapsed residual each normed, fused by `eh_proj` (stored as one
-/// `[hidden, 2·hidden]` plane, read as its two column halves), one DSA+MoE
-/// block over the fused row, the head's own norm (`shared_head.norm`) and
-/// the base `lm_head`. No hyper connections: the head reads the collapsed
-/// residual, not the streams.
-///
-/// ```text
-/// x   = e_proj(enorm(embed(tok))) + h_proj(hnorm(y))
-/// x   = block(x)                                   (DSA + MoE, pre-norm)
-/// out = lm_head(norm(x))
-/// ```
 pub struct Mtp {
     pub enorm: Weight,
     pub hnorm: Weight,
@@ -115,14 +83,9 @@ pub struct Mtp {
     pub mlp: Mlp,
     pub norm: Weight,
     pub norm_eps: f32,
-    /// How many tokens past a readout row the head drafts (the checkpoint
-    /// ships one prediction layer, run at depth 1). The `mtp.drafts` seam is
-    /// `[rows, depth]` and the shell advertises `depth` as `mtp_depth`.
     pub depth: u32,
 }
 
-/// The manifold hyper-connection tower's own constants (`hc_mult`, `hc_eps`,
-/// `hc_sinkhorn_iters`).
 pub struct Hyper {
     pub streams: u32,
     pub norm_eps: f32,
@@ -131,7 +94,6 @@ pub struct Hyper {
     pub sinkhorn: u32,
 }
 
-/// One sublayer's hyper mix: `scale [3]`, `base [2M + M²]`, `fn [2M + M², M·hidden]`.
 pub struct Mix {
     pub scale: Weight,
     pub base: Weight,
@@ -147,8 +109,6 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// The mixer sublayer's adapter bank, applied to the replicated output
-    /// after `all_reduce` and before the hyper fold.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -159,7 +119,6 @@ pub enum Mixer {
     Kda(Kda),
 }
 
-/// `mla_use_nope`: `qk_rope_head_dim` is zero, so no plane of this mixer ropes.
 pub struct Mla {
     pub qk_nope_head_dim: u32,
     pub qk_rope_head_dim: u32,
@@ -178,13 +137,10 @@ pub struct Mla {
     pub kv: String,
 }
 
-/// The sparse indexer, keyed by `index_kpool`-pooled compressed rows
-/// (`index_kpool_compress`) rather than by token.
 pub struct Indexer {
     pub heads: u32,
     pub head_dim: u32,
     pub top_k: u32,
-    /// `index_kpool`: how many tokens one cached key entry pools.
     pub kpool: u32,
     pub rope_dim: u32,
     pub theta: f32,
@@ -194,15 +150,12 @@ pub struct Indexer {
     pub k_norm: Weight,
     pub k_norm_bias: Weight,
     pub k_norm_eps: f32,
-    /// `index_kpool_compress_ape`: the intra-block position plane the gather adds.
     pub kpool_ape: Weight,
-    /// `index_kpool_compress_gate`: the gate whose logits weight the pooled rows.
     pub kpool_gate: Weight,
     pub keys: String,
 }
 
 pub struct Kda {
-    /// `gate_lower_bound`: the decay is `floor * sigmoid(exp(A_log) * g)` when negative.
     pub gate_floor: f32,
     pub heads: u32,
     pub head_dim: u32,
@@ -212,7 +165,6 @@ pub struct Kda {
     pub conv: Weight,
     pub f_a: Weight,
     pub f_b: Weight,
-    /// The output gate's low rank pair (`g_a_proj`, `g_b_proj`).
     pub g_a: Weight,
     pub g_b: Weight,
     pub b: Weight,
@@ -235,7 +187,6 @@ pub enum Mlp {
     },
     Routed {
         router: Weight,
-        /// `e_score_correction_bias`, the `noaux_tc` ranking correction.
         bias: Weight,
         gate_up: Weight,
         down: Weight,
@@ -284,8 +235,6 @@ struct Dims {
     hidden: u32,
     layers: u32,
     dense_layers: u32,
-    /// A `deepseek_sparse_attention` layer is one whose index is this many
-    /// short of a whole block (`layer_types`: every fourth, from layer 3).
     full_attn_every: u32,
     mla: MlaDims,
     kda: KdaDims,
@@ -306,18 +255,14 @@ struct Dims {
 }
 
 impl Model {
-    /// `Vontra/GLM-5.3-Flash-MLX-2bit-MTP`, text only: 45 layers, hidden 4096,
-    /// 288 routed experts top-8, the KDA/DSA cadence, mHC over four streams.
     pub fn flash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, experts, None, false, kv, tp, Model::flash_dims())
     }
 
-    /// [`flash`](Model::flash) with the vision tower.
     pub fn flash_vision(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, experts, None, true, kv, tp, Model::flash_dims())
     }
 
-    /// Tower and draft head together: what the shipped checkpoint publishes.
     pub fn flash_mtp_vision(
         w: Dtype,
         experts: Dtype,
@@ -336,9 +281,6 @@ impl Model {
         )
     }
 
-    /// [`flash`](Model::flash) with the draft head over it: the checkpoint's
-    /// `layers.45` block, its routed experts in `head_experts` (Q4 in
-    /// Vontra's conversion, where the trunk's are Q2).
     pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -408,8 +350,6 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
-        // Norms, the router, the conv bank, the pooled position plane and the
-        // hyper planes ship unquantized; they are stated in the compute dtype.
         let dense = crate::dense(weights);
 
         let mla_heads = d.mla.heads / tp;
@@ -437,9 +377,6 @@ impl Model {
 
         let dsa_at = |l: u32| d.full_attn_every > 0 && (l + 1).is_multiple_of(d.full_attn_every);
 
-        // **ONE MLA, STATED FOR A SITE**: the trunk's eleven DSA mixers and the
-        // draft head's one are the same block; what differs per site is its
-        // name prefix and its cache rows.
         let mla_at = |prefix: String, kv_row: String, index_row: String| -> Mla {
             let n = |s: &str| format!("{prefix}.{s}");
             let norm = |s: &str, width: u64| Weight::sym(n(s), [width], dense);
@@ -497,8 +434,6 @@ impl Model {
                 kv: kv_row,
             }
         };
-        // **ONE ROUTED MLP, STATED FOR A SITE**: the trunk's and the head's
-        // differ in prefix and in the experts' dtype.
         let routed_at = |prefix: String, experts: Dtype| -> Mlp {
             let n = |s: &str| format!("{prefix}.{s}");
             let m = &d.moe;
@@ -577,7 +512,6 @@ impl Model {
                         .columns(),
                         a_log: Weight::sym(n("kda_a_log"), [kda_heads as u64], Dtype::F32)
                             .columns(),
-                        // `rmsnorm_gated_by` scales by an f32 weight.
                         o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], Dtype::F32),
                         o_norm_eps: d.norm_eps,
                         o_proj: Weight::sym(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
@@ -614,8 +548,6 @@ impl Model {
             })
             .collect();
 
-        // **THE DRAFT HEAD** (`layers.45` of the checkpoint): its planes come
-        // in under `mtp.`; `eh_proj` is read as two column halves.
         let mtp = draft.map(|head_experts| Mtp {
             enorm: Weight::sym("mtp.enorm", [hidden], dense),
             hnorm: Weight::sym("mtp.hnorm", [hidden], dense),
@@ -654,10 +586,6 @@ impl Model {
                 alpha: d.alpha,
                 sinkhorn: d.sinkhorn,
             },
-            // The conversion ships both bf16 (1.27 GB each); the import
-            // encodes them to 4-bit on the way in — the head is read whole
-            // every token, and both tables sit in the resident tier where
-            // every byte is an expert seat forgone.
             embed: Weight::sym("embed", [d.vocab as u64, hidden], Dtype::U4g64),
             head: Weight::sym("lm_head", [d.vocab as u64, hidden], Dtype::U4g64),
             layers,
@@ -668,8 +596,6 @@ impl Model {
         }
     }
 
-    /// The `glm5_next_vision` tower at the checkpoint's numbers, every plane
-    /// bf16 as stored, under `vision.`.
     fn tower(d: &Dims) -> Tower {
         let (hidden, heads, depth, inter, merger_inter) =
             (1024u64, 16u32, 24u32, 4096u64, 10240u64);
@@ -731,9 +657,6 @@ impl Model {
     }
 }
 
-/// Deployment ceiling for adapter slots/rank; change and re-trace to grow it.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-/// Tokens the draft head drafts past a readout row: the checkpoint's one
-/// prediction layer, run as trained.
 const DRAFT_DEPTH: u32 = 1;

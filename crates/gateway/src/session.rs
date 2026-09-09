@@ -1,24 +1,3 @@
-//! The internal serving abstraction: every live request funnels through one
-//! [`Session`] (one-shot REST/SSE is a 1-turn session, WebSocket is
-//! multi-turn). Ingress adapters are thin shells over [`Sessions`]/
-//! [`SessionHandle`]; the worker-facing token push demuxes back in through
-//! [`Sessions::feed`]/[`Sessions::redirect`]; routing/admission/dispatch is
-//! reached through the [`TurnRouter`] seam (mocked in tests, real at the
-//! crate root).
-//!
-//! Each in-flight turn owns a bounded [`mpsc`] pipe keyed by [`ReqId`](ids::ReqId).
-//! [`feed`](Sessions::feed) awaits on a full pipe — the backpressure point
-//! that stalls the worker's push pump. A clean end forwards the worker's
-//! terminal [`Tokens::Eos`] in-band before the pipe closes; an abort (cancel,
-//! drain, or an already-emitted worker-drop) drops the sender without an
-//! `Eos`, so `recv` yields a bare `None`. Whether an `Eos` was seen is the
-//! unambiguous clean-vs-abort discriminator.
-//!
-//! On mid-turn worker loss, [`Sessions`] watches [`TurnRouter::connected`]:
-//! a turn that hasn't emitted yet is re-dispatched (same `ReqId`, idempotent);
-//! one that has is failed clean. True mid-stream resume needs a runtime
-//! resume-from-position hook and is deferred.
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -32,67 +11,35 @@ use ids::{ReqId, SessionId, TenantId, WorkerId};
 use tokio::sync::{mpsc, watch};
 use worker_api::{BlobRef, Priority, Request, Tokens};
 
-/// Default bounded token-pipe capacity (chunks). The pipe is the per-turn
-/// backpressure buffer; a slow consumer fills it and throttles the worker.
 const DEFAULT_PIPE_CAP: usize = 256;
 
-/// Poll interval while [`Sessions::drain`] waits for live sessions to finish.
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-// ───────────────────────────── ingress seam types ─────────────────────────────
-
-/// The edge-supplied principal for a turn, extracted by `ingress/identity.rs`
-/// from the trusted edge header (a light identity gate, not authentication).
-/// `session.rs` consumes only [`tenant`](Identity::tenant) for the dispatched
-/// [`Request`]; the rest is carried for tracing / quota.
 #[derive(Debug, Clone)]
 pub struct Identity {
-    /// Tenant the turn is attributed to (routing / quota / isolation).
     pub tenant: TenantId,
-    /// Edge-supplied user/principal id.
     pub user: String,
-    /// Origin client IP (left-most `X-Forwarded-For`), if present and parseable.
     pub client_ip: Option<IpAddr>,
-    /// Edge tracing id (`X-Request-Id`), if present.
     pub request_id: Option<String>,
 }
 
-/// The user-turn content ingress hands to [`Sessions::create`] /
-/// [`SessionHandle::turn`]. Gateway-internal (never crosses the gateway↔worker
-/// wire — only the assembled [`Request`] does), so it lives here, not on the
-/// `worker_api` floor. `session.rs` stamps `{req_id, session, tenant}`
-/// onto the `Request`; ingress never mints those.
 #[derive(Debug, Clone)]
 pub struct TurnInput {
-    /// The turn payload in the existing client-message vocabulary.
     pub message: ClientMessage,
-    /// Out-of-band binary inputs (image/audio) as references, never bytes.
     pub blobs: Vec<BlobRef>,
-    /// Scheduling priority (default [`Priority::Normal`]).
     pub priority: Priority,
 }
 
-/// The routing mode for a session, chosen by the ingress adapter (which knows
-/// one-shot from multi-turn) and threaded to the dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity {
-    /// Fresh one-shot (REST/SSE): no warm KV to stick to ⇒ load-aware
-    /// power-of-two-choices. Front-loads load-awareness and avoids herding.
     Ephemeral,
-    /// Multi-turn session (WS): stick to the warm-KV worker across turns ⇒ stable
-    /// HRW on the [`SessionId`], re-routed only if that worker is gone.
     Sticky,
 }
 
-/// Why a turn could not be started.
 #[derive(Debug, Clone)]
 pub enum SessionError {
-    /// The cluster-level admission gate rejected the turn (resource saturation).
-    /// Maps to an over-capacity user response (e.g. HTTP 429/503).
     Admission(String),
-    /// No healthy, connected worker accepted the turn after retries (HTTP 503).
     NoWorker,
-    /// The gateway is draining and is not accepting new sessions (HTTP 503).
     Draining,
 }
 
@@ -108,96 +55,45 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// The consumer end of one turn's bounded token pipe (owned by ingress).
-///
-/// `recv` yields `Some(Tokens::Chunk(..))` per output frame, `Some(Tokens::Eos)`
-/// at a **clean** turn end, then `None`; a bare `None` with no preceding `Eos`
-/// is an **abort**. Owned + `&mut`, so it composes in a `select!` alongside
-/// `&self` control calls on [`SessionHandle`] without a borrow clash.
 pub struct TokenRx {
     rx: mpsc::Receiver<Tokens>,
 }
 
 impl TokenRx {
-    /// Await the next token-stream item. See [`TokenRx`] for the
-    /// clean-end-vs-abort contract.
     pub async fn recv(&mut self) -> Option<Tokens> {
         self.rx.recv().await
     }
 }
 
-// ───────────────────────────── route/dispatch seam ─────────────────────────────
-
-/// Admission rejected the turn — carries a human-readable reason.
 #[derive(Debug, Clone)]
 pub struct AdmitReject(pub String);
 
-/// Dispatch exhausted all candidate workers (none accepted / reachable).
 #[derive(Debug, Clone)]
 pub struct DispatchFail;
 
-/// The orchestration backend `session.rs` drives — the in-proc seam onto
-/// `route.rs`/`admission.rs` and `WorkerRegistry`. Kept as a trait so the
-/// registry/pipe/lifecycle logic is unit-testable with a mock, and so
-/// `session.rs` carries no upward edge to those modules. The crate root
-/// provides the real adapter:
-///
-/// ```ignore
-/// struct RouteBackend { routing: RoutingHandle, workers: WorkerRegistry }
-/// #[async_trait::async_trait]
-/// impl TurnRouter for RouteBackend {
-///     async fn admit(&self, req: &Request) -> Result<(), AdmitReject> { self.routing.admit(req)... }
-///     async fn dispatch(&self, req: &Request, affinity: Option<u64>) -> Result<WorkerId, DispatchFail> { self.routing.dispatch_with_retry(&self.workers, req, affinity)... }
-///     async fn cancel(&self, w: WorkerId, r: ReqId) { if let Some(c) = self.workers.client(w) { c.cancel(.., r).await; } }
-///     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> { self.workers.connected_watch() }
-/// }
-/// ```
 #[async_trait::async_trait]
 pub trait TurnRouter: Send + Sync + 'static {
-    /// Coarse cluster admission gate (runs before routing).
     async fn admit(&self, req: &Request) -> Result<(), AdmitReject>;
 
-    /// Select a worker and dispatch with the worker-final-admission retry loop,
-    /// returning the bound worker. `affinity`: `Some(key)` → stable HRW
-    /// (warm-KV sticky, for a multi-turn session), `None` →
-    /// power-of-two-choices (load-aware, for a fresh one-shot).
     async fn dispatch(
         &self,
         req: &Request,
         affinity: Option<u64>,
     ) -> Result<WorkerId, DispatchFail>;
 
-    /// Immediately abort an in-flight turn on a specific worker (reverse-channel
-    /// `WorkerControl::cancel`, for when the piggybacked `Control::Abort` can't
-    /// reach a non-pushing worker promptly).
     async fn cancel(&self, worker: WorkerId, req: ReqId);
 
-    /// The live connected-worker set. Drives mid-turn worker-drop detection.
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
 }
 
-// ───────────────────────────── internal state ─────────────────────────────
-
-/// Per in-flight turn bookkeeping in the registry.
 struct TurnState {
-    /// The bound worker (set once dispatch succeeds; cleared while re-dispatching).
     worker: Option<WorkerId>,
-    /// The dispatched request, retained for idempotent re-dispatch on worker loss.
     request: Request,
-    /// The routing mode for this turn (`None` = p2c, `Some(key)` = HRW),
-    /// retained so a re-dispatch (redirect / worker-drop) keeps the same policy.
     affinity: Option<u64>,
-    /// Set once the first chunk is delivered to the consumer (in
-    /// [`Sessions::feed`], after the send succeeds — never for a bare `Eos`).
-    /// The re-dispatch-vs-fail discriminator: unset means a worker drop can
-    /// re-dispatch this turn; set means it must fail clean, since a fresh
-    /// dispatch would re-emit tokens the user already received.
     emitted: bool,
-    /// Producer end of the turn's bounded pipe.
     sink: mpsc::Sender<Tokens>,
 }
 
-/// Shared gateway-global session state behind [`Sessions`] / [`SessionHandle`].
 struct Inner {
     turns: Mutex<HashMap<ReqId, TurnState>>,
     router: Arc<dyn TurnRouter>,
@@ -209,8 +105,6 @@ struct Inner {
 }
 
 impl Inner {
-    /// Mint a `ReqId`, build the `Request`, gate admission, bind the bounded pipe
-    /// **before** dispatch (so an early `push_tokens` finds it), then dispatch.
     async fn run_turn(
         &self,
         session: SessionId,
@@ -263,8 +157,6 @@ impl Inner {
         }
     }
 
-    /// Tear a turn out of the registry (dropping its sink → consumer observes the
-    /// channel-close abort) and return its bound worker, if any.
     fn abort_turn(&self, req_id: ReqId) -> Option<WorkerId> {
         self.turns
             .lock()
@@ -274,27 +166,16 @@ impl Inner {
     }
 }
 
-// ───────────────────────────── public handles ─────────────────────────────
-
-/// Gateway-global session manager — the `GatewayState.sessions` handle.
-///
-/// `Clone` (cheap `Arc`), so it injects into the axum router state and the
-/// worker-RPC server alike. Serves both faces: ingress
-/// ([`create`](Sessions::create)/[`drain`](Sessions::drain)) and the worker
-/// token demux ([`feed`](Sessions::feed)/[`redirect`](Sessions::redirect)).
 #[derive(Clone)]
 pub struct Sessions {
     inner: Arc<Inner>,
 }
 
 impl Sessions {
-    /// Build the manager over a [`TurnRouter`] backend and spawn the worker-drop
-    /// watcher. Must be called on a Tokio runtime.
     pub fn new(router: Arc<dyn TurnRouter>) -> Self {
         Self::with_pipe_cap(router, DEFAULT_PIPE_CAP)
     }
 
-    /// As [`new`](Sessions::new) with an explicit bounded-pipe capacity.
     pub fn with_pipe_cap(router: Arc<dyn TurnRouter>, pipe_cap: usize) -> Self {
         let inner = Arc::new(Inner {
             turns: Mutex::new(HashMap::new()),
@@ -309,12 +190,6 @@ impl Sessions {
         Self { inner }
     }
 
-    /// Begin a session and dispatch its first turn (one-shot = the whole session;
-    /// WS = the first of many). `affinity` is the routing mode the ingress
-    /// adapter picks: [`Affinity::Ephemeral`] for a one-shot (→ p2c),
-    /// [`Affinity::Sticky`] for a multi-turn session (→ HRW on the session id).
-    /// Runs admission → route → dispatch internally. Errors if the gateway is
-    /// draining, admission rejects, or no worker accepts.
     pub async fn create(
         &self,
         ident: Identity,
@@ -325,8 +200,6 @@ impl Sessions {
             return Err(SessionError::Draining);
         }
         let session = SessionId(self.inner.next_session.fetch_add(1, Ordering::Relaxed));
-        // Sticky multi-turn sessions key affinity on the stable session id; a
-        // fresh one-shot has no warm KV to prefer, so it routes load-aware (p2c).
         let affinity_key = match affinity {
             Affinity::Ephemeral => None,
             Affinity::Sticky => Some(session.0),
@@ -353,14 +226,6 @@ impl Sessions {
         Ok((handle, rx))
     }
 
-    /// Worker → gateway token push (`GatewayInbound::push_tokens`): route a chunk
-    /// to its turn's bounded pipe and answer with the [`Control`] for the worker.
-    ///
-    /// [`Control`](worker_api::Control)`::Continue` while the pipe
-    /// accepts; `Abort` when the turn is gone or the consumer dropped. The send
-    /// **awaits on a full pipe** — the backpressure point. A forwarded
-    /// [`Tokens::Eos`] cleanly ends the turn (the pipe closes after the consumer
-    /// observes it).
     pub async fn feed(&self, req_id: ReqId, chunk: Tokens) -> worker_api::Control {
         use worker_api::Control;
 
@@ -378,8 +243,6 @@ impl Sessions {
                 {
                     let mut turns = self.inner.turns.lock().unwrap();
                     if is_eos {
-                        // Clean end: drop the registry's sender so the consumer
-                        // sees the buffered Eos, then the channel-close `None`.
                         turns.remove(&req_id);
                     } else if let Some(turn) = turns.get_mut(&req_id) {
                         turn.emitted = true;
@@ -388,17 +251,12 @@ impl Sessions {
                 Control::Continue
             }
             Err(_) => {
-                // Consumer dropped (user gone / turn aborted) → stop the worker.
                 self.inner.turns.lock().unwrap().remove(&req_id);
                 Control::Abort
             }
         }
     }
 
-    /// Worker → gateway redirect (`GatewayInbound::redirect`): the worker can no
-    /// longer serve an accepted turn. Re-dispatch the stored `Request`
-    /// (idempotent, same `ReqId`) to another worker; if none accepts, abort the
-    /// turn. Fire-and-forget (the re-dispatch runs on a spawned task).
     pub fn redirect(&self, req_id: ReqId) {
         let inner = self.inner.clone();
         let entry = {
@@ -429,9 +287,6 @@ impl Sessions {
         });
     }
 
-    /// Graceful drain: stop accepting new sessions, wait up to `max` for live
-    /// sessions to finish, then force-close any stragglers (their token
-    /// streams abort).
     pub async fn drain(&self, max: Duration) {
         self.inner.draining.store(true, Ordering::Release);
         let deadline = Instant::now() + max;
@@ -444,33 +299,20 @@ impl Sessions {
         self.inner.turns.lock().unwrap().clear();
     }
 
-    /// Number of live (not-yet-dropped) sessions. Exposed for drain/observability.
     pub fn live(&self) -> usize {
         self.inner.live.load(Ordering::Acquire)
     }
 }
 
-/// Controls one live session (the ingress adapter holds it). Control methods take
-/// `&self` so they compose in a `select!` while the owned [`TokenRx`] is borrowed
-/// mutably. Dropping the handle ends the session (cancels any in-flight turn).
 pub struct SessionHandle {
     inner: Arc<Inner>,
     session: SessionId,
     tenant: TenantId,
-    /// The session's affinity key, reused for every turn (a multi-turn session
-    /// sticks to its warm-KV worker; `None` for a one-shot).
     affinity_key: Option<u64>,
-    /// Every turn this session has opened and not yet cancelled — a WS client
-    /// may run several at once, so a single slot would leave older turns
-    /// running with nobody to stream them. Ids of turns that finished on
-    /// their own stay until the session ends; `abort_turn` is a no-op for them.
     current: Mutex<Vec<ReqId>>,
 }
 
 impl SessionHandle {
-    /// Submit the next turn on this session (WS multi-turn). Re-runs admission →
-    /// route → dispatch; the session's stable affinity key keeps it on its
-    /// warm-KV worker. Returns the new turn's token stream.
     pub async fn turn(&self, next: TurnInput) -> Result<TokenRx, SessionError> {
         let (req_id, rx) = self
             .inner
@@ -480,9 +322,6 @@ impl SessionHandle {
         Ok(rx)
     }
 
-    /// Cancel EVERY in-flight turn on this session (immediate abort on the
-    /// worker; each turn's `TokenRx` aborts). The session stays open — a WS
-    /// client may submit another [`turn`](SessionHandle::turn).
     pub async fn cancel(&self) {
         let req_ids = std::mem::take(&mut *self.current.lock().unwrap());
         for req_id in req_ids {
@@ -492,13 +331,10 @@ impl SessionHandle {
         }
     }
 
-    /// End the session: cancel any in-flight turn. Idempotent; [`Drop`] also runs
-    /// this, so an early `close` and the final drop are both safe.
     pub async fn close(&self) {
         self.cancel().await;
     }
 
-    /// The logical session id (stable across this session's turns).
     pub fn id(&self) -> SessionId {
         self.session
     }
@@ -517,21 +353,15 @@ impl Drop for SessionHandle {
     }
 }
 
-// ───────────────────────────── worker-drop watcher ─────────────────────────────
-
-/// Background task: when a live turn's bound worker leaves the connected set,
-/// re-dispatch the turn if it hasn't emitted, else fail it clean.
 fn spawn_drop_watcher(inner: Arc<Inner>) {
     let mut connected = inner.router.connected();
     tokio::spawn(async move {
         loop {
             if connected.changed().await.is_err() {
-                break; // router gone → gateway shutting down.
+                break;
             }
             let live: Arc<HashSet<WorkerId>> = connected.borrow_and_update().clone();
 
-            // Collect affected turns under the lock; do the async re-dispatch
-            // outside it.
             let affected: Vec<(ReqId, bool, Request, Option<u64>)> = {
                 let turns = inner.turns.lock().unwrap();
                 turns
@@ -543,16 +373,14 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
 
             for (req_id, emitted, request, affinity) in affected {
                 if emitted {
-                    // Tokens already reached the user → cannot resume cleanly.
                     inner.turns.lock().unwrap().remove(&req_id);
                     continue;
                 }
-                // Not emitted → re-dispatch the same ReqId (idempotent).
                 {
                     let mut turns = inner.turns.lock().unwrap();
                     match turns.get_mut(&req_id) {
                         Some(turn) => turn.worker = None,
-                        None => continue, // raced with completion/abort.
+                        None => continue,
                     }
                 }
                 match inner.router.dispatch(&request, affinity).await {
@@ -577,11 +405,9 @@ mod tests {
     use client_api::ServerMessage;
     use worker_api::Control;
 
-    /// Mock [`TurnRouter`]: admission/dispatch outcomes are scriptable, dispatched
-    /// `ReqId`s and cancels are recorded, and the connected set is controllable.
     struct MockRouter {
         admit_ok: AtomicBool,
-        dispatch_worker: Mutex<Option<WorkerId>>, // Some → Ok(worker); None → DispatchFail
+        dispatch_worker: Mutex<Option<WorkerId>>,
         dispatched: Mutex<Vec<ReqId>>,
         affinities: Mutex<Vec<Option<u64>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
@@ -673,7 +499,6 @@ mod tests {
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Continue);
         assert!(matches!(rx.recv().await, Some(Tokens::Chunk(_))));
 
-        // Eos is delivered in-band, then the pipe closes (clean end).
         assert_eq!(sessions.feed(req_id, Tokens::Eos).await, Control::Continue);
         assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
         assert!(rx.recv().await.is_none());
@@ -695,13 +520,13 @@ mod tests {
             .await
             .unwrap();
         let req_id = router.dispatched.lock().unwrap()[0];
-        drop(rx); // user disconnected
+        drop(rx);
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Abort);
     }
 
     #[tokio::test]
     async fn no_worker_surfaces() {
-        let router = MockRouter::new(None); // dispatch always fails
+        let router = MockRouter::new(None);
         let sessions = Sessions::new(router);
         let res = sessions.create(ident(), input(), Affinity::Sticky).await;
         assert!(matches!(res, Err(SessionError::NoWorker)));

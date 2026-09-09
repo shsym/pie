@@ -118,13 +118,6 @@ instantiate_gated_rms_strided(bfloat16, bfloat, bfloat)
       device itype*, const constant float&, const constant uint&,    \
       uint3, uint3, uint3, uint, uint);
 
-// `SILU = false` — the gate is the bare sigmoid, with no `z ·` in front of
-// it. TWO ops land on this one instantiation and neither is a special case of
-// the other: `elementwise.rmsnorm_gated_by` (the kda output norm, grouped by a
-// stated head COUNT) and `elementwise.rmsnorm_gated` when its
-// `output_gate_type` is `sigmoid` (qwen4's GatedDeltaNet, grouped by a stated
-// head WIDTH). The grouping is the host entry's arithmetic and the activation
-// is the shader's, so the name here says the activation.
 #define instantiate_gated_rms_sigmoid(name, xtype, itype)         \
   template [[host_name("gated_rms_sigmoid_" #name)]]              \
   [[kernel]] void gated_rms<xtype, itype, false>(                 \

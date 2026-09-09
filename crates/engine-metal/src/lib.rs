@@ -1,30 +1,20 @@
-//! The Metal engine's dispatch layer: the [`Run`] that resolves plan ids to
-//! device handles. Encodes through `kernels_metal::Ctx`, so this crate
-//! builds and tests on any OS; only the shell behind the sink is macOS-bound.
-
 pub mod abi;
-/// The `lora` sink: which channels an adapter's planes are, what a seeded
-/// cell means as bank bytes, and which slot it lands in.
 pub mod adapter;
 pub mod api;
 pub mod arena;
-/// The shared-adapter store: the deployment mount, `adapter.toml` grammar,
-/// host byte cache, and per-layer resolver from blob files to bank planes.
 pub mod blob;
 pub mod boot;
 pub mod device;
-/// What a person debugging turned on, typed and stated by the boot document.
 pub mod diag;
 mod dispatch;
 pub mod encode;
 pub mod weight_store;
 mod error;
 pub mod experts;
-/// The gathered row slab: the static-demand residency class.
+
+pub(crate) mod feeds;
 pub mod gather;
 pub mod host_source;
-/// The indirect command buffer. Metal-only; everything else in this crate
-/// compiles on any target.
 #[cfg(target_vendor = "apple")]
 pub mod icb;
 pub mod rebind;
@@ -35,15 +25,11 @@ pub mod program;
 pub mod record;
 pub mod rs;
 pub mod run;
-/// The observability slab the attention capture arm writes and the
-/// epilogue's `attn_score` intrinsic reads.
 pub mod scores;
 pub mod decoded;
 mod keepalive;
 mod scratch;
 pub mod serve;
-/// The settlement plane: run-ahead counters, completion seam, and the A/B
-/// seat ring the asynchronous fire path is built on.
 pub mod settle;
 pub mod store;
 pub mod weights;

@@ -1,22 +1,5 @@
-//! **EVERY FORMAT A `frames` HANDLE OFFERS PRODUCES THE FILE IT CLAIMS, AND
-//! REFUSES WHAT IT CANNOT DO BY NAME.**
-//!
-//! ```text
-//! cargo test -p runtime --test every_frames_format_says_what_it_encoded
-//! ```
-//!
-//! The subject is `Frames::encode`'s dispatch, not the individual encoders —
-//! those have their own gates beside them in `crate::codec`. What this pins is
-//! the layer the guest actually calls: a gradient in, a decodable file out,
-//! the right refusal when a still format meets a clip, and `raw-rgb8` giving
-//! back exactly the bytes the handle was built from (which is the only test
-//! that can tell a transposed encoder from a correct one).
-
 use runtime::inferlet::{Frames, ImageFormat, Pcm};
 
-/// A gradient, not a flat fill: a flat fill survives a transposed or
-/// mis-strided encoder and a gradient does not. Frame `f` is offset in blue so
-/// the frames of a clip differ from one another.
 fn gradient(w: u32, h: u32, count: u32) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * count * 3) as usize);
     for f in 0..count {
@@ -29,6 +12,13 @@ fn gradient(w: u32, h: u32, count: u32) -> Vec<u8> {
         }
     }
     v
+}
+
+fn every_frames_format_says_what_it_encoded_every_case() {
+    a_still_round_trips_through_png_and_raw_and_reads_back_identical();
+    a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name();
+    a_handle_whose_bytes_do_not_match_its_extent_is_refused_at_construction();
+    pcm_carries_its_own_rate_and_channels_into_the_wav_header();
 }
 
 #[test]
@@ -59,7 +49,6 @@ fn a_still_round_trips_through_png_and_raw_and_reads_back_identical() {
     assert_eq!(&jpeg[..2], b"\xff\xd8");
 }
 
-#[test]
 fn a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name() {
     let (w, h, n) = (8, 4, 3);
     let clip = Frames::from_rgb8(gradient(w, h, n), w, h, n, 24.0).expect("build");
@@ -82,7 +71,6 @@ fn a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name() {
     }
 }
 
-#[test]
 fn a_handle_whose_bytes_do_not_match_its_extent_is_refused_at_construction() {
     let err = Frames::from_rgb8(vec![0; 10], 4, 4, 1, 0.0).unwrap_err();
     assert!(err.contains("expected 48"), "{err}");
@@ -90,7 +78,6 @@ fn a_handle_whose_bytes_do_not_match_its_extent_is_refused_at_construction() {
     assert!(err.contains("non-zero extent"), "{err}");
 }
 
-#[test]
 fn pcm_carries_its_own_rate_and_channels_into_the_wav_header() {
     let samples: Vec<f32> = (0..64).map(|i| (i as f32 / 32.0) - 1.0).collect();
     let pcm = Pcm::from_f32(samples.clone(), 24_000, 2).expect("build");

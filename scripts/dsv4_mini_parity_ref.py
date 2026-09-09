@@ -41,15 +41,10 @@ from safetensors import safe_open
 
 mx.set_default_device(mx.gpu)
 
-# ----------------------------------------------------------------------------- organs
-# v4mlx/norm_rope.py
-
-
 def rmsnorm(x, weight, eps=1e-6):
     x = x.astype(mx.float32)
     var = x.square().mean(-1, keepdims=True)
     return weight.astype(mx.float32) * (x * mx.rsqrt(var + eps))
-
 
 def precompute_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow):
     def corr_dim(num_rot):
@@ -67,16 +62,13 @@ def precompute_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow):
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
     return freqs
 
-
 def rope_cos_sin(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow):
     freqs = precompute_freqs(dim, original_seq_len, base, factor, beta_fast, beta_slow)
     t = mx.arange(seqlen).astype(mx.float32)
     ang = t[:, None] * freqs[None, :]
     return mx.cos(ang), mx.sin(ang)
 
-
-ROPE_HALF = [False]  # `--pie rope_half`: pair lane i with i + d/2 (rotate-half) instead of 2i with 2i+1
-
+ROPE_HALF = [False]
 
 def apply_rotary_emb(x, cos, sin, inverse=False):
     """x: [..., seq, (heads,) d]; cos/sin: [seq, d/2]; interleaved pairs."""
@@ -87,10 +79,10 @@ def apply_rotary_emb(x, cos, sin, inverse=False):
     else:
         xp = x.astype(mx.float32).reshape(*lead, d // 2, 2)
         x0, x1 = xp[..., 0], xp[..., 1]
-    if x.ndim == 3:  # [seq, heads, d]
+    if x.ndim == 3:
         c = cos[:, None, :]
         s = sin[:, None, :]
-    else:  # [seq, d]
+    else:
         c, s = cos, sin
     if inverse:
         s = -s
@@ -99,10 +91,6 @@ def apply_rotary_emb(x, cos, sin, inverse=False):
     if ROPE_HALF[0]:
         return mx.concatenate([o0, o1], axis=-1)
     return mx.stack([o0, o1], axis=-1).reshape(*lead, d)
-
-
-# v4mlx/hc.py
-
 
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps):
     lead = mixes.shape[:-1]
@@ -117,7 +105,6 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps):
         comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
     return pre, post, comb
 
-
 def hc_pre(x, hc_fn, hc_scale, hc_base, hc, norm_eps, sinkhorn_iters, hc_eps):
     """x: [s, hc, dim] -> y [s, dim], post [s, hc], comb [s, hc, hc]."""
     s = x.shape[0]
@@ -128,11 +115,9 @@ def hc_pre(x, hc_fn, hc_scale, hc_base, hc, norm_eps, sinkhorn_iters, hc_eps):
     y = mx.sum(pre[..., None] * x, axis=1)
     return y, post, comb
 
-
 def hc_post(x, residual, post, comb):
     """y[s, j, :] = post[s, j] * x[s, :] + sum_i comb[s, i, j] * residual[s, i, :]."""
     return post[..., None] * x[:, None, :] + mx.sum(comb[..., None] * residual[:, :, None, :], axis=1)
-
 
 def hc_head(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):
     s = x.shape[0]
@@ -141,10 +126,6 @@ def hc_head(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):
     mixes = (xf @ hc_fn.T) * rsqrt
     pre = mx.sigmoid(mixes * hc_scale + hc_base) + hc_eps
     return mx.sum(pre[..., None] * x, axis=1)
-
-
-# v4mlx/compressor.py
-
 
 def act_quant_sim(x, block=64):
     a = np.array(x.astype(mx.float32))
@@ -156,7 +137,6 @@ def act_quant_sim(x, block=64):
     q = np.clip(ab / s, -fp8_max, fp8_max).astype(ml_dtypes.float8_e4m3fn).astype(np.float32) * s
     return mx.array(q.reshape(sh))
 
-
 def overlap_transform(t, ratio, d, value):
     """t: [g, ratio, 2d] -> [g, 2*ratio, d]: previous block's first half, this block's second."""
     g = t.shape[0]
@@ -164,7 +144,6 @@ def overlap_transform(t, ratio, d, value):
     new[:, ratio:] = t[:, :, d:]
     new[1:, :ratio] = t[:-1, :, :d]
     return new
-
 
 def compressor_prefill(x, wkv, wgate, ape, norm_w, cos, sin, head_dim, ratio, rope_head_dim, sim):
     """x: [s, dim] -> compressed rows [s // ratio, head_dim], roped at block starts."""
@@ -190,12 +169,6 @@ def compressor_prefill(x, wkv, wgate, ape, norm_w, cos, sin, head_dim, ratio, ro
         kv = mx.concatenate([act_quant_sim(kv[..., :-rd], 64), kv[..., -rd:]], axis=-1)
     return kv
 
-
-# v4mlx/sparse_attn.py, batched over the query rows with a visibility mask — the
-# same masked-dense arithmetic the reference states, with -inf where its gather
-# would not read.
-
-
 def windowed_attention(q, keys, sink, mask, scale):
     """q: [s, h, d], keys: [n, d], sink: [h], mask: [s, n] bool -> o [s, h, d]."""
     scores = scale * mx.einsum("shd,nd->shn", q, keys)
@@ -204,10 +177,6 @@ def windowed_attention(q, keys, sink, mask, scale):
     p = mx.exp(scores - rowmax)
     denom = p.sum(axis=-1, keepdims=True) + mx.exp(sink[None, :, None] - rowmax)
     return mx.einsum("shn,nd->shd", p, keys) / denom
-
-
-# ----------------------------------------------------------------------------- checkpoint
-
 
 class Checkpoint:
     def __init__(self, snapshot):
@@ -261,10 +230,6 @@ class Checkpoint:
         bi = self.raw(name + ".biases")[idx]
         return mx.dequantize(w, sc, bi, group_size=gs, bits=bits).astype(mx.float32)
 
-
-# ----------------------------------------------------------------------------- model
-
-
 class Reference:
     def __init__(self, ck, sim=False, pie=()):
         self.ck = ck
@@ -292,8 +257,6 @@ class Reference:
         self.scale = self.head_dim**-0.5
         rs = c["rope_scaling"]
         self.max_seq = 4096
-        # ROPE[0]: no compressor -> base theta, no YaRN. ROPE[1]: compressor layers -> the
-        # compress theta WITH YaRN (official `Attention.__init__`; decode_engine `ROPE`).
         self.rope0 = rope_cos_sin(self.rd, self.max_seq, 0, c["rope_theta"], rs["factor"], rs["beta_fast"], rs["beta_slow"])
         self.rope1 = rope_cos_sin(
             self.rd, self.max_seq, rs["original_max_position_embeddings"], c["compress_rope_theta"], rs["factor"], rs["beta_fast"], rs["beta_slow"]
@@ -325,7 +288,6 @@ class Reference:
         if self.sim:
             kv = mx.concatenate([act_quant_sim(kv[..., : -self.rd], 64), kv[..., -self.rd :]], axis=-1)
 
-        # Keys: the per-token latent window, then every compressed row of a ratio-4 layer.
         comp = None
         if r == 4:
             comp = compressor_prefill(
@@ -340,7 +302,7 @@ class Reference:
         if comp is not None and comp.shape[0] > 0:
             g = comp.shape[0]
             c = np.arange(g)[None, :]
-            comp_mask = c < ((i + 1) // r)  # row c visible once its block has closed
+            comp_mask = c < ((i + 1) // r)
             keys = mx.concatenate([kv, comp], axis=0)
             mask = np.concatenate([win_mask, comp_mask], axis=1)
         else:
@@ -348,10 +310,8 @@ class Reference:
             mask = win_mask
         o = windowed_attention(q, keys, self.W(n("attn.attn_sink")), mx.array(mask), self.scale)
         if "no_orope" not in self.pie:
-            # The value carries the key's rope (kv is both), so the output is un-roped.
             o = mx.concatenate([o[..., : -self.rd], apply_rotary_emb(o[..., -self.rd :], cos[pos], sin[pos], inverse=True)], axis=-1)
 
-        # o-projection: block-diagonal over `o_groups` (official einsum "bsgd,grd->bsgr").
         wo_a, wo_b = self.W(n("attn.wo_a")), self.W(n("attn.wo_b"))
         og = o.reshape(s, self.groups, -1)
         if "ogroups" in self.pie:
@@ -365,7 +325,6 @@ class Reference:
         y2, post2, comb2 = hc_pre(h, self.W(n("ffn_hc.fn")), self.W(n("ffn_hc.scale")), self.W(n("ffn_hc.base")), self.hc, self.eps, self.sinkhorn, self.hc_eps)
         xn2 = rmsnorm(y2, self.W(n("ffn_norm")), self.eps)
 
-        # Router: sqrt-softplus scores; hash layers pick by table, weights still from scores.
         logits = xn2 @ self.W(n("ffn.gate")).T
         sc = np.array(mx.sqrt(mx.log1p(mx.exp(-mx.abs(logits))) + mx.maximum(logits, 0)))
         if L < self.hash_layers:
@@ -414,10 +373,6 @@ class Reference:
         mx.eval(out)
         return out
 
-
-# ----------------------------------------------------------------------------- driver
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", default=os.path.expanduser("~/.cache/huggingface/hub/models--mlx-community--DeepSeek-V4-Flash-2bit-DQ/snapshots/mini-l5-e16"))
@@ -449,8 +404,6 @@ def main():
             cur.append(nxt)
             gen_rows.append(np.array(ref.logits(cur), dtype=np.float32)[-1])
         gen_np = np.stack(gen_rows[:-1]) if args.steps > 0 else np.stack(gen_rows)
-        # gen row k is the logits that chose gen[k]; the last computed row (after the final
-        # step) is dropped so rows and tokens align one to one, matching the pie dump.
         tf_np.tofile(os.path.join(args.out, f"{name}.{args.tag}.tf.f32"))
         gen_np.tofile(os.path.join(args.out, f"{name}.{args.tag}.gen.f32"))
         json.dump(
@@ -458,7 +411,6 @@ def main():
             open(os.path.join(args.out, f"{name}.{args.tag}.json"), "w"),
         )
         print(f"  {name}: {len(ids)} tokens, {args.steps} steps, {time.time() - t0:.1f}s, gen={gen[:12]}")
-
 
 if __name__ == "__main__":
     main()

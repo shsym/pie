@@ -1,5 +1,3 @@
-//! The qwen4 model: qwen_3's hybrid mix rebuilt around a non-summing gated residual, plus a hashed n-gram PLE.
-
 use model_dsl::{Dtype, Weight};
 
 pub use crate::qwen_3::model::{Attn, Gdn, Merger, Mlp, Tower, TowerBlock};
@@ -9,49 +7,33 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// Per rank.
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
 
-    /// `hc_count` and `hc_lowrank` in the checkpoint config.
     pub streams: u32,
     pub lowrank: u32,
 
     pub kv: Dtype,
     pub embed: Weight,
-    /// Untied from `embed` (`tie_word_embeddings: false`).
     pub head: Weight,
     pub layers: Vec<Layer>,
 
-    /// The final mixer's own norm is the last normalization before the head; there is no separate `model.norm`.
     pub mixer: Residual,
 
-    /// The layer it applies to is recorded inside [`Ple`], not by this field's position.
     pub ple: Option<Ple>,
 
-    /// The checkpoint's own draft head (`mtp.*`), or `None` for a text that
-    /// does not declare it. See [`Mtp`].
     pub mtp: Option<Mtp>,
 
-    /// The vision tower (`vision_tower.*`), or `None` for a text-only
-    /// reading. qwen_3's tower type verbatim: this checkpoint ships the
-    /// 27-block, 1152-wide tower qwen3.6/3.8-27B ship, merged into a 2560-wide
-    /// trunk instead of a 5120-wide one. `Some` also decides the trunk's
-    /// rotation: every attention layer takes the interleaved three-section
-    /// mrope (`mrope_interleaved: true`, `mrope_section: [11, 11, 10]`),
-    /// which on an image-free row is the plain rotation, position `(p, p, p)`.
     pub tower: Option<Tower>,
 }
 
-/// A tower's own numbers, read off `config.json`'s `vision_config`.
 #[derive(Clone, Copy)]
 struct TowerDims {
     depth: u32,
     hidden: u32,
     heads: u32,
     inter: u32,
-    /// `in_channels · temporal_patch_size · patch_size²`.
     patch_width: u32,
     merge: u32,
     positions: u32,
@@ -62,11 +44,6 @@ struct TowerDims {
 }
 
 impl TowerDims {
-    /// `Qwen/Qwen3.8-Flash-Next`'s `vision_config`: depth 27, hidden 1152,
-    /// 16 heads, intermediate 4304, patch 16, temporal patch 2, merge 2,
-    /// 2304 learned positions (a 48-side grid), `out_hidden_size` 2560, no
-    /// deepstack. `theta` and `norm_eps` are the class defaults, unset by
-    /// the config.
     const fn flash_next() -> TowerDims {
         TowerDims {
             depth: 27,
@@ -84,132 +61,58 @@ impl TowerDims {
     }
 }
 
-/// **THE DRAFT HEAD** (`mtp.*`, "1 layer, trained with multi-steps"): one
-/// trunk-shaped block over the WIDE residual, fused with the next token's
-/// embedding, collapsed by its own mixer and read through the trunk's
-/// `lm_head`. Wiring per the tensor shapes and llama.cpp's NextN port
-/// (`ggml-org/llama.cpp#27836`): transformers ignores `mtp.*`, so there is no
-/// reference forward to quote.
-///
-/// ```text
-/// h_s   = rms_s(y_wide) · pre_fc_norm_hidden         per stream s, [S·H]
-/// e     = rms(embed(t)) · pre_fc_norm_embedding      [H]
-/// r     = expand(fc_embedding · e) + [fc_hidden · h_s]_s   wide, [S·H]
-/// r    += attn(mix_in(r)) ; r += moe(mix_in(r))      the block, its own kv row
-/// draft = lm_head(mix_in(r; hyper_connection_mixer))  no final norm
-/// ```
-///
-/// `fc_hidden` is declared `[S·H, H]`: the one stored `[H, H]` plane
-/// `streams` times over, the block-diagonal bank `matmul_grouped` applies per
-/// stream (`deepseek_v4`'s `h_proj`, for the same reason). The block's
-/// experts are the checkpoint's Q4, not the trunk's Q2.
 pub struct Mtp {
-    /// `[hidden]`, scales the next token's embedding before the fusion.
     pub norm_embed: Weight,
-    /// `[streams · hidden]`, scales the wide residual per stream before the fusion.
     pub norm_hidden: Weight,
-    /// `[hidden, hidden]`.
     pub fc_embed: Weight,
-    /// `[streams · hidden, hidden]` — see above.
     pub fc_hidden: Weight,
-    /// Full attention with its own kv row (`kv.mtp`), hyper-connected, MoE.
     pub block: Layer,
-    /// The head's own collapse, `hyper_connection_mixer` (no inject bank).
     pub mixer: Residual,
     pub eps: f32,
-    /// How many tokens past a readout row the head drafts: step 0 is the
-    /// module as trained (the wide residual at `i`, the trunk's argmax at
-    /// `i`), every later step chains it on its own output and its own
-    /// argmax, attending read-only. The `mtp.drafts` seam is `[rows, depth]`.
     pub depth: u32,
 }
 
-/// The draft chain's depth: the module's own step and one chained one. The
-/// chained step routes the head's expert bank by a second routing vector,
-/// so under a weight budget the streamed tier holds that bank WHOLE rather
-/// than seating it (`engine_metal::experts`: a bank two routers index stays
-/// resident). Measured warm on qwen38 full, that is the right side of the
-/// trade: streamed through one slab cut twice, the head's per-fire misses
-/// cost more than the 1.3 GiB of trunk seats the resident bank displaces
-/// (k = 2: 26 ms/token resident against 52 streamed; plain decode 33 against
-/// 39). Acceptance falls with every chained step, so deeper buys little.
 pub const DRAFT_DEPTH: u32 = 2;
 
-/// One gated-residual site.
-///
-/// ```text
-/// normed = rmsnorm_grouped_plus_one(hyper)                  [S·H]
-/// x      = meanₛ(σ(up(silu(down(normed)/S))) ⊙ normed)      [H]
-/// …sublayer runs on x…
-/// hyper += 2·σ(inject(normed)/S) ⊗ o                        [S·H]
-/// ```
 pub struct Residual {
-    /// `[streams · hidden]`.
     pub norm: Weight,
-    /// `[lowrank, streams · hidden]`.
     pub down: Weight,
-    /// `[streams · hidden, lowrank]`.
     pub up: Weight,
-    /// `[streams, streams · hidden]`; `None` on the final mixer, which never injects.
     pub inject: Option<Weight>,
     pub eps: f32,
 }
 
 pub struct Layer {
     pub mixer: Mixer,
-    /// No separate input layernorm; this residual site's norm is the only one the sublayer input gets.
     pub attn_res: Residual,
     pub mlp_res: Residual,
     pub mlp: Mlp,
 }
 
 pub enum Mixer {
-    /// The checkpoint's fused `q_proj` (query + output gate) reads as
-    /// `qg_proj` here. Does not run the sparse-selection indexer.
     Attn(Attn),
     Gdn(Gdn),
 }
 
-/// The PLE: a hashed n-gram embedding gathered per token, gated per stream,
-/// locally mixed by a dilated depthwise convolution, and added into the wide row at one layer.
-///
-/// ```text
-/// e      = embed_concat(ngram_ids(tokens), table)            [E]
-/// key    = norm_key(key_proj(e))     value = value_proj(e)   [S·H], [H]
-/// gate_s = σ(signed_sqrt(keyₛ · norm_query(hyper)ₛ / √H))
-/// g      = gateₛ ⊗ value                                     [S·H]
-/// hyper += g + silu(conv₄,dil₃(norm_conv(g)))                [S·H]
-/// ```
-///
-/// Hash constants (`mults`/`primes`/`offsets`) are derived from config, not read from the checkpoint.
 pub struct Ple {
-    /// Zero-indexed; the config's `ple_layer_ids` is one-indexed.
     pub layer: u32,
-    /// `eos_token_id`; the hasher's padding id at sequence starts and eos boundaries.
     pub eos: u32,
     pub heads_per_ngram: u32,
-    /// One multiplier per n-gram position; `mults.len()` is `ngram_size`.
     pub mults: Vec<u64>,
-    /// Per-head prime vocab size; `offsets` holds each head's row offset in the table.
     pub primes: Vec<u64>,
     pub offsets: Vec<u64>,
-    /// Primes' sum, rounded up to `make_ngram_vocab_size_divisible_by`.
     pub padded_vocab: u64,
-    /// `[padded_vocab, embed_dim / heads]`.
     pub table: Weight,
     pub key_proj: Weight,
     pub value_proj: Weight,
     pub norm_key: Weight,
     pub norm_query: Weight,
     pub norm_conv: Weight,
-    /// `[streams · hidden, kernel]`, depthwise; dilated by `ngram_size` (tap `j` reads `3·j` positions back).
     pub conv: Weight,
     pub conv_kernel: u32,
     pub dilation: u32,
     pub eps: f32,
-    /// Trailing token-id window (`[ngram − 1]`, i32).
     pub ids_state: String,
-    /// Convolution history (`[(kernel−1)·dilation + 1, streams·hidden]`).
     pub conv_state: String,
 }
 
@@ -225,9 +128,7 @@ struct PleDims {
     heads_per_ngram: u32,
     ngram: u32,
     base_vocab: u64,
-    /// `make_ngram_vocab_size_divisible_by`.
     divisible_by: u64,
-    /// `split_ngram_parts`; how many shards the table is stored as.
     split_parts: u64,
     seed: u64,
     conv_kernel: u32,
@@ -254,35 +155,22 @@ struct Dims {
     vocab: u32,
     eos: u32,
     norm_eps: f32,
-    /// Whether the text declares the checkpoint's draft head ([`Mtp`]).
     draft: bool,
-    /// The vision tower this reading declares, or `None`.
     tower: Option<TowerDims>,
 }
 
-/// Per-role weight dtypes; a single dtype can't express this family's checkpoints
-/// (their per-tensor overrides disagree in different directions).
 #[derive(Clone, Copy, Debug)]
 pub struct Mix {
-    /// The token embedding and the (untied) output head.
     pub embed: Dtype,
-    /// Dense projections: attention banks, GDN qkv|z/output, shared expert, residual GEMMs, PLE key/value.
     pub proj: Dtype,
-    /// Residual injection gates (`block_inject_weight`, `[4, 10240]`); a separate role since conversions disagree on its width.
     pub inject: Dtype,
-    /// GDN's `in_proj_b | in_proj_a` pair (`[2·v_heads, hidden]`); also disagreed on by the two conversions.
     pub gdn_ba: Dtype,
-    /// Routed expert banks (fused `gate|up` and `down`); most of a layer's bytes live here.
     pub experts: Dtype,
-    /// The `lm_head` bank. The Mixed-2bit conversion ships it bf16 (1.27 GB,
-    /// read whole every token); the import encodes it to this on the way in.
     pub head: Dtype,
-    /// Hashed n-gram table; 160-wide rows can't group by 64, so quantized tables use G32 regardless of the trunk width.
     pub table: Dtype,
 }
 
 impl Mix {
-    /// Dtype mix for the mixed-4/8 conversion: dense projections raised to 8 bits; experts and table stay at the trunk width.
     #[must_use]
     pub fn of(w: Dtype) -> Mix {
         let proj = match w {
@@ -297,7 +185,6 @@ impl Mix {
             embed: proj,
             head: proj,
             proj,
-            // Too narrow for the 8-bit predicate; stay dense while the banks beside them go to 8 bits.
             inject: crate::dense(w),
             gdn_ba: crate::dense(w),
             experts: w,
@@ -305,9 +192,7 @@ impl Mix {
         }
     }
 
-    /// The `Mixed-2bit` conversion's own mix, read off its `config.json`.
     pub const MIXED_2BIT: Mix = Mix {
-        // Plain BF16, no `.scales` companion.
         embed: Dtype::Bf16,
         head: Dtype::U4g64,
         proj: Dtype::U4g64,
@@ -317,7 +202,6 @@ impl Mix {
         table: Dtype::U4g32,
     };
 
-    /// Dtype the always-unquantized banks (norms, router, shared gate, convolutions) compute in.
     #[must_use]
     pub fn dense(&self) -> Dtype {
         crate::dense(self.proj)
@@ -325,22 +209,14 @@ impl Mix {
 }
 
 impl Model {
-    /// The one shipped SKU (`Qwen/Qwen3.8-Flash-Next`). The vision tower and
-    /// MTP arm the artifact also publishes are not declared here.
     pub fn flash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::flash_mix(Mix::of(w), kv, tp)
     }
 
-    /// The shipped geometry with its mix stated rather than derived — same
-    /// dims [`flash`](Model::flash) builds, over roles a conversion names one
-    /// at a time. Exists for the arm [`Mix::of`] cannot reach: the
-    /// `Mixed-2bit` conversion, whose exceptions point down from a four-bit
-    /// default and whose embedding is not quantized at all.
     pub fn flash_mix(mix: Mix, kv: Dtype, tp: u32) -> Model {
         Model::new(mix, kv, tp, Model::flash_dims())
     }
 
-    /// Geometry for `Sawfwair/Qwen3.8-Flash-Next-MLX-Mixed-2bit` (published as `mini-l4-e16-p8`).
     pub fn flash_mini(mix: Mix, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::flash_dims();
         d.layers = 4;
@@ -351,7 +227,6 @@ impl Model {
         Model::new(mix, kv, tp, d)
     }
 
-    /// `Qwen/Qwen3.8-Flash-Next`'s `text_config`; both the shipped and mini arms start from this.
     fn flash_dims() -> Dims {
         Dims {
             hidden: 2560,
@@ -393,22 +268,18 @@ impl Model {
         }
     }
 
-    /// [`flash_mix`](Model::flash_mix) with the checkpoint's draft head declared.
     pub fn flash_mix_mtp(mix: Mix, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::flash_dims();
         d.draft = true;
         Model::new(mix, kv, tp, d)
     }
 
-    /// [`flash_mix`](Model::flash_mix) with the checkpoint's vision tower
-    /// declared — a two-unit plan (patch axis and token axis).
     pub fn flash_mix_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::flash_dims();
         d.tower = Some(TowerDims::flash_next());
         Model::new(mix, kv, tp, d)
     }
 
-    /// Tower and draft head together: what the shipped checkpoint publishes.
     pub fn flash_mix_mtp_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::flash_dims();
         d.draft = true;
@@ -416,8 +287,6 @@ impl Model {
         Model::new(mix, kv, tp, d)
     }
 
-    /// A qwen4 small enough to run against the reference implementation for parity testing.
-    /// No checkpoint ships this configuration.
     pub fn flash_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             Mix::of(w),
@@ -429,7 +298,6 @@ impl Model {
                 attn_every: 2,
                 q_heads: 4,
                 kv_heads: 2,
-                // Minimum head_dim the shipped attention kernels support.
                 head_dim: 64,
                 rotary_dim: 16,
                 theta: 10_000_000.0,
@@ -447,7 +315,6 @@ impl Model {
                     shared_inter: 32,
                 },
                 ple: Some(PleDims {
-                    // Must be a GDN layer; PLE only rides linear-attention layers.
                     layer: 2,
                     heads_per_ngram: 2,
                     ngram: 3,
@@ -469,7 +336,6 @@ impl Model {
     fn new(mix: Mix, kv: Dtype, tp: u32, d: Dims) -> Model {
         assert!(tp == 1, "the first qwen4 texts are whole-checkpoint texts");
         let dense = mix.dense();
-        // Each role's width is declared by `mix`; nothing is dequantized at load.
         let Mix {
             embed: embed_w,
             head: head_w,
@@ -499,9 +365,6 @@ impl Model {
             eps: d.norm_eps,
         };
 
-        // One block, at a name prefix, with the mixer kind, its cache names
-        // and its routed-expert width stated: the trunk's forty-eight and the
-        // draft head's one are the same shape at different names.
         let block = |n: &dyn Fn(&str) -> String,
                      attn: bool,
                      kv_name: String,
@@ -568,9 +431,7 @@ impl Model {
                     attn_res: residual(&n("attn_res"), true),
                     mlp_res: residual(&n("mlp_res"), true),
                     mlp: Mlp::Routed {
-                        // Dense: the 8-bit predicate doesn't reach the router or shared gate.
                         router: Weight::sym(n("router"), [u64::from(d.moe.experts), hidden], dense),
-                        // gate and up share one dtype/group in both conversions, so this stays a single fused bank.
                         gate_up: Weight::sym(
                             n("experts_gate_up"),
                             [u64::from(d.moe.experts), 2 * u64::from(inter), hidden],
@@ -616,10 +477,6 @@ impl Model {
                 )
             })
             .collect();
-        // The tower, when declared: every plane replicated and `dense` — the
-        // conversion ships it in bf16 whatever the trunk's width — under
-        // `visual.*`, the plan's own namespace (qwen_3's, so the import
-        // spelling is shared too).
         let tower = d.tower.map(|t| {
             assert_eq!(
                 t.out_hidden, d.hidden,
@@ -690,8 +547,6 @@ impl Model {
             norm_hidden: Weight::sym("mtp.norm_hidden", [sh], dense),
             fc_embed: Weight::sym("mtp.fc_embed", [hidden, hidden], dense),
             fc_hidden: Weight::sym("mtp.fc_hidden", [sh, hidden], dense),
-            // The head's experts are the checkpoint's Q4 (the trunk's are Q2
-            // in the mixed conversion): the projection dtype is that width.
             block: block(
                 &|s: &str| format!("mtp.layer.{s}"),
                 true,
@@ -720,7 +575,6 @@ impl Model {
                 primes,
                 offsets,
                 padded_vocab,
-                // Sharded into `split_ngram_parts` equal slices; read_concat rejoins them.
                 table: Weight::sym("ple.table", [padded_vocab, head_width], narrow_group)
                     .packed(vec![padded_vocab / shards; shards as usize]),
                 key_proj: Weight::sym("ple.key_proj", [sh, hidden], proj),
@@ -758,7 +612,6 @@ impl Model {
     }
 }
 
-/// Fixed by the checkpoint's own arithmetic, not chosen here.
 fn hash_constants(p: &PleDims, vocab: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
     const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
     const PRIME_1: u64 = 10_007;
@@ -785,7 +638,6 @@ fn hash_constants(p: &PleDims, vocab: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
         true
     }
 
-    // Single PLE layer, so the layer index is always zero; a second PLE layer would thread it here.
     let _ = PRIME_1;
     let multiplier_max = (i64::MAX as u64) / vocab.max(1);
     let half_bound = (multiplier_max / 2).max(1);
@@ -816,7 +668,6 @@ fn hash_constants(p: &PleDims, vocab: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
 mod tests {
     use super::*;
 
-    /// Checks the derived hash constants against the checkpoint's published buffers.
     #[test]
     fn the_hash_constants_are_the_checkpoints_own() {
         let m = Model::flash(Dtype::Bf16, Dtype::Bf16, 1);

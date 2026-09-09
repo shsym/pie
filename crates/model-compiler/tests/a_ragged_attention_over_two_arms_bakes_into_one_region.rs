@@ -1,26 +1,3 @@
-//! **A RAGGED ATTENTION WHOSE QUERIES AND KEYS COME FROM TWO CLASSES BAKES
-//! INTO ONE REGION THAT RUNS OVER BOTH, AND A PLAN THAT RETURNS ITS VELOCITY
-//! WITH NO `out` CARVES AN ARENA THAT KEEPS THE VELOCITY TO THE END.**
-//!
-//! ```text
-//! cargo test -p model-compiler --test a_ragged_attention_over_two_arms_bakes_into_one_region
-//! ```
-//!
-//! D2's one cross-class op and D3's float readout, through the compiler's
-//! front door. A denoiser with audio queries over video keys:
-//!
-//! ```text
-//! (a) bakes with no kv space, on every platform
-//! (b) the ragged node lands in a region whose class mask holds BOTH the
-//!     audio lanes' class and the video lanes' class — the node runs over
-//!     the union of the two windows, no other region does
-//! (c) the audio projection's region holds the audio class and not the
-//!     video one, so the join is the attention's alone
-//! (d) with no `out` seam, the `velocity` value is an arena rectangle whose
-//!     life reaches the end of the plan — the export tail `out` gets
-//! (e) the packing tables and float ports are `Placement::Runtime`
-//! ```
-
 mod common;
 
 use model_compiler::Placement;
@@ -102,7 +79,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             "no logits"
         );
 
-        // (a)
         let compiled = common::bake(&trace).unwrap_or_else(|e| panic!("{platform:?}: {e}"));
 
         let audio_class = compiled
@@ -123,7 +99,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
                 .unwrap_or_else(|| panic!("node {at} is in a region"))
         };
 
-        // (b)
         let (ragged_at, _) = trace
             .nodes
             .iter()
@@ -148,7 +123,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             );
         }
 
-        // (c)
         let (audio_proj, _) = trace
             .nodes
             .iter()
@@ -157,8 +131,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .expect("the audio projection is the first matmul");
         let region = region_of(audio_proj);
         assert!(region.mask.contains(audio_class) && !region.mask.contains(video_class));
-        // ... and the key projection, demanded through the attention from
-        // the other side, runs in the video class and not the audio one.
         let (video_proj, _) = trace
             .nodes
             .iter()
@@ -177,7 +149,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             compiled.classes.dead
         );
 
-        // (d)
         let velocity = trace
             .seams
             .iter()
@@ -197,7 +168,6 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             "{platform:?}: the velocity lives past the last node, for the reader after the graph"
         );
 
-        // (e)
         for (id, decl) in trace.values.iter().enumerate() {
             if let Def::Input(input) = &decl.def {
                 assert_eq!(compiled.arena.placements[id], Placement::Runtime(*input));

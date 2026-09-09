@@ -32,6 +32,8 @@ template <typename T>
 
 instantiate_split_rows(bfloat16, bfloat)
 
+instantiate_split_rows(float32, float)
+
 template <typename T>
 [[kernel]] void select_slice(
     const device T* table      [[buffer(0)]],
@@ -56,3 +58,4 @@ template <typename T>
       const constant int&, const constant int&, uint2);
 
 instantiate_select_slice(bfloat16, bfloat)
+instantiate_select_slice(float32, float)

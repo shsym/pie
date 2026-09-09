@@ -1,128 +1,27 @@
-//! A diffusers-style pipeline folder read as ONE tensor name space.
-//!
-//! A generative checkpoint is not a checkpoint the way a language model's is.
-//! It is a directory with a `model_index.json` at the top naming components,
-//! and one subdirectory per component — `transformer/`, `text_encoder/`,
-//! `vae/` — each with its own `config.json` and its own safetensors set, each
-//! of which spells its tensors from its own root (`norm.weight` appears in
-//! three of them). The flat discovery in [`super::read`] wants
-//! `model.safetensors` beside the config and sees none of this.
-//!
-//! This module is the component-aware half of discovery. It answers three
-//! questions and nothing else:
-//!
-//! - **which components does this snapshot hold** ([`components`]),
-//! - **what does one name space over all of them look like** ([`open`]),
-//! - **which JSON does each component say about itself** ([`configs`]).
-//!
-//! # The prefix vocabulary is fixed here
-//!
-//! A component's tensors enter the shared name space under a prefix, so
-//! `transformer/`'s `norm.weight` is `dit.norm.weight` and `vae/`'s is
-//! `vae.norm.weight`. The prefix is a ROLE, not a folder name, because a
-//! family's `import.rs` spells its checkpoint paths against the role: every
-//! diffusion transformer is `dit.`, whether the pipeline called its folder
-//! `transformer` or something else. [`prefix_of`] is the whole vocabulary:
-//!
-//! | folder | prefix | what it is |
-//! |---|---|---|
-//! | `transformer` | `dit.` | the denoising backbone |
-//! | `transformer_2` | `dit2.` | a second backbone (Wan's low-noise half) |
-//! | `text_encoder` | `te.` | the conditioning encoder |
-//! | `text_encoder_2` | `te2.` | a second encoder |
-//! | `vae` | `vae.` | the latent autoencoder |
-//! | `video_vae` | `vae.` | the same role under a pipeline that also
-//!   ships a second, non-latent codec (MiniMax H3 pairs a `video_vae/`
-//!   with an `audio_vae/`; the video one IS its latent autoencoder) |
-//! | `image_encoder` | `ie.` | a reference-image encoder |
-//! | `audio_vae` | `avae.` | an audio autoencoder |
-//! | `vocoder` | `voc.` | an audio decoder |
-//! | anything else | `<folder>.` | the folder's own name |
-//!
-//! This is the same staging `pie model import --aux` does for a drafter head
-//! (`aux.`), minus the byte copy: prefixing renames a catalog, so no pipeline
-//! is rewritten to be read.
-//!
-//! # A component may keep its weights ONE FOLDER DOWN
-//!
-//! MiniMax H3's `FL2VA/video_vae/` holds a dozen `.py` files, a
-//! `config.json` and a `source/` subdirectory, and the weights are in the
-//! subdirectory: `video_vae/source/model.safetensors`. So [`weight_files`]
-//! looks in the component folder first and, finding nothing there, in each
-//! of its immediate subdirectories.
-//!
-//! **One level, and only when the folder itself holds none.** The descent
-//! is not a walk: a component that keeps its own safetensors beside its
-//! config never looks deeper (so the common case costs one `read_dir` it
-//! was already doing), and a component that does not is answered by the
-//! first of its subfolders — in sorted order — that holds a set. Deeper
-//! nesting is not searched, because nothing ships it and an unbounded walk
-//! over a snapshot directory would sooner or later read a tokenizer's
-//! cache or a `.git` object as a weight file.
-//!
-//! This does NOT relax the rule below: the descent is INTO a component,
-//! never up out of one. A bundle at the top of the snapshot is still not
-//! read.
-//!
-//! # A top-level bundle beside a pipeline is IGNORED
-//!
-//! FLUX.2 ships `flux-2-klein-4b.safetensors` at the top of the snapshot
-//! beside `transformer/`, `text_encoder/` and `vae/`: one file holding the
-//! same weights again, packed the way ComfyUI wants them. Reading both would
-//! double the artifact and collide on nothing (the bundle's names are its
-//! own), so **the components win**: when `model_index.json` is present, the
-//! only weights this module reads are the ones under a component folder.
-//! `model_index.json` is the statement that the subfolders are the checkpoint.
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
-/// The file whose presence makes a directory a pipeline rather than a
-/// checkpoint.
 pub const PIPELINE_INDEX: &str = "model_index.json";
 
-/// The weight-file stems a component may use, in the order they are tried.
-/// `diffusers` writes `diffusion_pytorch_model*`, `transformers` writes
-/// `model*`; a component is one library's or the other's, never both.
 const STEMS: [&str; 2] = ["diffusion_pytorch_model", "model"];
 
-/// Components that are never weights: a scheduler is a formula in a JSON
-/// file, a tokenizer is a vocabulary. Both are carried as config
-/// ([`configs`]) and neither contributes a tensor.
 fn is_weightless(folder: &str) -> bool {
     folder == "scheduler" || folder.starts_with("tokenizer") || folder.starts_with("feature_")
 }
 
-/// One component of a pipeline: where it is, what it is, and what it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
-    /// The subdirectory's name, as `model_index.json` spells it —
-    /// `transformer`, `text_encoder_2`.
     pub folder: String,
-    /// The name space prefix its tensors take, ending in `.`. See
-    /// [`prefix_of`].
     pub prefix: String,
-    /// The `[library, class]` `model_index.json` records, e.g.
-    /// `("diffusers", "ZImageTransformer2DModel")`.
     pub library: String,
-    /// The class within that library.
     pub class: String,
-    /// The component's directory.
     pub dir: PathBuf,
-    /// Its safetensors set, in the order a shard index names them.
     pub weights: Vec<PathBuf>,
-    /// Its `config.json`, when it has one.
     pub config: Option<PathBuf>,
 }
 
-/// The prefix a component's tensors take in the shared name space.
-///
-/// A ROLE, not a folder name — see the module header for the table and for
-/// why a family's `import.rs` spells `dit.` rather than `transformer.`.
-/// A folder this vocabulary does not know keeps its own name, so an
-/// unrecognised component is readable rather than refused.
 #[must_use]
 pub fn prefix_of(folder: &str) -> String {
     let role = match folder {
@@ -139,37 +38,11 @@ pub fn prefix_of(folder: &str) -> String {
     format!("{role}.")
 }
 
-/// Whether `dir` is a diffusers pipeline: a directory with a
-/// `model_index.json` in it.
-///
-/// The cheap question, asked before the expensive one — every door that
-/// opens a checkpoint asks this first to decide whether the flat discovery
-/// or [`components`] applies.
 #[must_use]
 pub fn is_pipeline(dir: &Path) -> bool {
     dir.is_dir() && dir.join(PIPELINE_INDEX).is_file()
 }
 
-/// Every weight-bearing component of the pipeline at `dir`, in the order
-/// `model_index.json` lists them (which is alphabetical, since it is a JSON
-/// object read into a map).
-///
-/// A key is a component when its value is a two-element array of strings —
-/// `"transformer": ["diffusers", "ZImageTransformer2DModel"]`. Everything
-/// else in that file is pipeline configuration: `_class_name`,
-/// `_diffusers_version`, `boundary_ratio`, and the `[null, null]` Wan 2.2
-/// writes for a `transformer_2` its TI2V variant does not ship. Schedulers
-/// and tokenizers are components but hold no tensors, so they are dropped
-/// here and carried by [`configs`] instead.
-///
-/// A component the index names but the snapshot does not hold (a partial
-/// download, an `image_encoder` the repo lists and omits) is skipped, not
-/// refused: the set is what is on this disk.
-///
-/// # Errors
-///
-/// `dir` holds no `model_index.json`, the file is not JSON, or a component
-/// folder holds a shard index naming files that are not beside it.
 pub fn components(dir: &Path) -> Result<Vec<Component>, Error> {
     let index = dir.join(PIPELINE_INDEX);
     let text = std::fs::read_to_string(&index)
@@ -211,8 +84,6 @@ pub fn components(dir: &Path) -> Result<Vec<Component>, Error> {
     Ok(found)
 }
 
-/// `["diffusers", "AutoencoderKL"]` as a pair; `None` for anything else,
-/// including Wan's `[null, null]` placeholder for an absent second backbone.
 fn pair(entry: &serde_json::Value) -> Option<(String, String)> {
     let array = entry.as_array()?;
     let [library, class] = array.as_slice() else {
@@ -221,23 +92,6 @@ fn pair(entry: &serde_json::Value) -> Option<(String, String)> {
     Some((library.as_str()?.to_string(), class.as_str()?.to_string()))
 }
 
-/// The safetensors set one component holds — in its own directory, or one
-/// folder below it.
-///
-/// Each stem is tried whole before the next, so a directory holding both a
-/// `model.safetensors` and a `diffusion_pytorch_model.safetensors` reads as
-/// the diffusers one it is: the stems are two libraries' conventions, and a
-/// component belongs to one library.
-///
-/// Within a stem: a shard index names the set when there is one, else the
-/// lone unsharded file, else the numbered shards on the disk. The index is
-/// preferred because it is the checkpoint's own statement of which files
-/// belong together, and a directory can hold a stale extra shard.
-///
-/// When the component's own directory holds no set at all, its immediate
-/// subdirectories are asked in sorted order and the first that answers is
-/// the component's (MiniMax H3's `video_vae/source/`). The descent stops
-/// there — see the module header for why one level and no further.
 fn weight_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let here = weight_files_in(dir)?;
     if !here.is_empty() {
@@ -252,8 +106,6 @@ fn weight_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(Vec::new())
 }
 
-/// [`weight_files`] against ONE directory, with no descent — the rule the
-/// stems state, applied where it is asked.
 fn weight_files_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     for stem in STEMS {
         let index = dir.join(format!("{stem}.safetensors.index.json"));
@@ -272,8 +124,6 @@ fn weight_files_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(Vec::new())
 }
 
-/// A component's immediate subdirectories, sorted, hidden ones dropped —
-/// the one level [`weight_files`] descends into.
 fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -293,9 +143,6 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// The shard files a `*.safetensors.index.json` weight map names, unique and
-/// sorted — the same dedup [`super::read::discover_safetensors_files`] does,
-/// against the same shape of file.
 fn shards_from_index(dir: &Path, index: &Path) -> Result<Vec<PathBuf>, Error> {
     let text = std::fs::read_to_string(index)
         .map_err(|err| Error::Checkpoint(format!("cannot read {}: {err}", index.display())))?;
@@ -332,8 +179,6 @@ fn shards_from_index(dir: &Path, index: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(paths)
 }
 
-/// `<stem>-00001-of-00003.safetensors` and its siblings, sorted, for a
-/// component whose index file did not come down with the rest.
 fn loose_shards(dir: &Path, stem: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -355,19 +200,10 @@ fn loose_shards(dir: &Path, stem: &str) -> Vec<PathBuf> {
     found
 }
 
-/// The pipeline at `dir` as one tensor name space, every component's tensors
-/// under its [`prefix_of`] prefix.
-///
-/// # Errors
-///
-/// `dir` is not a pipeline, a component's files do not open as safetensors,
-/// or two components' prefixed names collide (which the fixed vocabulary
-/// makes impossible, and which is checked rather than assumed).
 pub fn open(dir: &Path) -> Result<ztensor::Source, Error> {
     open_from(&components(dir)?, dir)
 }
 
-/// [`open`], over a component set the caller already has.
 pub fn open_from(components: &[Component], dir: &Path) -> Result<ztensor::Source, Error> {
     if components.is_empty() {
         return Err(Error::Checkpoint(format!(
@@ -391,24 +227,6 @@ pub fn open_from(components: &[Component], dir: &Path) -> Result<ztensor::Source
     ztensor::Source::merge(parts).map_err(Error::from)
 }
 
-/// Every JSON a pipeline says about itself, as `(component, bytes)` — the
-/// pairs an import carries into the artifact's config name space.
-///
-/// The empty component name is the pipeline's own `model_index.json`, which
-/// is what a pipeline has instead of a top-level `config.json`; every other
-/// entry is a component folder's `config.json`, and `scheduler` is its
-/// `scheduler_config.json`. Callers land these at `model/config` and
-/// `model/<component>/config` respectively.
-///
-/// Keyed by FOLDER, not by prefix: the config is diffusers' own statement
-/// about diffusers' own component, and renaming it would make the carried
-/// JSON disagree with the file it came from. The prefix is pie's name for
-/// the weights; the folder is the checkpoint's name for the component.
-///
-/// # Errors
-///
-/// A file that is present does not parse as JSON — carrying a config that is
-/// not one would put a broken descriptor in the artifact.
 pub fn configs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, Error> {
     let mut carried = Vec::new();
     let index = dir.join(PIPELINE_INDEX);
@@ -438,7 +256,6 @@ pub fn configs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, Error> {
     Ok(carried)
 }
 
-/// A JSON file's bytes, verbatim, checked to be JSON; `None` if absent.
 fn read_json(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     if !path.is_file() {
         return Ok(None);
@@ -454,7 +271,11 @@ fn read_json(path: &Path) -> Result<Option<Vec<u8>>, Error> {
 mod tests {
     use super::*;
 
-    /// The vocabulary is a role table, and a stranger keeps its own name.
+    fn diffusers_every_case() {
+        every_known_component_takes_its_role_as_a_prefix();
+        a_null_pair_is_not_a_component();
+    }
+
     #[test]
     fn every_known_component_takes_its_role_as_a_prefix() {
         assert_eq!(prefix_of("transformer"), "dit.");
@@ -468,9 +289,6 @@ mod tests {
         assert_eq!(prefix_of("connector"), "connector.");
     }
 
-    /// Wan 2.2's `"transformer_2": [null, null]` is an absent component, not
-    /// a component named null.
-    #[test]
     fn a_null_pair_is_not_a_component() {
         assert_eq!(
             pair(&serde_json::json!(["diffusers", "AutoencoderKL"])),

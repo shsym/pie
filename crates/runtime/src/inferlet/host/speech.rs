@@ -1,14 +1,3 @@
-//! pie:core/audio-out — native audio output (CSM-1B + Mimi): the runtime
-//! emits Mimi codec tokens and the Mimi decoder turns them back into a
-//! 24 kHz waveform. The inverse of `media` (perception -> text).
-//!
-//! Model-agnostic, mirroring `media`: the inferlet supplies neutral intent
-//! (text + [`Voice`] + an optional target duration) via a [`SpeechRequest`];
-//! everything model-specific is applied here, dispatched off the bound
-//! model's arch. The engine runs the whole frame-stepped loop in one
-//! `generate_audio` cold-path request. The returned [`Speech`] is
-//! self-describing, so the inferlet never hardcodes a model constant.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::speech::{SpeechRequest, Voice};
@@ -16,32 +5,18 @@ use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-// CSM (Llama-3 tokenizer) audio-output front-end constants.
-
-/// Llama-3 `<|begin_of_text|>` — the CSM processor prepends it (add_special_tokens).
 const CSM_BOS: u32 = 128000;
-/// Llama-3 `<|end_of_text|>` — the CSM processor appends it. Without the BOS/EOS
-/// framing the backbone emits the audio-EOS frame immediately (no speech).
 const CSM_EOS: u32 = 128001;
-/// Mimi output sample rate (24 kHz mono).
 const CSM_SAMPLE_RATE: u32 = 24_000;
-/// Mimi frame period: 12.5 Hz => 80 ms per frame (= 1920 samples @ 24 kHz).
 const CSM_MS_PER_FRAME: u32 = 80;
-/// Frame cap applied when the request gives no `max-duration-ms` (~82 s). The
-/// generation still stops early at the all-EOS frame; this is just a safety cap.
 const CSM_DEFAULT_MAX_FRAMES: u32 = 1024;
 
-/// A generated audio clip held host-side. Self-describing — carries its own
-/// sample rate and channel count (`pcm` is handed to the guest only on request).
 pub struct Speech {
     pub pcm: Vec<f32>,
     pub sample_rate: u32,
     pub channels: u32,
 }
 
-/// Build the CSM audio-output prompt host-side: BOS + "[speaker]text" + EOS,
-/// using the bound model's tokenizer. Mirrors the verified prompt the CSM
-/// processor produces with `add_special_tokens=True`.
 fn csm_frame_prompt(model: &crate::model::Model, text: &str, speaker: u32) -> Vec<u32> {
     let prompt = format!("[{speaker}]{text}");
     let mut ids = Vec::with_capacity(2 + text.len() / 3);
@@ -58,11 +33,9 @@ impl pie::inferlet::speech::HostSpeech for ProcessCtx {
         if req.text.trim().is_empty() {
             return Ok(Err("audio-out: empty text".into()));
         }
-        // Gate on arch and frame the prompt — all host-side.
         let prompt = {
             let m = crate::model::model();
             let arch = m.arch_name();
-            // reject early with a clear message for every non-CSM arch.
             if arch != "csm" {
                 return Ok(Err(format!(
                     "model '{}' (arch '{arch}') has no audio-output front-end \
@@ -81,12 +54,10 @@ impl pie::inferlet::speech::HostSpeech for ProcessCtx {
             };
             csm_frame_prompt(m, &req.text, speaker)
         };
-        // Neutral duration -> model frame count.
         let max_frames = match req.max_duration_ms {
             Some(ms) => ms.div_ceil(CSM_MS_PER_FRAME).max(1),
             None => CSM_DEFAULT_MAX_FRAMES,
         };
-        // Default device for the single model (single-engine configs use engine 0).
         let engine_idx = 0;
         match crate::engine::generate_audio(engine_idx, &prompt, max_frames).await {
             Ok(pcm) => {

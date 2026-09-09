@@ -1,9 +1,3 @@
-//! The plan structs and their builders: four owned structs, each built as a
-//! pure function of host geometry copies, shape facts ([`Shape`]/[`Live`]),
-//! device facts ([`Device`]), the workspace grant ([`Workspace`]), and the
-//! toggles ([`Toggles`]). A build stages index vectors into `int_upload`,
-//! copied to the device in the prepare phase.
-
 use crate::error::Error;
 
 use crate::attn::{sched_decode, sched_mla, sched_prefill, sched_sm90};
@@ -11,9 +5,6 @@ use crate::attn::{sched_decode, sched_mla, sched_prefill, sched_sm90};
 use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
 
-/// The device facts every builder takes as an argument (never probed
-/// inside a builder). Schedule math reads `num_sm`/`cc_major`; the fa2
-/// launch geometry reads the two shared-memory bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Device {
     pub num_sm: u32,
@@ -23,7 +14,6 @@ pub struct Device {
 }
 
 impl Device {
-    /// The facts assumed when the device probe fails: an L40S.
     pub const L40S: Self = Self {
         num_sm: 148,
         cc_major: 8,
@@ -31,8 +21,6 @@ impl Device {
         max_smem_per_block_optin: 101_376,
     };
 
-    /// Probes the current device once. A convenience for the engine — the
-    /// builders themselves never call it.
     #[must_use]
     pub fn probe(ctx: &Ctx) -> Option<Self> {
         #[cfg(feature = "cuda")]
@@ -53,10 +41,6 @@ impl Device {
     }
 }
 
-/// The workspace grant a plan is carved into: base addresses plus byte
-/// bounds. Builders read only the bounds (an offset past them is a build-
-/// time refusal, not a device fault); addresses ride the plan for launches
-/// to resolve staged offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Workspace {
     pub int_ptr: u64,
@@ -65,23 +49,14 @@ pub struct Workspace {
     pub float_bytes: usize,
 }
 
-/// The kv-side shape a plan is built at. The attention entries restate
-/// `head_dim` and `kv_heads` from the IR op and refuse a plan built at a
-/// different shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
-    /// The lane count this schedule is carved for, not always the count
-    /// this fire brought (see [`Live::requests`]).
     pub num_requests: u32,
-    /// How far into the fire's lane order this schedule may reach before
-    /// its own lanes begin; `0` unless raised to a bucket ceiling
-    /// ([`Live::lane_offset`] is the twin naming this fire's own lanes).
     pub lane_offset: u32,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub page_size: u32,
-    /// Whether the pool pages are laid out `[heads][tokens][dim]`.
     pub hnd_layout: bool,
 }
 
@@ -96,28 +71,14 @@ impl Shape {
     }
 }
 
-/// What this fire actually brought, alongside the [`Shape`] the schedule is
-/// carved at. [`Shape`] is structure (hash-stable, what to allocate); `Live`
-/// is origin and extent (which lanes/rows this fire brought), and flows
-/// into staging only, never into a hashed plan field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Live {
-    /// The lanes this fire actually brought, where [`Shape::num_requests`]
-    /// is the count the schedule is carved for.
     pub requests: u32,
-    /// Where the first of them sits in the fire's lane order — the number
-    /// the schedules add to every staged request id. [`Shape::lane_offset`]
-    /// is the twin.
     pub lane_offset: u32,
-    /// Where their first query row sits in the fire's row order.
     pub row_offset: u32,
-    /// The rows this fire actually brought, where the builders'
-    /// `total_tokens` argument is the row count the schedule is carved for.
     pub rows: u32,
 }
 
-/// What a raw schedule build hands back before it is folded into a plan
-/// struct: the offset table, the staged bytes, and the sizes actually used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Built<I> {
     pub info: I,
@@ -132,20 +93,14 @@ pub struct Sizes {
     pub int_bytes: usize,
 }
 
-/// The fa2 decode plan: the schedule the decode kernels walk, plus the
-/// shape and workspace it was carved for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub info: DecodePlanInfo,
-    /// The int-workspace image; the engine copies it to
-    /// `workspace.int_ptr` each prepare phase (see [`DecodePlan::stage`]).
     pub int_upload: Vec<u8>,
     pub int_bytes: usize,
     pub float_bytes: usize,
     pub workspace: Workspace,
     pub shape: Shape,
-    /// The sliding window this plan was carved for; the entries check the
-    /// stated window against it.
     pub window: Option<u32>,
     pub device: Device,
 }
@@ -156,11 +111,6 @@ impl DecodePlan {
         self.window.is_none()
     }
 
-    /// The op's restated facts must be the ones this plan was carved at —
-    /// plan facts are engine-supplied, so disagreement is refused, not
-    /// asserted. Decode states no kv head count and no exact window: only
-    /// the windowed/full reading has
-    /// to match.
     pub fn accepts(
         &self,
         op: &'static str,
@@ -178,7 +128,6 @@ impl DecodePlan {
         Ok(())
     }
 
-    /// Copies the staged int workspace to the device. Prepare-phase work.
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
@@ -189,7 +138,6 @@ impl DecodePlan {
     }
 }
 
-/// The fa2 prefill plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefillPlan {
     pub info: PrefillPlanInfo,
@@ -201,14 +149,7 @@ pub struct PrefillPlan {
     pub total_tokens: u32,
     pub window: Option<u32>,
     pub causal: bool,
-    /// Whether the schedule kept its graph-shaped padding. A build asked to
-    /// be capturable may fall back to an uncapturable schedule rather than
-    /// decline; the engine reads this before capture.
     pub graph_capturable: bool,
-    /// `i32`, `[lanes + 1]`: each request's span of the mask bits
-    /// `attention.masked` names. Bound only when this plan serves that op.
-    /// The span table itself has no IR seat; the engine derives and binds
-    /// it here at build time.
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
 }
@@ -219,10 +160,6 @@ impl PrefillPlan {
         self.window.is_none()
     }
 
-    /// As [`DecodePlan::accepts`], at prefill's stricter reading: the kv
-    /// head count (when the op states one — `attention.masked` does not)
-    /// and the exact window must be the ones the schedule carved its kv
-    /// spans for.
     pub fn accepts(
         &self,
         op: &'static str,
@@ -271,8 +208,6 @@ impl PrefillPlan {
     }
 }
 
-/// The sm90 prefill plan. The builder is real, but no launcher consumes it
-/// yet; `attn::prefill_sm90` answers a typed refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefillPlanSm90 {
     pub info: PrefillPlanSm90Info,
@@ -296,7 +231,6 @@ impl PrefillPlanSm90 {
     }
 }
 
-/// The latent-attention plan, shared by mla decode and prefill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlaPlan {
     pub info: MlaPlanInfo,
@@ -305,8 +239,6 @@ pub struct MlaPlan {
     pub float_bytes: usize,
     pub workspace: Workspace,
     pub num_heads: u32,
-    /// Not derivable from any other field here: decided per fire from the
-    /// window's own boundaries. Carried so `Run::schedule_shape` can hash it.
     pub causal: bool,
     pub device: Device,
 }
@@ -317,7 +249,6 @@ impl MlaPlan {
     }
 }
 
-/// The fa2 lattice's instantiated head widths.
 const HEAD_DIMS: [u32; 4] = [64, 128, 256, 512];
 
 #[must_use]
@@ -325,25 +256,14 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
     HEAD_DIMS.contains(&head_dim)
 }
 
-/// The operator toggles a decode build takes as an argument — like
-/// [`Device`], never probed inside a builder (purity is the design). The
-/// engine resolves them once with [`Toggles::from_env`] and threads the
-/// value through every [`plan_decode`] call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    /// `PIE_CUDA_FORCE_SPLIT_KV_SMALL`: send even the small batches that
-    /// qualify for the static non-split fast path through the split-kv
-    /// planner.
     pub force_split_small: bool,
 
-    /// `PIE_CUDA_WINDOW_SPLIT_KV`: plan windowed decodes through the
-    /// split-kv planner rather than the static fast path.
     pub window_split: bool,
 }
 
 impl Toggles {
-    /// Reads both toggles from the environment. Engine-side, once — the
-    /// builders only ever see the resulting value.
     #[must_use]
     pub fn from_env() -> Self {
         Self {
@@ -360,8 +280,6 @@ fn truthy(key: &str) -> bool {
     }
 }
 
-/// The sliding extent as the device text reads it: `-1` is "no window", and
-/// a stated window of zero is a degenerate statement, not an unwindowed one.
 pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     match window {
         None => Ok(-1),
@@ -375,7 +293,6 @@ pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, 
     }
 }
 
-/// A stated head width must be the one the plan was carved at.
 fn planned_head_dim(op: &'static str, planned: u32, stated: u32) -> Result<(), Error> {
     if planned == stated {
         return Ok(());
@@ -408,10 +325,6 @@ fn some_requests(op: &'static str, shape: &Shape) -> Result<(), Error> {
     Ok(())
 }
 
-/// Builds the fa2 decode plan. `max_grid_size` is a device fact from an
-/// occupancy probe. `shape` says what to allocate; `live` says which lanes
-/// this fire brought. `kv_len` goes unread since the schedule derives its
-/// extents from `kv_indptr` alone.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_decode(
     kv_indptr: &[i32],
@@ -479,9 +392,6 @@ pub fn plan_decode(
     })
 }
 
-/// Builds the fa2 prefill plan. When a graph-shaped schedule does not fit
-/// the workspace, falls back to an uncapturable one and records that on
-/// `graph_capturable`. `kv_len` goes unread here, unlike the sm90 twin.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill(
     qo_indptr: &[i32],
@@ -561,13 +471,8 @@ pub fn plan_prefill(
     })
 }
 
-/// What a graph-shaped fa2 prefill would pad to at a stated ceiling —
-/// re-exported so the engine can size a plan's float grant before any fire
-/// arrives, using the planner's own arithmetic rather than a guess.
 pub use crate::attn::sched_prefill::graph_padding as prefill_graph_padding;
 
-/// Builds the sm90 prefill plan. `kv_len` is the op's own named input
-/// (per-request kv lengths in tokens).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill_sm90(
     qo_indptr: &[i32],
@@ -609,9 +514,6 @@ pub fn plan_prefill_sm90(
     })
 }
 
-/// Builds the latent-attention plan, shared by mla decode (`causal` false,
-/// one token per lane) and prefill. `total_tokens` and `num_requests` are
-/// the carved row/lane counts the cluster split averages over.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(
     qo_indptr: &[i32],
@@ -651,10 +553,6 @@ pub fn plan_mla(
     })
 }
 
-/// Copies a plan's staged int workspace to the device, async on the
-/// context's stream. Prepare-phase work: the source is pageable host
-/// memory, which CUDA graph capture would refuse, so the engine runs this
-/// before capture and never inside it.
 pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result<(), Error> {
     if bytes.is_empty() {
         return Ok(());
@@ -693,15 +591,6 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
     }
 }
 
-// ─── the offset tables a plan build produces ───────────────────────────────
-
-// Every field here is either a launch shape fact or a byte offset into the
-// int/float workspace the schedule was staged for.
-
-/// The fa2 decode schedule's workspace map. An offset is `Some` exactly
-/// when the schedule laid that table out; `None` seats resolve to the
-/// workspace base and are guarded off by `split_kv`/`enable_cuda_graph`
-/// before the device ever reads them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodePlanInfo {
     pub padded_batch_size: i64,
@@ -716,8 +605,6 @@ pub struct DecodePlanInfo {
     pub split_kv: bool,
 }
 
-/// The fa2 prefill schedule's workspace map; offsets as on
-/// [`DecodePlanInfo`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanInfo {
     pub padded_batch_size: i64,
@@ -737,7 +624,6 @@ pub struct PrefillPlanInfo {
     pub split_kv: bool,
 }
 
-/// The sm90 prefill schedule's workspace map.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanSm90Info {
     pub qo_tile_indices_offset: Option<u32>,
@@ -751,8 +637,6 @@ pub struct PrefillPlanSm90Info {
     pub same_schedule_for_all_heads: bool,
 }
 
-/// The latent-attention schedule's workspace map; offsets as on
-/// [`DecodePlanInfo`] (every seat is laid out on this schedule).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MlaPlanInfo {
     pub num_blks_x: i64,
@@ -774,5 +658,3 @@ pub struct MlaPlanInfo {
     pub partial_o_offset: Option<u32>,
     pub partial_lse_offset: Option<u32>,
 }
-
-

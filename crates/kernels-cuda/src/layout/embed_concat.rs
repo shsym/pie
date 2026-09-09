@@ -1,7 +1,3 @@
-//! The gather that concatenates (`layout.embed_concat`, qwen4's PLE n-gram
-//! read): `heads` table rows per token, side by side, `heads` read off the
-//! id rectangle's width.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -50,15 +46,11 @@ pub fn embed_concat(
             stated(OP, heads)?.arg(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The gather over an affine-landed table: MLX 4-bit codes under bf16 scales
-/// and zero points, dequantized for exactly the rows a token touches. Group
-/// width is recovered from the factor plane's own rectangle.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_concat_mlxu4(
     ctx: &Ctx,
@@ -91,8 +83,6 @@ pub fn embed_concat_mlxu4(
         ));
     }
     let width = y.width / heads;
-    // Factors plane is `[vocab, width / group]` bf16, bound as its byte
-    // rectangle: `bytes / rows / 2` factors a row.
     let factor_rows = nonzero(OP, "the factor plane's rows", scales.rows)?;
     let per_row = scales.width / 2;
     if factor_rows != vocab || per_row == 0 || !width.is_multiple_of(per_row) {
@@ -131,16 +121,11 @@ pub fn embed_concat_mlxu4(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The plain embedding read (`layout.embed`) over an affine-landed table:
-/// the concatenating gather at one head. Bit width comes from the codes
-/// plane's own rectangle: `width` bytes a row at eight bits, `width / 2` at
-/// four.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_mlx_affine(
     ctx: &Ctx,
@@ -215,7 +200,6 @@ pub fn embed_mlx_affine(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
-            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

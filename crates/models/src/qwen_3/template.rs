@@ -19,8 +19,6 @@ pub fn chatml(tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     ))
 }
 
-/// ChatML with interleaved thinking: a replayed assistant turn keeps its
-/// `<think>` block, matching how Qwen3.8 was trained (3.5/3.6 strip it).
 #[must_use]
 pub fn chatml_interleaved(tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
     Arc::new(ChatMLInstruct::new(

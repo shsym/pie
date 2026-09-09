@@ -1,19 +1,3 @@
-//! PyTorch `.pt` / `.bin` → zTensor object model projection.
-//!
-//! A torch checkpoint is a ZIP: `<root>/data.pkl` (a pickle stream
-//! describing the state dict) plus `<root>/data/<key>` raw storages.
-//!
-//! The pickle stream is evaluated by a restricted VM that executes **no
-//! code**: it recognizes exactly the reconstruction patterns torch uses
-//! (`persistent_load` storage tuples, `torch._utils._rebuild_tensor_v2`,
-//! `collections.OrderedDict`) and materializes everything else as opaque.
-//! Anything that would require reinterpreting bytes to "make work" is a loud
-//! refusal: an unknown storage dtype, or a non-contiguous stride.
-//!
-//! This module is feature-gated (`pickle`): parsing pickle at all is a
-//! larger attack surface than any other format here, and enabling it is an
-//! explicit choice.
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -28,23 +12,17 @@ fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("pt: {}", detail.into()))
 }
 
-// =======================================================================
-// Restricted pickle VM
-// =======================================================================
-
 const MAX_PICKLE_BYTES: usize = 256 << 20;
 const MAX_STACK: usize = 10_000_000;
 const MAX_MEMO: usize = 10_000_000;
 const MAX_OPCODES: usize = 50_000_000;
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_DEPTH: usize = 128;
-/// Longest string kept in the memo table (longer ones become opaque).
 const MAX_MEMO_STR: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct TensorRef {
     storage_key: String,
-    /// Byte offset within the storage.
     byte_offset: u64,
     shape: Vec<u64>,
     dtype: Leaf,
@@ -99,12 +77,8 @@ struct Vm<'a> {
     data: &'a [u8],
     pos: usize,
     stack: Vec<Val>,
-    /// Stack indices of live MARK sentinels.
     marks: Vec<usize>,
     memo: BTreeMap<u32, Val>,
-    /// A refusal encountered mid-stream (e.g., a non-contiguous tensor):
-    /// recorded here so the failure is loud, never a silently dropped
-    /// tensor.
     refusal: Option<Error>,
 }
 
@@ -165,9 +139,6 @@ impl<'a> Vm<'a> {
         self.stack.pop().unwrap_or(Val::None)
     }
 
-    /// Pops back to the most recent MARK. `marks` tracks mark positions so
-    /// this is O(popped items). A linear rescan would make N mark-less
-    /// POP_MARKs quadratic.
     fn pop_to_mark(&mut self) -> Vec<Val> {
         match self.marks.pop() {
             Some(i) if i < self.stack.len() => {
@@ -194,91 +165,87 @@ impl<'a> Vm<'a> {
             let op = self.byte()?;
             match op {
                 0x80 => {
-                    self.byte()?; // PROTO
+                    self.byte()?;
                 }
                 0x95 => {
-                    let n = self.u64()?; // FRAME
+                    let n = self.u64()?;
                     if self.pos as u64 + n > self.data.len() as u64 {
                         return Err(bad("FRAME length exceeds stream"));
                     }
                 }
-                0x2e => break, // STOP
+                0x2e => break,
                 0x28 => {
-                    self.marks.push(self.stack.len()); // MARK
+                    self.marks.push(self.stack.len());
                     self.stack.push(Val::Mark);
                 }
-                0x29 => self.stack.push(Val::Tuple(Vec::new())), // EMPTY_TUPLE
-                0x5d => self.stack.push(Val::List(Vec::new())),  // EMPTY_LIST
-                0x7d => self.stack.push(Val::Dict(Vec::new())),  // EMPTY_DICT
-                0x4e => self.stack.push(Val::None),              // NONE
-                0x88 => self.stack.push(Val::Bool(true)),        // NEWTRUE
-                0x89 => self.stack.push(Val::Bool(false)),       // NEWFALSE
+                0x29 => self.stack.push(Val::Tuple(Vec::new())),
+                0x5d => self.stack.push(Val::List(Vec::new())),
+                0x7d => self.stack.push(Val::Dict(Vec::new())),
+                0x4e => self.stack.push(Val::None),
+                0x88 => self.stack.push(Val::Bool(true)),
+                0x89 => self.stack.push(Val::Bool(false)),
                 0x4a => {
                     let v = self.u32()? as i32;
-                    self.stack.push(Val::Int(v as i64)); // BININT
+                    self.stack.push(Val::Int(v as i64));
                 }
                 0x4b => {
                     let v = self.byte()?;
-                    self.stack.push(Val::Int(v as i64)); // BININT1
+                    self.stack.push(Val::Int(v as i64));
                 }
                 0x4d => {
                     let v = self.u16()?;
-                    self.stack.push(Val::Int(v as i64)); // BININT2
+                    self.stack.push(Val::Int(v as i64));
                 }
                 0x8a => {
-                    // LONG1
                     let n = self.byte()? as usize;
                     let bytes = self.take(n)?;
                     self.stack.push(Val::Int(long_from_le(bytes)));
                 }
                 0x47 => {
-                    // BINFLOAT (big-endian f64)
                     let v = f64::from_be_bytes(self.take(8)?.try_into().unwrap());
                     self.stack.push(Val::Float(v));
                 }
                 0x58 => {
                     let n = self.u32()? as usize;
                     let b = self.sized(n)?;
-                    self.push_str(b); // BINUNICODE
+                    self.push_str(b);
                 }
                 0x8c => {
                     let n = self.byte()? as usize;
                     let b = self.take(n)?;
-                    self.push_str(b); // SHORT_BINUNICODE
+                    self.push_str(b);
                 }
                 0x8d => {
                     let n = self.u64()? as usize;
                     let b = self.sized(n)?;
-                    self.push_str(b); // BINUNICODE8
+                    self.push_str(b);
                 }
                 0x55 => {
                     let n = self.byte()? as usize;
                     let b = self.take(n)?;
-                    self.push_str(b); // SHORT_BINSTRING
+                    self.push_str(b);
                 }
                 0x43 => {
                     let n = self.byte()? as usize;
                     let b = self.take(n)?.to_vec();
-                    self.stack.push(Val::Bytes(b)); // SHORT_BINBYTES
+                    self.stack.push(Val::Bytes(b));
                 }
                 0x44 => {
                     let n = self.u32()? as usize;
                     let b = self.sized(n)?.to_vec();
-                    self.stack.push(Val::Bytes(b)); // BINBYTES
+                    self.stack.push(Val::Bytes(b));
                 }
                 0x8e | 0x96 => {
                     let n = self.u64()? as usize;
                     let b = self.sized(n)?.to_vec();
-                    self.stack.push(Val::Bytes(b)); // BINBYTES8 / BYTEARRAY8
+                    self.stack.push(Val::Bytes(b));
                 }
                 0x63 => {
-                    // GLOBAL
                     let module = String::from_utf8_lossy(self.line()?).into_owned();
                     let name = String::from_utf8_lossy(self.line()?).into_owned();
                     self.stack.push(Val::Global { module, name });
                 }
                 0x93 => {
-                    // STACK_GLOBAL
                     let name = self.pop();
                     let module = self.pop();
                     match (module, name) {
@@ -290,40 +257,38 @@ impl<'a> Vm<'a> {
                 }
                 0x85 => {
                     let a = self.pop();
-                    self.stack.push(Val::Tuple(vec![a])); // TUPLE1
+                    self.stack.push(Val::Tuple(vec![a]));
                 }
                 0x86 => {
                     let b = self.pop();
                     let a = self.pop();
-                    self.stack.push(Val::Tuple(vec![a, b])); // TUPLE2
+                    self.stack.push(Val::Tuple(vec![a, b]));
                 }
                 0x87 => {
                     let c = self.pop();
                     let b = self.pop();
                     let a = self.pop();
-                    self.stack.push(Val::Tuple(vec![a, b, c])); // TUPLE3
+                    self.stack.push(Val::Tuple(vec![a, b, c]));
                 }
                 0x74 => {
                     let items = self.pop_to_mark();
-                    self.stack.push(Val::Tuple(items)); // TUPLE
+                    self.stack.push(Val::Tuple(items));
                 }
                 0x6c => {
                     let items = self.pop_to_mark();
-                    self.stack.push(Val::List(items)); // LIST
+                    self.stack.push(Val::List(items));
                 }
                 0x64 => {
                     let items = self.pop_to_mark();
-                    self.stack.push(Val::Dict(pairs(items))); // DICT
+                    self.stack.push(Val::Dict(pairs(items)));
                 }
                 0x52 | 0x81 => {
-                    // REDUCE / NEWOBJ
                     let args = self.pop();
                     let callable = self.pop();
                     let v = self.reduce(callable, args)?;
                     self.stack.push(v);
                 }
                 0x92 => {
-                    // NEWOBJ_EX
                     let _kwargs = self.pop();
                     let args = self.pop();
                     let callable = self.pop();
@@ -331,19 +296,16 @@ impl<'a> Vm<'a> {
                     self.stack.push(v);
                 }
                 0x51 => {
-                    // BINPERSID
                     let pid = self.pop();
                     let v = self.persistent_load(pid);
                     self.stack.push(v);
                 }
                 0x62 => {
-                    // BUILD
                     let state = self.pop();
                     let obj = self.pop();
                     self.stack.push(build(obj, state));
                 }
                 0x73 => {
-                    // SETITEM
                     let value = self.pop();
                     let key = self.pop();
                     if let Some(Val::Dict(entries)) = self.stack.last_mut() {
@@ -354,7 +316,6 @@ impl<'a> Vm<'a> {
                     }
                 }
                 0x75 => {
-                    // SETITEMS
                     let items = self.pop_to_mark();
                     if let Some(Val::Dict(entries)) = self.stack.last_mut() {
                         if entries.len() + items.len() / 2 > MAX_ITEMS {
@@ -364,7 +325,6 @@ impl<'a> Vm<'a> {
                     }
                 }
                 0x61 => {
-                    // APPEND
                     let value = self.pop();
                     if let Some(Val::List(list)) = self.stack.last_mut() {
                         if list.len() >= MAX_ITEMS {
@@ -374,7 +334,6 @@ impl<'a> Vm<'a> {
                     }
                 }
                 0x65 => {
-                    // APPENDS
                     let items = self.pop_to_mark();
                     if let Some(Val::List(list)) = self.stack.last_mut() {
                         if list.len() + items.len() > MAX_ITEMS {
@@ -385,32 +344,31 @@ impl<'a> Vm<'a> {
                 }
                 0x71 => {
                     let idx = self.byte()? as u32;
-                    self.memoize(idx); // BINPUT
+                    self.memoize(idx);
                 }
                 0x72 => {
                     let idx = self.u32()?;
-                    self.memoize(idx); // LONG_BINPUT
+                    self.memoize(idx);
                 }
                 0x94 => {
                     let idx = self.memo.len() as u32;
-                    self.memoize(idx); // MEMOIZE
+                    self.memoize(idx);
                 }
                 0x68 => {
                     let idx = self.byte()? as u32;
-                    self.memo_get(idx); // BINGET
+                    self.memo_get(idx);
                 }
                 0x6a => {
                     let idx = self.u32()?;
-                    self.memo_get(idx); // LONG_BINGET
+                    self.memo_get(idx);
                 }
                 0x30 => {
-                    self.pop(); // POP
+                    self.pop();
                 }
                 0x31 => {
-                    self.pop_to_mark(); // POP_MARK
+                    self.pop_to_mark();
                 }
                 0x49 => {
-                    // INT (text)
                     let line = String::from_utf8_lossy(self.line()?).into_owned();
                     let s = line.trim();
                     let v = match s {
@@ -421,14 +379,13 @@ impl<'a> Vm<'a> {
                     self.stack.push(v);
                 }
                 0x91 | 0x90 => {
-                    // FROZENSET / ADDITEMS: irrelevant to state dicts
                     let items = self.pop_to_mark();
                     if op == 0x91 {
                         self.stack.push(Val::Tuple(items));
                     }
                 }
-                0x97 => self.stack.push(Val::Opaque), // NEXT_BUFFER
-                0x98 => {}                            // READONLY_BUFFER
+                0x97 => self.stack.push(Val::Opaque),
+                0x98 => {}
                 other => {
                     return Err(bad(format!(
                         "unsupported pickle opcode 0x{other:02x} at {}",
@@ -448,10 +405,6 @@ impl<'a> Vm<'a> {
 
     fn memoize(&mut self, idx: u32) {
         if let Some(v) = self.stack.last() {
-            // Only scalars are memoized. Containers (including tuples,
-            // which torch nests freely) would let `T <- (T, T)` double the
-            // heap every few opcodes; state dicts never need container
-            // back-references.
             let stored = match v {
                 Val::Int(n) => Val::Int(*n),
                 Val::Bool(b) => Val::Bool(*b),
@@ -492,10 +445,6 @@ impl<'a> Vm<'a> {
         Ok(Val::Opaque)
     }
 
-    /// `_rebuild_tensor_v2(storage, storage_offset, size, stride, ...)`.
-    /// Non-contiguous strides are refused: the storage bytes of such a
-    /// tensor are not its row-major bytes, and reading them as dense would
-    /// silently return wrong data.
     fn rebuild_tensor(&mut self, args: &[Val]) -> Result<Val> {
         if args.len() < 4 {
             return Ok(Val::Opaque);
@@ -511,8 +460,6 @@ impl<'a> Vm<'a> {
             return Ok(Val::Opaque);
         };
 
-        // Contiguity: stride[i] == product(shape[i+1..]), dims of size ≤ 1
-        // exempt (their stride is arbitrary).
         let mut expected = 1u64;
         for (i, &dim) in shape.iter().enumerate().rev() {
             if dim > 1 && stride.get(i) != Some(&expected) {
@@ -537,7 +484,6 @@ impl<'a> Vm<'a> {
         })))
     }
 
-    /// torch persistent id: `("storage", <StorageType>, key, location, numel)`.
     fn persistent_load(&mut self, pid: Val) -> Val {
         let Val::Tuple(items) = &pid else {
             return Val::Opaque;
@@ -615,8 +561,6 @@ fn long_from_le(bytes: &[u8]) -> i64 {
     v
 }
 
-/// Walks the unpickled tree and collects named tensors. Duplicate names
-/// are rejected (a genuine Python dict cannot produce them).
 fn collect_tensors(
     prefix: &str,
     v: &Val,
@@ -657,27 +601,14 @@ fn collect_tensors(
     Ok(())
 }
 
-// =======================================================================
-// Container
-// =======================================================================
-
 enum StorageLoc {
-    /// Stored entry: absolute range in the file.
     Stored { offset: u64, length: u64 },
-    /// Compressed entry: inflated on demand, cached whole.
     Compressed { zip_index: usize, length: u64 },
 }
 
-/// Tensors that live inside a compressed storage.
-///
-/// A `.pt` tensor is a window into a storage, and a compressed storage has no
-/// window until it is inflated, so these have no address and the whole
-/// storage is cached once rather than inflated per tensor.
 struct Compressed {
     archive: std::sync::Mutex<zip::ZipArchive<File>>,
     cache: std::sync::Mutex<BTreeMap<usize, Vec<u8>>>,
-    /// Keyed by the `key` in [`Payload::Opaque`]:
-    /// (zip index, storage length, byte offset within the storage).
     slices: Vec<(usize, u64, u64)>,
 }
 
@@ -731,7 +662,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
     let mut archive = zip::ZipArchive::new(File::open(store.path())?)
         .map_err(|e| bad(format!("not a ZIP archive: {e}")))?;
 
-    // Locate the pickle.
     let pickle_name = (0..archive.len())
         .filter_map(|i| archive.by_index_raw(i).ok().map(|e| e.name().to_string()))
         .find(|n| n.ends_with("data.pkl"))
@@ -741,8 +671,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         pickle_name.strip_suffix("data.pkl").unwrap_or_default()
     );
 
-    // The pickle is decompressed here, so its *decompressed* size must be
-    // capped independently of what the ZIP declares.
     let mut pickle = Vec::new();
     let mut entry = archive
         .by_name(&pickle_name)
@@ -753,7 +681,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
     }
     drop(entry);
 
-    // Run the VM and collect tensors.
     let mut vm = Vm {
         data: &pickle,
         pos: 0,
@@ -771,7 +698,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         return Err(bad("no tensors found"));
     }
 
-    // Locate each referenced storage entry.
     let mut storages: BTreeMap<String, StorageLoc> = BTreeMap::new();
     for t in tensors.values() {
         let key = &t.storage_key;
@@ -805,7 +731,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         storages.insert(key.clone(), loc);
     }
 
-    // Build the catalog, bounds-checking every tensor against its storage.
     let mut catalog = Catalog::new();
     let mut slices: Vec<(usize, u64, u64)> = Vec::new();
     for (name, t) in &tensors {
@@ -853,9 +778,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         );
     }
 
-    // Storages sit behind ZIP local headers and torch packs several tensors
-    // into one storage, so nothing here can prove a tensor has its pages to
-    // itself: occupancy stays unstated.
     let projection = Projection::new(catalog);
     Ok(if slices.is_empty() {
         projection

@@ -1,16 +1,3 @@
-//! The hand-written bidirectional encoder layer the engine's M3 relative-bias
-//! test fires: one text lane per request, q/k/v projections, one
-//! `attention.ragged` over per-lane CSRs under `RaggedMask::RelativeBias`
-//! whose table `elementwise.relative_bucket_bias` computes from the layer's
-//! bucket embedding, an output projection, a residual fold and a `hidden`
-//! export — plus the host's f32 reading of the same arithmetic (the T5
-//! bucket function included), the artifact of random weights it loads
-//! from, and a pass-through epilogue so every lane has a channel to feed
-//! its rows through.
-//!
-//! Traced with `model_dsl` directly (no catalog family), loaded through the
-//! real `Engine` API. The shape of `common_dit`, for one stream.
-
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -39,25 +26,15 @@ use model_dsl::{
     ops, seam, trace_hybrid,
 };
 
-/// The residual width.
 pub const WIDTH: u32 = 32;
-/// The ragged arm's smallest stamped head width.
 pub const HEAD_DIM: u32 = 64;
-/// Two heads, so the table has a row per head and the arm reads the right one.
 pub const HEADS: u32 = 2;
-/// The longest lane the table answers exactly.
 pub const MAX_LEN: u32 = 64;
-/// T5's bucket parameters.
 pub const NUM_BUCKETS: u32 = 32;
 pub const MAX_DISTANCE: f32 = 128.0;
-/// `q · k` scale: a power of two well under T5's 1, so the bias (`±0.7`
-/// from a `1/sqrt(heads)`-scaled embedding) is comparable to the logit
-/// spread and a dropped bias fails the comparison.
 pub const SM_SCALE: f32 = 0.125;
-/// The name the trace and the artifact stamp share.
 pub const NAME: &str = "encoder-mini";
 
-/// No facts: one class, every lane in it.
 pub struct NoFacts;
 
 impl Classify for NoFacts {
@@ -77,7 +54,6 @@ pub fn classify_for(_: &str) -> Option<model_ir::ClassifyFn> {
     Some(classify)
 }
 
-/// The layer.
 pub struct EncoderLayer;
 
 impl ForwardHybrid for EncoderLayer {
@@ -129,8 +105,6 @@ pub fn trace() -> Trace {
     trace_hybrid(NAME, &EncoderLayer, Platform::Cuda)
 }
 
-// ── numbers ───────────────────────────────────────────────────────────────
-
 pub fn to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     let round = 0x7fff + ((bits >> 16) & 1);
@@ -141,7 +115,6 @@ pub fn from_bf16(v: u16) -> f32 {
     f32::from_bits(u32::from(v) << 16)
 }
 
-/// Round through bf16.
 pub fn bf(x: f32) -> f32 {
     from_bf16(to_bf16(x))
 }
@@ -153,7 +126,6 @@ impl Lcg {
         Lcg(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
 
-    /// The next value in `[-1, 1)`.
     pub fn unit(&mut self) -> f32 {
         self.0 = self
             .0
@@ -164,8 +136,6 @@ impl Lcg {
     }
 }
 
-/// The weights, by plan name: row-major, bf16-rounded f32, scaled by
-/// `1/sqrt(fan_in)` (the trailing dim) so activations stay `O(1)`.
 pub struct Weights {
     pub planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
 }
@@ -193,8 +163,6 @@ impl Weights {
             .1
     }
 
-    /// Write the artifact the engine loads: every plane as a bf16 leaf
-    /// under the stamp the load checks.
     pub fn write(&self, dir: &Path) -> PathBuf {
         let path = dir.join(format!("cuda-{NAME}.zt"));
         let bytes: Vec<(String, Vec<u64>, Vec<u8>)> = self
@@ -234,8 +202,6 @@ pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String>
         .map_err(|why| why.to_string())
 }
 
-// ── the host reference ───────────────────────────────────────────────────
-
 fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut y = vec![0f32; rows * n];
     for r in 0..rows {
@@ -250,8 +216,6 @@ fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32
     y
 }
 
-/// HF `T5Attention._relative_position_bucket`, in torch's own f32 steps,
-/// for `d = memory_position − context_position`.
 pub fn bucket(d: i64, bidirectional: bool, mut num_buckets: i64, max_distance: f32) -> i64 {
     let mut out = 0;
     let n = if bidirectional {
@@ -273,16 +237,11 @@ pub fn bucket(d: i64, bidirectional: bool, mut num_buckets: i64, max_distance: f
     out + large.min(num_buckets - 1)
 }
 
-/// The bias of head `h` at distance `d`, read from the (bf16-rounded)
-/// `[num_buckets, heads]` embedding.
 fn bias(embedding: &[f32], h: usize, d: i64) -> f32 {
     let b = bucket(d, true, i64::from(NUM_BUCKETS), MAX_DISTANCE) as usize;
     embedding[b * HEADS as usize + h]
 }
 
-/// Non-causal attention over one lane's rows with the relative bias on
-/// every logit, f32 softmax, `P` rounded to bf16 as the tensor core reads
-/// it, output rounded once.
 fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize, embedding: &[f32]) -> Vec<f32> {
     let hd = HEAD_DIM as usize;
     let heads = HEADS as usize;
@@ -313,7 +272,6 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize, embedding: &[f32]) ->
     o
 }
 
-/// One lane's hidden rows, `[rows, WIDTH]`, as the plan computes them.
 pub fn reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
     let w = WIDTH as usize;
     let width = (HEADS * HEAD_DIM) as usize;
@@ -325,12 +283,6 @@ pub fn reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
     y.iter().zip(x).map(|(a, b)| bf(a + b)).collect()
 }
 
-// ── the engine, the program, the channels ────────────────────────────────
-
-/// The epilogue: takes the latent cell and puts it back on the reader
-/// channel — every lane needs an instance for its port to be fed from, and
-/// the rows come back through the hidden readout, not the program.
-/// Channels: 0 latent (writer), 1 out (reader).
 pub fn epilogue(rows: u32) -> TraceContainer {
     let decl = |host_role: HostRole| ChannelDecl {
         shape: Shape::matrix(rows, WIDTH),
@@ -351,7 +303,6 @@ pub fn epilogue(rows: u32) -> TraceContainer {
     }
 }
 
-/// The channel ids one lane's instance binds, and the instance.
 pub struct LaneHandles {
     pub instance: u64,
     pub latent: u64,
@@ -359,8 +310,6 @@ pub struct LaneHandles {
     pub rows: u32,
 }
 
-/// A loaded engine with a program per row count and a fresh channel id
-/// counter.
 pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
@@ -370,10 +319,6 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// Load the layer at these budgets under the stated graph mode:
-    /// `Graphs::On` is the load's default (bodies armed, golden checked,
-    /// replayed after), `Graphs::Shaped` runs eagerly on graph-shaped
-    /// schedules.
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>, graphs: Graphs) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
@@ -461,7 +406,6 @@ impl Rig {
         id
     }
 
-    /// One lane's instance: its two channels registered and bound.
     pub fn lane(&mut self, rows: u32) -> LaneHandles {
         let program = self.program(rows);
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
@@ -500,7 +444,6 @@ impl Rig {
     }
 }
 
-/// One lane of a submission, fed from its handles.
 pub fn lane(slot: u32, handles: &LaneHandles, group: u32) -> Lane {
     Lane {
         slot,

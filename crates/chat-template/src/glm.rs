@@ -1,9 +1,3 @@
-//! GLM-5's turn format: `[gMASK]<sop>` opens the conversation, each role is
-//! its own marker (`<|system|>`, `<|user|>`, `<|assistant|>`,
-//! `<|observation|>`) with no closer, and an assistant turn carries an
-//! explicit `<think>…</think>` block. The generation cue is
-//! `<|assistant|><think>`, so the reasoning decoder starts inside the block.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -14,7 +8,6 @@ use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, speci
 pub const STOP_TOKENS: &[&str] = &["<|user|>", "<|observation|>", "<|endoftext|>"];
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
-/// The template's default reasoning effort, stated as the first system line.
 const EFFORT: &str = "Reasoning Effort: Max";
 
 pub struct Glm {
@@ -57,7 +50,6 @@ impl Glm {
         tokens
     }
 
-    /// A replayed reply without a thinking block is given the empty one.
     fn assistant_body(msg: &str) -> String {
         if msg.trim_start().starts_with(THINK_OPEN) {
             msg.to_string()

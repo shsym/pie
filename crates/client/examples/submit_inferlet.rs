@@ -1,22 +1,3 @@
-//! Submit a single inferlet to a running Pie engine and print its return
-//! value. Boots no engine of its own: point it at an already-running
-//! engine's client WebSocket, and it adds the inferlet program, launches
-//! it, and prints the `Return` value (the inferlet's `Result<String>`).
-//!
-//! Usage:
-//! ```text
-//! cargo run -p pie-client --example submit_inferlet -- \
-//!     <ws_host> <inferlet_name@version> <wasm_path> <manifest_path> [input_json]
-//! ```
-//! e.g.
-//! ```text
-//! cargo run -p pie-client --example submit_inferlet -- \
-//!     ws://127.0.0.1:9123 mirostat@0.1.0 \
-//!     runtime/tests/inferlets/target/wasm32-wasip2/debug/mirostat.wasm \
-//!     runtime/tests/inferlets/mirostat/Pie.toml '{}'
-//! ```
-//! Exits non-zero if the inferlet returns an error or never produces a result.
-
 use std::path::Path;
 
 use ::client::client::Client;
@@ -43,10 +24,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Connect to an already-running engine, register the inferlet program,
-/// launch it with `input`, and return the inferlet's `Return` value.
-/// Mirrors the canonical `pie` CLI submit flow (connect, authenticate,
-/// add, launch, recv).
 pub async fn submit_inferlet(
     ws_host: &str,
     inferlet: &str,
@@ -54,14 +31,11 @@ pub async fn submit_inferlet(
     manifest_path: &Path,
     input: &str,
 ) -> Result<String> {
-    // the gateway's `/v1/ws` upgrade rejects a missing `x-pie-identity`, so a
-    // standalone engine needs the header supplied here.
     let identity = std::env::var("PIE_IDENTITY").unwrap_or_else(|_| "test-user".to_string());
     let client = Client::connect_with_identity(ws_host, &identity)
         .await
         .with_context(|| format!("connect to engine at {ws_host}"))?;
 
-    // no-auth path: the bench/test engine disables public-key auth.
     client
         .authenticate("test-user", &None)
         .await
@@ -77,6 +51,5 @@ pub async fn submit_inferlet(
         .await
         .with_context(|| format!("launch_process {inferlet}"))?;
 
-    // forwards inferlet stdout/stderr for live debugging.
     proc.wait_for_return().await
 }

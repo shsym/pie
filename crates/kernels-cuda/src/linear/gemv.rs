@@ -1,8 +1,3 @@
-//! The skinny fires: one output vector against the whole weight, split over
-//! k when the column count allows it. The unroll depth follows the
-//! architecture probe — Blackwell prefers shallow unrolls with more warps in
-//! flight.
-
 use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
@@ -42,13 +37,10 @@ pub(crate) fn gemv_bf16(
         ArgValue::Ptr(out),
         ArgValue::I32(n),
         ArgValue::I32(k),
-        // beta: nothing ever accumulates into the output on this plane.
         ArgValue::F32(0.0),
     ];
     let blackwell = ctx.compute_capability_major().is_some_and(|major| major >= 10);
 
-    // Split over k while the row count is skinny enough to leave SMs idle:
-    // one block per row, the warps sharing the row's k walk.
     if n <= 4096 {
         let (instantiation, warps) = if blackwell {
             ("::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>", 4)
@@ -68,7 +60,6 @@ pub(crate) fn gemv_bf16(
     } else {
         "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 4>"
     };
-    // Four warps per block, one row per warp.
     ctx.fire(
         "linear.gemv",
         Fire::at("linear/gemv.cuh", instantiation)

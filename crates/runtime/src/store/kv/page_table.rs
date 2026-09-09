@@ -1,8 +1,3 @@
-//! `KvPageTable`: the hash-labeled, radix-compressed KV mapping trie and its WorkingSet terminal registry (no reverse hash index or per-page refcount; lifetime is reachability from terminals, cache roots, and residency pins).
-
-// Some methods here are not yet called by the live single-model fire path
-// but are exercised by this module's own tests and reserved for upcoming
-// increments.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -17,18 +12,14 @@ use super::hash::{self, Hash256};
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::PoolId;
 
-/// Marker for WorkingSet ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WsMarker {}
-/// Marker for trie node ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeMarker {}
 
 pub type WorkingSetId = GenKey<WsMarker>;
 pub type NodeId = GenKey<NodeMarker>;
 
-/// A stable pool offset. Never renumbered while live; the kernel address is
-/// `kv_pool_base + id * kv_page_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PhysicalKvPageId(pub u32);
 
@@ -41,7 +32,6 @@ impl PoolId for PhysicalKvPageId {
     }
 }
 
-/// A host-pinned slot in the engine's KV swap pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostKvSlotId(pub u32);
 
@@ -54,49 +44,26 @@ impl PoolId for HostKvSlotId {
     }
 }
 
-/// Physical backing for one committed logical KV page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KvPageBacking {
     Resident(PhysicalKvPageId),
     Swapped(HostKvSlotId),
 }
 
-/// What suspending one group of WorkingSets would actually free, decided by
-/// the same rule [`PageTable::private_resident_pages`] applies at suspend
-/// time, so selection and execution can't disagree. A transient policy
-/// signal, not a holdings measure — has no scalar accessor on purpose, so a
-/// caller can't mistake "would free nothing now" for "holds nothing"
-/// (liveness predicates use [`PageTable::held_pages`] instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimQuote {
-    /// Suspending this group frees exactly this many resident pages.
     Pages(u32),
-    /// It would free nothing — and this is why.
     Nothing(NoReclaim),
 }
 
-/// Why a group would free nothing. These are NOT interchangeable: each is
-/// cleared by a different event, and victim selection has to know which.
-/// Collapsing them into one boolean is what allowed the reclaim ladder to
-/// re-pick a useless victim forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoReclaim {
-    /// Holds no pages at all. Cannot become reclaimable by waiting — only by
-    /// allocating.
     HoldsNothing,
-    /// Holds pages, but every one is reachable from another WorkingSet or a
-    /// cache root. Cleared when the sharer releases.
     AllShared,
-    /// Holds private pages, but none are resident — they are already on host
-    /// swap, so there is nothing left to move out.
     AllSwapped,
-    /// An in-flight pin overlaps the group's residency. Cleared when this
-    /// process's own fires drain.
     Pinned,
 }
 
-/// Stable location of an owned page while a suspend/restore transaction pins
-/// the process's trie terminals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TriePageLocation {
     pub node: NodeId,
@@ -105,13 +72,10 @@ pub struct TriePageLocation {
 
 type Runs = SmallVec<[Range<u32>; 2]>;
 
-/// One committed page being published into the mapping.
 #[derive(Debug, Clone)]
 pub struct PublishedPage {
     pub id: PhysicalKvPageId,
-    /// One entry per token slot of the page; `None` = unwritten/invalid.
     pub token_hashes: Vec<Option<Hash256>>,
-    /// `None` while the page hash is not yet valid/committed.
     pub page_hash: Option<Hash256>,
 }
 
@@ -121,10 +85,6 @@ enum Pages {
         token_hashes: Vec<Vec<Option<Hash256>>>,
         page_hashes: Vec<Option<Hash256>>,
     },
-    /// Ordered runs selecting from the parent's aligned vectors. The selected
-    /// entries replace the parent's local contribution on this branch. A
-    /// selection's parent is always an owned node (selection-of-selection
-    /// composes runs and becomes another child of the owner).
     ParentSelection { runs: Runs },
 }
 
@@ -133,49 +93,19 @@ struct KvTrieNode {
     children: SmallVec<[NodeId; 2]>,
     pages: Pages,
     cached_path_hash: Option<Hash256>,
-    /// Number of WorkingSet terminals plus the presence of cache-root and
-    /// snapshot-pin keys anchored exactly at this node.
     exact_anchors: u32,
-    /// Number of exact anchors whose structural parent chain includes this
-    /// node. A zero transition makes the node unreachable immediately.
     path_anchors: u32,
 }
 
-/// Registry entry for one WorkingSet.
 struct WorkingSetEntry {
     terminal: Option<NodeId>,
-    /// Logical extent including pending (reserved, unpublished) space.
-    ///
-    /// Written only through [`WorkingSetEntry::set_page_len`], which keeps
-    /// `page_len_mirror` in step.
     page_len: u64,
-    /// Lock-free copy of `page_len` for readers outside the global KV mutex
-    /// (avoids an exclusive lock acquisition just to read one integer).
-    /// Sound as a plain release/acquire pair because `page_len` moves only
-    /// under this process's own operations (`reserve`, adoption,
-    /// `drop`/`discard`), never under the residency planner, so a reader
-    /// never races its own writer. Set to [`Self::TORN_DOWN`] once the
-    /// WorkingSet is gone, so a stale handle still reports the right error.
     page_len_mirror: Arc<AtomicU64>,
-    /// Exclusive end of the published mapping; the lookup anchor. Distinct
-    /// from `page_len` because `reserve` is purely logical, so the anchor
-    /// must exclude reserved-but-unpublished space.
     mapped_len: u64,
-    /// The token-slot hash the NEXT appended slot chains from: the identity
-    /// of the visible content so far. `None` = empty mapping (chain start).
-    /// Maintained by `KvStore` — the most recently committed slot hash after an
-    /// append, or a recomputed visible-content identity after surgery that
-    /// edits the prefix (so post-surgery appends never impersonate the
-    /// unedited continuation).
     chain_state: Option<Hash256>,
-    // The device-shared flattened table handle attaches here with the
-    // KvStore/engine integration; the pure flatten lives in `flatten()`.
 }
 
 impl WorkingSetEntry {
-    /// Mirror value for a WorkingSet that no longer exists. `u64::MAX` is
-    /// unreachable as a real extent — the index space is bounded by the page
-    /// pool — so it needs no extra flag to disambiguate.
     const TORN_DOWN: u64 = u64::MAX;
 
     fn new(
@@ -199,9 +129,6 @@ impl WorkingSetEntry {
     }
 }
 
-/// Opaque-index snapshot of one fully mapped WorkingSet entry. The index owns
-/// a separate cache-root lease for `terminal`; materializing the snapshot as a
-/// WorkingSet adds a normal terminal anchor.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct IndexedWorkingSet {
     pub(super) terminal: Option<NodeId>,
@@ -249,8 +176,6 @@ pub enum KvTableError {
 #[derive(Debug, Clone, Copy)]
 struct Segment {
     node: NodeId,
-    /// Contribution start in WorkingSet coordinates; negative when `page_len`
-    /// truncation hides the front of the path.
     start: i64,
     len: u64,
 }
@@ -261,22 +186,12 @@ impl Segment {
     }
 }
 
-/// The mapping trie and WorkingSet terminal registry.
 #[derive(Default)]
 pub struct KvPageTable {
     working_sets: GenMap<WsMarker, WorkingSetEntry>,
     nodes: GenMap<NodeMarker, KvTrieNode>,
-    /// Cache/checkpoint lease roots (lease counts). A lease keeps an
-    /// otherwise-unused subtree's path alive.
     cache_roots: HashMap<NodeId, u32>,
-    /// Terminal pins held by asynchronous suspend/restore transactions.
     pins: HashMap<NodeId, u32>,
-    /// Page locations whose backings are mid-swap (suspend/restore copy in
-    /// flight). Unlike `pins` — collection anchors keyed by terminal — this
-    /// set is PRECISE: only the locations a swap transaction is actually
-    /// replacing. Its sole consumer is adoption (`page_location_pinned`):
-    /// a resident page not being moved stays adoptable even while some
-    /// working set on the same path is suspending.
     swap_locations: HashMap<TriePageLocation, u32>,
 }
 
@@ -285,17 +200,11 @@ impl KvPageTable {
         Self::default()
     }
 
-    // ------------------------------------------------------------------
-    // WorkingSet lifecycle
-    // ------------------------------------------------------------------
-
     pub fn create_working_set(&mut self) -> WorkingSetId {
         self.working_sets
             .insert(WorkingSetEntry::new(None, 0, 0, None))
     }
 
-    /// `fork`: O(1) child over the complete logical address space. Parent and
-    /// child point at the same terminal until they diverge.
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvTableError> {
         let entry = self.entry(ws)?;
         let (terminal, page_len, mapped_len, chain_state) = (
@@ -316,9 +225,6 @@ impl KvPageTable {
         Ok(child)
     }
 
-    /// Capture the complete visible mapping for an opaque index. Logical
-    /// reservations without backing are rejected because `from-index` must
-    /// reconstruct an immediately usable WorkingSet without token semantics.
     pub(super) fn index_snapshot(
         &self,
         ws: WorkingSetId,
@@ -338,7 +244,6 @@ impl KvPageTable {
         })
     }
 
-    /// Create a fresh WorkingSet terminal from an opaque-index snapshot.
     #[allow(
         clippy::wrong_self_convention,
         reason = "not a conversion: it mutates the table to seat a new working set, \
@@ -358,9 +263,6 @@ impl KvPageTable {
         ws
     }
 
-    /// `slice`: structurally shared child over `range`, rebased to page zero.
-    /// At most one prefix selection is created at the end boundary; the front
-    /// cut is implicit in the child's smaller mapped extent.
     pub fn slice(
         &mut self,
         ws: WorkingSetId,
@@ -383,8 +285,6 @@ impl KvPageTable {
             let segs = self.segments(terminal, mapped_len);
             Some(self.boundary_terminal(&segs, range.end))
         };
-        // The caller (`KvStore::slice`) derives the child's chain state:
-        // inherit on a full-range slice, recompute otherwise.
         let child = self
             .working_sets
             .insert(WorkingSetEntry::new(child_terminal, len, len, None));
@@ -394,7 +294,6 @@ impl KvPageTable {
         Ok(child)
     }
 
-    /// Purely logical reservation: extends the index space, allocates nothing.
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvTableError> {
         let entry = self.entry_mut(ws)?;
         let start = entry.page_len;
@@ -402,9 +301,6 @@ impl KvPageTable {
         Ok(start..entry.page_len)
     }
 
-    /// Publish committed pages at the end of the mapping (`[mapped_len,
-    /// mapped_len + k)`). Extends the terminal node in place when it is
-    /// private and unobserved; otherwise attaches a fresh owned child.
     pub fn publish_appended(
         &mut self,
         ws: WorkingSetId,
@@ -448,8 +344,6 @@ impl KvPageTable {
                     }
                     Pages::ParentSelection { .. } => unreachable!("checked owned"),
                 }
-                // The node's contribution changed; its path hash (and any
-                // descendants', vacuously none here) is stale.
                 self.invalidate_subtree(t);
                 t
             }
@@ -484,11 +378,6 @@ impl KvPageTable {
         Ok(())
     }
 
-    /// CoW mapping publication: rebase the mapping tail from `from` onward
-    /// onto `pages` (copied tail pages plus fresh appends). The old tail
-    /// remains owned by its (shared) node; `page_len` is untouched, so the
-    /// fresh portion must have been reserved. This is a growth-boundary edit:
-    /// the terminal moves to the boundary and new owned growth attaches below.
     pub fn replace_tail(
         &mut self,
         ws: WorkingSetId,
@@ -529,11 +418,6 @@ impl KvPageTable {
         Ok(Vec::new())
     }
 
-    /// Hash-lifecycle step 4: commit an in-place write to a committed page.
-    /// The physical id is unchanged; only the affected page's token hashes and
-    /// page hash are replaced, and cached path hashes at and below the owning
-    /// node are invalidated. The caller (KvStore prepare) is responsible for
-    /// having classified the page as privately writable.
     pub fn commit_in_place(
         &mut self,
         ws: WorkingSetId,
@@ -572,9 +456,6 @@ impl KvPageTable {
         Ok(())
     }
 
-    /// Whether the committed page at `index` may be written in place: its
-    /// owning node is observed by nothing but `ws` itself (no other terminal,
-    /// cache root, or residency pin reaches it).
     pub fn privately_writable(&self, ws: WorkingSetId, index: u64) -> Result<bool, KvTableError> {
         let entry = self.entry(ws)?;
         if index >= entry.mapped_len {
@@ -596,10 +477,6 @@ impl KvPageTable {
         Ok(self.is_private_to(ws, &targets))
     }
 
-    /// `discard`: remove `ranges` (pre-discard indexes, applied atomically)
-    /// from the mapping. Returns freed physical ids (caller recycles them
-    /// after the appropriate epoch); an interior range on a shared path is
-    /// rejected before any mutation.
     pub fn discard(
         &mut self,
         ws: WorkingSetId,
@@ -608,7 +485,6 @@ impl KvPageTable {
         let entry = self.entry(ws)?;
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
 
-        // Normalize: sort descending by start, merge overlaps, validate.
         let mut norm: Vec<Range<u64>> =
             ranges.iter().filter(|r| r.start < r.end).cloned().collect();
         norm.sort_by_key(|r| r.start);
@@ -627,9 +503,8 @@ impl KvPageTable {
                 _ => merged.push(r),
             }
         }
-        merged.reverse(); // process back to front so shifts never move pending ranges
+        merged.reverse();
 
-        // Legality pre-pass: reject SharedInteriorDiscard before any mutation.
         self.classify_discard(ws, terminal, mapped_len, &merged)?;
 
         let mut freed = Vec::new();
@@ -639,7 +514,6 @@ impl KvPageTable {
         Ok(freed)
     }
 
-    /// Drop a WorkingSet and reclaim everything only it kept alive.
     pub fn release_working_set(&mut self, ws: WorkingSetId) -> Vec<PhysicalKvPageId> {
         self.release_working_set_backings(ws)
             .into_iter()
@@ -657,8 +531,6 @@ impl KvPageTable {
         let Some(entry) = self.working_sets.remove(ws) else {
             return Vec::new();
         };
-        // Tombstone the mirror so a handle that outlives the WorkingSet gets
-        // the same error the locked read would have raised.
         entry
             .page_len_mirror
             .store(WorkingSetEntry::TORN_DOWN, Ordering::Release);
@@ -666,10 +538,6 @@ impl KvPageTable {
             .terminal
             .map_or_else(Vec::new, |terminal| self.remove_anchor(terminal))
     }
-
-    // ------------------------------------------------------------------
-    // Lookup
-    // ------------------------------------------------------------------
 
     pub fn lookup(&self, ws: WorkingSetId, index: u64) -> Result<PhysicalKvPageId, KvTableError> {
         let entry = self.entry(ws)?;
@@ -697,16 +565,13 @@ impl KvPageTable {
         unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    /// The full logical-to-physical mapping, `mapped_len` entries. This is
-    /// the source for the device-shared flattened table; the runtime performs
-    /// this walk once per mapping change, kernels only read the result.
     pub fn flatten(&self, ws: WorkingSetId) -> Result<Vec<PhysicalKvPageId>, KvTableError> {
         let entry = self.entry(ws)?;
         let mapped_len = entry.mapped_len;
         let mut out = Vec::with_capacity(mapped_len as usize);
         let segs = self.segments(entry.terminal, mapped_len);
         for seg in segs.iter().rev() {
-            let from = (-seg.start).max(0) as u64; // clip hidden front
+            let from = (-seg.start).max(0) as u64;
             for local in from..seg.len {
                 out.push(
                     self.resolve_id(seg.node, local)
@@ -720,8 +585,6 @@ impl KvPageTable {
         Ok(out)
     }
 
-    /// The chain state the next appended slot hashes from (see
-    /// [`WorkingSetEntry::chain_state`]).
     pub fn chain_state(&self, ws: WorkingSetId) -> Result<Option<Hash256>, KvTableError> {
         Ok(self.entry(ws)?.chain_state)
     }
@@ -735,8 +598,6 @@ impl KvPageTable {
         Ok(())
     }
 
-    /// The committed token-slot hashes of the page at `index` (one entry per
-    /// slot, `None` = unwritten).
     pub fn page_token_hashes(
         &self,
         ws: WorkingSetId,
@@ -765,10 +626,6 @@ impl KvPageTable {
         unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    /// Per-visible-page identity, mapping order: the committed page hash,
-    /// else a fold of the page's recorded token-slot hashes, else `None`
-    /// (nothing recorded — the caller substitutes an opaque draw). Feeds the
-    /// post-surgery chain-state recompute.
     pub fn visible_page_identities(
         &self,
         ws: WorkingSetId,
@@ -777,7 +634,7 @@ impl KvPageTable {
         let mut out = Vec::with_capacity(entry.mapped_len as usize);
         let segs = self.segments(entry.terminal, entry.mapped_len);
         for seg in segs.iter().rev() {
-            let from = (-seg.start).max(0) as u64; // clip hidden front
+            let from = (-seg.start).max(0) as u64;
             for local in from..seg.len {
                 let (owner, owner_local) = self.resolve_owner(seg.node, local);
                 match &self.nodes.get(owner).expect("live node").pages {
@@ -802,8 +659,6 @@ impl KvPageTable {
         Ok(out)
     }
 
-    /// Locate the owning node + node-local index of the page at `index` (CAS
-    /// index bookkeeping).
     pub fn locate_page(&self, ws: WorkingSetId, index: u64) -> Result<(NodeId, u64), KvTableError> {
         let entry = self.entry(ws)?;
         if index >= entry.mapped_len {
@@ -822,7 +677,6 @@ impl KvPageTable {
         unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    /// Whether a CAS-index entry still points at a live owned page slot.
     pub fn page_location_alive(&self, node: NodeId, local: u64) -> bool {
         match self.nodes.get(node).map(|n| &n.pages) {
             Some(Pages::Owned { backings, .. }) => (local as usize) < backings.len(),
@@ -830,9 +684,6 @@ impl KvPageTable {
         }
     }
 
-    /// Pages on the structural path from the trie root through page `local`
-    /// of `node`, inclusive (selection predecessors skip their owners, like
-    /// every walk).
     pub fn path_prefix_len(&self, node: NodeId, local: u64) -> u64 {
         let mut full = local + 1;
         let mut cursor = self.predecessor(node);
@@ -843,13 +694,6 @@ impl KvPageTable {
         full
     }
 
-    /// Prefix-cache graft: adopt the structural path prefix ending at page
-    /// `local` of `node` as the mapping prefix of an unmapped WorkingSet
-    /// `ws`. Existing reserved logical tail capacity is preserved. The path
-    /// becomes the child's visible mapping (structurally
-    /// shared — writes CoW like any shared path); a mid-node boundary gets
-    /// one prefix selection, exactly slice's end-boundary mechanism. Returns
-    /// the adopted page count. The caller owns chain-state bookkeeping.
     pub fn adopt_path_prefix(
         &mut self,
         ws: WorkingSetId,
@@ -885,14 +729,10 @@ impl KvPageTable {
         Ok(end)
     }
 
-    /// Whether `node` currently holds a cache-root lease.
     pub fn is_cache_root(&self, node: NodeId) -> bool {
         self.cache_roots.contains_key(&node)
     }
 
-    /// The last committed token-slot hash of an owned page, addressed by node
-    /// and node-local index (CAS lookup validation: owner compaction can shift
-    /// locals, so an index entry must re-prove its content before use).
     pub fn node_page_last_slot_hash(&self, node: NodeId, local: u64) -> Option<Hash256> {
         match self.nodes.get(node).map(|n| &n.pages) {
             Some(Pages::Owned { token_hashes, .. }) => token_hashes
@@ -904,7 +744,6 @@ impl KvPageTable {
         }
     }
 
-    /// Page hash of the page at `index`, if valid/committed.
     pub fn page_hash_at(
         &self,
         ws: WorkingSetId,
@@ -934,10 +773,6 @@ impl KvPageTable {
         unreachable!("published mapping covers [0, mapped_len)");
     }
 
-    /// Cached path hash at the WorkingSet's terminal: folds all visible page
-    /// hashes from the trie root through the terminal's contribution,
-    /// independent of node boundaries. `None` when any contributing page hash
-    /// is not yet valid (or the path is empty). Lazily computed and cached.
     pub fn terminal_path_hash(
         &mut self,
         ws: WorkingSetId,
@@ -948,10 +783,6 @@ impl KvPageTable {
             None => None,
         })
     }
-
-    // ------------------------------------------------------------------
-    // Anchors: cache roots and residency pins
-    // ------------------------------------------------------------------
 
     pub fn lease_cache_root(&mut self, node: NodeId) {
         let first = !self.cache_roots.contains_key(&node);
@@ -999,10 +830,6 @@ impl KvPageTable {
         self.remove_anchor(node)
     }
 
-    // ------------------------------------------------------------------
-    // Introspection
-    // ------------------------------------------------------------------
-
     pub fn terminal(&self, ws: WorkingSetId) -> Result<Option<NodeId>, KvTableError> {
         Ok(self.entry(ws)?.terminal)
     }
@@ -1017,8 +844,6 @@ impl KvPageTable {
         Ok(entry.page_len)
     }
 
-    /// The lock-free `page_len` mirror for `ws`, to be read outside the
-    /// global KV mutex. See [`WorkingSetEntry::page_len_mirror`].
     pub fn page_len_mirror(&self, ws: WorkingSetId) -> Result<Arc<AtomicU64>, KvTableError> {
         Ok(Arc::clone(&self.entry(ws)?.page_len_mirror))
     }
@@ -1085,10 +910,6 @@ impl KvPageTable {
             );
         }
     }
-
-    // ------------------------------------------------------------------
-    // Internal: path walk and resolution
-    // ------------------------------------------------------------------
 
     fn entry(&self, ws: WorkingSetId) -> Result<&WorkingSetEntry, KvTableError> {
         self.working_sets
@@ -1199,8 +1020,6 @@ impl KvPageTable {
         }
     }
 
-    /// The logical predecessor of a node's contribution: a selection replaces
-    /// its parent's local contribution, so it skips past the parent.
     fn predecessor(&self, node: NodeId) -> Option<NodeId> {
         let n = self.nodes.get(node).expect("live node");
         match &n.pages {
@@ -1212,8 +1031,6 @@ impl KvPageTable {
         }
     }
 
-    /// Backward walk from the terminal, anchored so the terminal's
-    /// contribution ends at `anchor`. Stops once coverage reaches index 0.
     fn segments(&self, terminal: Option<NodeId>, anchor: u64) -> Vec<Segment> {
         let mut out = Vec::new();
         let mut end = anchor as i64;
@@ -1235,7 +1052,6 @@ impl KvPageTable {
         out
     }
 
-    /// Resolve a node-local offset to the owning node and its local index.
     fn resolve_owner(&self, node: NodeId, local: u64) -> (NodeId, u64) {
         let n = self.nodes.get(node).expect("live node");
         match &n.pages {
@@ -1271,9 +1087,6 @@ impl KvPageTable {
         }
     }
 
-    /// Terminal for a boundary at index `boundary` (> 0): the node whose
-    /// contribution ends there, or a prefix selection of the node containing
-    /// it (composed against the owner when that node is itself a selection).
     fn boundary_terminal(&mut self, segs: &[Segment], boundary: u64) -> NodeId {
         let b = boundary as i64;
         debug_assert!(boundary > 0);
@@ -1289,7 +1102,6 @@ impl KvPageTable {
         self.make_prefix_selection(seg.node, off)
     }
 
-    /// A selection over the first `off` entries of `node`'s contribution.
     fn make_prefix_selection(&mut self, node: NodeId, off: u64) -> NodeId {
         let (owner, runs) = {
             let n = self.nodes.get(node).expect("live node");
@@ -1308,7 +1120,6 @@ impl KvPageTable {
         self.insert_selection(owner, runs)
     }
 
-    /// A selection over `node`'s contribution excluding local `[a, b)`.
     fn selection_excluding(&mut self, node: NodeId, a: u64, b: u64) -> NodeId {
         let (owner, runs) = {
             let n = self.nodes.get(node).expect("live node");
@@ -1344,13 +1155,6 @@ impl KvPageTable {
         node
     }
 
-    // ------------------------------------------------------------------
-    // Internal: privacy and mutation
-    // ------------------------------------------------------------------
-
-    /// True when no anchor other than `ws` itself reaches any node in
-    /// `targets`. An anchor reaches a node when the node is on the anchor's
-    /// trie-parent chain (which retains selection owners transitively).
     fn is_private_to(&self, ws: WorkingSetId, targets: &HashSet<NodeId>) -> bool {
         let Some(terminal) = self.entry(ws).ok().and_then(|entry| entry.terminal) else {
             return false;
@@ -1374,8 +1178,6 @@ impl KvPageTable {
         false
     }
 
-    /// In-place terminal extension is allowed only when nothing but `ws`
-    /// observes the node: owned, childless, no lease/pin, no other terminal.
     fn can_extend_in_place(&self, ws: WorkingSetId, terminal: NodeId) -> bool {
         let node = self.nodes.get(terminal).expect("live terminal");
         if !matches!(node.pages, Pages::Owned { .. }) || !node.children.is_empty() {
@@ -1387,7 +1189,6 @@ impl KvPageTable {
             && node.path_anchors == 1
     }
 
-    /// Clear cached path hashes on `node` and its whole subtree.
     fn invalidate_subtree(&mut self, node: NodeId) {
         let mut stack = vec![node];
         while let Some(n) = stack.pop() {
@@ -1397,8 +1198,6 @@ impl KvPageTable {
         }
     }
 
-    /// Drain local `[a, b)` from a node's contribution. Owned nodes free
-    /// their slots; selections just rewrite runs.
     fn drain_node(&mut self, node: NodeId, a: u64, b: u64) -> Vec<KvPageBacking> {
         let (owner, mut freed) = {
             let n = self.nodes.get_mut(node).expect("live node");
@@ -1426,14 +1225,6 @@ impl KvPageTable {
         freed
     }
 
-    // ------------------------------------------------------------------
-    // Internal: discard
-    // ------------------------------------------------------------------
-
-    /// Legality pre-pass over `ranges` (descending, disjoint): simulates only
-    /// `(mapped_len, terminal-span start)` and rejects any range that would
-    /// need to reroute a shared suffix. Runs before any mutation so `discard`
-    /// is atomic.
     fn classify_discard(
         &self,
         ws: WorkingSetId,
@@ -1446,7 +1237,7 @@ impl KvPageTable {
         let mut sim_term_start: i64 = segs.first().map(|s| s.start).unwrap_or(0);
         for r in ranges {
             if r.start >= sim_mapped {
-                continue; // logical-only
+                continue;
             }
             let m = r.start..r.end.min(sim_mapped);
             let m_len = m.end - m.start;
@@ -1463,9 +1254,8 @@ impl KvPageTable {
                 sim_term_start -= removed_below;
                 sim_mapped -= m_len;
             } else if (m.start as i64) >= sim_term_start {
-                sim_mapped -= m_len; // within terminal contribution
+                sim_mapped -= m_len;
             } else if m.end == sim_mapped {
-                // tail-reaching: terminal moves up to the boundary
                 if m.start == 0 {
                     sim_mapped = 0;
                     sim_term_start = 0;
@@ -1479,7 +1269,7 @@ impl KvPageTable {
                     sim_mapped = m.start;
                 }
             } else if m.start == 0 {
-                sim_mapped -= m_len; // front truncation
+                sim_mapped -= m_len;
             } else {
                 return Err(KvTableError::SharedInteriorDiscard);
             }
@@ -1520,16 +1310,12 @@ impl KvPageTable {
                 let b = (hi - seg.start) as u64;
                 freed.extend(self.drain_node(seg.node, a, b));
             }
-            // Content below the shallowest affected node shifted; all cached
-            // path hashes at and below it are stale.
             let shallowest = affected.last().expect("nonempty affected").node;
             self.invalidate_subtree(shallowest);
             let entry = self.entry_mut(ws)?;
             entry.mapped_len -= m_len;
             entry.set_page_len(entry.page_len - page_reduction);
         } else if (m.start as i64) >= segs[0].start {
-            // Within the terminal node's contribution: replace the terminal
-            // with a selection excluding the range.
             let t = segs[0].node;
             let a = (m.start as i64 - segs[0].start) as u64;
             let b = (m.end as i64 - segs[0].start) as u64;
@@ -1539,7 +1325,6 @@ impl KvPageTable {
             entry.mapped_len -= m_len;
             entry.set_page_len(entry.page_len - page_reduction);
         } else if m.end == mapped_len {
-            // Tail-reaching above the terminal: move the terminal up.
             let new_terminal = if m.start == 0 {
                 None
             } else {
@@ -1550,8 +1335,6 @@ impl KvPageTable {
             entry.mapped_len = m.start;
             entry.set_page_len(entry.page_len - page_reduction);
         } else if m.start == 0 {
-            // Front-reaching: pure truncation; the anchor shift re-bases all
-            // surviving indexes. Excluded pages stay on the ancestor path.
             let entry = self.entry_mut(ws)?;
             entry.mapped_len -= m_len;
             entry.set_page_len(entry.page_len - page_reduction);
@@ -1562,13 +1345,6 @@ impl KvPageTable {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // Reachability collection and owner compaction
-    // ------------------------------------------------------------------
-
-    /// Mark every node on the parent chain of each anchor (anchors retain
-    /// their whole prefix path; selection owners are parents, so they are
-    /// retained transitively).
     fn mark_chains(&self, anchors: impl IntoIterator<Item = NodeId>) -> HashSet<NodeId> {
         let mut marked: HashSet<NodeId> = HashSet::new();
         for anchor in anchors {
@@ -1583,10 +1359,6 @@ impl KvPageTable {
         marked
     }
 
-    /// Drop cache-root leases on prefixes no WorkingSet terminal or
-    /// in-flight pin reaches — retained only by the lease, so reclaiming
-    /// them loses no work. Returns the number of lease roots dropped; the
-    /// caller runs [`Self::collect`] to free their pages.
     pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
         if self.cache_roots.is_empty() {
             return (0, Vec::new());
@@ -1611,24 +1383,6 @@ impl KvPageTable {
         (dropped.len(), freed)
     }
 
-    /// Batched [`ReclaimQuote`] over several candidate groups, in the caller's
-    /// preference order, stopping once the quoted pages reach `budget`.
-    ///
-    /// The shared exclusions — how many WorkingSets reach each location, which
-    /// locations a cache root anchors, which an in-flight pin holds — are
-    /// computed once for the whole batch, since recomputing the union of
-    /// every other WorkingSet per candidate would be quadratic in the fleet.
-    ///
-    /// `budget` truncates the RESULT, never the census: the returned vector
-    /// may be shorter than `groups`, and a caller that needs an opinion on
-    /// every group passes `u32::MAX`. Quoting is not free (each group costs
-    /// a walk of its own locations plus lookups per location), and the
-    /// eviction picker consumes the list in order until the deficit is
-    /// covered, so stopping at `budget` avoids quoting groups nobody will use.
-    ///
-    /// Advisory by design: a WorkingSet that has vanished contributes no
-    /// locations rather than failing the batch. The authoritative decision is
-    /// still `private_resident_pages` at suspend time.
     pub fn reclaim_quotes(
         &self,
         groups: &[HashSet<WorkingSetId>],
@@ -1636,9 +1390,6 @@ impl KvPageTable {
     ) -> Vec<ReclaimQuote> {
         let mut quotes = Vec::with_capacity(groups.len());
         let mut covered = 0u32;
-        // The group's OWN locations, deduplicated: a chain that walks both a
-        // selection and the parent it selects from yields the same location
-        // twice, and the set collapses that without a counting pass.
         let mut mine: FxHashSet<TriePageLocation> = FxHashSet::default();
         for group in groups {
             if covered >= budget {
@@ -1659,15 +1410,6 @@ impl KvPageTable {
         quotes
     }
 
-    /// One group's quote.
-    ///
-    /// Every question is asked against the group's own locations, never by
-    /// materializing a fleet-wide census first: a census form (`owners[location]`
-    /// over every WorkingSet, plus full `cache_held`/`pinned` unions) is
-    /// O(fleet × depth) and gets paid even when the budget stops after the
-    /// first group. This walks the same data but records only hits inside
-    /// `mine` and stops once every one of them is accounted for — the same
-    /// predicate as the census form, not an approximation of it.
     fn quote_group(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1681,10 +1423,6 @@ impl KvPageTable {
         }
         let shared_ws = match self.locations_shared_outward(working_sets, mine) {
             Ok(shared) => shared,
-            // Unreachable: the walk only visits WorkingSets it enumerated
-            // from this same table. Should it ever fire, "assume shared" is
-            // the safe answer — a quote must never promise pages the suspend
-            // path would then refuse to move.
             Err(_) => return ReclaimQuote::Nothing(NoReclaim::AllShared),
         };
         let cache_held = self.locations_held_by_cache_roots(mine);
@@ -1707,12 +1445,6 @@ impl KvPageTable {
         }
     }
 
-    /// Exact private resident pages reachable by `working_sets`. Sharing
-    /// between members of the set is counted once; pages visible from any
-    /// outside WorkingSet, cache root, or in-flight pin are excluded.
-    ///
-    /// The boolean reports whether an in-flight pin overlaps the target
-    /// residency. Callers defer the whole suspend transaction in that case.
     pub fn private_resident_pages(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1742,8 +1474,6 @@ impl KvPageTable {
         Ok((pages, false))
     }
 
-    /// Private resident pages after this process drains its own fire pins.
-    /// External WorkingSets and cache roots still exclude shared pages.
     pub fn post_drain_private_resident_pages(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1766,15 +1496,6 @@ impl KvPageTable {
             .collect())
     }
 
-    /// Which of `target`'s locations some WorkingSet outside `working_sets`
-    /// also reaches.
-    ///
-    /// Answering "is this location shared" by building the union of every
-    /// other WorkingSet's locations materializes the whole fleet's residency
-    /// — tens of thousands of entries — to test a few dozen. This walks the
-    /// same WorkingSets but only records the target's own locations, so the
-    /// result is bounded by `target` and the walk stops as soon as every
-    /// target location is already known to be shared.
     fn locations_shared_outward(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1800,8 +1521,6 @@ impl KvPageTable {
         Ok(shared)
     }
 
-    /// [`Self::locations_shared_outward`] for cache roots, which retain pages
-    /// independently of any WorkingSet.
     fn locations_held_by_cache_roots(
         &self,
         target: &FxHashSet<TriePageLocation>,
@@ -1823,8 +1542,6 @@ impl KvPageTable {
         held
     }
 
-    /// [`Self::locations_shared_outward`] for in-flight pins, which hold a
-    /// page against any suspend until the owning fire drains.
     fn locations_held_by_pins(
         &self,
         target: &FxHashSet<TriePageLocation>,
@@ -1863,16 +1580,6 @@ impl KvPageTable {
             .collect())
     }
 
-    /// Every page this group holds — resident AND swapped, pinned or not,
-    /// shared or not.
-    ///
-    /// This is the durable fact, deliberately not a [`ReclaimQuote`]: a quote
-    /// answers "what would suspending free right now", which collapses to
-    /// zero the instant a pin or a sharer appears. Liveness predicates need
-    /// the other question — how much of the pool this process occupies that
-    /// evicting everyone else cannot recover — so they must use this, not a
-    /// quote. Shared pages count: a sharer releasing doesn't free the page
-    /// while this group still references it.
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
         let mut locations = HashSet::new();
         for &ws in working_sets {
@@ -1923,8 +1630,6 @@ impl KvPageTable {
         self.swap_locations.contains_key(&location)
     }
 
-    /// Mark the exact locations a swap transaction is replacing; overlapping
-    /// transactions stack (counted).
     pub fn pin_swap_locations<I: IntoIterator<Item = TriePageLocation>>(&mut self, locations: I) {
         for location in locations {
             *self.swap_locations.entry(location).or_insert(0) += 1;
@@ -2006,15 +1711,6 @@ impl KvPageTable {
         Ok(locations)
     }
 
-    /// Feed `visit` every published location of `ws`, without materializing a
-    /// set for it — the fleet-wide censuses call this once per WorkingSet
-    /// while holding the global KV mutex, so a per-call allocation there
-    /// would be paid inside that critical section for every WorkingSet.
-    ///
-    /// Locations are NOT deduplicated: a chain that walks both a
-    /// `ParentSelection` and the parent it selects from yields the parent's
-    /// location twice. Callers that count owners must dedupe per WorkingSet;
-    /// callers that only test membership need not.
     fn visit_working_set_locations(
         &self,
         ws: WorkingSetId,
@@ -2038,8 +1734,6 @@ impl KvPageTable {
         locations
     }
 
-    /// [`Self::visit_working_set_locations`] for a retention anchor (a cache
-    /// root or an in-flight pin). Same rationale, same no-dedup contract.
     fn visit_anchor_locations(&self, terminal: NodeId, mut visit: impl FnMut(TriePageLocation)) {
         let mut cursor = Some(terminal);
         while let Some(node) = cursor {
@@ -2099,7 +1793,7 @@ impl KvPageTable {
             Pages::ParentSelection { .. } => unreachable!("checked owned"),
         };
         if kept.len() == backings.len() {
-            return Vec::new(); // full-coverage selection: nothing to free
+            return Vec::new();
         }
 
         let keep_set: HashSet<u32> = kept.iter().copied().collect();
@@ -2120,7 +1814,7 @@ impl KvPageTable {
         *backings = new_backings;
         *token_hashes = new_tokens;
         *page_hashes = new_pages;
-        node.cached_path_hash = None; // full contribution changed (unobserved)
+        node.cached_path_hash = None;
 
         let kept_len = kept.len() as u32;
         match &mut self.nodes.get_mut(sole_child).expect("live child").pages {
@@ -2130,13 +1824,7 @@ impl KvPageTable {
         freed
     }
 
-    // ------------------------------------------------------------------
-    // Internal: path hashes
-    // ------------------------------------------------------------------
-
     fn node_path_hash(&mut self, node: NodeId) -> Option<Hash256> {
-        // Collect the uncached chain (terminal-ward to root-ward), then fold
-        // forward. Iterative to keep deep paths off the call stack.
         let mut chain = Vec::new();
         let mut base: Option<Hash256> = None;
         let mut cursor = Some(node);
@@ -2159,7 +1847,6 @@ impl KvPageTable {
         acc
     }
 
-    /// The node's contribution as page hashes; `None` if any is invalid.
     fn contribution_page_hashes(&self, node: NodeId) -> Option<Vec<Hash256>> {
         let n = self.nodes.get(node).expect("live node");
         match &n.pages {
@@ -2179,15 +1866,10 @@ impl KvPageTable {
     }
 }
 
-// ----------------------------------------------------------------------
-// Runs helpers (selection-space arithmetic over ordered ranges)
-// ----------------------------------------------------------------------
-
 fn runs_len(runs: &Runs) -> u64 {
     runs.iter().map(|r| (r.end - r.start) as u64).sum()
 }
 
-/// Owner index of selection-space offset `i`.
 fn runs_offset(runs: &Runs, mut i: u64) -> u32 {
     for r in runs {
         let len = (r.end - r.start) as u64;
@@ -2199,7 +1881,6 @@ fn runs_offset(runs: &Runs, mut i: u64) -> u32 {
     unreachable!("offset within runs");
 }
 
-/// Selection-space slice `[sel.start, sel.end)` of `runs`.
 fn runs_slice(runs: &Runs, sel: Range<u64>) -> Runs {
     let mut out: Runs = SmallVec::new();
     let mut pos: u64 = 0;
@@ -2217,7 +1898,6 @@ fn runs_slice(runs: &Runs, sel: Range<u64>) -> Runs {
     out
 }
 
-/// `runs` with selection-space `[a, b)` removed.
 fn runs_remove(runs: &Runs, a: u64, b: u64) -> Runs {
     let total = runs_len(runs);
     let mut out = runs_slice(runs, 0..a);

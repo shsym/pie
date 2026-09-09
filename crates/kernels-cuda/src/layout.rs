@@ -1,7 +1,3 @@
-//! `Layout`: gathers, cuts, and slices — data movement with no arithmetic.
-//! One entry per IR variant. The embed gather picks its vectorised
-//! instantiation from alignment alone; that choice never leaves this file.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -19,7 +15,6 @@ const WARP: u32 = 32;
 
 const VEC_WIDTH: u32 = 8;
 
-/// One block per row, sized to the row in whole warps.
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;
 
@@ -33,7 +28,6 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     )
 }
 
-/// Whether the embed gather may move eight elements at a time.
 fn vectorisable(hidden: u32, table: u64, y: u64) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(table) && aligned16(y)
 }
@@ -77,29 +71,11 @@ pub fn embed(
             vocab.arg(),
             rows.arg(),
             stated(OP, per_row)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// [`embed`] over a VOCAB-BANDED table: `y[r] = table[ids[r] - offset]` where
-/// the id falls in this rank's band, zeros where it does not.
-///
-/// **THE CALLER MUST `collective::all_reduce` THE RESULT.** Each rank lands
-/// only its band, so the sum across ranks is the whole embedded row, and the
-/// zeros are what make that sum exact rather than an average.
-///
-/// The band is read off the COMMUNICATOR, not the trace: traces are SPMD and
-/// carry no rank, while the loader has already landed rows
-/// `[rank * table.rows, (rank + 1) * table.rows)`. So the rank the collectives
-/// agree on is the rank the gather bands by, and the two cannot drift.
-///
-/// # Errors
-///
-/// [`Error::Refused`] on a context with no communicator (a single rank has
-/// nothing to band), a dtype outside the lattice, or a refused launch.
 pub fn embed_vocab_shard(
     ctx: &Ctx,
     ids: Tensor,
@@ -137,7 +113,6 @@ pub fn embed_vocab_shard(
                 hidden.arg(),
                 stated(OP, local)?.arg(),
                 stated(OP, rank.saturating_mul(local))?.arg(),
-                // The staged-geometry seat, as `embed` passes it.
                 ctx.stage(),
             ],
         )
@@ -149,18 +124,6 @@ pub fn embed_vocab_shard(
     }
 }
 
-/// The permute a width-concatenating gather needs: `src` holds
-/// `[world][rows][shard]` — each rank's whole rectangle, one after the other,
-/// which is what `ncclAllGather` lands — and `y` takes `[rows, world * shard]`,
-/// each rank's columns joined into every row, which is what the IR declares.
-///
-/// Only `collective::all_gather` calls this, and only above one row: at one
-/// row the two layouts are already the same buffer.
-///
-/// # Errors
-///
-/// [`Error::Refused`] for a `y` that is not `world` shards wide, or a launch
-/// the runtime refused.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn gather_width_concat(
     ctx: &Ctx,
@@ -200,9 +163,6 @@ pub(crate) fn gather_width_concat(
     )
 }
 
-/// `e = table[ids]`, `e_scaled = e * embed_scale`, `y += e_scaled` in place,
-/// `y_scaled = y * out_scale`: what [`embed`], `mul_scalar`, `residual_add`
-/// and `mul_scalar` land, one launch.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_scale_add(
     ctx: &Ctx,
@@ -245,21 +205,11 @@ pub fn embed_scale_add(
             hidden.arg(),
             vocab.arg(),
             rows.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// [`embed_scale_add`] whose residual is layer `layer`'s `width`-wide slice
-/// of the stacked table `stacked` (the `select` folded away), landing the
-/// folded row in `y_out`.
-///
-/// # Errors
-///
-/// [`Error::Refused`] for a slice past the stacked table or a width other
-/// than the embedded row's, or a launch the runtime refused.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_scale_add_select(
     ctx: &Ctx,
@@ -326,8 +276,6 @@ pub fn embed_scale_add_select(
             hidden.arg(),
             vocab.arg(),
             rows.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -357,9 +305,6 @@ pub fn split_qkv(
     let width = q.width.max(k.width);
     ctx.fire(
         OP,
-        // Rows on `grid.x`, width tiles on `grid.y`: `y` caps at 65535 and a
-        // video fire is taller than that (`split_rows` was moved for this
-        // reason and this one was not).
         Fire::at(FILE, "::pie::layout::split_qkv<::pie::bf16>").apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -371,14 +316,11 @@ pub fn split_qkv(
             v.arg(),
             q_dim.arg(),
             kv_dim.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Deinterleaves per-head `(q, gate)` pairs from the packed projection.
 pub fn split_q_gate(
     ctx: &Ctx,
     packed: Tensor,
@@ -411,14 +353,11 @@ pub fn split_q_gate(
             stated(OP, q.rows)?.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Splits each row at column `width`.
 pub fn split_rows(
     ctx: &Ctx,
     x: Tensor,
@@ -427,8 +366,6 @@ pub fn split_rows(
     right: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
-    // f32 rows (a lane vector's modulation slices) take the scalar path: the
-    // vector kernel moves eight bf16 per thread and is sized for that width.
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
     debug_assert_eq!(
         left.width, width,
@@ -450,12 +387,6 @@ pub fn split_rows(
     let (entrypoint, launch) = if vectors {
         (
             "::pie::layout::split_rows_vec8<::pie::bf16>".to_string(),
-            // Rows on `grid.x`, column tiles on `grid.y`. `gridDim.y` is
-            // capped at 65535 on every compute capability; rows are not
-            // bounded by anything but the fire (a 65536-token ceiling, a
-            // VAE's voxel rectangle), so they take the wide axis. The seat
-            // semantics are unchanged: the kernel still retires a replay's
-            // padded rows off `win[0]` and shifts by `win[1]`.
             Launch::grid(
                 [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
                 [BLOCK, 1, 1],
@@ -476,14 +407,11 @@ pub fn split_rows(
             right.arg(),
             left_dim.arg(),
             right_dim.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// Copies layer `layer`'s `width`-wide slice out of a stacked table.
 pub fn select(
     ctx: &Ctx,
     table: Tensor,
@@ -526,18 +454,11 @@ pub fn select(
             stated(OP, table.width)?.arg(),
             stated(OP, offset)?.arg(),
             stated(OP, width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The copy unit a row of `bytes` bytes at `a` and `b` may move in, and the
-/// template argument that names it. Width is an optimization, not part of
-/// the contract: a 16-byte unit when both addresses and the row's width
-/// admit one, a 4-byte unit when they admit that, a byte otherwise. No
-/// arithmetic or dtype in the kernel, so any element type moves unrounded.
 fn unit(bytes: u64, a: u64, b: u64) -> (&'static str, u64) {
     if bytes.is_multiple_of(16) && aligned16(a) && aligned16(b) {
         ("::int4", 16)
@@ -548,7 +469,6 @@ fn unit(bytes: u64, a: u64, b: u64) -> (&'static str, u64) {
     }
 }
 
-/// How wide one row of this handle is, in bytes.
 fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, Error> {
     let elem = match handle.dtype {
         Dtype::Bf16 | Dtype::F16 => 2,
@@ -559,12 +479,6 @@ fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, Error> {
     Ok(u64::from(handle.width) * elem)
 }
 
-/// The two halves of one `Fallback::Copy`, which differ only in which way the
-/// index is read — so they are one body, and the pair cannot drift apart into
-/// a gather and a scatter that disagree about what the map means.
-///
-/// The row map is a fire table the shell assembles; no op names it, so its
-/// dtype is refused here rather than checked by a trace-time validator.
 fn move_rows(
     ctx: &Ctx,
     op: &'static str,
@@ -616,21 +530,6 @@ fn move_rows(
     )
 }
 
-/// Gather: the rows a fragmented window covers, laid down as one.
-/// `Fallback::Copy`'s first half. A windowed consumer cannot seat stands
-/// over several intervals of the fire's rows, so this reads them out of
-/// `wide` in the order `index` names and writes them contiguously into
-/// `tight` — one launch over a rectangle rather than one per interval.
-///
-/// `index` is `i32`, one entry per row of `tight`: the fire row that row
-/// stands at (the caller's span list flattened). This entry checks the
-/// shapes agree and moves bytes.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for a packed element with no byte size,
-/// and a refusal for an index vector or a rectangle that does not match the
-/// one beside it.
 pub fn gather_rows(
     ctx: &Ctx,
     wide: Tensor,
@@ -649,14 +548,6 @@ pub fn gather_rows(
     )
 }
 
-/// Scatter: the answers put back where their rows came from.
-/// `Fallback::Copy`'s second half, the same map as [`gather_rows`] read the
-/// other way: row `i` of `tight` lands at fire row `index[i]` of `wide`.
-/// Rows the window does not cover are not written.
-///
-/// # Errors
-///
-/// As [`gather_rows`].
 pub fn scatter_rows(
     ctx: &Ctx,
     tight: Tensor,
@@ -675,10 +566,6 @@ pub fn scatter_rows(
     )
 }
 
-/// The two seated halves of a row permutation, which differ only in which
-/// side of the copy the map indexes — so they are one body, and the pair
-/// cannot drift into a pack and an unpack that disagree about what the
-/// permutation means.
 fn permute_rows(
     ctx: &Ctx,
     op: &'static str,
@@ -728,8 +615,6 @@ fn permute_rows(
             perm.arg(),
             o.arg(),
             stated(op, per_row)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -739,9 +624,6 @@ const TOPK_FILE: &str = "layout/topk.cuh";
 
 const TOPK_THREADS: u32 = 128;
 
-/// `y[row, column] = argmax_c x[row, c]` — one column of an i32 plane, ties
-/// to the LOWEST column and a NaN never chosen (the epilogue's rule). What a
-/// draft chain feeds itself between its steps.
 pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "layout.argmax";
     const THREADS: u32 = 1024;
@@ -771,41 +653,14 @@ pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), E
     )
 }
 
-/// Pack: `o[i] = x[perm[i]]`. The joint sequence a DiT attends over, laid
-/// down out of the streams it is built from.
-///
-/// Any element type whose row has a byte size moves: the kernel is a copy
-/// unit and no arithmetic, so nothing is rounded or promoted on the way. The
-/// unit is the widest of 16, 4 and 1 bytes the row's width and both addresses
-/// admit — a row that is a whole number of 16-byte units on aligned planes
-/// moves as `int4`.
-///
-/// The seated twin of [`gather_rows`], which serves the host's own window
-/// copies and reads no seat.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for a packed element with no byte size, and a
-/// refusal for a permutation that is not one i32 per moved row, a rectangle
-/// that does not match the one beside it, or a zero-row launch.
 pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
     permute_rows(ctx, "layout.pack_rows", "pack_rows", x, perm, o)
 }
 
-/// Unpack: `o[perm[i]] = x[i]` — [`pack_rows`]'s map read the other way, so
-/// the pair round-trips a rectangle exactly. Rows the permutation does not
-/// name are not written.
-///
-/// # Errors
-///
-/// As [`pack_rows`].
 pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
     permute_rows(ctx, "layout.unpack_rows", "unpack_rows", x, perm, o)
 }
 
-/// The `k` largest entries of every row of `x`, sorted descending, ties to
-/// the LOWER column and a NaN never chosen: `values` `[rows, k]` f32 and
-/// `indices` `[rows, k]` i32. Stamped for bf16 and f32 rows at k = 8 and 16.
 pub fn topk(
     ctx: &Ctx,
     x: Tensor,

@@ -1,43 +1,3 @@
-//! H.264 through NVENC, reached by `dlopen` — no link-time dependency, no
-//! `cc`, no ffmpeg.
-//!
-//! `libnvidia-encode.so.1` ships with the NVIDIA driver, so the encoder is
-//! already on any machine that can run the models whose pixels it encodes.
-//! This module opens it the way cudarc opens every CUDA library — by name at
-//! run time, with a clear refusal when it is absent — and hand-declares the
-//! slice of `nvEncodeAPI.h` it uses.
-//!
-//! ## The layout contract
-//!
-//! Every struct below is `repr(C)` and carries a `const` assertion on its
-//! size, checked against NVENCAPI 13.1 (`nv-codec-headers`). NVENC's structs
-//! are size-stable within a major version — new fields are carved out of the
-//! trailing `reserved` arrays, never appended — so the assertions are the
-//! thing that would break if that ever stopped being true, at compile time,
-//! rather than a garbled frame at run time.
-//!
-//! Fields this module never sets are collapsed into `tail: [u32; N]` arrays
-//! sized so the total matches. That is deliberate: naming a field we do not
-//! write is a claim about its meaning that nothing here checks. The offsets
-//! that ARE named were read off the header. Every declaration carries
-//! `#[allow(dead_code)]` for the same reason: these fields exist for the
-//! driver to read, not for this file.
-//!
-//! ## The encode
-//!
-//! One session per call, `NV_ENC_DEVICE_TYPE_CUDA` over the primary context of
-//! the chosen device. Input surfaces are `NvEncCreateInputBuffer` system-memory
-//! buffers: the RGB -> NV12 transform runs on the host ([`super::color`]) and
-//! the driver DMAs the result. design.md D11 wants the frames encoded from
-//! device memory once the VAE writes them there; that is a `NvEncRegisterResource`
-//! over a `CUdeviceptr` and it changes this file only, which is why the seam
-//! is `FrameStore` and not this module's signature.
-//!
-//! Preset P4, tuning HIGH_QUALITY, VBR. **B-frames and lookahead are turned
-//! off explicitly** (`frameIntervalP = 1`, `enableLookahead = 0`,
-//! `zeroReorderDelay = 1`): decode order is then presentation order, which is
-//! the other half of [`super::mp4`]'s decision to write no `ctts`.
-
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -46,37 +6,25 @@ use libloading::Library;
 use super::color::rgb8_to_nv12_pitched;
 use super::y4m::frame_rate;
 
-// -- version arithmetic -------------------------------------------------------
-
-/// The major API version this file's struct layouts were transcribed from.
 const API_MAJOR: u32 = 13;
-/// The minor version. Requested only when the driver supports at least it;
-/// otherwise the request drops to `.0`, whose layouts are identical.
 const API_MINOR_MAX: u32 = 1;
 
-/// `NVENCAPI_VERSION`: major in the low byte, minor in bits 24+.
 const fn api_version(major: u32, minor: u32) -> u32 {
     major | (minor << 24)
 }
 
-/// `NVENCAPI_STRUCT_VERSION(ver)`.
 const fn struct_version(api: u32, ver: u32) -> u32 {
     api | (ver << 16) | (0x7 << 28)
 }
 
-/// The five structs whose header spells `| (1u << 31)` after the macro.
 const fn struct_version_ex(api: u32, ver: u32) -> u32 {
     struct_version(api, ver) | (1 << 31)
 }
-
-// -- status -------------------------------------------------------------------
 
 type Status = c_int;
 const NV_ENC_SUCCESS: Status = 0;
 const NV_ENC_ERR_NEED_MORE_INPUT: Status = 17;
 
-/// The enumerator names, in declaration order, so a failure reads as the
-/// header's own word rather than a number.
 const STATUS_NAMES: [&str; 27] = [
     "SUCCESS",
     "NO_ENCODE_DEVICE",
@@ -111,9 +59,7 @@ fn status_name(s: Status) -> &'static str {
     STATUS_NAMES.get(s as usize).copied().unwrap_or("UNKNOWN")
 }
 
-// -- the slice of nvEncodeAPI.h this file uses -------------------------------
-
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Guid {
@@ -123,21 +69,18 @@ struct Guid {
     data4: [u8; 8],
 }
 
-/// `{6BC82762-4E63-4CA4-AA85-1E50F321F6BF}`
 const H264_GUID: Guid = Guid {
     data1: 0x6bc8_2762,
     data2: 0x4e63,
     data3: 0x4ca4,
     data4: [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf],
 };
-/// `{90A7B826-DF06-4862-B9D2-CD6D73A08681}` — preset P4, the balance point.
 const PRESET_P4_GUID: Guid = Guid {
     data1: 0x90a7_b826,
     data2: 0xdf06,
     data3: 0x4862,
     data4: [0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81],
 };
-/// `{E7CBC309-4F7A-4B89-AF2A-D537C92BE310}` — H.264 High.
 const H264_PROFILE_HIGH_GUID: Guid = Guid {
     data1: 0xe7cb_c309,
     data2: 0x4f7a,
@@ -145,10 +88,6 @@ const H264_PROFILE_HIGH_GUID: Guid = Guid {
     data4: [0xaf, 0x2a, 0xd5, 0x37, 0xc9, 0x2b, 0xe3, 0x10],
 };
 
-/// NVENC's own floor for H.264, measured on driver 595 and matching the SDK's
-/// documented 145x49 minimum. The driver's refusal below it says "Frame
-/// Dimension less than the minimum supported value" without saying what the
-/// minimum is, so this catches it first and names the number.
 const MIN_WIDTH: u32 = 145;
 const MIN_HEIGHT: u32 = 49;
 
@@ -160,10 +99,7 @@ const NV_ENC_PIC_FLAG_EOS: u32 = 0x8;
 const NV_ENC_TUNING_INFO_HIGH_QUALITY: u32 = 1;
 const NV_ENC_PARAMS_RC_VBR: u32 = 1;
 
-/// `NV_ENC_RC_PARAMS`. Only the first six words are named; `tail` is the
-/// QP tables, AQ knobs and reserved space the preset fills and this file
-/// leaves as it found them.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RcParams {
@@ -174,8 +110,6 @@ struct RcParams {
     max_bitrate: u32,
     vbv_buffer_size: u32,
     vbv_initial_delay: u32,
-    /// The `enableMinQP .. reservedBitFields` bitfield word. Bit 5 is
-    /// `enableLookahead`, bit 9 `zeroReorderDelay`, bit 16 `enableExtLookahead`.
     flags: u32,
     tail: [u32; 22],
 }
@@ -183,12 +117,8 @@ const _: () = assert!(size_of::<RcParams>() == 128);
 const RC_FLAG_LOOKAHEAD: u32 = 1 << 5;
 const RC_FLAG_ZERO_REORDER_DELAY: u32 = 1 << 9;
 const RC_FLAG_EXT_LOOKAHEAD: u32 = 1 << 16;
-// `lookaheadDepth` is a u16 at byte 90 of the same struct. Zeroing it is done
-// through `Config::disable_reordering`, which writes the whole word it sits
-// in, so the offset arithmetic is stated there rather than here.
 
-/// `NV_ENC_CONFIG`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Config {
@@ -200,8 +130,6 @@ struct Config {
     frame_field_mode: u32,
     mv_precision: u32,
     rc_params: RcParams,
-    /// `NV_ENC_CODEC_CONFIG` — 1792 bytes of codec union, filled by the
-    /// preset query and passed back untouched.
     codec_config: [u32; 448],
     reserved: [u32; 278],
     reserved2: [*mut c_void; 64],
@@ -209,24 +137,15 @@ struct Config {
 const _: () = assert!(size_of::<Config>() == 3584);
 
 impl Config {
-    /// Turn off every source of picture reordering, so decode order equals
-    /// presentation order and the muxer needs no `ctts`.
     fn disable_reordering(&mut self) {
         self.frame_interval_p = 1;
         self.rc_params.flags &= !(RC_FLAG_LOOKAHEAD | RC_FLAG_EXT_LOOKAHEAD);
         self.rc_params.flags |= RC_FLAG_ZERO_REORDER_DELAY;
-        // `lookaheadDepth`: a u16 at offset 90 of NV_ENC_RC_PARAMS, i.e. the
-        // high half of `tail[12]` (tail starts at offset 40, so 90 = 40 + 50,
-        // word 12 covers 88..92). Clearing the whole word also clears
-        // `targetQuality`/`targetQualityLSB` at 88..90, which is right: VBR
-        // with a target quality is a different rate control than the bitrate
-        // this file asks for.
         self.rc_params.tail[12] = 0;
     }
 }
 
-/// `NV_ENC_PRESET_CONFIG`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PresetConfig {
@@ -238,8 +157,7 @@ struct PresetConfig {
 }
 const _: () = assert!(size_of::<PresetConfig>() == 5128);
 
-/// `NV_ENC_INITIALIZE_PARAMS`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct InitializeParams {
     version: u32,
@@ -253,7 +171,6 @@ struct InitializeParams {
     frame_rate_den: u32,
     enable_encode_async: u32,
     enable_ptd: u32,
-    /// `reportSliceOffsets .. reservedBitFields`, all zero here.
     flags: u32,
     priv_data_size: u32,
     reserved: u32,
@@ -261,7 +178,6 @@ struct InitializeParams {
     encode_config: *mut Config,
     max_encode_width: u32,
     max_encode_height: u32,
-    /// `maxMEHintCountsPerBlock[2]`, 16 bytes each.
     max_me_hint_counts: [u32; 8],
     tuning_info: u32,
     buffer_format: u32,
@@ -272,8 +188,7 @@ struct InitializeParams {
 }
 const _: () = assert!(size_of::<InitializeParams>() == 1800);
 
-/// `NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct OpenSessionExParams {
     version: u32,
@@ -286,8 +201,7 @@ struct OpenSessionExParams {
 }
 const _: () = assert!(size_of::<OpenSessionExParams>() == 1552);
 
-/// `NV_ENC_CREATE_INPUT_BUFFER`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct CreateInputBuffer {
     version: u32,
@@ -303,8 +217,7 @@ struct CreateInputBuffer {
 }
 const _: () = assert!(size_of::<CreateInputBuffer>() == 776);
 
-/// `NV_ENC_CREATE_BITSTREAM_BUFFER`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct CreateBitstreamBuffer {
     version: u32,
@@ -318,8 +231,7 @@ struct CreateBitstreamBuffer {
 }
 const _: () = assert!(size_of::<CreateBitstreamBuffer>() == 776);
 
-/// `NV_ENC_LOCK_INPUT_BUFFER`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct LockInputBuffer {
     version: u32,
@@ -332,9 +244,7 @@ struct LockInputBuffer {
 }
 const _: () = assert!(size_of::<LockInputBuffer>() == 1544);
 
-/// `NV_ENC_LOCK_BITSTREAM`. Named through `bitstream_buffer_ptr`; everything
-/// past it is per-frame statistics this file does not read.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct LockBitstream {
     version: u32,
@@ -352,8 +262,7 @@ struct LockBitstream {
 }
 const _: () = assert!(size_of::<LockBitstream>() == 1544);
 
-/// `NV_ENC_PIC_PARAMS`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct PicParams {
     version: u32,
@@ -370,15 +279,11 @@ struct PicParams {
     buffer_fmt: u32,
     picture_struct: u32,
     picture_type: u32,
-    /// Four bytes of padding before the 8-aligned `codecPicParams`, then the
-    /// 1544-byte union, then everything after it — all zero here, so the
-    /// array's own alignment need not reproduce the union's.
     tail: [u32; 821],
 }
 const _: () = assert!(size_of::<PicParams>() == 3360);
 
-/// `NV_ENC_SEQUENCE_PARAM_PAYLOAD`.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct SequenceParamPayload {
     version: u32,
@@ -395,9 +300,7 @@ const _: () = assert!(size_of::<SequenceParamPayload>() == 1544);
 type Fn1<T> = Option<unsafe extern "C" fn(*mut c_void, *mut T) -> Status>;
 type FnPtr = Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> Status>;
 
-/// `NV_ENCODE_API_FUNCTION_LIST`. The entries this file never calls are held
-/// as opaque `*mut c_void` so nothing can call them by accident.
-#[allow(dead_code)] // driver-facing: written for the ABI, mostly never read
+#[allow(dead_code)]
 #[repr(C)]
 struct FunctionList {
     version: u32,
@@ -451,31 +354,18 @@ struct FunctionList {
 }
 const _: () = assert!(size_of::<FunctionList>() == 2552);
 
-// -- loading ------------------------------------------------------------------
-
-/// The library plus the dispatch table it handed back. Leaked for the life of
-/// the process: the driver's function pointers must outlive every session, and
-/// a runtime that has encoded once will encode again.
 struct Api {
-    #[allow(dead_code)] // kept alive so the pointers below stay valid
+    #[allow(dead_code)]
     lib: Library,
     list: FunctionList,
     api_version: u32,
 }
 
-// The dispatch table is immutable after load and every entry is a driver
-// function that takes its own encoder handle; the `Library` is only held to
-// keep the mapping alive.
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
-/// The one shared load. `Err` is cached too: a machine with no encoder should
-/// not pay a failing `dlopen` per request.
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
-/// The library's SONAME. `.so.1` rather than `.so`: the unversioned symlink is
-/// part of the `-dev` package and is absent on a plain driver install, which
-/// is exactly the machine this has to work on.
 const SONAME: &str = "libnvidia-encode.so.1";
 
 fn load() -> Result<&'static Api, String> {
@@ -510,8 +400,6 @@ fn load() -> Result<&'static Api, String> {
             (v, *create)
         };
 
-        // The driver answers `(major << 4) | minor`, which is NOT the layout
-        // of `NVENCAPI_VERSION` — that one is `major | (minor << 24)`.
         let (drv_major, drv_minor) = ((max_version >> 4) & 0xff, max_version & 0xf);
         if drv_major < API_MAJOR {
             return Err(format!(
@@ -519,7 +407,6 @@ fn load() -> Result<&'static Api, String> {
                  and this build speaks {API_MAJOR}.x; upgrade the driver"
             ));
         }
-        // Ask for the newest layout-compatible version the driver admits.
         let minor = if drv_major > API_MAJOR {
             API_MINOR_MAX
         } else {
@@ -548,9 +435,6 @@ fn load() -> Result<&'static Api, String> {
     .map_err(|e| e.clone())
 }
 
-// -- the session --------------------------------------------------------------
-
-/// An open encode session, closed on drop even if the encode fails partway.
 struct Session {
     api: &'static Api,
     encoder: *mut c_void,
@@ -583,7 +467,6 @@ impl Drop for Session {
 }
 
 impl Session {
-    /// The driver's own words for the last failure, when it has any.
     fn last_error(&self) -> String {
         let Some(f) = self.api.list.get_last_error_string else {
             return String::new();
@@ -612,17 +495,12 @@ impl Session {
         }
     }
 
-    /// The session's SPS + PPS as an Annex-B byte string, asked for rather
-    /// than scavenged from the first picture: a configuration that suppresses
-    /// in-band parameter sets would otherwise yield a file no decoder can
-    /// configure itself from, and the failure would look like a muxer bug.
     fn sequence_header(&self) -> Result<Vec<u8>, String> {
         let get = self
             .api
             .list
             .get_sequence_params
             .ok_or("NVENC exposes no nvEncGetSequenceParams")?;
-        // `NV_MAX_SEQ_HDR_LEN`.
         let mut buf = vec![0u8; 512];
         let mut written: u32 = 0;
         let mut p: SequenceParamPayload = unsafe { std::mem::zeroed() };
@@ -640,16 +518,8 @@ impl Session {
     }
 }
 
-/// How many input/output buffer pairs to keep. With reordering off the
-/// encoder returns a picture per submission and only one is ever in flight;
-/// the depth is slack against a driver that buffers anyway, and running out
-/// of it is reported rather than papered over.
 const POOL: usize = 8;
 
-/// Encode `count` interleaved-RGB8 frames as H.264, returning one Annex-B
-/// byte string per coded picture, in presentation order.
-///
-/// `device` is the CUDA ordinal whose primary context the session opens on.
 pub fn encode_h264(
     rgb: &[u8],
     width: u32,
@@ -683,9 +553,6 @@ pub fn encode_h264(
 
     let api = load()?;
 
-    // The CUDA context. `CudaContext::new` retains the device's PRIMARY
-    // context, so this is the same context the engine's own allocations live
-    // in rather than a second one competing for the card.
     let ctx = cudarc::driver::CudaContext::new(device)
         .map_err(|e| format!("mp4-h264: no CUDA context on device {device}: {e}"))?;
     ctx.bind_to_thread()
@@ -717,7 +584,6 @@ pub fn encode_h264(
         outputs: Vec::new(),
     };
 
-    // -- configure
     let mut preset: PresetConfig = unsafe { std::mem::zeroed() };
     preset.version = struct_version_ex(api.api_version, 5);
     preset.preset_cfg.version = struct_version_ex(api.api_version, 9);
@@ -742,13 +608,10 @@ pub fn encode_h264(
     let mut config = preset.preset_cfg;
     config.version = struct_version_ex(api.api_version, 9);
     config.profile_guid = H264_PROFILE_HIGH_GUID;
-    // One IDR every two seconds, and never fewer than one: a seekable clip
-    // without a keyframe per frame.
     config.gop_length = ((rate_num as u64 * 2 / rate_den.max(1) as u64) as u32).clamp(1, 250);
     config.disable_reordering();
     config.rc_params.version = struct_version(api.api_version, 1);
     config.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_VBR;
-    // ~0.1 bits per pixel per frame, floored so a thumbnail is not starved.
     let bitrate = ((w as u64 * h as u64 * rate_num as u64 / rate_den.max(1) as u64) / 10)
         .clamp(200_000, 60_000_000) as u32;
     config.rc_params.average_bitrate = bitrate;
@@ -764,7 +627,7 @@ pub fn encode_h264(
     init.dar_height = height;
     init.frame_rate_num = rate_num;
     init.frame_rate_den = rate_den;
-    init.enable_ptd = 1; // the encoder decides picture types
+    init.enable_ptd = 1;
     init.encode_config = &mut config;
     init.max_encode_width = width;
     init.max_encode_height = height;
@@ -778,7 +641,6 @@ pub fn encode_h264(
     let s = unsafe { initialize(encoder, &mut init) };
     session.check(s, "nvEncInitializeEncoder")?;
 
-    // -- buffers
     let depth = POOL.min(n);
     let create_input = api
         .list
@@ -819,7 +681,6 @@ pub fn encode_h264(
     let lock_bs = api.list.lock_bitstream.ok_or("no nvEncLockBitstream")?;
     let unlock_bs = api.list.unlock_bitstream.ok_or("no nvEncUnlockBitstream")?;
 
-    /// Copy one finished picture out of its bitstream buffer.
     fn drain(
         session: &Session,
         slot: usize,
@@ -865,8 +726,6 @@ pub fn encode_h264(
         }
         let slot = frame % depth;
 
-        // Fill the input surface: lock, transform RGB -> NV12 straight into
-        // the driver's pitched memory, unlock.
         let mut lib_: LockInputBuffer = unsafe { std::mem::zeroed() };
         lib_.version = struct_version(api.api_version, 1);
         lib_.input_buffer = session.inputs[slot];
@@ -907,7 +766,7 @@ pub fn encode_h264(
         pp.output_bitstream = session.outputs[slot];
         pp.buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
         pp.picture_struct = NV_ENC_PIC_STRUCT_FRAME;
-        pp.picture_type = NV_ENC_PIC_TYPE_UNKNOWN; // enablePTD decides
+        pp.picture_type = NV_ENC_PIC_TYPE_UNKNOWN;
         // SAFETY: every pointer in `pp` is a live buffer of this session.
         let s = unsafe { encode(encoder, &mut pp) };
         queued.push(slot);
@@ -924,7 +783,6 @@ pub fn encode_h264(
         }
     }
 
-    // End of stream: flushes anything the encoder still holds.
     let mut eos: PicParams = unsafe { std::mem::zeroed() };
     eos.version = struct_version_ex(api.api_version, 7);
     eos.encode_pic_flags = NV_ENC_PIC_FLAG_EOS;
@@ -942,10 +800,6 @@ pub fn encode_h264(
         ));
     }
 
-    // Make sure the parameter sets are somewhere the muxer can find them.
-    // NVENC writes them in-band ahead of each IDR by default; when a driver
-    // or preset does not, this puts the session's own header in front of the
-    // first picture, where `mp4::sample_from_annexb` lifts it into `avcC`.
     let has_sps = super::mp4::nal_units(&pictures[0])
         .iter()
         .any(|nal| nal[0] & 0x1f == 7);
@@ -961,10 +815,12 @@ pub fn encode_h264(
 mod tests {
     use super::*;
 
-    /// Nothing here touches the GPU: the claim is that the transcribed
-    /// layouts still match the header they were read from, which is what the
-    /// `const` assertions above already enforce at compile time. This test
-    /// exists so a `cargo test` on a GPU-less machine still says so out loud.
+    fn nvenc_every_case() {
+        the_struct_layouts_match_the_header();
+        the_version_words_are_the_headers_macros();
+        reordering_is_off_after_configuring();
+    }
+
     #[test]
     fn the_struct_layouts_match_the_header() {
         assert_eq!(size_of::<Guid>(), 16);
@@ -974,13 +830,11 @@ mod tests {
         assert_eq!(size_of::<InitializeParams>(), 1800);
         assert_eq!(size_of::<PicParams>(), 3360);
         assert_eq!(size_of::<FunctionList>(), 2552);
-        // The two offsets this file reads by hand rather than by name.
         assert_eq!(std::mem::offset_of!(Config, rc_params), 40);
         assert_eq!(std::mem::offset_of!(Config, codec_config), 168);
         assert_eq!(std::mem::offset_of!(RcParams, tail), 40);
     }
 
-    #[test]
     fn the_version_words_are_the_headers_macros() {
         let api = api_version(13, 1);
         assert_eq!(api, 0x0100_000d);
@@ -997,7 +851,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn reordering_is_off_after_configuring() {
         let mut c: Config = unsafe { std::mem::zeroed() };
         c.frame_interval_p = 3;

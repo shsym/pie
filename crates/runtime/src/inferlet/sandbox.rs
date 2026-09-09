@@ -1,9 +1,3 @@
-//! Per-instance security policies attached to every WASM component.
-//!
-//! Today's two policies — filesystem and network — are the user-facing
-//! capabilities exposed by `[runtime]` config. Both are compiled once at
-//! bootstrap time and shared by reference into every instance.
-
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 
-/// Security policies applied to each spawned inferlet.
 #[derive(Clone)]
 pub struct InstancePolicy {
     pub(crate) fs: FsPolicy,
@@ -19,7 +12,6 @@ pub struct InstancePolicy {
 }
 
 impl InstancePolicy {
-    /// Maximally restrictive policy for components instantiated for inspection.
     pub(crate) fn deny_all() -> Self {
         Self {
             fs: FsPolicy {
@@ -31,33 +23,12 @@ impl InstancePolicy {
     }
 }
 
-// =============================================================================
-// Filesystem
-// =============================================================================
-
-/// Filesystem capabilities granted to each inferlet.
-///
-/// Today this is "all-or-nothing scratch": when `allow` is true a
-/// per-process directory is mounted at `/scratch` with full RW; when
-/// false, no `wasi:filesystem` access at all. The base directory is
-/// always supplied by the caller — Python is the source of truth.
 #[derive(Debug, Clone)]
 pub struct FsPolicy {
     pub allow: bool,
-    /// Base directory under which per-process scratch dirs are created.
-    /// Each instance gets `<base_dir>/<process_id>`.
     pub base_dir: PathBuf,
 }
 
-// =============================================================================
-// Network
-// =============================================================================
-
-/// Network capabilities granted to each inferlet.
-///
-/// `allow == false` denies all socket operations. `allow == true` with
-/// `unrestricted == true` matches the legacy `inherit_network()`
-/// behavior. Otherwise each connect/bind goes through `check`.
 #[derive(Debug, Clone)]
 pub struct NetworkPolicy {
     pub allow: bool,
@@ -89,13 +60,8 @@ impl PortFilter {
 }
 
 impl NetworkPolicy {
-    /// Build a policy from `allow_network` + the raw `network_allowed_hosts`
-    /// list. Each entry is `cidr` or `cidr:port` or `cidr:lo-hi`. The
-    /// special entry `"*"` is allowed only as a sole element and means
-    /// "no restriction".
     pub fn parse(allow: bool, items: &[String]) -> Result<Self> {
         if !allow {
-            // rule list is unused; don't require it to parse, but warn on contradictions.
             if items.iter().any(|s| s != "*") && !items.is_empty() {
                 tracing::warn!(
                     "[runtime] allow_network = false but network_allowed_hosts \
@@ -109,7 +75,6 @@ impl NetworkPolicy {
             });
         }
 
-        // Empty list is equivalent to allow_network = false.
         if items.is_empty() {
             return Ok(NetworkPolicy {
                 allow: true,
@@ -118,7 +83,6 @@ impl NetworkPolicy {
             });
         }
 
-        // the wildcard must be alone; mixing it with rules is likely a config bug.
         if items.iter().any(|s| s == "*") {
             if items.len() != 1 {
                 return Err(anyhow!(
@@ -142,15 +106,10 @@ impl NetworkPolicy {
         })
     }
 
-    /// True if the policy is `allow_network = true` + `["*"]` — the legacy
-    /// `inherit_network()` behavior, no per-address check needed.
     pub fn is_unrestricted(&self) -> bool {
         self.allow && self.unrestricted
     }
 
-    /// True if the address satisfies any rule. If the policy is
-    /// unrestricted, always returns true; if `allow == false`, always
-    /// returns false. Otherwise checks each rule in order.
     pub fn check(&self, addr: &SocketAddr) -> bool {
         if !self.allow {
             return false;
@@ -166,12 +125,7 @@ impl NetworkPolicy {
     }
 }
 
-/// `cidr` or `cidr:port` or `cidr:lo-hi`. A bare IP without `/<n>` is
-/// accepted as a host route (`/32` for v4, `/128` for v6). Bracketed
-/// IPv6 (`[::1]:443`) is also accepted; for unbracketed IPv6 use the
-/// no-port form (`::1/128`).
 fn parse_rule(spec: &str) -> Result<Rule> {
-    // Bracketed IPv6: [addr] or [addr/cidr] or [addr]:port etc.
     if let Some(rest) = spec.strip_prefix('[') {
         let (inside, after) = rest
             .split_once(']')
@@ -190,8 +144,6 @@ fn parse_rule(spec: &str) -> Result<Rule> {
         return Ok(Rule { cidr, port });
     }
 
-    // unbracketed: try the last `:` split first; if the LHS parses as a CIDR/IP, the RHS is unconditionally a port.
-    // Falls back to the whole string as a CIDR otherwise, for IPv6 forms like `::1/128` that contain colons.
     if let Some((host, port_str)) = spec.rsplit_once(':')
         && let Ok(cidr) = parse_cidr(host)
     {
@@ -211,7 +163,6 @@ fn parse_cidr(s: &str) -> Result<IpNet> {
     if let Ok(net) = s.parse::<IpNet>() {
         return Ok(net);
     }
-    // Bare IP: promote to host route.
     let ip: IpAddr = s.parse().map_err(|e| anyhow!("{e}"))?;
     Ok(match ip {
         IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
@@ -244,4 +195,3 @@ fn ip_in_cidr(ip: IpAddr, net: &IpNet) -> bool {
         _ => false,
     }
 }
-

@@ -1,5 +1,3 @@
-//! `Pool`: pooled (compressed) attention — every `ratio` tokens close a boundary whose pooled entry lands in its own cache. The pooled compressor state slabs still have no IR seat and arrive as explicit seam arguments the engine binds from fire state.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -15,7 +13,6 @@ const ATTN_BLOCK: u32 = 128;
 
 const WARP: u32 = 32;
 
-/// One block per row, sized to the row in whole warps.
 fn route_rows(rows: u32, width: u32) -> Launch {
     const MAX_BLOCK: u32 = 1024;
 
@@ -37,7 +34,6 @@ fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, Error> {
     count(op, "the pooling ratio this statement states", ratio)
 }
 
-/// The boundary kernels' third column: the compressed row's rope position, `(p / ratio) * ratio` — the block's first token, not `boundary_pos`'s closing cell.
 fn boundary_rope_table(op: &'static str, boundary_pos: &Tensor, boundary_rope: &Tensor) {
     debug_assert_eq!(
         boundary_rope.dtype,
@@ -67,7 +63,6 @@ fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tenso
     );
 }
 
-/// Marks which decode rows close a pooling boundary. `row_valid` is the CUDA-graph padding mask.
 #[allow(clippy::too_many_arguments)]
 pub fn boundary_decode(
     ctx: &Ctx,
@@ -99,7 +94,6 @@ pub fn boundary_decode(
     )
 }
 
-/// The prefill twin: boundaries within each request's ragged span; the fire indptr rides in `positions`.
 #[allow(clippy::too_many_arguments)]
 pub fn boundary_prefill(
     ctx: &Ctx,
@@ -134,9 +128,6 @@ pub fn boundary_prefill(
     )
 }
 
-/// The rolling state's writer. `kv` is the compressor's `wkv * x` and `score` its `wgate * x`, both `[rows, coff * head_dim]`; each row scatters into the cell `write_page`/`write_offset` name for it.
-///
-/// The two state slabs are a seam the shell owns, no IR value names; this is the op that writes them, addressed by the cache's cell, not the fire's row.
 #[allow(clippy::too_many_arguments)]
 pub fn state_write(
     ctx: &Ctx,
@@ -154,8 +145,6 @@ pub fn state_write(
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
-    // The projection's own width states the window: `head_dim` for one
-    // block per pool, `2 * head_dim` for the overlapping pair.
     let width = count(OP, "the compressor's row width", kv.width)?;
     if (width != head_dim && width != 2 * head_dim) || score.width != kv.width {
         return Err(refuse(
@@ -192,9 +181,6 @@ pub fn state_write(
     )
 }
 
-/// Pools the closing window out of the kv cache into per-boundary entries.
-///
-/// The pooled compressor state (`state_kv`, `state_score`) has no IR seat; the engine binds the slabs it staged for this cache. `ape` does have a seat (it's a checkpoint plane, not shell scratch); the arm hands over the shell's absent seat when the compressor states none.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     ctx: &Ctx,
@@ -222,8 +208,6 @@ pub fn gather(
     }
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this gather states", head_dim)?;
-    // The window's blocks: read off the `[ratio, coff * head_dim]` ape when
-    // one is stated, else the ratio's own default.
     let coff = if ape.is_absent() {
         compressor_coff(ratio)
     } else {
@@ -255,16 +239,11 @@ pub fn gather(
             ratio.arg(),
             coff.arg(),
             pages.page_size.arg(),
-            // The plane's ROW PITCH, which is not always this gather's own
-            // `coff * head_dim` — see the shader's note.
             count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
         ],
     )
 }
 
-/// Stores pooled entries into the compressed cache. The compressed pages are the pool row's storage plane (`pool.keys`).
-///
-/// The op states its write geometry (`write_page`/`write_offset`), but still re-derives each entry's cell from the boundary tables and the pool's read-side page tables — the stated pair goes unread until the store takes explicit descriptors.
 pub fn kv_append(
     ctx: &Ctx,
     entries: Tensor,
@@ -296,7 +275,6 @@ pub fn kv_append(
     )
 }
 
-/// Attention over the compressed entries, with the log-sum-exp plane a later `attention.merge_lse` folds against the dense pass. `request_of_token` is the owning request per token row.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_lse(
     ctx: &Ctx,
@@ -352,7 +330,6 @@ pub fn attention_lse(
             ratio.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
-            // region's live-rows word when a body replay armed one, else the null seat.
             ctx.stage(),
         ],
     )

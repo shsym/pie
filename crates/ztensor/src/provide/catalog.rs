@@ -1,15 +1,3 @@
-//! The resolved index: names to addresses.
-//!
-//! A [`Catalog`] is what a consumer queries, and it is deliberately not a
-//! [`Manifest`](crate::format::Manifest). A manifest is one file's own claim,
-//! addressed through that file's shard table. A catalog is process-local: its
-//! addresses are [`StoreId`]s, so it can span files that never heard of each
-//! other: a sharded snapshot, a mixed set, or a single foreign file, without
-//! anyone having to claim an identity nobody wrote down.
-//!
-//! Every projection in the compat crate produces one of these. None of them
-//! produces a manifest, because none of them ever had one.
-
 use std::collections::BTreeMap;
 
 use crate::error::Result;
@@ -17,7 +5,6 @@ use crate::format::cbor::Value;
 use crate::format::{canonical_term, check_shape, Blocks, Digest, Leaf, Plane, Term};
 use crate::provide::store::StoreId;
 
-/// Where decoded bytes are: a range of one store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
     pub store: StoreId,
@@ -26,8 +13,6 @@ pub struct Location {
 }
 
 impl Location {
-    /// Largest power of two dividing the offset. The pointer alignment of a
-    /// whole-file mapping is `min(alignment, page_size)`.
     pub fn alignment(&self) -> u64 {
         if self.offset == 0 {
             return crate::provide::store::page_size();
@@ -36,20 +21,14 @@ impl Location {
     }
 }
 
-/// How a tensor's bytes can be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
-    /// Raw decoded bytes, exactly at this range. Addressable and mappable.
     At(Location),
-    /// Stored at this range under an encoding profile. The range is *not* the
-    /// tensor, so it is not an address a consumer can read directly.
     Encoded {
         at: Location,
         encoding: String,
         decoded_len: u64,
     },
-    /// Only the projection that opened the file can produce these bytes, as
-    /// with a deflated archive entry or a chunked dataset.
     Opaque {
         store: StoreId,
         key: u64,
@@ -82,29 +61,22 @@ impl Payload {
     }
 }
 
-/// One named tensor: what it is, and where its bytes are.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub shape: Vec<u64>,
-    /// Absent only under a layout that defines the values itself.
     pub term: Option<Term>,
-    /// Absent ⇒ canonical layout.
     pub layout: Option<String>,
     pub attributes: Option<Value>,
     pub payload: Payload,
-    /// Over decoded bytes, when the format carries one. Most foreign formats
-    /// do not.
     pub digest: Option<Digest>,
     pub blocks: Option<Blocks>,
 }
 
 impl Entry {
-    /// A tensor of one leaf at a raw range, which is what most formats have.
     pub fn leaf(shape: Vec<u64>, leaf: Leaf, at: Location) -> Self {
         Entry::at(shape, Term::Leaf(leaf), at)
     }
 
-    /// A tensor of any term in canonical layout at a raw range.
     pub fn at(shape: Vec<u64>, term: Term, at: Location) -> Self {
         Entry {
             shape,
@@ -121,8 +93,6 @@ impl Entry {
         check_shape(&self.shape)
     }
 
-    /// The planes under the canonical layout; `Unsupported` under a named
-    /// layout or without a term.
     pub fn planes(&self) -> Result<Vec<Plane>> {
         canonical_term(self.term.as_ref(), self.layout.as_deref())?.planes(&self.shape)
     }
@@ -132,8 +102,6 @@ impl Entry {
     }
 }
 
-/// Names to entries, sorted, with the file-level attributes of whatever was
-/// opened.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     entries: BTreeMap<String, Entry>,
@@ -145,7 +113,6 @@ impl Catalog {
         Self::default()
     }
 
-    /// Inserts a tensor, returning the entry it displaced (as `BTreeMap` does).
     pub fn insert(&mut self, name: impl Into<String>, entry: Entry) -> Option<Entry> {
         self.entries.insert(name.into(), entry)
     }
@@ -162,8 +129,6 @@ impl Catalog {
         self.entries.get(name)
     }
 
-    /// The entry and the name as this catalog stores it, so a handle can
-    /// borrow the stored `&str`.
     pub(crate) fn get_key_value(&self, name: &str) -> Option<(&str, &Entry)> {
         self.entries
             .get_key_value(name)
@@ -194,12 +159,6 @@ impl Catalog {
         self.entries.into_iter()
     }
 
-    /// This catalog with every name rewritten by `f`.
-    ///
-    /// `f` must be injective over the names in it — two names mapped onto
-    /// one would silently lose an entry, so a collision is refused rather
-    /// than resolved by precedence, the same rule
-    /// [`Source::merge`](crate::Source::merge) applies across files.
     pub(crate) fn renamed(self, f: impl Fn(&str) -> String) -> crate::Result<Catalog> {
         let attributes = self.attributes;
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();

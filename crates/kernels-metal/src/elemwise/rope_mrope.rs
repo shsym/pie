@@ -1,10 +1,3 @@
-//! The multimodal rotary: [`rope`](crate::elemwise::rope)'s partial arm over
-//! a position that is a `(t, h, w)` triple rather than a scalar, mirroring
-//! `kernels_cuda::elemwise::rope_mrope`. A file of its own beside `rope.rs`
-//! because this reads a different position stream (`[rows, 3]`) under a
-//! different section-split statute. Unverified on device: written against
-//! `elemwise/rope_neox.metal` on a box with no Metal compiler.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -13,13 +6,8 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/rope_mrope.metal";
 
-/// The axes a multimodal position carries: time, and the patch's row and
-/// column in its grid.
 pub const AXES: u32 = 3;
 
-/// The head count a row's width spells at a stated head width. A zero-wide
-/// row is the `k`-shaped absence `rope::partial_q` already uses — zero heads,
-/// and this entry fires no launch for it.
 fn heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
     if width % head_dim != 0 {
         return Err(refuse(
@@ -30,10 +18,6 @@ fn heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32,
     Ok(width / head_dim)
 }
 
-/// One rotation, over one tensor. The family's shape: `rope_neox.metal`'s
-/// arms each take a single tensor, so the entry fires twice rather than
-/// handing one grid both rows — which keeps `num_kv_heads` out of the shader
-/// entirely.
 #[allow(clippy::too_many_arguments)]
 fn rotate(
     ctx: &Ctx<'_>,
@@ -65,10 +49,6 @@ fn rotate(
     )
 }
 
-/// What both forms check before either fires: the two head counts a
-/// `(q, k)` pair spells. One validation for two forms, deliberately — the
-/// two arms differ only in shader-side arithmetic, not in what a caller can
-/// get wrong about the geometry.
 struct Geometry {
     num_q_heads: u32,
 
@@ -132,8 +112,6 @@ fn validate(
         ));
     }
 
-    // Sections may not run past the head's own frequency pairs; a
-    // checkpoint whose sections don't fit is refused, not truncated.
     let half = head_dim / 2;
     let stated_pairs: u32 = sections.iter().copied().sum();
     if stated_pairs > half {
@@ -153,23 +131,6 @@ fn validate(
     })
 }
 
-/// The 3D rotary, section-split and interleaved (`MropeForm::Interleaved`).
-///
-/// `q` and `k` are rotated in place at their stated head geometry.
-/// `positions` is `i32`, one `(t, h, w)` triple per rotated row — a
-/// `[rows, 3]` rectangle. `sections` is the checkpoint's own `mrope_section`,
-/// a trace constant so it arrives stated rather than read from device
-/// memory. `rotary_dim` is the rotated prefix of each head, as in
-/// [`rope::partial`](crate::elemwise::rope::partial) — state it equal to
-/// `head_dim` for the full rotation.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16; a refusal for a row
-/// width that is not a whole number of heads, a head with no whole number of
-/// rotation pairs, a rotated prefix wider than the head, a position stream
-/// that is not `[rows, 3]` `i32`, or sections whose interleaved prefix does
-/// not fit the head's frequency pairs.
 #[allow(clippy::too_many_arguments)]
 pub fn interleaved(
     ctx: &Ctx<'_>,
@@ -213,19 +174,6 @@ pub fn interleaved(
     )
 }
 
-/// The tower's rotation: contiguous sections, and each restarts the
-/// frequency ladder (`MropeForm::Blocked`). [`interleaved`]'s signature and
-/// validation, a different shader: sections are contiguous blocks (pairs
-/// `[0, s0)` turn by `t`, `[s0, s0+s1)` by `h`, `[s0+s1, s0+s1+s2)` by `w`;
-/// `s0 == 0` spells a two-axis rotation), and each block restarts the
-/// frequency ladder at denominator `Σ sections` rather than `head_dim`. The
-/// grid is `min(rotary_dim / 2, Σ sections)`.
-///
-/// # Errors
-///
-/// As [`interleaved`], plus a refusal for sections that name no pair at all —
-/// a rotation of nothing, which the interleaved form spells as a launch over
-/// the whole prefix and this one cannot spell at all.
 #[allow(clippy::too_many_arguments)]
 pub fn blocked(
     ctx: &Ctx<'_>,
@@ -241,8 +189,6 @@ pub fn blocked(
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_blocked_bfloat16" });
     let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
 
-    // A zero total is refused rather than launched at zero extent: the
-    // shader divides by it.
     let total: u32 = sections.iter().copied().sum();
     if total == 0 {
         return Err(refuse(
@@ -281,9 +227,6 @@ pub fn blocked(
     )
 }
 
-/// The split rotation (`MropeForm::Split`): each section owns a contiguous
-/// channel block and `rotate_half` stays inside it — Gemma's tower. Same
-/// validation, grid and refusals as [`blocked`]; a different shader.
 #[allow(clippy::too_many_arguments)]
 pub fn split(
     ctx: &Ctx<'_>,
@@ -299,8 +242,6 @@ pub fn split(
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_split_bfloat16" });
     let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
 
-    // A zero total is refused rather than launched at zero extent: the
-    // shader divides by it.
     let total: u32 = sections.iter().copied().sum();
     if total == 0 {
         return Err(refuse(
@@ -338,4 +279,3 @@ pub fn split(
         sections,
     )
 }
-

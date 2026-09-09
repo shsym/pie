@@ -1,55 +1,3 @@
-//! Wan 2.2's reading of a checkpoint: the only place the checkpoint's own
-//! tensor spellings appear.
-//!
-//! The shipped checkpoint is a diffusers pipeline folder
-//! (`Wan-AI/Wan2.2-TI2V-5B-Diffusers`), which `checkpoint::file::diffusers`
-//! opens as ONE name space with a component prefix per folder:
-//! `transformer/` → `dit.` (825 fp32 tensors over five shards),
-//! `text_encoder/` → `te.` (242 bf16 tensors over three shards), `vae/` →
-//! `vae.` (196 fp32 tensors). Below the prefix the names are the
-//! components' own `state_dict` names, read off the snapshot's safetensors
-//! headers. The miniatures `wan22_golden.py --mini` write the
-//! transformer's `state_dict` alone, unprefixed, in one fp32 file each:
-//! [`Layout::Bare`].
-//!
-//! What is not a plain read:
-//!
-//! * `attn1.to_{q,k,v}` fuse into one packed `qkv` (weights and biases),
-//!   `attn2.to_{k,v}` into one packed `kv`;
-//! * `patch_embedding.weight` `[dim, C, 1, 2, 2]` is read as the
-//!   `[dim, C·4]` linear it is (a transmute: the `(c, ph, pw)` row order
-//!   is the conv's own input order);
-//! * `proj_out`'s rows are permuted from the checkpoint's `(ph, pw, c)`
-//!   feature order to `(c, ph, pw)`, so the velocity row is laid out like
-//!   the latent row in (`forward.rs`);
-//! * the modulation planes are stored `[shift | scale | gate]` per set
-//!   (`time_proj`, `scale_shift_table` `[1, 6, dim]`, the head's
-//!   `[1, 2, dim]` as `[shift | scale]`) and read in the plan's
-//!   `[scale | shift | gate]`, because `elementwise.modulate` takes its
-//!   pair as `[s | b]` and this IR cannot permute columns at run time; the
-//!   swap is a slice-and-concatenate of the stored plane, done once here.
-//!   The two tables are declared f32 and read without a cast;
-//! * `time_embedder.linear_2` is stacked twice into `head_proj`
-//!   (`model::Dit::head_proj`);
-//! * every VAE conv kernel `[C_out, C_in, kt, kh, kw]` is read as the
-//!   `[C_out, C_in·taps]` rectangle `Weight::conv_taps_major` declares (a
-//!   transmute; the shell relabels at load); the `time_conv` rows are
-//!   permuted from `(r1, c)` to `(c, r1)` and `conv_out`'s from
-//!   `(c, pw, ph)` to `(c, ph, pw)` for the two depth-to-space ops that
-//!   read them; conv biases are cast to f32; the RMS gains `[C, 1, 1, 1]`
-//!   are read as `[C]`;
-//! * the transformer and VAE ship fp32 and every bank is declared bf16, so
-//!   those reads are casts;
-//! * the encoder's `conv_in` has its INPUT channels permuted from the
-//!   checkpoint's `(c, pw, ph)` patchify order into the `(c, ph, pw)` a
-//!   `spatial.pixel_unshuffle` lands — the mirror of `conv_out`'s row
-//!   gather on the decode side, on axis 1 because a conv's input channels
-//!   are its second axis; and `quant_conv` is read as its FIRST 48 output
-//!   rows alone, the posterior mean's, the logvar's never being computed.
-//!
-//! Every plane of the checkpoint is read: the decoder's, the encoder's,
-//! `post_quant_conv` and `quant_conv`.
-
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint_dsl::{Builder, Error, extents, stored_encoding};
 use model_dsl::{Platform, Weight};
@@ -59,14 +7,9 @@ use super::model::{
     TextEncoder, VAE_LATENTS_MEAN, VAE_LATENTS_STD, VAE_PATCH, VAE_RGB, VAE_Z, Vae, VaeEncoder,
 };
 
-/// Where a checkpoint puts the components.
 #[derive(Clone, Copy)]
 enum Layout {
-    /// A diffusers pipeline folder read through `checkpoint::file::diffusers`:
-    /// `dit.<transformer name>`, `te.<UMT5EncoderModel name>`, `vae.<name>`.
     Diffusers,
-    /// The transformer's `state_dict` alone, at the root — a miniature's
-    /// one file. No encoder or VAE can be read under it.
     Bare,
 }
 
@@ -153,7 +96,6 @@ fn dit(
     let at = |tail: &str| layout.dit(tail);
     let dim = d.dim;
 
-    // `Conv3d(C, dim, (1, 2, 2), stride (1, 2, 2))` as the linear it is.
     transmuted(b, src, &m.patch_embed.w, &at("patch_embedding.weight"))?;
     b.read(&m.patch_embed.bias, at("patch_embedding.bias"))?;
 
@@ -162,12 +104,10 @@ fn dit(
     biased(b, &m.text_embed.linear_2, &cond("text_embedder.linear_2"))?;
     biased(b, &m.time_embed.linear_1, &cond("time_embedder.linear_1"))?;
     biased(b, &m.time_embed.linear_2, &cond("time_embedder.linear_2"))?;
-    // `linear_2` twice over, for the head's `[temb | temb]`.
     let l2 = cond("time_embedder.linear_2");
     let doubled = |e: Expr| Expr::concat(0, vec![e.clone(), e]);
     b.read_over(&m.head_proj.w, format!("{l2}.weight"), doubled)?;
     b.read_over(&m.head_proj.bias, format!("{l2}.bias"), doubled)?;
-    // `time_proj`: six `dim`-row sets, `(shift, scale)` swapped in each.
     let proj = cond("time_proj");
     let swap = |axis: u8, width: i64| move |e: Expr| slices_reordered(&e, MOD_SLICES, width, axis);
     b.read_over(
@@ -185,8 +125,6 @@ fn dit(
         transformer_block(b, src, block, &at(&format!("blocks.{i}")))?;
     }
 
-    // The head's `[1, 2, dim]` table as a `[2·dim]` f32 bias, `[scale |
-    // shift]`, and `proj_out` with its rows brought to `(c, ph, pw)`.
     table(b, src, &m.head_table, &at("scale_shift_table"), HEAD_SLICES)?;
     let rows = head_rows(d.out_channels);
     b.read_over(&m.proj_out.w, at("proj_out.weight"), |e| {
@@ -195,7 +133,6 @@ fn dit(
     b.read_over(&m.proj_out.bias, at("proj_out.bias"), |e| e.gather(0, rows))
 }
 
-/// One `WanTransformerBlock`'s planes under `stem`.
 fn transformer_block(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -229,9 +166,6 @@ fn transformer_block(
     biased(b, &block.ffn.down, &n("ffn.net.2"))
 }
 
-/// The encoder: `UMT5EncoderModel`'s names under `te.` — `shared`, the 24
-/// blocks (`layer.0` attention with its bucket embedding, `layer.1` the
-/// gated MLP), `final_layer_norm`.
 fn text_encoder(b: &mut Builder, te: &TextEncoder, layout: Layout) -> Result<(), Error> {
     let at = |tail: &str| layout.component("te.", tail);
     b.read(&te.embed, at("shared.weight")?)?;
@@ -255,15 +189,9 @@ fn text_encoder(b: &mut Builder, te: &TextEncoder, layout: Layout) -> Result<(),
     b.read(&te.final_norm, at("encoder.final_layer_norm.weight")?)
 }
 
-/// The VAE decoder side, `AutoencoderKLWan`'s own names under `vae.`.
 fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Result<(), Error> {
     let at = |tail: &str| layout.component("vae.", tail);
 
-    // The two config rows the decoder arm denormalises with. They are in
-    // `vae/config.json` and in no tensor, so the contract STATES them:
-    // `Fill` is realized by zeroing and `Bias` adds the number, one
-    // element at a time, concatenated into the row (the same algebra
-    // `z_image`'s pad tables use).
     row_of(b, src, &v.denorm_scale, &at("post_quant_conv.bias")?, |i| {
         VAE_LATENTS_STD[i]
     })?;
@@ -318,8 +246,6 @@ fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae, layout: Layout) -> Resul
     encoder(b, src, &v.enc, layout)
 }
 
-/// The VAE encoder side, `WanEncoder3d`'s own names under `vae.encoder.`,
-/// plus `vae.quant_conv`.
 fn encoder(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -328,8 +254,6 @@ fn encoder(
 ) -> Result<(), Error> {
     let at = |tail: &str| layout.component("vae.", tail);
 
-    // The mirror of the decoder's stated rows: `mean` and `1/std`, so the
-    // arm lands `(z − mean)/std` — the denoise reading's own space.
     row_of(b, src, &e.norm_bias, &at("quant_conv.bias")?, |i| {
         VAE_LATENTS_MEAN[i]
     })?;
@@ -337,8 +261,6 @@ fn encoder(
         1.0 / VAE_LATENTS_STD[i]
     })?;
 
-    // `patchify`'s `(c, pw, ph)` feature order into the `(c, ph, pw)` a
-    // `pixel_unshuffle` lands, on the kernel's INPUT-channel axis.
     conv_over_channels(b, src, &e.conv_in, &at("encoder.conv_in")?, conv_out_rows())?;
 
     for (i, block) in e.down.iter().enumerate() {
@@ -374,9 +296,6 @@ fn encoder(
 
     gamma(b, src, &e.norm_out, &at("encoder.norm_out.gamma")?)?;
     conv(b, src, &e.conv_out, &at("encoder.conv_out")?, None)?;
-    // `quant_conv`'s first `z_dim` output rows: the posterior MEAN's. A
-    // LEADING run, so it is a slice and not a gather (the contract checker
-    // refuses the gather that spells the same thing).
     let quant = at("quant_conv")?;
     let name = format!("{quant}.weight");
     let stored = stored_encoding(src, &name)?;
@@ -390,10 +309,6 @@ fn encoder(
     })
 }
 
-/// A conv whose INPUT channels are permuted: the stored `[C_out, C_in, kt,
-/// kh, kw]` kernel gathered along AXIS 1 (a conv's input-channel axis) and
-/// then transmuted to the declared `[C_out, C_in·taps]`. The bias is read
-/// straight through — it is per output channel and nothing moved there.
 fn conv_over_channels(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -408,28 +323,22 @@ fn conv_over_channels(
     b.read(&c.bias, format!("{stem}.bias"))
 }
 
-/// A `nn.Linear`: `<stem>.weight` and `<stem>.bias`.
 fn biased(b: &mut Builder, w: &Linear, stem: &str) -> Result<(), Error> {
     b.read(&w.w, format!("{stem}.weight"))?;
     b.read(&w.bias, format!("{stem}.bias"))
 }
 
-/// Several `nn.Linear`s fused into one packed bank, weights and biases.
 fn packed(b: &mut Builder, w: &Linear, stems: &[String]) -> Result<(), Error> {
     b.read_concat(&w.w, stems.iter().map(|s| format!("{s}.weight")))?;
     b.read_concat(&w.bias, stems.iter().map(|s| format!("{s}.bias")))
 }
 
-/// A stored tensor read as the declared shape over the same bytes (a conv
-/// kernel as `[C_out, C_in·taps]`, a `[C, 1, 1, 1]` gain as `[C]`).
 fn transmuted(b: &mut Builder, src: &ztensor::Source, w: &Weight, name: &str) -> Result<(), Error> {
     let stored = stored_encoding(src, name)?;
     let shape = TensorType::new(extents(w), stored);
     b.read_over(w, name.to_string(), |e| e.transmute(shape))
 }
 
-/// A `scale_shift_table` `[1, k, dim]` as the `[k·dim]` bias the plan
-/// reads, its `(shift, scale)` pairs swapped.
 fn table(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -444,9 +353,6 @@ fn table(
     })
 }
 
-/// The permutation itself: `slices` consecutive `width`-wide blocks of
-/// `axis`, concatenated in the plan's order — every `(shift, scale)` pair
-/// exchanged, every gate left in place.
 fn slices_reordered(from: &Expr, slices: u32, width: i64, axis: u8) -> Expr {
     let take = |i: i64| from.clone().slice(axis, i * width, width);
     let order: Vec<i64> = match slices {
@@ -457,9 +363,6 @@ fn slices_reordered(from: &Expr, slices: u32, width: i64, axis: u8) -> Expr {
     Expr::concat(axis, order.into_iter().map(take).collect())
 }
 
-/// `proj_out`'s rows in the plan's `(c, ph, pw)` order: row `(c·2 + ph)·2
-/// + pw` of the plan is row `(ph·2 + pw)·C + c` of the checkpoint (the
-/// reference's `reshape(.., p_t, p_h, p_w, -1)` puts the channel last).
 fn head_rows(c_out: u32) -> Vec<i64> {
     let c_out = i64::from(c_out);
     let mut rows = Vec::with_capacity((4 * c_out) as usize);
@@ -473,17 +376,11 @@ fn head_rows(c_out: u32) -> Vec<i64> {
     rows
 }
 
-/// A `time_conv`'s `2C` output rows in `(c, r1)` order: the checkpoint's
-/// `reshape(b, 2, c, ..)` puts the frame parity first.
 fn time_conv_rows(c: u32) -> Vec<i64> {
     let c = i64::from(c);
     (0..c).flat_map(|ch| [ch, c + ch]).collect()
 }
 
-/// The 12 patchify channels in `(c, ph, pw)` order: the checkpoint's
-/// `patchify`/`unpatchify` pair reads channel `c·4 + pw·2 + ph`. The
-/// decoder gathers `conv_out`'s ROWS by it; the encoder gathers
-/// `conv_in`'s input CHANNELS by it.
 fn conv_out_rows() -> Vec<i64> {
     let p = i64::from(VAE_PATCH);
     let mut rows = Vec::new();
@@ -497,9 +394,6 @@ fn conv_out_rows() -> Vec<i64> {
     rows
 }
 
-/// A conv: the kernel `[C_out, C_in, kt, kh, kw]` transmuted to the
-/// declared `[C_out, C_in·taps]` (rows gathered first where `rows` says
-/// so), and its bias (gathered the same way).
 fn conv(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -525,16 +419,6 @@ fn conv(
     }
 }
 
-/// A `[n]` row of STATED numbers — a config vector the checkpoint holds no
-/// tensor for (`latents_mean`, `latents_std`).
-///
-/// The affine fragment of the contract algebra composes byte spans, and a
-/// `Bias` is a kernel, so a filled-and-biased element cannot sit inside the
-/// `Concat` directly: each element is its own internal one-element tensor
-/// and the row is their concatenation, exactly as `z_image`'s pad tables
-/// are built. `seed` names a stored plane whose raw dtype the constants are
-/// stated in, so every checkpoint of this family derives them the same way;
-/// the row is cast where it declares another dtype.
 fn row_of(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -565,8 +449,6 @@ fn row_of(
         );
         parts.push(Expr::out(cell));
     }
-    // Pushed, not `read_expr`d: a row built from `Out` alone names no
-    // checkpoint tensor, and `read_expr` reads the stored encoding off one.
     let want = checkpoint_dsl::encoding(w.dtype);
     let row = Expr::concat(0, parts);
     let row = if want == stored {
@@ -583,7 +465,6 @@ fn row_of(
     Ok(())
 }
 
-/// A `WanRMS_norm` gain `[C, 1, 1, 1]` (or `[C, 1, 1]`) as `[C]`.
 fn gamma(b: &mut Builder, src: &ztensor::Source, w: &Weight, name: &str) -> Result<(), Error> {
     transmuted(b, src, w, name)
 }

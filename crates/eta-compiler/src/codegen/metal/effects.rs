@@ -1,10 +1,3 @@
-//! The readiness and commit kernels: the guard that decides a lane may run,
-//! and the cursor advance that retires it.
-//!
-//! Single-lane (`M1`) forms specialise the channel effects into the emitted
-//! text; the grouped (`M3`) forms are generic and read the same decisions out
-//! of a per-channel `M3ChannelMeta` flag word at run time.
-
 use crate::codegen::error::{EmitError, EmitterKind};
 use alloc::string::String;
 use core::fmt::Write as _;
@@ -22,15 +15,8 @@ use eta_ir::validate::{BoundTrace, Direction};
 use super::preamble::{common_effect_preamble, emit_word_arguments, grouped_preamble};
 use super::{M1ChannelEffect, METAL_M1_MAX_CHANNELS};
 
-/// The lane-table ABI revision the emitted readiness kernel refuses to run
-/// against anything else (`PTIR_LANE_TABLE_ABI_VERSION`).
 const LANE_TABLE_ABI_VERSION: u32 = crate::plan::LANE_TABLE_ABI_VERSION;
 
-/// `emit_readiness_msl` — one lane, channel effects baked in.
-///
-/// Rejects a channel count past [`METAL_M1_MAX_CHANNELS`] rather than
-/// emitting it: past that count a program would produce a `[[buffer(31)]]`
-/// Metal rejects, a raw shader diagnostic at PSO build time.
 pub fn emit_readiness(
     function_name: &str,
     channels: &[M1ChannelEffect],
@@ -125,7 +111,6 @@ pub fn emit_readiness(
     Ok(source)
 }
 
-/// `emit_commit_msl` — one lane; advance head for takes, tail for puts.
 pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, EmitError> {
     if channels.len() > METAL_M1_MAX_CHANNELS {
         return Err(EmitError::ChannelLimitExceeded {
@@ -167,8 +152,6 @@ pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<
     Ok(source)
 }
 
-/// `emit_grouped_readiness_msl` — one thread per lane, effects read from
-/// `M3ChannelMeta::flags` instead of baked in.
 pub fn emit_grouped_readiness(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
@@ -232,7 +215,6 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
     source
 }
 
-/// `emit_grouped_commit_msl` — the grouped counterpart of [`emit_commit`].
 pub fn emit_grouped_commit(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
@@ -270,11 +252,6 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
     source
 }
 
-/// The per-program channel effect table the M1/M2 readiness and commit
-/// kernels are baked against. Capacity and the take/put flags come from the
-/// container; the two readiness bits come from the bound trace's first-op
-/// direction table. Emitted here rather than derived on the far side so an
-/// engine never needs the decoded plan to build it.
 pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
     let channels = &bound.container.channels;
     let mut effects = Vec::with_capacity(channels.len());
@@ -295,11 +272,9 @@ pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
                 if used != chan {
                     continue;
                 }
-                // the engine advances the ring off these two flags only.
                 match use_ {
                     ChannelUse::Take => effect.take = true,
                     ChannelUse::Put => effect.put = true,
-                    // a peek neither drains nor fills.
                     ChannelUse::Read => {}
                 }
             }

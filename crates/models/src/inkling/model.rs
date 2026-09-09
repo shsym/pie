@@ -2,55 +2,20 @@ use model_dsl::{Dtype, Weight};
 
 pub use crate::adapter::Adapters;
 
-/// Inkling's text decoder (`thinkingmachines/Inkling`, HF `inkling_mm_model`):
-/// a sparse mixture-of-experts stack with NO rotary embedding — every score
-/// carries a learned relative-position bias — a short causal convolution on
-/// four seams of every layer, and two sink (shared) experts routed beside the
-/// top-k. Only the text is declared here: the hMLP vision tower, the discrete
-/// audio embedding and the eight chained MTP heads are separate bring-ups.
-///
-/// Per layer, in order:
-///
-/// ```text
-/// x  = rmsnorm(y)
-/// q  = x·Wq                       k = conv(x·Wk)     v = conv(x·Wv)     r = x·Wr
-/// q  = rmsnorm_head(q)            k = rmsnorm_head(k)
-/// b  = r ⊗ P                      -- [rows, heads · extent] bias over backward distance
-/// a  = softmax(q·kᵀ / d + b)·v    -- 1/d, not 1/√d: q and k are unit-normed per head
-/// y += conv(a·Wo)
-/// x  = rmsnorm(y)
-/// y += conv(mlp(x))               -- dense SwiGLU × scale, or the routed mixture
-/// ```
-///
-/// `conv` is the depthwise causal width-4 convolution with the input added
-/// back (`Attention::ShortConv`), kept per slot as the recurrent mixers keep
-/// theirs. Local layers (five of six) attend a 512-token window over 16 kv
-/// heads with a 512-deep bias; global layers attend everything over 8 kv
-/// heads with a 1024-deep one.
 pub struct Model {
     pub hidden: u32,
-    /// The embedding table's rows (padded).
     pub vocab: u32,
-    /// The head's rows: the unpadded vocabulary the readout is cut to.
     pub head_rows: u32,
     pub tp: u32,
 
     pub heads: u32,
     pub head_dim: u32,
-    /// Per-head width of the relative projection `Wr`.
     pub d_rel: u32,
-    /// The local reading's window (and its bias extent).
     pub window: u32,
-    /// The short convolution's taps.
     pub conv_width: u32,
-    /// `1 / head_dim`.
     pub sm_scale: f32,
     pub norm_eps: f32,
-    /// `1 / logits_mup_width_multiplier`, over the final norm's output.
     pub head_scale: f32,
-    /// The global reading's log attention scaling: `(log_scaling_n_floor,
-    /// log_scaling_alpha)`, past which a query's scores grow as
-    /// `1 + alpha · ln(n / floor)`. Local layers have none.
     pub log_scaling: (u32, f32),
 
     pub adapters: Adapters,
@@ -60,12 +25,9 @@ pub struct Model {
     pub embed_norm: Weight,
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
-    /// `unembed`, `[head_rows, hidden]`; never tied.
     pub unembed: Weight,
 }
 
-/// Which reading of the sequence a layer takes; the discriminant indexes
-/// the per-reading plan arrays.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Reading {
     Local = 0,
@@ -75,22 +37,17 @@ pub enum Reading {
 pub struct Layer {
     pub reading: Reading,
     pub kv_heads: u32,
-    /// The bias profile's depth: how many backward distances carry a
-    /// learned bias (512 local, 1024 global).
     pub extent: u32,
 
     pub attn_norm: Weight,
     pub q_proj: Weight,
     pub k_proj: Weight,
     pub v_proj: Weight,
-    /// `[heads · d_rel, hidden]`.
     pub r_proj: Weight,
     pub o_proj: Weight,
     pub q_norm: Weight,
     pub k_norm: Weight,
-    /// `[d_rel, extent]`: the bank of bias-vs-distance profiles.
     pub rel_proj: Weight,
-    /// The four short convolutions, `[channels, conv_width]` each.
     pub k_conv: Weight,
     pub v_conv: Weight,
     pub attn_conv: Weight,
@@ -109,33 +66,22 @@ pub struct Layer {
 }
 
 pub enum Mlp {
-    /// The two dense foundation layers: SwiGLU, then a learned `[1]` scale.
     Dense {
-        /// `[2 · inter, hidden]`, gate first.
         gate_up: Weight,
         inter: u32,
         down: Weight,
         scale: Weight,
     },
-    /// The routed mixture. The banks stack the `sink` shared experts after
-    /// the `experts` routed ones, so the router's fixed sink routes select
-    /// them like any other expert.
     Routed {
-        /// `gate.weight`, `[experts + sink, hidden]`.
         router: Weight,
-        /// `gate.bias`, `[experts]` f32: steers the choice only.
         bias: Weight,
-        /// `gate.global_scale`, `[1]` f32, over every weight.
         scale: Weight,
-        /// `[experts + sink, 2 · inter, hidden]`, gate first.
         gate_up: Weight,
-        /// `[experts + sink, hidden, inter]`.
         down: Weight,
         experts: u32,
         top_k: u32,
         sink: u32,
         inter: u32,
-        /// `route_scale`.
         scaling: f32,
     },
 }
@@ -153,9 +99,7 @@ struct Dims {
     window: u32,
     global_extent: u32,
     conv_width: u32,
-    /// Every sixth layer is global: `(l + 1) % global_every == 0`.
     global_every: u32,
-    /// The leading dense layers.
     dense_layers: u32,
     dense_inter: u32,
     experts: u32,
@@ -170,15 +114,10 @@ struct Dims {
 }
 
 impl Model {
-    /// `thinkingmachines/Inkling`'s text, off its `text_config`.
     pub fn full(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::dims())
     }
 
-    /// The text cut to its first `layers` layers over `experts` routed
-    /// experts — the miniature `benches/shrink_checkpoint.py` carves
-    /// (`--layers 0-6 --experts 8`: both dense layers, four local sparse
-    /// ones and the first global).
     pub fn mini(layers: u32, experts: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::dims();
         d.layers = layers;
@@ -222,8 +161,6 @@ impl Model {
             "tp {tp} is not a world this catalog ships"
         );
         let dense = crate::dense(w);
-        // The 2-D projections take the tiled 4-bit placement on CUDA (see
-        // `muse_glimmer::model`); the expert banks and the embedding do not.
         let proj = match w {
             Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
@@ -248,7 +185,6 @@ impl Model {
                     (Reading::Local, d.local_kv_heads / tp, d.window)
                 };
                 let kv_w = u64::from(kv_heads) * hd;
-                // A conv over a columns-cut channel axis is cut with it.
                 let conv = |s: &str, channels: u64| {
                     Weight::sym(n(s), [channels, kw], dense).columns()
                 };
@@ -336,5 +272,4 @@ impl Model {
     }
 }
 
-/// What every SKU seats. A deployment ceiling, not a checkpoint fact.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };

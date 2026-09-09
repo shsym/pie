@@ -1,11 +1,3 @@
-//! The SDK-port goldens: the canonical container bytes of seven programs,
-//! pinned in `goldens/sdk_containers.txt` and rebuilt byte for byte by the
-//! Python (`sdk/inferlet/python/tests/test_eta_goldens.py`) and JavaScript
-//! (`sdk/inferlet/javascript/src/__tests__/eta_goldens.test.ts`) ports of
-//! this crate. A change to the encoder moves the bytes here first; run with
-//! `UPDATE_SDK_GOLDENS=1` to rewrite the file, then copy it to
-//! `sdk/inferlet/python/tests/goldens/eta_containers.txt` (the JS test reads
-//! that copy) and re-run both port suites.
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
 use eta_dsl::{Channel, Traced};
@@ -21,7 +13,6 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// lowering.rs `build_s3` verbatim (golden hash 4213522552817221928 with VOCAB 32000, PAGE 16).
 fn s3() -> Traced {
     let vocab = 32_000u32;
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
@@ -50,7 +41,6 @@ fn s3() -> Traced {
     b.build().unwrap()
 }
 
-/// text-completion's decode pass (host-driven token).
 fn text_completion_decode() -> Traced {
     let n = 5u32;
     let page_size = PAGE;
@@ -88,7 +78,6 @@ fn text_completion_decode() -> Traced {
     b.build().unwrap()
 }
 
-/// naive-baseline's decode pass (device-carried token, gumbel-max, stats mirrors).
 fn naive_decode() -> Traced {
     let n = 7u32;
     let page_size = PAGE;
@@ -146,7 +135,6 @@ fn naive_decode() -> Traced {
     b.build().unwrap()
 }
 
-/// Op coverage: touches most of the op surface in one epilogue.
 fn coverage() -> Traced {
     let k = 8u32;
     let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
@@ -228,7 +216,6 @@ fn coverage() -> Traced {
     b.build().unwrap()
 }
 
-/// Prologue sinks + names table + kernel call.
 fn sinks() -> Traced {
     let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
     let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
@@ -259,10 +246,6 @@ fn sinks() -> Traced {
     b.build().unwrap()
 }
 
-/// diffusion-baseline's denoise pass (`tests/inferlets/diffusion-baseline`),
-/// with `inferlet::eta::diffusion::{entropy_bound_accept, stable_and_confident}`
-/// inlined — this crate cannot depend on `inferlet`, so keep the two bodies
-/// in step with `crates/inferlet/src/eta.rs`.
 fn diffusion_step() -> Traced {
     let length = 8u32;
     let taps = 4u32;
@@ -330,7 +313,6 @@ fn diffusion_step() -> Traced {
         let sampled = gumbel_max(&scaled, &r);
         let argmax = reduce_argmax(&scaled);
 
-        // entropy_bound_accept(&h, bound)
         let accept = {
             let n = h.shape().dims()[0];
             let (neg_sorted, order) = sort_desc(neg(&h));
@@ -345,7 +327,6 @@ fn diffusion_step() -> Traced {
 
         let previous = history.take();
         history.put(&argmax);
-        // stable_and_confident(&argmax, &previous, &h, confidence)
         let done = {
             let n = argmax.shape().dims()[0];
             let unchanged = reduce_sum(cast(eq(&argmax, &previous), dtype::i32));
@@ -377,8 +358,6 @@ fn diffusion_step() -> Traced {
     b.build().unwrap()
 }
 
-/// beam-search's step (`tests/inferlets/beam-search`): the `mask` port,
-/// `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]` block.
 fn beam_step() -> Traced {
     #[allow(non_snake_case)]
     let B = 2u32;
@@ -481,17 +460,6 @@ fn beam_step() -> Traced {
     b.build().unwrap()
 }
 
-/// The image sampler's epilogue in small (design D4): a `velocity()` read, a
-/// keyed `N(0, 1)` draw, one Euler step `x <- x + dsigma * v`, a sinusoidal
-/// term the IR could not spell before `sin`/`cos`, and the row norms an APG
-/// rescale wants a real `sqrt`/`rsqrt` for. Its reason for existing is the
-/// wire bytes: it is the one program here that carries tags 0x08..0x0B,
-/// `RngKind::Normal` and `IntrinsicId::Velocity`, so the Python and
-/// JavaScript ports cannot drift on any of them unnoticed.
-///
-/// Written as one binding per op, deliberately: the ports must emit the same
-/// nodes in the same order, and a nested call's argument order is one more
-/// thing three languages have to agree on.
 fn latent_step() -> Traced {
     let rows = 8u32;
     let channels = 16u32;
@@ -569,15 +537,6 @@ fn latent_step() -> Traced {
     b.build().unwrap()
 }
 
-/// A VAE reading's epilogue in small (design D8): the one golden that
-/// carries `IntrinsicId::Pixels`, so the Python and JavaScript ports cannot
-/// drift on the new intrinsic's wire id unnoticed. A `vae.decode` pass binds
-/// no descriptor port and embeds no token; its answer is the pixels plane,
-/// which the guest remaps from the model's `[-1, 1]` to the `[0, 1]` a
-/// frames encoder wants and hands back on one channel.
-///
-/// The rows are DECLARED, not hinted: a VAE lane's token rows are not its
-/// clip's voxels, so `pixels(rows, width)` takes both.
 fn vae_readback() -> Traced {
     let (rows, rgb) = (16u32, 3u32);
     let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
@@ -608,6 +567,12 @@ fn programs() -> Vec<(&'static str, Traced)> {
 
 const GOLDENS: &str = "tests/goldens/sdk_containers.txt";
 
+fn sdk_goldens_every_case() {
+    sdk_port_goldens_are_pinned();
+    the_latent_step_binds_against_a_denoising_model();
+    the_vae_readback_binds_against_a_model_that_lands_pixels();
+}
+
 #[test]
 fn sdk_port_goldens_are_pinned() {
     let rendered: String = programs()
@@ -633,10 +598,6 @@ fn sdk_port_goldens_are_pinned() {
     assert_eq!(pinned.lines().count(), rendered.lines().count());
 }
 
-/// The new-op program is not only encodable but bindable: `velocity()` is
-/// gated and width-checked, so a golden that traced a shape no model serves
-/// would pin bytes nothing can run.
-#[test]
 fn the_latent_step_binds_against_a_denoising_model() {
     let profile = eta_ir::registry::ModelProfile {
         vocab: VOCAB,
@@ -649,12 +610,6 @@ fn the_latent_step_binds_against_a_denoising_model() {
         .expect("the latent step binds against a model that predicts a velocity");
 }
 
-/// The pixels golden is bindable too, and only against a model that lands
-/// them: a golden pinning bytes no model can run would pin a shape the
-/// engine never binds. `pixels_width` is `0` here on purpose — a VAE plants
-/// two widths (a decode's RGB beside an encode's 16-channel mean), which is
-/// what a real family's profile states.
-#[test]
 fn the_vae_readback_binds_against_a_model_that_lands_pixels() {
     let profile = eta_ir::registry::ModelProfile {
         vocab: VOCAB,

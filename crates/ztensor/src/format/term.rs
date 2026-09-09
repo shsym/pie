@@ -1,46 +1,26 @@
-//! Types (spec §4): the leaf table, the term grammar, and the planes a term
-//! lays out under the canonical layout (§5.1).
-//!
-//! A [`Term`] is what an object's `type` field says. It has exactly one
-//! spelling per tree, so two types are equal iff their strings are.
-
 use std::fmt;
 
 use crate::error::{Error, Result, Rule};
 use crate::format::align_up;
 
-/// Planes inside one blob start at multiples of this (spec §5.1 rule 3).
-/// 256 because a consumer binds a plane straight out of a file mapping, and
-/// the device APIs want a 256-byte-aligned operand.
 pub const PLANE_ALIGN: u64 = 256;
-/// Group nesting bound (spec §4.2).
 pub const MAX_TERM_DEPTH: u32 = 8;
 
-/// A leaf: a bit pattern of fixed width and the number it denotes (§4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Leaf {
-    /// Unsigned integer of `b` bits, `1..=64`.
     U(u8),
-    /// Two's-complement signed integer of `b` bits, `1..=64`.
     I(u8),
     F16,
     BF16,
     F32,
     F64,
-    /// OCP MX FP4.
     E2M1,
-    /// OCP MX FP6 E2M3.
     E2M3,
-    /// OCP MX FP6 E3M2.
     E3M2,
-    /// OCP FP8 E4M3 (finite-only).
     E4M3,
-    /// OCP FP8 E5M2.
     E5M2,
-    /// OCP MX scale: `2^(code − 127)`, `0xFF` is NaN.
     E8M0,
-    /// One byte, `0x00` or `0x01`.
     Bool,
 }
 
@@ -66,12 +46,10 @@ impl Leaf {
         }
     }
 
-    /// Bytes of `n` packed elements: `⌈n · bits / 8⌉`.
     pub fn size(self, n: u64) -> Option<u64> {
         n.checked_mul(self.bits()).map(|bits| bits.div_ceil(8))
     }
 
-    /// Byte width when the leaf is a whole number of bytes.
     pub fn width(self) -> Option<u64> {
         let bits = self.bits();
         (bits % 8 == 0).then_some(bits / 8)
@@ -132,16 +110,11 @@ impl std::str::FromStr for Leaf {
     }
 }
 
-/// How many elements share one factor (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Group {
-    /// `g{N}`: `N` consecutive elements along the last axis.
     N(u64),
-    /// `g{R}x{C}`: an `R × C` tile over the last two axes, `R ≥ 2`.
     Tile(u64, u64),
-    /// `gr`: one row.
     Row,
-    /// `gt`: the whole tensor.
     Tensor,
 }
 
@@ -156,14 +129,10 @@ impl fmt::Display for Group {
     }
 }
 
-/// The offset of a group form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Offset {
-    /// `n`.
     None,
-    /// `b_<term>`: added after scaling.
     Post(Box<Term>),
-    /// `z_<term>`: subtracted before scaling.
     Pre(Box<Term>),
 }
 
@@ -176,8 +145,6 @@ impl Offset {
     }
 }
 
-/// A type (§4.2): a leaf, or codes of a leaf grouped under a gain term and an
-/// offset.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Leaf(Leaf),
@@ -195,16 +162,11 @@ impl From<Leaf> for Term {
     }
 }
 
-/// One plane of a term under the canonical layout: where it is in the blob
-/// and what it holds (§4.4, §5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plane {
-    /// `"code"`, `"gain"`, `"offset"`, `"gain.code"`, ...; `"data"` for a
-    /// leaf term.
     pub path: String,
     pub leaf: Leaf,
     pub shape: Vec<u64>,
-    /// Byte offset within the decoded blob.
     pub offset: u64,
     pub len: u64,
 }
@@ -301,8 +263,6 @@ impl<'s> Parser<'s> {
 }
 
 impl Term {
-    /// Parses a type string. Rejects under [`Rule::Type`] anything that is not
-    /// exactly one well-formed term.
     pub fn parse(text: &str) -> Result<Term> {
         let mut p = Parser {
             text,
@@ -323,8 +283,6 @@ impl Term {
         }
     }
 
-    /// The planes this term lays out for an object of `shape`, in canonical
-    /// order with canonical offsets (§4.4, §5.1).
     pub fn planes(&self, shape: &[u64]) -> Result<Vec<Plane>> {
         let mut out = Vec::new();
         walk(self, shape, "", &mut out)?;
@@ -349,8 +307,6 @@ impl Term {
         Ok(out)
     }
 
-    /// The decoded blob size under the canonical layout: the end of the last
-    /// plane (§5.1 rule 4).
     pub fn canonical_size(&self, shape: &[u64]) -> Result<u64> {
         Ok(self
             .planes(shape)?
@@ -359,9 +315,6 @@ impl Term {
             .unwrap_or(0))
     }
 
-    /// Content rules over a canonical blob: `bool` bytes are 0 or 1, the
-    /// unused high bits of a packed plane's last byte are zero, and so are
-    /// the bytes between planes (§4.1, §4.4, §5.1 rule 3).
     pub fn check_bytes(&self, shape: &[u64], bytes: &[u8]) -> Result<()> {
         let mut end = 0;
         for plane in self.planes(shape)? {
@@ -508,6 +461,13 @@ impl std::str::FromStr for Term {
 mod tests {
     use super::*;
 
+    fn term_every_case() {
+        round_trips_and_is_canonical();
+        planes_of_u4g64();
+        planes_align_and_nest();
+        content_rules();
+    }
+
     #[test]
     fn round_trips_and_is_canonical() {
         for s in [
@@ -531,7 +491,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn planes_of_u4g64() {
         let t = Term::parse("g64_u4_bf16_b_bf16").unwrap();
         let planes = t.planes(&[4096, 4096]).unwrap();
@@ -551,7 +510,6 @@ mod tests {
         assert!(t.planes(&[4096, 100]).is_err());
     }
 
-    #[test]
     fn planes_align_and_nest() {
         let t = Term::parse("g32_u4_g8_u6_f16_n_b_g8_u6_f16_n").unwrap();
         let paths: Vec<String> = t
@@ -574,7 +532,6 @@ mod tests {
         assert_eq!(t.canonical_size(&[3, 16]).unwrap(), 516);
     }
 
-    #[test]
     fn content_rules() {
         let t = Term::Leaf(Leaf::U(3));
         assert!(t.check_bytes(&[2], &[0b0011_1111]).is_ok());

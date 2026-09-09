@@ -1,12 +1,3 @@
-//! Device-side scratch: gives a transform's operands somewhere on the device
-//! to be. A transform reading the checkpoint gets an
-//! [`StorageInstr::ExtentWrite`] into a staging buffer and then reads that;
-//! an intermediate a device transform reads or writes is placed in the
-//! arena's scratch region. Whether a rewrite is worth making is decided by
-//! asking [`kernel_for`] about the instruction as it would be once rewritten.
-//!
-//! [`ArenaBacking::run_tile_map`]: crate::executor::arena::ArenaBacking::run_tile_map
-
 use crate::error::Result;
 use crate::extent::Extent;
 use crate::plan::index::{PlanIndex, instr_by_id};
@@ -15,7 +6,6 @@ use crate::plan::{BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr};
 use crate::types::{BufferId, Encoding, InstrId};
 
 pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
-    // A target with no kernels has nothing to stage for; skip walking a host plan.
     if program.target.tile_map_mask == 0 {
         return Ok(0);
     }
@@ -23,7 +13,6 @@ pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
     let old = program.instrs.clone();
     let schedule = program.schedule.clone();
 
-    // Pass one: decide, reading only.
     let mut decisions = Vec::with_capacity(schedule.len());
     let mut wanted: Vec<BufferId> = Vec::new();
     for id in &schedule {
@@ -38,8 +27,6 @@ pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
         return Ok(0);
     }
 
-    // Pass two: rewrite. Each staged transform gains a buffer to read and an
-    // `ExtentWrite` that fills it, immediately before the transform.
     let mut rewritten: Vec<StorageInstr> = Vec::with_capacity(old.len() + decisions.len() * 2);
     let mut staged = 0usize;
     for (id, decision) in schedule.iter().zip(decisions) {
@@ -75,17 +62,11 @@ pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
     Ok(staged + placed)
 }
 
-/// What this pass decided about one instruction.
 struct Decision {
-    /// The checkpoint extent to stage, or `None` when the transform already
-    /// reads a buffer and only needs that buffer placed.
     stage: Option<Staging>,
-    /// Operands that have to be arena spans for the backing to be offered
-    /// this transform at all.
     arena_operands: Vec<BufferId>,
 }
 
-/// A checkpoint extent, and the buffer type the bytes will be read back as.
 struct Staging {
     source: SourceExtent,
     shape: Vec<i64>,
@@ -93,10 +74,6 @@ struct Staging {
     alignment: u32,
 }
 
-/// Would the device run this transform, and what does that need?
-///
-/// `None` means "leave it alone", which is the answer for every transform the
-/// target has no row for — the host runs those and always did.
 fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result<Option<Decision>> {
     let StorageInstr::TileMap {
         source,
@@ -119,7 +96,6 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
     };
 
     let Some(source) = source else {
-        // Already reads a buffer; only question is whether it's device-addressable.
         let facts = TileMapFacts {
             operands_in_arena: true,
             ..facts
@@ -130,13 +106,9 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
         }));
     };
 
-    // A block-scaled `Encode` reads its input's per-group factors out of the
-    // checkpoint while it works, so its source is not merely bytes to move.
     if transform.metadata_source.is_some() {
         return Ok(None);
     }
-    // `SourceExtent::dtype` is the logical dtype (e.g. BF16 for an MXFP4
-    // payload), not the raw bytes, so only a raw-encoded source can stage.
     let Some(raw) = index.source(program, source.tensor_id) else {
         return Ok(None);
     };
@@ -147,26 +119,19 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
         return Ok(None);
     };
     let out = program.buffer(*primary)?;
-    // Destination's logical shape when writing a whole buffer, else the
-    // extent's own counts for a window write.
     let shape = match dest {
         Some(dest) => dest.stride.dims.iter().map(|dim| dim.count).collect(),
         None => out.ty.shape.clone(),
     };
     let elements = crate::types::tensor_elements(&shape).unwrap_or(0);
     if elements == 0 || elements.saturating_mul(source.dtype.bytes_ceil()) != source.span_bytes {
-        // Extent doesn't cover a whole operand of the declared shape.
         return Ok(None);
     }
 
-    // The instruction as it would be: reading a dense buffer of exactly these
-    // bytes rather than a file.
     let staged_facts = TileMapFacts {
         has_source: false,
         compact_source: true,
         source_dtype: Some(source.dtype),
-        // in_place: a staging buffer is never the destination.
-        // operands_in_arena: what this pass is making true.
         in_place: false,
         operands_in_arena: true,
         ..facts
@@ -185,8 +150,6 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
     }))
 }
 
-/// Point a `TileMap` at a buffer instead of at the checkpoint. The staged
-/// buffer goes first in `inputs`, where every reader expects the payload.
 fn read_from_buffer(instr: StorageInstr, buffer: BufferId) -> Result<StorageInstr> {
     let StorageInstr::TileMap {
         id,
@@ -223,12 +186,10 @@ fn declare_staging_buffer(program: &mut LoadPlan, stage: &Staging) -> Result<Buf
     );
     program.buffers.push(BufferDecl {
         id,
-        // Not a tensor: a staging buffer is the arena's, not the contract's.
         tensor: None,
         ty: crate::contract::TensorType::new(stage.shape.clone(), stage.encoding.clone()),
         bytes: stage.source.span_bytes,
         alignment: stage.alignment.max(program.target.preferred_alignment),
-        // Reusable, freed at its last use, not part of what the load leaves behind.
         temporary: true,
         persistent_offset: None,
         scratch_offset: None,

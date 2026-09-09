@@ -1,10 +1,3 @@
-//! A generated region is one kernel, and its streams may read a value in a
-//! later pass than the op graph's last reader of it: the softmax's third
-//! pass recomputes `exp(x - m)` and so reads the row max again after the
-//! broadcast that the op graph calls its last reader. The scratch layout
-//! must therefore keep a value the region both defines and reads until the
-//! region ends — the row max may not hand its slot to the row sum inside
-//! the same launch.
 use engine_cuda::program::scratch_offsets;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_compiler::plan::compile_bound;

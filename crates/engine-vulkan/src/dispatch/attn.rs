@@ -191,15 +191,9 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            // This plane's masked read is causal AND mask; a bidirectional
-            // block (a v1 block drafter's full layer) is not served here, and
-            // the two block-drafter ops have no vulkan kernel yet — refused by
-            // name rather than approximated.
             Attention::Masked { causal: false, .. }
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
-            // M0: the ragged attention (D2) is CUDA-first; refused by name
-            // here in this phase.
             | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
             | Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }

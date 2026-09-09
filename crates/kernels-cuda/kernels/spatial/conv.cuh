@@ -1,37 +1,5 @@
 #pragma once
 
-// **IMPLICIT-GEMM CONVOLUTION OVER THE VOXEL AXIS.** `o[m][n] = bias[n] +
-// sum_{tap, c} x[in_row(m, tap)][c] * w[n][tap * C_in + c]` — a GEMM whose
-// A operand (`[rows_out, K]`, `K = kt*kh*kw*C_in`) is never materialised:
-// each K-step gathers the `BK` channels of one tap's input voxel per output
-// row straight into shared memory. Two kernels compute the same thing:
-//
-//   `conv3d_direct` — fp32 FMA tiles, 64 voxels x 64 channels a block, every
-//   channel count and alignment (the scalar-gather instantiation), the
-//   reference the tensor-core kernel is measured against;
-//   `conv3d_mma`    — `mma.sync.m16n8k16` bf16 tiles with fp32 accumulators,
-//   128 x 128 a block, `cp.async` gathers three stages deep; asks for
-//   `C_in % 8 == 0` and 16-byte-aligned planes.
-//
-// **THE WEIGHT IS TAP-MAJOR, CHANNEL-FASTEST.** `w` is `[C_out, kt*kh*kw*C_in]`
-// with `K = ((it*kh + ih)*kw + iw)*C_in + c_in` — PyTorch's
-// `weight.permute(0, 2, 3, 4, 1).reshape(C_out, -1)`, cuDNN's KRSC. The
-// natural `[C_out, C_in, kt, kh, kw]` flattening would put the `BK`
-// channels of one tap `kt*kh*kw` elements apart: every B tile a strided
-// two-byte gather, which is what `conv_weight_taps_major` exists to undo
-// once at load.
-//
-// **TIME.** Symmetric: `pt` frames each side, zeros or — under `replicate`
-// — the clip's own first frame in front and its last frame behind (LTX-2.5's
-// non-causal decoder pads that way). Causal: `pt` frames in front and none
-// behind; a frame before the clip reads `cache` (the previous tile's last
-// `pt` frames, per lane `[pt * h * w, C_in]` rows in lane order) when one is
-// given, else frame 0 (`replicate`) or zero. `h`/`w` are always symmetric
-// zero padding. Output rows no lane claims land zeros.
-//
-// Numerics: bf16 in, fp32 accumulate over all of K, bias added in fp32, one
-// rounding at the store. The two kernels sum K in different orders and agree
-// to fp32 rounding, not bit-for-bit.
 
 #include "prelude/device.cuh"
 #include "prelude/mma.cuh"
@@ -41,8 +9,6 @@
 
 namespace pie::spatial {
 
-/// The static shape of one convolution, one launch argument by value.
-/// Mirrors `spatial::conv::Geom` in the Rust entry field for field.
 struct ConvGeom {
     int c_in;
     int c_out;
@@ -52,22 +18,18 @@ struct ConvGeom {
     int st;
     int sh;
     int sw;
-    /// Front time pad (causal) or the symmetric time pad.
+
     int pt;
     int ph;
     int pw;
-    /// 1: time pad in front only; `cache` frames stand in for it.
+
     int causal;
-    /// 1: a padded frame reads the clip's own end frame instead of zeros —
-    /// frame 0 in front (with no cache), and, when not causal, the last
-    /// frame behind.
+
     int replicate;
     int lanes;
     int rows_out;
 };
 
-/// One output row's view of its lane: the input box, the output voxel, and
-/// where this lane's cache frames start.
 struct OutRow {
     Lane in;
     Voxel o;
@@ -90,8 +52,7 @@ __device__ __forceinline__ OutRow out_row(
     if (l < 0) return r;
     r.in = lane_at(grid, l);
     r.o = unravel(og, m - og.off);
-    // The cache is `pt` frames per lane, lane after lane, each in its own
-    // lane's plane size.
+
     int planes = 0;
     for (int j = 0; j < l; ++j) planes += lane_at(grid, j).plane();
     r.cache_base = planes * g.pt;
@@ -99,8 +60,6 @@ __device__ __forceinline__ OutRow out_row(
     return r;
 }
 
-/// The row one tap of one output voxel reads: a row of `x` (`from_cache`
-/// false), a row of `cache` (true), or `-1` for a zero.
 __device__ __forceinline__ int tap_row(
     const ConvGeom& g,
     const OutRow& r,
@@ -124,16 +83,13 @@ __device__ __forceinline__ int tap_row(
         ti = 0;
     }
     if (ti >= r.in.t) {
-        // Behind the clip: a symmetric replicating convolution reads the
-        // last frame; a causal one never pads behind, and a zero-padded
-        // symmetric one reads zeros.
+
         if (g.causal || !g.replicate) return -1;
         ti = r.in.t - 1;
     }
     return ravel(r.in, ti, hi, wi);
 }
 
-/// The `(it, ih, iw)` of tap index `tap` in the weight's tap-major order.
 __device__ __forceinline__ void tap_of(const ConvGeom& g, int tap, int& it, int& ih, int& iw) {
     const int plane = g.kh * g.kw;
     it = tap / plane;
@@ -142,18 +98,12 @@ __device__ __forceinline__ void tap_of(const ConvGeom& g, int tap, int& it, int&
     iw = rest - ih * g.kw;
 }
 
-// ---------------------------------------------------------------------------
-// Version A: fp32 FMA tiles.
-// ---------------------------------------------------------------------------
 
 constexpr int kDirectTM = 64;
 constexpr int kDirectTN = 64;
 constexpr int kDirectBK = 32;
 constexpr int kDirectThreads = 256;
 
-/// Eight consecutive channels of one row into `out`, zero past `c_in`.
-/// `VEC` reads them as one 16-byte word (the caller guaranteed `c_in % 8 ==
-/// 0` and alignment); otherwise element by element under a channel guard.
 template <bool VEC>
 __device__ __forceinline__ void gather8(const bf16* __restrict__ row, int c, int c_in, float (&out)[8]) {
     if constexpr (VEC) {
@@ -192,9 +142,6 @@ __global__ __launch_bounds__(kDirectThreads) void conv3d_direct(
     const int m0 = blockIdx.x * kDirectTM;
     const int n0 = blockIdx.y * kDirectTN;
 
-    // Staging map: a warp stages 32 consecutive rows (of A) and 32
-    // consecutive weight rows (of B), one 8-wide channel chunk each, so the
-    // transposed shared-memory writes land on 32 distinct banks.
     const int s_row = tid % 64;
     const int s_k = (tid / 64) * 8;
     const OutRow r = out_row(g, grid, o_grid, m0 + s_row);
@@ -205,7 +152,6 @@ __global__ __launch_bounds__(kDirectThreads) void conv3d_direct(
     const bool n_live = (n0 + s_row) < g.c_out;
     const bf16* wrow = w + static_cast<long long>(n_live ? n0 + s_row : 0) * taps * g.c_in;
 
-    // Compute map: 16 x 16 threads, four rows by four columns each.
     const int ty = tid / 16;
     const int tx = tid % 16;
     float acc[4][4];
@@ -284,22 +230,17 @@ __global__ __launch_bounds__(kDirectThreads) void conv3d_direct(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Version B: bf16 tensor-core tiles.
-// ---------------------------------------------------------------------------
 
 constexpr int kMmaTM = 128;
 constexpr int kMmaTN = 128;
 constexpr int kMmaBK = 32;
 constexpr int kMmaThreads = 256;
-/// The staged row pitch in bf16: eight of padding so the eight rows of one
-/// `ldmatrix` phase land in eight different 16-byte bank groups.
+
 constexpr int kMmaLd = kMmaBK + 8;
 constexpr int kMmaStageElems = (kMmaTM + kMmaTN) * kMmaLd;
-/// The epilogue tile's row pitch (bf16), padded the same way.
+
 constexpr int kMmaLdC = kMmaTN + 8;
 
-/// Dynamic shared memory one launch of `conv3d_mma<kStages>` asks for.
 template <int kStages>
 __host__ __device__ constexpr int conv3d_mma_smem() {
     constexpr int ring = kStages * kMmaStageElems * 2;
@@ -307,9 +248,6 @@ __host__ __device__ constexpr int conv3d_mma_smem() {
     return ring > tile ? ring : tile;
 }
 
-/// One 16-byte `cp.async`, zero-filled when `bytes` is 0 (the gather's
-/// out-of-range taps): `src` must still be a valid address, so the caller
-/// hands the plane base.
 __device__ __forceinline__ void conv_cp_async16(void* dst, const void* src, int bytes) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
@@ -318,11 +256,6 @@ __device__ __forceinline__ void conv_cp_async16(void* dst, const void* src, int 
                  : "memory");
 }
 
-/// `ldmatrix.x4` over a row-major 16x16 bf16 tile: lane `l` addresses row
-/// `l & 15`, column `(l >> 4) * 8`; the registers come back as the (rows
-/// 0-7, k 0-7), (rows 8-15, k 0-7), (rows 0-7, k 8-15), (rows 8-15, k 8-15)
-/// 8x8 tiles — the mma A fragment as is, and off a `[n][k]` weight tile the
-/// B fragments of two 8-row subtiles as {r0, r2} and {r1, r3}.
 __device__ __forceinline__ void conv_ldmatrix_x4(unsigned (&reg)[4], const bf16* at) {
     const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(at));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -356,10 +289,6 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
     const int steps = taps * cchunks;
     const long long wpitch = static_cast<long long>(taps) * g.c_in;
 
-    // Staging map: chunk `tid + i * 256` is row `chunk / 4`, channels
-    // `(chunk % 4) * 8`; two A rows and two B rows a thread, fixed for the
-    // whole K loop, so the voxel arithmetic is done once and the tap
-    // arithmetic once per tap.
     const int s_kc = (tid & 3) * 8;
     OutRow rows[2];
     int src_row[2] = {-1, -1};
@@ -404,8 +333,6 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
         __pipeline_commit();
     };
 
-    // Warp tile: 2 (rows) x 4 (columns) warps, 64 x 32 each — four m16
-    // tiles by four n8 tiles.
     const int warp_m = warp >> 2;
     const int warp_n = warp & 3;
     float acc[4][4][4];
@@ -465,10 +392,6 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
         __syncthreads();
     }
 
-    // **THE EPILOGUE GOES THROUGH SHARED MEMORY.** One lane's accumulator
-    // holds two rows (`g`, `g + 8`) by two adjacent columns; staged as a
-    // `[row][col]` bf16 tile it drains as whole 16-byte row pieces. The bias
-    // joins in fp32 before the one rounding.
     __pipeline_wait_prior(0);
     __syncthreads();
     bf16* c_tile = ring;
@@ -522,14 +445,7 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The load-time weight relabelling.
-// ---------------------------------------------------------------------------
 
-/// `dst[n][tap * c_in + c] = src[n][c * taps + tap]`: PyTorch's
-/// `[C_out, C_in, kt, kh, kw]` rectangle, flattened as stored, into the
-/// tap-major channel-fastest order the two kernels read. One thread per
-/// element of the destination.
 __global__ void conv_weight_taps_major(
     const bf16* __restrict__ src,
     bf16* __restrict__ dst,

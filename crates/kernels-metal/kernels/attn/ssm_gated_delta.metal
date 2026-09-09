@@ -17,18 +17,7 @@ template <typename T, int WIDTH, int KMAX>
     uint3 lpos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]]) {
-  // ONE TOKEN THROUGH THE DELTA RULE, a simdgroup per value column.
-  //
-  // The state is `[v_dim][k_dim]` per head, `k_dim` contiguous. The
-  // previous shape gave each THREAD one column and walked its `k_dim`
-  // cells serially, twice (decay-and-read, then update-and-write): across
-  // the threadgroup that is 128 lanes striding `k_dim` floats apart —
-  // every load its own cache line — and four passes over the state. Here
-  // a SIMDGROUP takes a column: its 32 lanes hold the column's cells
-  // `PER` apart in registers (coalesced, one read and one write per cell),
-  // the two dot products the rule needs fold with `simd_sum`, and the
-  // column count is split across `splits` threadgroups down z so a
-  // one-row fire still spreads a head over the device.
+
   constexpr int PER = KMAX / 32;
   threadgroup float sq[KMAX];
   threadgroup float sk[KMAX];
@@ -83,7 +72,6 @@ template <typename T, int WIDTH, int KMAX>
                    size_t(dv) * size_t(dk);
   const size_t out = (size_t(n) * size_t(v_heads) + size_t(hv)) * size_t(dv);
 
-  // This threadgroup's columns, a simdgroup at a time.
   const int per_part = dv / splits;
   const int c0 = part * per_part;
   constexpr int simdgroups = WIDTH / 32;
@@ -234,16 +222,6 @@ instantiate_gated_delta(bfloat16, bfloat, 128, 256)
 
 instantiate_gated_delta_chunked(bfloat16, bfloat, 128, 256)
 
-// ── the committed form ───────────────────────────────────────────────────────
-//
-// `gated_delta_chunked` over the extended row run `causal_conv1d_committed`
-// describes, with one difference that is the whole point: the recurrence runs
-// on a WORK copy of the bank and the bank itself is written only as of row
-// `commit[lane0 + r] - 1`. The rows past the commit are computed (their
-// outputs are the speculative window's logits) from the state they should see
-// and leave nothing behind. Each thread copies, scans and commits its own
-// columns, so no barrier orders the bank write. `work` is one bank per fire
-// lane, `[lane][v_heads][v_dim][k_dim]`.
 template <typename T, int WIDTH, int KMAX>
 [[kernel]] void gated_delta_committed(
     const device T* qkv         [[buffer(0)]],
@@ -265,19 +243,7 @@ template <typename T, int WIDTH, int KMAX>
     uint3 lpos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]]) {
-  // The shape of `gated_delta` (a simdgroup per value column, the column's
-  // cells in registers, the columns split across `splits` threadgroups
-  // down z) over the extended run: the run's rows are staged `SPAN` at a
-  // time, and a column's state stays in registers across every row of the
-  // chunk — the bank is read once, and written once, as of `keep`. Only a
-  // run longer than one chunk goes through `work` between chunks.
-  // SPAN rows a chunk, sized for a depth-one window and its replay (fold
-  // ≤ 2 + 2 own rows) in ONE chunk while keeping the staging under 10 KB —
-  // an 8-row chunk with a fold table a row was 24 KB, which on this device
-  // (32 KB a core) parks a single threadgroup per core and made the arm 6×
-  // the decode kernel's per-row cost. The norm fold is `gated_delta`'s
-  // WIDTH-wide tree, one row at a time through one table, so the banks it
-  // leaves are bit for bit the unbuffered fold's.
+
   constexpr int PER = KMAX / 32;
   constexpr int SPAN = 4;
   constexpr int simdgroups = WIDTH / 32;
@@ -326,7 +292,6 @@ template <typename T, int WIDTH, int KMAX>
   for (int t0 = 0; t0 < span; t0 += SPAN) {
     const int rows = min(SPAN, span - t0);
 
-    // Stage this chunk's normalized q and k rows, a row at a time.
     for (int t = 0; t < rows; ++t) {
       const size_t row = size_t(begin + t0 + t) * pitch;
       const size_t qbase = row + size_t(hk) * size_t(dk);
@@ -356,7 +321,6 @@ template <typename T, int WIDTH, int KMAX>
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Every column of this threadgroup, the chunk's rows in registers.
     for (int c = c0 + int(simd_gid); c < c0 + per_part; c += simdgroups) {
       const device float* from = (t0 == 0 ? bank : carry) + size_t(c) * size_t(dk);
       float s[PER];

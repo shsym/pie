@@ -1,7 +1,3 @@
-//! Typed resource stores: device memory as pages, slots, and mappings, over
-//! typed static backing pools. KV-contention policy lives in `crate::planner`;
-//! these stores own only physics (pools, transactions, swap).
-
 pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
@@ -9,7 +5,6 @@ pub(crate) mod registry;
 pub(crate) mod rs;
 pub(crate) mod seat;
 
-/// Stable identity for one pipeline ownership scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);
 
@@ -56,8 +51,6 @@ impl PipelineScope {
         uuid::Uuid::from_u128(self.state.id.0)
     }
 
-    /// Mark the scope closed. Returns whether this call performed the
-    /// transition, allowing lifecycle notifications to remain idempotent.
     pub(crate) fn close(&self) -> bool {
         !self
             .state
@@ -80,7 +73,6 @@ impl std::fmt::LowerHex for PipelineScopeId {
     }
 }
 
-/// Coarse worker-routing signal derived from real KV residency and contention.
 pub fn kv_pressure_bucket() -> u8 {
     if let Some(planner) = crate::planner::planner() {
         return planner.kv_pressure_bucket();

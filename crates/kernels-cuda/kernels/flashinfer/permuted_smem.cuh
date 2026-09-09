@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_PERMUTED_SMEM_CUH_
 #define FLASHINFER_PERMUTED_SMEM_CUH_
 
@@ -20,13 +20,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// PIE: REMOVED -- `<cuda/pipeline>`, vestigial upstream. 1 line, and nothing behind it is named:
-// `cuda::pipeline`, `memcpy_async`, `pipeline_shared_state` and `aligned_size_t` are zero here,
-// zero in the closure that reaches this file, and zero in the FlashInfer tree outside
-// `3rdparty/` -- this file stages through smem with `cp_async.cuh`'s own wrappers, onto the same
-// `cp.async` instructions the shim emitted. `csrc/shim/cuda/pipeline` answered this directive
-// and was retired with it; see `csrc/shim/README.md`. This marker is one a strip does NOT undo;
-// see MODIFICATIONS.
 
 #include "cp_async.cuh"
 #include "mma.cuh"
@@ -38,13 +31,11 @@ enum class SwizzleMode {
   k128B,
 };
 
-// Use 128bit as the granularity to fetch/store data per thread to maximize memory bandwidth
 using b128_t = uint4;
 
-/*!
- * \brief Compute the number of elements that can be stored in a b128_t.
- * \tparam T The data type of the elements.
- */
+
+
+
 template <typename T>
 constexpr __host__ __device__ __forceinline__ uint32_t upcast_size() {
   return sizeof(b128_t) / sizeof(T);
@@ -55,34 +46,32 @@ __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) 
   if constexpr (swizzle_mode == SwizzleMode::k128B) {
     return i * stride + (j ^ (i % 8));
   } else {
-    // swizzle_mode == SwizzleMode::k64B
+
     return i * stride + (j ^ ((i / 2) % 4));
   }
 }
 
-/*!
- * \brief The shared memory wrapper.
- */
+
+
 template <SwizzleMode swizzle_mode>
 struct smem_t {
-  // The base pointer.
+
   b128_t* base;
   __device__ __forceinline__ smem_t() : base(nullptr) {}
   template <typename T>
   __device__ __forceinline__ smem_t(T* base) : base((b128_t*)base) {}
 
-  /*!
-   * \brief Compute the element offset given coordinates in a permuted shared memory.
-   * \tparam stride The stride (in terms of b128_t's) in the permuted shared memory.
-   * \param i The row index.
-   * \param j The column index.
-   */
+
+
+
+
+
   template <uint32_t stride>
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
       return i * stride + (j ^ (i % 8));
     } else {
-      // swizzle_mode == SwizzleMode::k64B
+
       static_assert(stride == 4);
       return i * stride + (j ^ ((i / 2) % 4));
     }
@@ -99,11 +88,11 @@ struct smem_t {
       } else if constexpr (step_size == 4) {
         return (offset ^ 0x4) + (step_idx % 2 == 1) * 8;
       } else {
-        // step_size % 8 == 0
+
         return offset + step_size;
       }
     } else {
-      // swizzle_mode == SwizzleMode::k64B
+
       static_assert(step_size == 2, "Unsupported step size");
       return (offset ^ 0x2) + (step_idx % 2 == 1) * 4;
     }
@@ -116,7 +105,7 @@ struct smem_t {
       if constexpr (step_size == 4) {
         return (offset ^ 0x4) + step_size * row_stride;
       } else {
-        // step_size % 8 == 0
+
         return offset + step_size * row_stride;
       }
     } else {
@@ -124,7 +113,7 @@ struct smem_t {
       if constexpr (step_size == 4) {
         return (offset ^ 0x2) + step_size * row_stride;
       } else {
-        // step_size % 8 == 0
+
         return offset + step_size * row_stride;
       }
     }
@@ -192,6 +181,6 @@ struct smem_t {
   }
 };
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_PERMUTED_SMEM_CUH_
+#endif

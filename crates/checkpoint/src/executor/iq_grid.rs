@@ -1,25 +1,13 @@
-//! The lattice grids the IQ2 and IQ3 GGUF schemes index.
-//!
-//! These schemes code an address, not a magnitude: a payload byte selects one of a few hundred fixed eight- or four-element points, and the block's scale and a sign mask place it. The grids are the output of an offline search over real weight distributions and are not in the file; llama.cpp compiles them in, so anything reading these formats must too.
-//!
-//! Written the way `gguf-py`'s `gguf/quants.py` writes them — ASCII hex, each grid element narrowed to an index into a three- or eight-entry map — so it can be diffed against upstream, and so the narrowing is stated rather than implicit. Expansion runs in `const fn`, so what reaches the decoder is a flat table with no lazy initialization to synchronize.
-
-/// The three magnitudes an IQ2 grid component takes. A grid point is eight of these, all positive; sign comes from the block's mask, scale from its `d`. Two bits index this.
 const GRID_MAP_IQ2: [i8; 4] = [0x08, 0x19, 0x2b, 0];
 
-/// The eight magnitudes an `IQ3_XXS` grid component takes. Three bits index this; not evenly spaced (top step 10, rest 8).
 const GRID_MAP_IQ3XXS: [i8; 8] = [0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e];
 
-/// The eight magnitudes an `IQ3_S` grid component takes: odd numbers 1-15. Different scale from `IQ3_XXS`'s, so the two cannot share a grid or decoder.
 const GRID_MAP_IQ3S: [i8; 8] = [0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f];
 
-/// Decodes one ASCII hex digit.
 const fn nibble(c: u8) -> u8 {
     if c >= b'a' { c - b'a' + 10 } else { c - b'0' }
 }
 
-/// Expands a packed grid: components sit `SLOT` bits apart and are `BITS` wide, and `map` gives the value each index stands for.
-/// Two hex digits make a byte, holding `8 / SLOT` components from the low end. `SLOT` and `BITS` differ for IQ3, which stores three-bit indices in four-bit slots (the fourth bit is padding that must not reach `map`).
 const fn expand<const N: usize, const SLOT: u32, const BITS: u32>(
     hex: &[u8],
     map: &[i8],
@@ -41,7 +29,6 @@ const fn expand<const N: usize, const SLOT: u32, const BITS: u32>(
     grid
 }
 
-/// llama.cpp's `iq2xxs_grid`, packed: 256 points of 8 components.
 const IQ2XXS_GRID_HEX: &[u8] = b"00000200050008000a00110014002000220028002a0041004400500058006100\
       6400800082008a00a20001010401100115014001840198010002020222028202\
       010404041004210424044004420448046004810484049004a404000502050805\
@@ -59,10 +46,8 @@ const IQ2XXS_GRID_HEX: &[u8] = b"00000200050008000a00110014002000220028002a00410
       608400854685948509864086608602880489118a0490109024904090a1901691\
       8091459200942294449451958198209902a050a085a009a100a218a450a804a9";
 
-/// llama.cpp's `iq2xxs_grid`, expanded.
 pub const IQ2XXS_GRID: [i8; 2048] = expand::<2048, 2, 2>(IQ2XXS_GRID_HEX, &GRID_MAP_IQ2);
 
-/// llama.cpp's `iq2xs_grid`, packed: 512 points of 8 components.
 const IQ2XS_GRID_HEX: &[u8] = b"00000200050008000a0011001400160019002000220025002800410044004600\
       49005000520055005800610064008000820085008800910094009900a0000101\
       04010601090110011201150118011a0121012401400142014501480151015401\
@@ -96,10 +81,8 @@ const IQ2XS_GRID_HEX: &[u8] = b"00000200050008000a001100140016001900200022002500
       02a008a00aa020a02aa0a0a051a159a1a6a100a202a208a22aa280a2a0a240a4\
       95a465a698a60aa820a822a828a8a0a8a8a804a984a986a928aa2aaa91aaaaaa";
 
-/// llama.cpp's `iq2xs_grid`, expanded.
 pub const IQ2XS_GRID: [i8; 4096] = expand::<4096, 2, 2>(IQ2XS_GRID_HEX, &GRID_MAP_IQ2);
 
-/// llama.cpp's `iq2s_grid`, packed: 1024 points of 8 components.
 const IQ2S_GRID_HEX: &[u8] = b"00000200050008000a0011001400160019002000220025002800410044004600\
       490050005200550058006100640066006900800082008500880091009400a000\
       a500aa0001010401060109011001120115011801210124014001420145014801\
@@ -165,10 +148,8 @@ const IQ2S_GRID_HEX: &[u8] = b"00000200050008000a0011001400160019002000220025002
       40a165a102a20aa222a228a22aa282a288a28aa2a8a201a404a410a440a489a4\
       a4a400a519a551a60aa828a8a2a854a986a908aa0aaa20aa22aa28aa88aaaaaa";
 
-/// llama.cpp's `iq2s_grid`, expanded.
 pub const IQ2S_GRID: [i8; 8192] = expand::<8192, 2, 2>(IQ2S_GRID_HEX, &GRID_MAP_IQ2);
 
-/// llama.cpp's `iq3xxs_grid`, packed: 256 points of 4 components.
 const IQ3XXS_GRID_HEX: &[u8] = b"0000020004001100130017002000220031004200730075000101030110011201\
       2101250130013201410154017001000202020402110220022202310233023702\
       5102570275020103070310031203250370031304370444045704730475040105\
@@ -186,10 +167,8 @@ const IQ3XXS_GRID_HEX: &[u8] = b"00000200040011001300170020002200310042007300750
       6161176264623063366344640565526533660367216703700570077010703270\
       5270267140711272457252720073157333736073217441740075027524753076";
 
-/// llama.cpp's `iq3xxs_grid`, expanded.
 pub const IQ3XXS_GRID: [i8; 1024] = expand::<1024, 4, 3>(IQ3XXS_GRID_HEX, &GRID_MAP_IQ3XXS);
 
-/// llama.cpp's `iq3s_grid`, packed: 512 points of 4 components.
 const IQ3S_GRID_HEX: &[u8] = b"0000010002000500070010001100120014001600200021002500330040004200\
       4500470051005300600062007100740077000001010102010401100111011501\
       2001230127013101350144016101650172010002010205020702100213021602\
@@ -223,5 +202,4 @@ const IQ3S_GRID_HEX: &[u8] = b"0000010002000500070010001100120014001600200021002
       2070227036704070547062700271117124714371457101720472107216722172\
       3072517202733273357353730174057413742074507422754275027631760077";
 
-/// llama.cpp's `iq3s_grid`, expanded.
 pub const IQ3S_GRID: [i8; 2048] = expand::<2048, 4, 3>(IQ3S_GRID_HEX, &GRID_MAP_IQ3S);

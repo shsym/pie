@@ -1,8 +1,3 @@
-//! pie:instruct/tool-use — Tool calling support
-//!
-//! Imported by inferlets that support tool-use capabilities.
-//! Delegates to the model's `Instruct` implementation.
-
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
@@ -12,13 +7,6 @@ use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Tool-use decoder resource — wraps a model-specific ToolDecoder trait object.
-///
-/// A decoder answers a batch with every call that batch completed, and a batch
-/// can complete more than one. The WIT `feed` hands back a single event, so
-/// the surplus queues here and drains on the following calls; an idle batch
-/// answers with `ToolEvent::None`, which is the WIT's `start` because the
-/// variant has no idle arm and `start` is what an idle feed has always said.
 pub struct Decoder {
     inner: Box<dyn ToolDecoder>,
     pending: VecDeque<ToolEvent>,

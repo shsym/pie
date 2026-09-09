@@ -16,49 +16,12 @@ using namespace metal;
 #define MLX_MTL_CONST static constant constexpr const
 MLX_MTL_CONST int SIMD_SIZE = 32;
 
-// The simdgroup split down M, as a function of the row block — the DEFAULT
-// every template below takes for `WM`, so that a row block names its own
-// warp shape instead of each instantiation restating it.
-//
-// `mlx::steel::BlockMMA` computes `TM = BM / (kFragSize * WM)` with
-// `kFragSize = 8`, so `BM = 8` admits `WM = 1` AND NOTHING ELSE: at `WM = 2`
-// every simdgroup gets a zero-row warp tile and the MMA computes nothing at
-// all. That single constraint is why the 8 rung needed a source
-// instantiation rather than another argument to the stamp — see `BM_RUNGS`
-// in `kernels-metal/src/linear/quant.rs` for what it buys.
-//
-// The threadgroup shrinks with it: `WM * WN * SIMD_SIZE` is 64 lanes at the 8
-// rung against 128 at every rung above, which the host has to launch to match
-// (`quant::qmm_group`), because both block loaders divide their tile by
-// `tgp_size` and a loader told 128 while 64 arrive leaves half the tile
-// unwritten.
 template <int BM>
 inline constexpr int qmm_wm() {
   return BM < 16 ? 1 : 2;
 }
 
-// **`WM = 1` AT `BM = 16` WAS TRIED AND LOSES (M4 Pro, 2026-09-04).** The
-// diagnosis it came from is real — at `WM = 2` each of the two simdgroups
-// reads every B fragment out of threadgroup memory, so one simdgroup halves
-// that traffic — but the measurement refuses it: 512.7 us against 496.6 at
-// sixteen rows, K=5120 N=17408 4-bit. One simdgroup is 64 lanes where two are
-// 128, and the parallelism lost inside the threadgroup costs more than the
-// duplicate fragment reads. Consistent with the `bn_16` result already
-// recorded upstream: this tile is not short of threadgroup memory, so buying
-// residency with lanes is buying what it already has.
-//
-// THE RULE IS STATED TWICE and both copies must move together: this function,
-// and `quant::qmm_group`'s `bm < 2 * FRAG_ROWS` on the host. Changing one
-// alone launches 128 lanes into a kernel that expects 64 — the loaders divide
-// their tile by `tgp_size` and half of it is never written, which
-// `every_row_count_is_timed` catches as a wrong answer (worst relative 1.2991)
-// rather than a slow one.
 
-// The lanes a row block's threadgroup holds. `WN = 2` throughout this file —
-// the one place a column split of four appears is a hand-written
-// instantiation at the bottom — so a block loader that carries no `WN` of its
-// own reads its `tgp_size` from here rather than from a literal `4 *
-// SIMD_SIZE`, which was correct for exactly the rungs that predate the 8.
 template <int BM>
 inline constexpr int qmm_tgp() {
   return qmm_wm<BM>() * 2 * SIMD_SIZE;
@@ -70,31 +33,6 @@ inline constexpr int qmm_tgp() {
 #include "../third_party/mlx_steel_loader.metal"
 #include "../third_party/mlx_quantized_block.metal"
 
-// ── the affine 4-bit tile loader, in vectors ──────────────────────────────
-//
-// The vendored `QuantizedBlockLoader` reads a thread's `n_reads` packed bytes
-// one `uint8_t` at a time and writes each dequantized pair as two two-byte
-// threadgroup stores — the same shape the MXFP4 loader above had, for the
-// same reason: `src` is a `uint8_t*`, so the compiler can prove no alignment
-// and merges nothing. At the 8-row rung that is the tile's whole margin: the
-// MMA per K step is eight fragment products a simdgroup, and the dequantized
-// staging that feeds them — eight byte loads, sixteen stores, a barrier — is
-// what the 345 us at K=5120 N=17408 is mostly made of (the same shape reads
-// 497 at sixteen rows for twice the FLOPs; the fixed part is ~200 us).
-//
-// Measured (M4 Pro, 2026-09-05, `a_quantized_matmul_is_priced_by_its_rows`):
-// K=5120 N=17408 345 -> 335 us at eight rows and 497 -> 485 at sixteen;
-// N=5120 161 -> 157 at sixteen. Three percent, bit-identical — the loader was
-// not the 8-row rung's margin either (see the split-K note below for where
-// it LOSES and is not used), and what that rung is made of is barriers.
-//
-// This reads the run as one `vec<uint8_t, VEC>` and stores each pair of
-// bytes as one `vec<D, 4>`, with the SAME arithmetic as the vendored
-// `dequantize<D, 2, 4>` — `s0 * (w & 0x0f) + bias`, `s1 * (w & 0xf0) + bias`
-// with `s1 = scale / 16` — in the same order, so the bits it lands are the
-// vendored loader's and `every_folded_point_answers_the_one_row_point`
-// vouches for it. Group stepping is the vendored loader's for
-// `reduction_dim == 1`, the only orientation this file launches.
 template <
     typename T,
     short BROWS,
@@ -182,8 +120,6 @@ struct AffineVec4Loader {
   }
 };
 
-// Which weight loader an affine tile takes: the vectorized one at 4 bits, the
-// vendored one at every other width.
 template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
           short group_size, int bits, typename D>
 struct AffineLoaderFor {
@@ -519,6 +455,26 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
           int WM = qmm_wm<BM>(), int WN = 2>
+[[kernel]] void affine_qmm_t_wide(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(T);
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
+      w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          int WM = qmm_wm<BM>(), int WN = 2>
 [[kernel]] void affine_qmm_t_aligned(
     const device uint32_t* w   [[buffer(0)]],
     const device T* scales     [[buffer(1)]],
@@ -630,38 +586,6 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       loader_w);
 }
 
-// ── the routed MXFP4 tile loader, in vectors ────────────────────────────────
-//
-// The same values in the same places as `mlx::steel::Mxfp4BlockLoader`, which
-// is vendored and stays as it is: a thread still owns `n_reads` consecutive
-// bytes of one weight row, still reads the one E8M0 exponent those bytes
-// share, and still multiplies each nibble by it before staging. Nothing about
-// the k order or the rounding moves, so this lands the SAME BITS as the
-// loader it replaces and the quant tile family's fingerprint is untouched.
-//
-// **WHAT MOVES IS THE SHAPE OF THE TWO MEMORY ACCESSES AROUND THAT
-// MULTIPLY.** The vendored loader spells its read `src[i]` over `n_reads` and
-// its write `dst[2 * i]`, `dst[2 * i + 1]` — eight one-byte device loads and
-// sixteen two-byte threadgroup stores per thread per k step at the 64-column
-// tile. Both runs are contiguous and both are aligned; NEITHER FACT IS
-// AVAILABLE TO THE COMPILER, because `src` is a `uint8_t*` whose alignment is
-// one by declaration, so the eight loads cannot be merged and are not.
-//
-// The alignment is the CALLER's property and is stated here rather than
-// assumed. `src` reaches a thread as `e * N * K / 2 + y_col * K / 2` plus
-// `bi * K / 2 + bj`, and the k loop steps it by `BCOLS_PACKED`, which is 16.
-// `qmm_grid` refuses to launch unless `K % BK == 0` at `BK = 32`, so every
-// row offset is a multiple of 16 bytes; `bj` is a multiple of `n_reads` by
-// construction. So each address is `n_reads`-aligned and the read is one
-// vector. `dst` lands at `bi * BK_padded + 2 * bj` with `BK_padded = BK + 8`,
-// a multiple of four halves both ways, so the store is one `vec<D, 4>`.
-//
-// Measured on an M1 Max over gpt-oss-20b's two expert shapes at 2048 sorted
-// rows, the shipped 32x64 tile: 12.29 → 12.12 ms on gate/up and 6.19 → 6.09
-// on down, +1.4% and +1.6%. It is a small number because the loader was never
-// what bound this kernel — see the note under the stamps — and it is kept
-// because it is free and because eight byte loads of an eight-byte aligned
-// run is a defect whatever it costs.
 template <
     typename T,
     short BROWS,
@@ -676,9 +600,7 @@ struct Mxfp4VecLoader {
   MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
   MLX_MTL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  // The widest byte vector that divides a thread's run. Over the stamped
-  // column tiles at this family's 128 lanes `n_reads` is 8, 4 or 2, so this
-  // is 4 or 2 and never 1.
+
   MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
   static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
 
@@ -735,20 +657,6 @@ struct Mxfp4VecLoader {
   }
 };
 
-// ── the routed MXFP4 GEMM, biased and not ──────────────────────────────────
-//
-// **BOTH FORMS ARE STAMPED, AND THE SECOND ONE IS WHY THIS IS A `_impl`.**
-// gpt-oss is the family that ships mxfp4, and it biases its gate/up
-// projection and does NOT bias its down projection: `down_bias` is folded
-// after the weighted reduce, where a tensor-parallel split can still add it
-// once, so the down GEMM itself reaches this file with no bias plane. When
-// only the biased form existed, `batched_point` answered `None` for that
-// half of every mixture layer and the driver fell through to the MATVEC arm
-// -- one simdgroup per (row, four columns), reading each expert's down slice
-// once per ROUTED ROW instead of once per tile. Measured on an M1 Max at 512
-// prompt tokens that was 9.0 GB of weight traffic a layer against the tiled
-// arm's 0.53. Stamping this form measures 1547.0 -> 784.9 ms, 331.0 -> 652.4
-// tok/s. See `.wiki/macos-bench.md` section 18.
 template <typename T, int BM, int BK, int BN, bool WITH_BIAS>
 METAL_FUNC void mxfp4_qmm_t_routed_impl(
     const device uint32_t* w,
@@ -804,10 +712,6 @@ template <typename T, int BM, int BK, int BN>
       simd_lid);
 }
 
-// The unbiased form does not DECLARE buffer 7. The driver binds a nil buffer
-// at every seat the family leaves unbound, and a seat that is declared and
-// never read is the trap this file already warns about one point down; not
-// naming it is how the trap is avoided rather than tolerated.
 template <typename T, int BM, int BK, int BN>
 [[kernel]] void mxfp4_qmm_t_routed(
     const device uint32_t* w [[buffer(0)]],
@@ -834,6 +738,13 @@ template <typename T, int BM, int BK, int BN>
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device int*, uint3, uint, uint);
+
+#define PIE_STAMP_qmm_t_wide(entry, gs, b, bm, bk, bn)                         \
+  template [[host_name(entry)]]                                                \
+  [[kernel]] void affine_qmm_t_wide<bfloat, gs, b, bm, bk, bn>(                \
+      const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, uint3, uint, uint);
 
 #define PIE_STAMP_qmm_t(entry, gs, b, bm, bk, bn)                              \
   template [[host_name(entry)]]                                                \
@@ -900,13 +811,6 @@ instantiate_mxfp4_qmm_t_routed_plain(64, 64)
       const device bfloat*, device bfloat*, const constant int&,              \
       const constant int&, const device int*, uint3, uint, uint);
 
-// The 8-row rung: a verify block routes a few rows to each expert it
-// touches (a DFlash block of 8-16 rows on gemma-4-26B-A4B lands ~5 rows an
-// expert), so a 16-row tile would spend most of its MMA on padding while
-// the matvec arm dequantizes the same expert once per pair. Measured through
-// `DeviceTuning::moe_batch_min_pairs` and it LOSES to the matvec by 2.4x at
-// eight rows (too few threadgroups, each a serial k walk); kept stamped so
-// the measurement can be repeated, not because it is served.
 instantiate_qmm_t_routed_fp16(8, 16)
 instantiate_qmm_t_routed_fp16(8, 32)
 instantiate_qmm_t_routed_fp16(8, 64)
@@ -938,27 +842,6 @@ instantiate_qmm_t_fp16_precast(64, 16)
 instantiate_qmm_t_fp16_precast(64, 32)
 instantiate_qmm_t_fp16_precast(64, 64)
 
-// **THE 8 RUNG**, `WM = 1` by `qmm_wm` and 64 lanes to the threadgroup.
-// Three of the file's families are stamped at it and the rest are not:
-//
-//   * PRE-CAST, here and in its `_bias`/`_residual` forms below, is the one
-//     that matters. On a machine that emulates bfloat every dense projection
-//     of a 4-bit/g64 checkpoint takes this family (`quant::act_x_wt` rung 2),
-//     so a two-to-seven-lane decode is arithmetic that only this rung can cut.
-//   * SPLIT-K follows it, because rung 3 is reachable at the same row block
-//     whenever the pre-cast arm declines — and a `bm_rung` of 8 with no split
-//     point stamped at 8 is a refusal at fire time rather than a slower path.
-//   * PLAIN needs no line anywhere: it is minted by `PIE_STAMP_qmm_t`, and
-//     `affine_qmm_t_aligned` reads its `WM` from `qmm_wm<BM>()` like
-//     everything else, so the existing stamp mints the 8 rung unchanged and
-//     the macro's arity did not move.
-//
-// STRIDED, ROUTED and MXFP4 are deliberately left out. No Rust caller composes
-// a strided name at all, and the routed pair's row block comes from
-// `linear::moe`'s own `MOE_TILE_ROWS = [16, 32, 64]` — an expert's run is
-// `rows x top_k / experts`, which reaches a block this narrow only in a fleet
-// too small to take the batched arm in the first place. Stamping them would
-// compile entrypoints for a fire that cannot arrive.
 instantiate_qmm_t_fp16_precast(8, 16)
 instantiate_qmm_t_fp16_precast(8, 32)
 instantiate_qmm_t_fp16_precast(8, 64)
@@ -1305,11 +1188,7 @@ METAL_FUNC void qmm_t_splitk_impl(
 
   using loader_w_t = QuantizedBlockLoader<
       T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
-  // The vendored loader, on purpose: the vectorized one (`AffineVec4Loader`)
-  // measured 107 -> 172 us at eight rows on K=5120 N=5120 and 29.5 -> 44.4
-  // at N=1024 through this split-K path, where it gains 3% on the unsplit
-  // tile. A split partition's k-run is short and this kernel's threadgroups
-  // are many; whatever the vector store costs there, it is not amortized.
+
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;

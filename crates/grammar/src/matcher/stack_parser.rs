@@ -1,7 +1,3 @@
-//! DFA-based pushdown automaton (stack parser): drives per-rule DFA
-//! transitions with a pushdown stack; predict/complete cycles happen only
-//! at rule boundaries.
-
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -12,23 +8,13 @@ use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::{FsmEdge, StateId};
 use crate::grammar::RuleId;
 
-// ---------------------------------------------------------------------------
-// Stack state
-// ---------------------------------------------------------------------------
-
 pub(super) const NO_PARENT: u32 = u32::MAX;
 
-/// DFA-based parser state: tracks position within a grammar rule via DFA
-/// state. 8 bytes (down from 28-byte ParserState), since the DFA encodes
-/// all intra-rule transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub(super) struct StackState {
-    /// Which rule we're parsing.
     pub(super) rule_id: u16,
-    /// Position within the rule's DFA.
     pub(super) dfa_state: u16,
-    /// History level where this rule was entered (NO_PARENT for root).
     pub(super) return_level: u32,
 }
 
@@ -45,10 +31,6 @@ impl StackState {
         (self.rule_id as u64) | ((self.dfa_state as u64) << 16) | ((self.return_level as u64) << 32)
     }
 }
-
-// ---------------------------------------------------------------------------
-// SmallDedup — linear scan for small sets, FxHashSet above threshold
-// ---------------------------------------------------------------------------
 
 const SMALL_DEDUP_THRESHOLD: usize = 12;
 
@@ -88,13 +70,11 @@ impl<T: Eq + Hash + Copy> SmallDedup<T> {
             return false;
         }
 
-        // Linear scan for small sets
         if self.vec.contains(&item) {
             return false;
         }
         self.vec.push(item);
 
-        // Upgrade to hash set if threshold reached
         if self.vec.len() >= SMALL_DEDUP_THRESHOLD {
             let mut set = FxHashSet::default();
             for &x in &self.vec {
@@ -106,37 +86,20 @@ impl<T: Eq + Hash + Copy> SmallDedup<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Steady-state acceleration
-// ---------------------------------------------------------------------------
-
-/// Result of checking whether a byte can be handled by steady-state.
 enum SteadyAdvance {
-    /// Byte is in range — steady-state handles it.
     InRange,
-    /// Byte is out of range — exit steady-state, fall through to normal advance.
     OutOfRange,
-    /// Steady-state is not active.
     NotActive,
 }
 
-/// Steady-state detection and acceleration fields. When consecutive
-/// advance() calls produce structurally identical state sets differing
-/// only by a uniform return_level delta, the parser enters steady-state
-/// mode: a lazy counter when the delta is zero, else copy-with-delta.
 #[derive(Clone)]
 struct SteadyState {
     active: bool,
     ranges: Vec<(u8, u8)>,
     is_completed: bool,
-    /// When true, deltas are all zero and we use a lazy counter (no arena copies).
-    /// When false, deltas are non-zero and we copy states per byte with delta adjustment.
     is_lazy: bool,
-    /// Lazy byte count for zero-delta steady state.
     count: usize,
-    /// Per-state return_level deltas for copy-with-delta steady state.
     state_deltas: Vec<i32>,
-    /// Per-return parent return_level deltas for copy-with-delta steady state.
     return_deltas: Vec<i32>,
 }
 
@@ -173,36 +136,19 @@ impl SteadyState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stack parser (DFA-based pushdown automaton)
-// ---------------------------------------------------------------------------
-
-/// DFA-based pushdown automaton parser. Replaces the Earley parser with
-/// per-rule DFA transitions; predict/complete cycles happen only at rule
-/// boundaries.
 #[derive(Clone)]
 pub(super) struct StackParser {
     compiled: Arc<CompiledGrammar>,
-    /// Flat arena of scanable states across all levels.
     state_arena: Vec<StackState>,
-    /// Start offset of each level in `state_arena`.
     state_offsets: Vec<usize>,
-    /// Flat arena of return entries: (expected_rule_id, parent_state_after_advance).
     return_arena: Vec<(u16, StackState)>,
-    /// Start offset of each level in `return_arena`.
     return_offsets: Vec<usize>,
-    /// Whether the grammar can terminate at each position.
     is_completed: Vec<bool>,
-    // Reusable scratch buffers
     buf_queue: Vec<StackState>,
     buf_visited: SmallDedup<StackState>,
     buf_scanable: Vec<StackState>,
     buf_return: Vec<(u16, StackState)>,
-    // Steady-state acceleration
     steady: SteadyState,
-    /// Cached terminal level for completion-chain short-circuit (O(N) ->
-    /// O(1)): (chain_rule_id, chain_dfa_state, terminal_level,
-    /// last_walk_start); valid only when start_level == last_walk_start + 1.
     chain_terminal: Cell<Option<(u16, u16, usize, usize)>>,
 }
 
@@ -226,7 +172,6 @@ impl StackParser {
         parser
     }
 
-    /// Initialize the parser by expanding the root rule.
     fn init(&mut self) {
         self.state_arena.clear();
         self.state_offsets.clear();
@@ -244,11 +189,9 @@ impl StackParser {
         returns.clear();
         let mut accept_stop = false;
 
-        // Expand root rule
         let root = self.compiled.grammar.root_rule();
         self.expand_rule(root, NO_PARENT, &mut queue, &mut visited);
 
-        // Process queue (predict/complete)
         self.process_queue(
             &mut queue,
             &mut visited,
@@ -258,14 +201,12 @@ impl StackParser {
             &[],
         );
 
-        // Append to arenas
         self.state_offsets.push(self.state_arena.len());
         self.state_arena.extend_from_slice(&scanable);
         self.return_offsets.push(self.return_arena.len());
         self.return_arena.extend_from_slice(&returns);
         self.is_completed.push(accept_stop);
 
-        // Return scratch buffers
         scanable.clear();
         returns.clear();
         queue.clear();
@@ -276,9 +217,7 @@ impl StackParser {
         self.buf_visited = visited;
     }
 
-    /// Advance the parser by one byte. Returns true if at least one state survived.
     pub(super) fn advance(&mut self, ch: u8) -> bool {
-        // Fast path: steady-state
         match self.steady.try_advance(ch) {
             SteadyAdvance::InRange => {
                 if self.steady.is_lazy {
@@ -312,7 +251,6 @@ impl StackParser {
         scanable.clear();
         returns.clear();
 
-        // Scan phase: advance each active state by the byte via DFA
         self.scan_states(
             &self.state_arena[state_start..state_end],
             ch,
@@ -331,7 +269,6 @@ impl StackParser {
 
         let mut accept_stop = false;
 
-        // Process queue (predict/complete) — only when there are non-pure-scan states
         if !queue.is_empty() {
             self.process_queue(
                 &mut queue,
@@ -343,7 +280,6 @@ impl StackParser {
             );
         }
 
-        // Append to arenas
         let new_offset = self.state_arena.len();
         self.state_offsets.push(new_offset);
         self.state_arena.extend_from_slice(&scanable);
@@ -352,7 +288,6 @@ impl StackParser {
         self.return_arena.extend_from_slice(&returns);
         self.is_completed.push(accept_stop);
 
-        // Return scratch buffers
         scanable.clear();
         returns.clear();
         queue.clear();
@@ -362,14 +297,11 @@ impl StackParser {
         self.buf_queue = queue;
         self.buf_visited = visited;
 
-        // Detect steady state: check if current level is identical to previous
         self.detect_and_enter_steady_state(ch);
 
         true
     }
 
-    /// Advance through all bytes in a slice. On failure, rolls back any partial
-    /// progress and returns false.
     pub(super) fn advance_bytes(&mut self, bytes: &[u8]) -> bool {
         let start = self.position();
         for &byte in bytes {
@@ -381,7 +313,6 @@ impl StackParser {
         true
     }
 
-    /// Non-zero uniform delta steady advance: copy states+returns with delta adjustment.
     fn advance_steady_with_delta(&mut self) {
         let prev_start = *self.state_offsets.last().unwrap();
         let state_count = self.state_arena.len() - prev_start;
@@ -408,16 +339,12 @@ impl StackParser {
             self.return_arena.push((expected, parent));
         }
         self.is_completed.push(self.steady.is_completed);
-        // Keep chain cache up to date
         if let Some((rid, dfa, terminal, last)) = self.chain_terminal.get() {
             self.chain_terminal
                 .set(Some((rid, dfa, terminal, last + 1)));
         }
     }
 
-    /// Scan phase: advance each state by one byte via DFA. States whose
-    /// successors have only CharRange edges go to `scanable` (pure scan);
-    /// others go to `queue` for predict/complete.
     fn scan_states(
         &self,
         states: &[StackState],
@@ -446,10 +373,6 @@ impl StackParser {
         }
     }
 
-    /// Process the queue: run predict/complete until fixed point. Tracks
-    /// which rules completed at the current level so a nullable rule
-    /// expanded again (deduped by `visited`) can advance its parent
-    /// immediately — the Earley "forward prediction" case.
     fn process_queue(
         &self,
         queue: &mut Vec<StackState>,
@@ -460,7 +383,6 @@ impl StackParser {
         extra_returns: &[(u16, StackState)],
     ) {
         let current_level = self.state_offsets.len() as u32;
-        // Track rule_ids that completed at current_level (for nullable dedup handling).
         let mut completed_at_level = Vec::with_capacity(8);
 
         let mut idx = 0;
@@ -470,9 +392,7 @@ impl StackParser {
 
             let action = self.compiled.action(state.rule_id, state.dfa_state);
 
-            // Predict: expand RuleRef edges (using pre-computed rule_refs)
             for &(rule_id, target) in &action.rule_refs {
-                // Record return: when `rule` completes, parent advances to `target`
                 let parent_after = StackState {
                     rule_id: state.rule_id,
                     dfa_state: target,
@@ -480,9 +400,6 @@ impl StackParser {
                 };
                 returns.push((rule_id, parent_after));
 
-                // Ancestor flattening: if parent_after is pass-through, it
-                // completes immediately when the child finishes, so
-                // pre-register grandparents as also waiting for this child.
                 let parent_action = self
                     .compiled
                     .action(parent_after.rule_id, parent_after.dfa_state);
@@ -504,19 +421,14 @@ impl StackParser {
                     }
                 }
 
-                // Expand the referenced rule
                 if !self.expand_rule(RuleId(rule_id as u32), current_level, queue, visited) {
-                    // Rule already expanded at this level. If it has already
-                    // completed (nullable), advance the parent immediately.
                     if completed_at_level.contains(&rule_id) && visited.insert(parent_after) {
                         queue.push(parent_after);
                     }
                 }
             }
 
-            // Complete: if accepting state, advance parents
             if action.flags.is_accepting() {
-                // Track completion for nullable dedup handling
                 if state.return_level == current_level
                     && !completed_at_level.contains(&state.rule_id)
                 {
@@ -525,14 +437,12 @@ impl StackParser {
                 self.complete(&state, queue, visited, returns, accept_stop, extra_returns);
             }
 
-            // If has char edges, it's scanable
             if action.flags.has_char_edges() {
                 scanable.push(state);
             }
         }
     }
 
-    /// Complete: a rule finished, advance parent states.
     fn complete(
         &self,
         state: &StackState,
@@ -550,7 +460,6 @@ impl StackParser {
         let start_pos = state.return_level as usize;
         let rule_id = state.rule_id;
 
-        // From stored history
         if start_pos < self.return_offsets.len() {
             let rstart = self.return_offsets[start_pos];
             let rend = self
@@ -561,8 +470,6 @@ impl StackParser {
             for i in rstart..rend {
                 let (expected_rule, parent_after) = self.return_arena[i];
                 if expected_rule == rule_id {
-                    // Detect self-referencing completion chain (only for grammars
-                    // with explicit recursive rules, not Repeat-based JSON schemas).
                     if self.compiled.has_self_ref_chains
                         && parent_after.rule_id == state.rule_id
                         && parent_after.return_level != NO_PARENT
@@ -590,7 +497,6 @@ impl StackParser {
             }
         }
 
-        // From current (being built) returns + extra returns
         let current_level = self.state_offsets.len();
         if start_pos == current_level {
             for &(expected_rule, parent_after) in returns {
@@ -606,9 +512,6 @@ impl StackParser {
         }
     }
 
-    /// Follow a self-referencing completion chain (e.g. `[^"\\]*`) to its
-    /// terminal level — only the terminal produces a useful parent state.
-    /// Uses a cached terminal level for O(1) amortized cost.
     fn follow_chain_to_terminal(
         &self,
         chain_rule_id: u16,
@@ -618,23 +521,18 @@ impl StackParser {
         visited: &mut SmallDedup<StackState>,
         accept_stop: &mut bool,
     ) {
-        // Cache is valid only for consecutive advances (start == last + 1).
         if let Some((cached_rid, cached_dfa, terminal, last_start)) = self.chain_terminal.get()
             && cached_rid == chain_rule_id
             && cached_dfa == chain_dfa_state
             && start_level == last_start + 1
             && terminal < self.return_offsets.len()
         {
-            // Use cached terminal — process its returns directly.
-            // Non-chain parents at start_level are handled by complete()'s normal loop.
             self.process_terminal_returns(chain_rule_id, terminal, queue, visited, accept_stop);
             self.chain_terminal
                 .set(Some((cached_rid, cached_dfa, terminal, start_level)));
             return;
         }
 
-        // Walk the chain to find the terminal level, processing all
-        // non-chain parents at each level along the way.
         let mut level = start_level;
         loop {
             if level >= self.return_offsets.len() {
@@ -674,9 +572,6 @@ impl StackParser {
         }
     }
 
-    /// Process return entries at the terminal level of a completion chain.
-    /// Also collects non-chain parents from intermediate levels between
-    /// start_level and the terminal (they're all the same after dedup).
     fn process_terminal_returns(
         &self,
         chain_rule_id: u16,
@@ -695,7 +590,6 @@ impl StackParser {
         for i in rstart..rend {
             let (expected, parent) = self.return_arena[i];
             if expected == chain_rule_id {
-                // Terminal parent — add to queue for normal processing.
                 if visited.insert(parent) {
                     queue.push(parent);
                 }
@@ -703,8 +597,6 @@ impl StackParser {
         }
     }
 
-    /// Expand a rule: add its DFA start state to the queue.
-    /// Returns true if the state was new (not deduped).
     fn expand_rule(
         &self,
         rule_id: RuleId,
@@ -726,8 +618,6 @@ impl StackParser {
         }
     }
 
-    /// Like `advance`, but doesn't commit to the arenas — used for trie walk
-    /// probing. Results are appended to `scanable_buf` and `returns_buf`.
     #[allow(
         clippy::too_many_arguments,
         reason = "the four `_buf` parameters exist so the caller can reuse \
@@ -749,7 +639,6 @@ impl StackParser {
         scanable_buf.clear();
         returns_buf.clear();
 
-        // Scan phase
         self.scan_states(current_states, ch, queue_buf, visited_buf, scanable_buf);
 
         if queue_buf.is_empty() && scanable_buf.is_empty() {
@@ -771,7 +660,6 @@ impl StackParser {
         true
     }
 
-    /// Whether the grammar can terminate at the current position.
     pub(super) fn is_completed(&self) -> bool {
         if self.steady.count > 0 {
             return self.steady.is_completed;
@@ -779,7 +667,6 @@ impl StackParser {
         self.is_completed.last().copied().unwrap_or(false)
     }
 
-    /// Write an equality-safe key for the current parser state.
     pub(super) fn write_cache_key(&self, key: &mut Vec<u64>) {
         let states = self.current_states();
         let returns = self.current_returns();
@@ -795,7 +682,6 @@ impl StackParser {
         key.push(self.is_completed() as u64);
     }
 
-    /// Get the current scanable states.
     pub(super) fn current_states(&self) -> &[StackState] {
         if let Some(&start) = self.state_offsets.last() {
             &self.state_arena[start..]
@@ -804,7 +690,6 @@ impl StackParser {
         }
     }
 
-    /// Get the current return entries.
     pub(super) fn current_returns(&self) -> &[(u16, StackState)] {
         if let Some(&start) = self.return_offsets.last() {
             &self.return_arena[start..]
@@ -813,18 +698,15 @@ impl StackParser {
         }
     }
 
-    /// Current input position (number of bytes consumed).
     pub(super) fn position(&self) -> usize {
         self.state_offsets.len().saturating_sub(1) + self.steady.count
     }
 
-    /// Pop the last `count` input positions (rollback).
     pub(super) fn pop_last_states(&mut self, count: usize) {
         if count == 0 {
             return;
         }
         self.chain_terminal.set(None);
-        // First consume lazy steady-state bytes
         if self.steady.count > 0 {
             let from_lazy = count.min(self.steady.count);
             self.steady.count -= from_lazy;
@@ -839,7 +721,6 @@ impl StackParser {
         self.pop_committed(count);
     }
 
-    /// Pop `count` committed levels from arenas.
     fn pop_committed(&mut self, count: usize) {
         for _ in 0..count {
             if self.state_offsets.len() > 1 {
@@ -852,15 +733,12 @@ impl StackParser {
         }
     }
 
-    /// Reset to initial state.
     pub(super) fn reset(&mut self) {
         self.steady.reset();
         self.chain_terminal.set(None);
         self.init();
     }
 
-    /// Commit one level for pending lazy steady-state bytes.
-    /// Since deltas are zero, the states are identical to the last committed level.
     fn flush_steady(&mut self) {
         if self.steady.count == 0 {
             return;
@@ -879,7 +757,6 @@ impl StackParser {
         self.steady.count = 0;
     }
 
-    /// Detect steady state: compare current and previous levels structurally.
     fn detect_and_enter_steady_state(&mut self, ch: u8) {
         if self.state_offsets.len() < 2 {
             return;
@@ -896,7 +773,6 @@ impl StackParser {
             return;
         }
 
-        // Structural comparison: same rule_id and dfa_state (return_level may differ)
         let structurally_same = prev_states
             .iter()
             .zip(curr_states.iter())
@@ -905,7 +781,6 @@ impl StackParser {
             return;
         }
 
-        // Also check return entries structurally
         let prev_rstart = self.return_offsets[num - 2];
         let prev_rend = self.return_offsets[num - 1];
         let curr_rstart = self.return_offsets[num - 1];
@@ -922,7 +797,6 @@ impl StackParser {
             return;
         }
 
-        // Compute return_level deltas (state deltas)
         let state_deltas: Vec<i32> = prev_states
             .iter()
             .zip(curr_states.iter())
@@ -935,12 +809,10 @@ impl StackParser {
             })
             .collect();
 
-        // Safety: reject deltas outside {0, 1} to avoid recursive-grammar pitfalls
         if state_deltas.iter().any(|&d| !(0..=1).contains(&d)) {
             return;
         }
 
-        // Compute return_level deltas (return entry deltas)
         let return_deltas: Vec<i32> = prev_returns
             .iter()
             .zip(curr_returns.iter())
@@ -960,7 +832,6 @@ impl StackParser {
         let all_zero =
             state_deltas.iter().all(|&d| d == 0) && return_deltas.iter().all(|&d| d == 0);
 
-        // Extract steady ranges from DFA edges
         if let Some(ranges) = self.extract_steady_ranges(curr_states, ch) {
             self.steady.ranges = ranges;
             self.steady.is_completed = *self.is_completed.last().unwrap();
@@ -971,10 +842,6 @@ impl StackParser {
         }
     }
 
-    /// Extract accepted byte ranges for steady-state optimization: for each
-    /// state that directly advances on `ch`, collect byte ranges leading to
-    /// the same DFA target. States with no transition on `ch` are "reborn"
-    /// (re-added by process_queue each advance) and don't constrain ranges.
     fn extract_steady_ranges(&self, states: &[StackState], ch: u8) -> Option<Vec<(u8, u8)>> {
         let mut winner: Option<Vec<(u8, u8)>> = None;
         let mut found_direct = false;
@@ -982,16 +849,13 @@ impl StackParser {
         for state in states {
             let dfa = &self.compiled.rule_dfas[state.rule_id as usize];
 
-            // Check if this state directly advances on ch
             let ch_target = dfa.fsm.next_state(StateId(state.dfa_state as u32), ch);
             if ch_target.is_none() {
-                // Reborn state — doesn't constrain steady ranges
                 continue;
             }
             found_direct = true;
             let ch_target = ch_target.unwrap();
 
-            // Collect byte ranges leading to the SAME target as ch
             let edges = dfa.fsm.edges(StateId(state.dfa_state as u32));
             let ranges: Vec<(u8, u8)> = edges
                 .iter()
@@ -1008,7 +872,6 @@ impl StackParser {
                 })
                 .collect();
 
-            // All direct-advance states must agree on the ranges
             match &winner {
                 None => winner = Some(ranges),
                 Some(w) if *w == ranges => {}
@@ -1019,8 +882,3 @@ impl StackParser {
         if found_direct { winner } else { None }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-

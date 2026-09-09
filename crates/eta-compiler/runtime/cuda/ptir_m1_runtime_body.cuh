@@ -422,9 +422,7 @@ __device__ __forceinline__ void ptir_m1_execute(
     return;
   }
   if (p.tag == 0x40 || p.tag == 0x41) {
-    // Scanned in the operand's own dtype. A u32 offset scan is exactly what
-    // ragged row offsets are built from, and accumulating one through float
-    // is exact only below 2^24 -- past that it rounds, silently.
+
     const bool is_sum = p.tag == 0x40;
     for (m1_u32 row = 0; row < d0.rows; ++row) {
       float accumulated_f = is_sum ? 0.0f : 1.0f;
@@ -549,12 +547,7 @@ __device__ __forceinline__ void ptir_m1_execute(
         if (k == 0u) {
           for (m1_u32 i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
         } else {
-          // 4-pass 8-bit MSB radix select on `m1_desc_key`. The earlier form
-          // rescanned the whole row per element, i.e. O(len^2) on a single
-          // thread -- ~2.3e10 visits at a 151936-token vocabulary, which never
-          // returns. `greater(i) < k` holds exactly when `key(i) <= K_k` for
-          // `K_k` the k-th smallest key counting multiplicity, so ties survive
-          // or fall together exactly as the reference has them.
+
           m1_u32 histogram[256];
           m1_u32 prefix = 0u;
           m1_u32 target = k;
@@ -586,15 +579,7 @@ __device__ __forceinline__ void ptir_m1_execute(
           }
         }
       } else if (p.pred_tag == 1) {
-        // Descending selection with the LAST PICK's total-order key as the
-        // availability threshold (the k_pivot_cummassle technique) instead
-        // of an already-picked rescan: the rescan made this O(len^3) on ONE
-        // thread — a de-facto hang at LM vocab sizes (>10^15 steps at
-        // 151,936). Bit-identical picks and keep bits: m1_sort_better is a
-        // strict total order, so "strictly after the previous pick" visits
-        // the same elements in the same order, and once `exclusive` clears
-        // the threshold (or goes NaN) every later keep is false — they are
-        // pre-stored and the loop stops early.
+
         const float threshold =
             m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
         for (m1_u32 i = 0; i < d0.last; ++i)

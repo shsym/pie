@@ -1,141 +1,3 @@
-//! LTX-2.5's traced arithmetic: four arms of one plan (three on the
-//! miniature), selected per lane by the reading bits of the fact word
-//! (design D1, D5).
-//!
-//! | reading | lanes (stream) | binds | reads back |
-//! |---|---|---|---|
-//! | `denoise` | `Video` + `Audio` + `Context` + `Reference`, one group | video: `latents` `[S, 128]`, `positions` `[S, 3]`, `timestep`; audio: `latents` `[L, 128]`, `audio_positions` `[L, 1]`, `timestep`; context: `context` `[1024, 4096]`, `timestep`; reference: `audio_context` `[1024, 2048]`, `timestep` | `velocity` `[S + L, 128]` on the video AND audio lanes |
-//! | `refine.video` | one, `Text` | `text` `[1024, caption·49]`, `text_positions` `[1024, 1]` | `hidden` `[1024, 4096]` |
-//! | `refine.audio` | one, `Text` | the same two ports | `hidden` `[1024, 2048]` |
-//! | `vae.decode` (flagship only; see the contract below) | one, `Video` | `latent` `[t·h·w, 128]` + the clip's box | `pixels` `[(8t−7)·32h·32w, 3]` |
-//!
-//! # THE `vae.decode` CONTRACT
-//!
-//! **A decode fire is ONE WHOLE CLIP, and there is no head arm.** The
-//! decoder is non-causal (`decoder_causal: False`): every convolution pads
-//! its time axis with the clip's own first and last frames
-//! (`Conv::same3().replicate_time()`), so a later frame's pixels depend on
-//! the frames after it and no frame-by-frame chunking reproduces the
-//! reference. `wan_2`'s two-arm, cache-carrying loop is that family's
-//! contract and not this one's: here the arm holds no state and a slot
-//! carries nothing between fires.
-//!
-//! **`F` output frames need `(F − 1) % 8 == 0`.** Each of the three
-//! temporal upsamplers doubles the frame count and drops the first frame
-//! of the result (`hidden_states[:, :, s_t − 1:]`, unconditionally — the
-//! non-causal decoder keeps the anchor drop), so `T` latent frames land
-//! `8·(T − 1) + 1` frames: 1, 9, 17, ..., 121. `LatentSpace::temporal_compression`
-//! (8) states the same rule from the other side.
-//!
-//! **The denormalisation is the arm's.** The denoiser works in
-//! `(z − latents_mean)/latents_std` and the reference pipeline undoes that
-//! before `vae.decode` (`_denormalize_latents`); `vae_decode` reads the two
-//! `[128]` buffers off the checkpoint and undoes it itself, so a
-//! family-blind guest hands the arm the rows the denoise reading answered.
-//!
-//! **What is not clamped.** `AutoencoderKLLTX2Video.decode` hands back the
-//! decoder's raw output and the pipeline's video processor clips it to
-//! `[-1, 1]` later; this arm plants the raw output too, so its `pixels`
-//! are the reference's `decode(...)` to the number.
-//!
-//! # FOUR STREAMS, SIX ATTENTIONS, ONE FIRE
-//!
-//! LTX-2 is not MM-DiT: nothing is concatenated, the two modalities keep
-//! separate widths (video 4096, audio 2048) and separate weights for
-//! everything, and they meet only in two cross-attentions. That is exactly
-//! D2's picture — a lane per stream, one group, per-stream weights as
-//! guarded arms — and it needs no merge at all except at the readout,
-//! because every attention's answer comes back under its QUERY's guard
-//! (`IMAGEGEN_CONTRACT.md` §1).
-//!
-//! The four lanes of a step:
-//!
-//! * `Stream::Video` — the video latent rows, 4096 wide inside.
-//! * `Stream::Audio` — the audio latent rows, 2048 wide inside.
-//! * `Stream::Context` — the VIDEO text context (the video connector's
-//!   1024 rows at 4096).
-//! * `Stream::Reference` — the AUDIO text context (1024 rows at 2048). It
-//!   is a context lane in everything but name; the stream vocabulary has one
-//!   `Context` and this text needs two, at two widths, in two classes.
-//!
-//! Per block, in the reference's order: video self-attention, audio
-//! self-attention, video→text cross-attention, audio→text cross-attention,
-//! then the cross-modal PAIR (a2v: video queries over audio keys; v2a: the
-//! other way), both reading norms of the two streams taken BEFORE either
-//! fold, then the two feed-forwards.
-//!
-//! # THE TIMESTEP IS PER LANE, AND A PER-TOKEN TIMESTEP IS SEVERAL LANES
-//!
-//! The reference's I2V path hands the transformer a `[B, S]` timestep in
-//! which the conditioning image's tokens carry `0` and every other token
-//! carries `t`, and every modulation then runs per token. Every token of
-//! one conditioning span shares its value, so this text keeps the per-LANE
-//! modulation of `IMAGEGEN_CONTRACT.md` §3 and an I2V step submits the
-//! video as SEVERAL `Stream::Video` lanes of one group — the clean tokens
-//! at `timestep = 0`, the rest at `t` — each with its own `timestep` cell
-//! and its own rotary coordinates. The self-attention packs the group's
-//! video lanes into one sequence (`GroupBlockDiagonal` over the video
-//! selection's group CSR), which with explicit coordinates is the
-//! reference's one sequence in another row order. This is `wan_2`'s
-//! answer to the same question, for the same reason: a per-token `[rows, 1]`
-//! timestep port would need an f32 token-axis GEMM chain this shell has no
-//! arm for.
-//!
-//! The two context lanes carry a `timestep` cell too, and for a reason: the
-//! reference modulates the text context itself
-//! (`prompt_scale_shift_table + prompt_adaln_single(t_prompt)`), and a
-//! modulation vector must be computed on the arm whose rows it modulates.
-//! `t_prompt` is the reference's `amax` over the (possibly per-token)
-//! timestep, which for a scalar step is `t` and for an I2V step is the
-//! noisy lanes' `t`; the guest hands that number.
-//!
-//! # POSITIONS ARE PHYSICAL, FRACTIONAL AND ALREADY NORMALISED
-//!
-//! LTX's rope does not turn by an index. It turns by a coordinate in
-//! SECONDS and PIXELS, taken at the MIDPOINT of the latent cell, mapped to
-//! `[-1, 1]` against a fixed maximum, and multiplied by `π/2` — and its
-//! frequency ladder runs ACROSS the whole row with the axes handed out
-//! round-robin along it, which is [`RopeForm::SplitLadder`]. So the
-//! `positions` port takes the finished angle scale, not the grid:
-//!
-//! ```text
-//! video row (f, h, w) of an F_l x H_l x W_l latent grid, at `fps`:
-//!   t_start = max(f·8 + 1 − 8, 0) / fps        t_end = max((f+1)·8 + 1 − 8, 0) / fps
-//!   h_start = h·32                             h_end = (h+1)·32
-//!   w_start = w·32                             w_end = (w+1)·32
-//!   coord_a = (start_a + end_a) / 2            (`use_middle_indices_grid`)
-//!   positions[a] = (2·coord_a / max_a − 1) · π/2,  max = (20 s, 2048 px, 2048 px)
-//!
-//! audio row f:  mel_start = max(f·4 + 1 − 4, 0),  mel_end = max((f+1)·4 + 1 − 4, 0)
-//!   coord = (mel_start + mel_end)/2 · 160/16000  seconds
-//!   audio_positions[0] = (2·coord/20 − 1) · π/2
-//!
-//! connector row i:  text_positions[0] = (2·(i/4096) − 1) · π/2
-//! ```
-//!
-//! The cross-modal pair's rope is the video row's TIME coordinate on one
-//! side and the audio row's on the other — the same absolute-seconds axis,
-//! normalised by the same 20 s (`max(pos_embed_max_pos,
-//! audio_pos_embed_max_pos)`), which is why the video lane's `positions[0]`
-//! serves both its own three-axis rope and its half of the pair, and why
-//! this text splits the first column off rather than taking a second port.
-//! **Q-rope ≠ K-rope**: the a2v attention turns its queries by video time
-//! and its keys by audio time, in two `rope_axes` calls on two rectangles.
-//!
-//! # WHAT THIS ARM DOES NOT DO
-//!
-//! * The connector's **learnable registers**. The reference compacts the
-//!   unpadded rows to the front of the window and fills the tail with tiles
-//!   of a `[128, dim]` learned table, then attends everything; that is a
-//!   data-dependent gather with no `Layout` member. `refine.*` runs the
-//!   blocks over exactly the rows its lane carries and attends all of them,
-//!   which is the reference for a prompt that fills its window, and differs
-//!   on the padded tail otherwise. A guest hands the rows it wants attended.
-//! * The **CFG / STG / modality-guidance passes** of the dev variant: those
-//!   are extra lanes and guest arithmetic (D4), not text.
-//!
-//! [`RopeForm::SplitLadder`]: model_dsl::RopeForm::SplitLadder
-
 use model_dsl::ops::spatial;
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Predicate, RaggedMask,
@@ -155,28 +17,17 @@ use super::model::{
     VAE_TEMPORAL_COMPRESSION, VAE_Z, Vae, VaeConv, VaeResnet, port,
 };
 
-/// The bit the one-hot stream facts start at (D2): bits 0..6 are the six
-/// streams, of which this text names Video, Audio, Context, Reference and
-/// Text.
 pub const STREAM_BASE: u8 = 0;
 
-/// The two bits the reading index lives in, as a plain binary code: bit
-/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes
-/// — `denoise`, `refine.video`, `refine.audio`, `vae.decode` — of which the
-/// miniature (no VAE) uses the first three.
 pub const READING_LO: u8 = 6;
 pub const READING_HI: u8 = 7;
 
-/// Which reading code means what. Every row of this family carries both
-/// connectors, so the codes are the same on all of them; `vae.decode` is
-/// declared only where a row carries the VAE ([`Model::vae`]).
 pub const DENOISE: u8 = 0;
 pub const REFINE_VIDEO: u8 = 1;
 pub const REFINE_AUDIO: u8 = 2;
 pub const VAE_DECODE: u8 = 3;
 
 impl Model {
-    /// This row's generative facts (design D12).
     #[must_use]
     pub fn generative(&self) -> Generative {
         let d = &self.dims;
@@ -188,8 +39,6 @@ impl Model {
             at,
             rows: None,
         };
-        // Both connectors read one rectangle of packed trunk rows, and both
-        // hand a text lane one coordinate column.
         let refine_ports = || {
             vec![
                 port(
@@ -242,8 +91,6 @@ impl Model {
                         &[Stream::Reference],
                         Some(port::AUDIO_CONTEXT),
                     ),
-                    // Every lane of the reading: the two context lanes
-                    // modulate their own rows from the prompt timestep.
                     port(
                         "timestep",
                         PortKind::LaneVector,
@@ -294,9 +141,6 @@ impl Model {
             },
         ];
         if self.vae.is_some() {
-            // One whole clip on one voxel port (module doc). A VAE tile is
-            // a box on the voxel axis, not rows in a rotary space: it takes
-            // no positions and states no convention.
             readings.push(ReadingFact {
                 name: "vae.decode",
                 index: VAE_DECODE,
@@ -317,8 +161,6 @@ impl Model {
         }
         Generative {
             readings,
-            // One token is one latent cell: patch (1, 1, 1) at 128 channels,
-            // /32 in space and /8 in time.
             latent: Some(LatentSpace {
                 channels: d.channels,
                 patch_t: PATCH_T,
@@ -329,24 +171,12 @@ impl Model {
             }),
             schedule: Some(ScheduleFact {
                 kind: ScheduleKind::Flow,
-                // The distilled row shifts nothing: its sigmas are pinned.
-                // (The dev row's resolution-dependent `mu` — base 0.95 at
-                // 1024 tokens, max 2.05 at 4096 — is a second checkpoint's,
-                // not this one's.)
                 shift: 1.0,
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 pinned_sigmas: DISTILLED_SIGMAS.to_vec(),
-                // The audio stream keeps its OWN scheduler cursor and runs
-                // the same eight sigmas on it (`denoising.py:1584` clones
-                // the scheduler), so one list states both and no stream
-                // takes a shift of its own.
                 stream_shifts: Vec::new(),
             }),
-            // 960x544x121 is 8160 video + 126 audio + two 1024-row contexts;
-            // 1920x1088 is 32640 video. The miniature's job is far smaller,
-            // and the connector's rectangle is the flagship's real cost:
-            // a `[max_rows, caption·49]` bf16 seat.
             max_rows: match d.layers {
                 48 => 32_768 + 2 * TEXT_LEN,
                 _ => 4096,
@@ -355,11 +185,8 @@ impl Model {
     }
 }
 
-/// The per-lane facts: which stream the lane's rows are, and which reading
-/// its pass runs.
 pub struct Facts {
     pub stream: Stream,
-    /// The reading index, `0..4` (a wider index is truncated to two bits).
     pub reading: u8,
 }
 
@@ -374,15 +201,11 @@ impl Facts {
         Predicate::stream(STREAM_BASE, Stream::Audio)
     }
 
-    /// The VIDEO text context lane. `Stream::Text` and not `Context` for
-    /// the ORDER it puts the lane in: see the module doc.
     #[must_use]
     pub fn context() -> Predicate {
         Predicate::stream(STREAM_BASE, Stream::Context)
     }
 
-    /// The AUDIO text context lane, on `Stream::Context` for the same
-    /// reason.
     #[must_use]
     pub fn audio_context() -> Predicate {
         Predicate::stream(STREAM_BASE, Stream::Reference)
@@ -420,15 +243,11 @@ impl Classify for Facts {
 impl ForwardHybrid for Model {
     type Facts = Facts;
 
-    /// No kv space and no state anywhere: the denoiser holds nothing between
-    /// fires and the connectors are one pass each.
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
-        // Four arms by reading code, each a conjunction of the two reading
-        // literals (so every arm names a `Selection` the host can pack).
         let (hi, lo) = inputs.split(&Facts::reading_hi());
         let (c3, c2) = hi.split(&Facts::reading_lo());
         let (c1, c0) = lo.split(&Facts::reading_lo());
@@ -450,15 +269,12 @@ impl ForwardHybrid for Model {
             self.connectors.1.rescale(caption),
         );
         if let Some(vae) = &self.vae {
-            // The arm plants its own `pixels` seam; the trace hands back
-            // the velocity as the plan's one value.
             let _ = vae_decode(arm(VAE_DECODE), vae);
         }
         velocity
     }
 }
 
-/// One projection, biased where the checkpoint has a bias.
 fn linear(w: &Linear, x: &Value) -> Value {
     let y = ops::linear::matmul(x, &w.w);
     match &w.bias {
@@ -467,25 +283,19 @@ fn linear(w: &Linear, x: &Value) -> Value {
     }
 }
 
-/// `RMSNormNoWeight` over the whole row: `x · rsqrt(mean(x²) + eps)`.
 fn rms(x: &Value) -> Value {
     let width = u32::try_from(x.width()).expect("a row narrower than 4 G");
     ops::elemwise::rmsnorm_no_scale(x, width, NORM_EPS)
 }
 
-/// `x · (1 + scale) + shift`, per lane.
 fn modulate(x: &Value, scale_shift: &Value, lanes: &Value) -> Value {
     ops::elemwise::modulate(x, scale_shift, Some(lanes), ModulateForm::ScaleShift)
 }
 
-/// The scale-free RMS norm and the modulation that follows it.
 fn norm_modulate(x: &Value, scale_shift: &Value, lanes: &Value) -> Value {
     modulate(&rms(x), scale_shift, lanes)
 }
 
-/// The tables one stream's attentions need: the token→lane map, the rotary
-/// coordinates (three columns on the video lane, one on the audio lane and
-/// on a text lane), and the selection's permutation and group CSR.
 struct Geom {
     lanes: Value,
     positions: Value,
@@ -493,18 +303,12 @@ struct Geom {
     csr: Value,
 }
 
-/// A key side's tables: its permutation, its group CSR, and — for a context
-/// lane, which modulates its own rows — its token→lane map.
 struct KeyGeom {
     lanes: Value,
     perm: Value,
     csr: Value,
 }
 
-/// One stream's nine modulation rows cut into what they apply: the
-/// self-attention pair and gate, the FFN pair and gate, the prompt
-/// cross-attention pair and gate — the plan's own slice order, which
-/// `import.rs` makes.
 struct Mods {
     msa_ss: Value,
     msa_gate: Value,
@@ -531,8 +335,6 @@ fn adaln9(e: &Value, dim: u32) -> Mods {
     }
 }
 
-/// One stream's four cross-modal rows: the a2v pair and the v2a pair. The
-/// checkpoint stores them scale-first already, so no exchange is needed.
 struct AvMods {
     a2v_ss: Value,
     v2a_ss: Value,
@@ -544,24 +346,16 @@ fn adaln_av(e: &Value, dim: u32) -> AvMods {
     AvMods { a2v_ss, v2a_ss }
 }
 
-/// One `LTX2AdaLayerNormSingle` over a lane's timestep: the sinusoid, the
-/// two-layer embedder, and `linear(silu(·))`. The embedder's hidden is
-/// handed back beside the answer because the model head reads it (as
-/// `embedded_timestep`, through the doubled `head_proj`).
 fn adaln(head: &AdaLn, sinusoid: &Value) -> (Value, Value) {
     let h = ops::elemwise::silu(&linear(&head.embed.linear_1, sinusoid));
     let emb = linear(&head.embed.linear_2, &h);
     (linear(&head.proj, &ops::elemwise::silu(&emb)), h)
 }
 
-/// `timestep_embedding(t, 256, max_period=10000)` — `[sin | cos]`, fp32.
 fn sinusoid(t: &Value) -> Value {
     ops::elemwise::sinusoid(t, T_FREQ_DIM, T_MAX_PERIOD, T_FLIP_SIN_COS, T_SCALE)
 }
 
-/// Every modulation vector one stream's lanes carry, per block-invariant
-/// piece: the nine rows, the four cross-modal rows, the one gate row, and
-/// the head's `[temb | temb] + table`.
 struct StreamMods {
     proj9: Value,
     av_ss: Value,
@@ -573,8 +367,6 @@ fn stream_mods(heads: &StreamHeads, t: &Value) -> StreamMods {
     let sin = sinusoid(t);
     let (proj9, hidden) = adaln(&heads.adaln, &sin);
     let (av_ss, _) = adaln(&heads.av_ss, &sin);
-    // The cross-modal GATE reads its own timestep scale; for LTX-2.5 the
-    // reference's factor is 1, so the same sinusoid serves.
     debug_assert_eq!(AV_GATE_TIMESTEP_SCALE, 1.0);
     let (av_gate, _) = adaln(&heads.av_gate, &sin);
     let head = ops::elemwise::add_bias(&heads.head_table, &linear(&heads.head_proj, &hidden));
@@ -586,14 +378,10 @@ fn stream_mods(heads: &StreamHeads, t: &Value) -> StreamMods {
     }
 }
 
-/// The attention's QK norm: `torch.nn.RMSNorm(inner_dim)` — one gain over
-/// the whole `heads·head_dim` row, not per head.
 fn qk_norm(x: &Value, gain: &Weight) -> Value {
     ops::elemwise::rmsnorm(x, gain, NORM_EPS)
 }
 
-/// One rope call in LTX's own form: one ladder across the row, the axes
-/// round-robin along it, the pairing rotate-half within a head.
 fn turn(x: &Value, positions: &Value, dims: [u32; 4], head_dim: u32) -> Value {
     ops::elemwise::rope_axes(
         x,
@@ -606,17 +394,12 @@ fn turn(x: &Value, positions: &Value, dims: [u32; 4], head_dim: u32) -> Value {
     )
 }
 
-/// The gated fold every LTX attention ends with: `out · 2σ(W_gate · x_norm)`
-/// per head, then the output projection.
 fn gate_out(o: &Value, h: &Value, a: &Attn) -> Value {
     let logits = linear(&a.gate, h);
     let gated = ops::elemwise::gate_sigmoid_mul_heads(o, &logits, a.head_dim, GATE_SCALE);
     linear(&a.out, &gated)
 }
 
-/// A self-attention over one selection's rows: packed `q|k|v`, the
-/// across-heads QK norms, one rope per side, one ragged read over the
-/// selection's group CSR, the per-head gate, the output projection.
 fn self_attention(h: &Value, a: &Attn, dims: [u32; 4], g: &Geom) -> Value {
     let inner = a.inner();
     let (q, k, v) = ops::layout::split_qkv(&linear(&a.qkv, h), inner, inner);
@@ -635,10 +418,6 @@ fn self_attention(h: &Value, a: &Attn, dims: [u32; 4], g: &Geom) -> Value {
     gate_out(&ops::layout::unpack_rows(&o, &g.perm), h, a)
 }
 
-/// A cross-attention: queries off `h` (with `qg`'s tables), keys and values
-/// off `ctx` (with `kg`'s), each side turned by its OWN coordinates — which
-/// is what makes the cross-modal pair a clock and not a mixer. `rope` is
-/// `None` for the text cross-attentions, which turn nothing.
 #[allow(clippy::too_many_arguments)]
 fn cross_attention(
     h: &Value,
@@ -675,14 +454,12 @@ fn cross_attention(
     gate_out(&ops::layout::unpack_rows(&o, &qg.perm), h, a)
 }
 
-/// `x += gate · down(gelu_tanh(up(mod(rms(x)))))`.
 fn ff_sublayer(x: &Value, ff: &Ffn, ss: &Value, gate: &Value, lanes: &Value) -> Value {
     let h = norm_modulate(x, ss, lanes);
     let f = linear(&ff.down, &ops::elemwise::gelu(&linear(&ff.up, &h), true));
     ops::elemwise::gated_residual_add(x, gate, &f, Some(lanes))
 }
 
-/// One stream's per-block modulation, table plus global vector.
 struct BlockMods {
     m: Mods,
     av: AvMods,
@@ -690,11 +467,6 @@ struct BlockMods {
     prompt_ss: Value,
 }
 
-/// `table + vector`, on a COPY of the vector. `elementwise.add_bias` folds
-/// its bias in place (the IR aliases `out_out` onto `out`), and every table
-/// below is added to a vector the WHOLE STACK shares — one adaLN head serves
-/// all 48 blocks — so each block must add its table to a copy or the second
-/// block reads the first block's table as well as its own.
 fn table_add(table: &Weight, v: &Value) -> Value {
     ops::elemwise::add_bias(table, &ops::elemwise::copy(v))
 }
@@ -708,7 +480,6 @@ fn block_mods(side: &Side, s: &StreamMods, prompt: &Value, dim: u32) -> BlockMod
     }
 }
 
-/// The two streams' rows through one `LTX2TransformerBlock`.
 #[allow(clippy::too_many_arguments)]
 fn block(
     xv: &Value,
@@ -725,7 +496,6 @@ fn block(
     cg: &KeyGeom,
     acg: &KeyGeom,
 ) -> (Value, Value) {
-    // 1-2. The two self-attentions, each over its own stream's rows.
     let hv = norm_modulate(xv, &mv.m.msa_ss, &vg.lanes);
     let ov = self_attention(&hv, &b.video.self_attn, d.rope_dims(), vg);
     let xv = ops::elemwise::gated_residual_add(xv, &mv.m.msa_gate, &ov, Some(&vg.lanes));
@@ -734,8 +504,6 @@ fn block(
     let oa = self_attention(&ha, &b.audio.self_attn, d.audio_rope_dims(), ag);
     let xa = ops::elemwise::gated_residual_add(xa, &ma.m.msa_gate, &oa, Some(&ag.lanes));
 
-    // 3-4. The two text cross-attentions. The CONTEXT is modulated too,
-    //      on its own arm, from its own lane's prompt timestep.
     let hv = norm_modulate(&xv, &mv.m.q_ss, &vg.lanes);
     let c = modulate(ctx, &mv.prompt_ss, &cg.lanes);
     let ov = cross_attention(&hv, &c, &b.video.cross, None, vg, cg);
@@ -746,8 +514,6 @@ fn block(
     let oa = cross_attention(&ha, &ac, &b.audio.cross, None, ag, acg);
     let xa = ops::elemwise::gated_residual_add(&xa, &ma.m.q_gate, &oa, Some(&ag.lanes));
 
-    // 5. The cross-modal pair. BOTH norms are taken before EITHER fold —
-    //    v2a reads the video rows as a2v found them, not as a2v left them.
     let nv = rms(&xv);
     let na = rms(&xa);
     let av_dims = d.av_rope_dims();
@@ -784,20 +550,15 @@ fn block(
     );
     let xa = ops::elemwise::gated_residual_add(&xa, &ma.av_gate, &o, Some(&ag.lanes));
 
-    // 6. The two feed-forwards.
     let xv = ff_sublayer(&xv, &b.video.ffn, &mv.m.mlp_ss, &mv.m.mlp_gate, &vg.lanes);
     let xa = ff_sublayer(&xa, &b.audio.ffn, &ma.m.mlp_ss, &ma.m.mlp_gate, &ag.lanes);
     (xv, xa)
 }
 
-/// The `denoise` reading.
 fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     let d = &m.dims;
     let dit: &Dit = &m.dit;
 
-    // The four lanes: the two text contexts peeled off first, so that what
-    // is left is EXACTLY the two modalities — the guard the merged velocity
-    // is planted under, and the one every class of it must be covered by.
     let (ctx, rest) = arm.split(&Facts::context());
     let (actx, media) = rest.split(&Facts::audio_context());
     let (vid, aud) = media.split(&Facts::video());
@@ -824,25 +585,18 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
         perm: actx.row_permutation(),
         csr: actx.group_indptr(),
     };
-    // The cross-modal pair turns the video rows by their TIME coordinate
-    // alone, normalised by the same 20 s the three-axis rope uses, so the
-    // first column of the video positions IS the pair's video half.
     let (v_time, _) = ops::layout::split_rows(&vg.positions, 1);
 
-    // ---- the conditioning vectors, once per lane --------------------------
     let vt = vid.lane_vector(port::TIMESTEP, 1);
     let at = aud.lane_vector(port::TIMESTEP, 1);
     let mods_v = stream_mods(&dit.video, &vt);
     let mods_a = stream_mods(&dit.audio, &at);
-    // The two prompt vectors live on the CONTEXT arms: they modulate those
-    // lanes' rows, and a modulation vector is computed where it is applied.
     let (prompt_v, _) = adaln(&dit.prompt, &sinusoid(&ctx.lane_vector(port::TIMESTEP, 1)));
     let (prompt_a, _) = adaln(
         &dit.audio_prompt,
         &sinusoid(&actx.lane_vector(port::TIMESTEP, 1)),
     );
 
-    // ---- the rows in ------------------------------------------------------
     let mut xv = linear(
         &dit.video.patchify,
         &vid.latents(port::LATENTS, d.channels, Dtype::Bf16),
@@ -864,9 +618,6 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
         xa = a;
     }
 
-    // ---- the two heads ----------------------------------------------------
-    // `LayerNorm(affine=False)` in fp32, then `·(1 + scale) + shift` from
-    // `scale_shift_table + embedded_timestep`, then `proj_out`.
     let head = |x: &Value, s: &StreamHeads, mods: &StreamMods, g: &Geom| {
         let h = ops::elemwise::modulate(
             &ops::elemwise::layernorm_no_scale(x, NORM_EPS),
@@ -878,16 +629,11 @@ fn denoise(arm: &Input<Facts>, m: &Model) -> Value {
     };
     let vv = head(&xv, &dit.video, &mods_v, &vg);
     let va = head(&xa, &dit.audio, &mods_a, &ag);
-    // One velocity plane over both streams' rows: the two are 128 wide
-    // apiece and their rows are disjoint, so a merge is the whole readout
-    // and each lane reads back its own.
     let velocity = Value::merge(vec![vv, va]);
     seam::at(seam::VELOCITY, &[&velocity]);
     velocity
 }
 
-/// A `refine.*` reading: one connector transformer over the packed trunk
-/// rows a text lane carries.
 fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
     let g = Geom {
         lanes: arm.request_of_token(),
@@ -895,10 +641,6 @@ fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
         perm: arm.row_permutation(),
         csr: arm.lane_indptr(),
     };
-    // `W·(s·x) + b` with the reference's `sqrt(dim / caption_channels)`
-    // rescale moved to the far side of the projection, where it is one
-    // in-place scale of a fresh rectangle instead of a copy of the
-    // `caption·49`-wide port cell.
     let x = arm.latents(port::TEXT, text_in, Dtype::Bf16);
     let mut h = ops::elemwise::mul_scalar(rescale, &ops::linear::matmul(&x, &conn.aggregate.w));
     if let Some(bias) = &conn.aggregate.bias {
@@ -920,11 +662,6 @@ fn refine(arm: &Input<Facts>, conn: &Connector, text_in: u32, rescale: f32) {
     seam::at(seam::HIDDEN, &[&out]);
 }
 
-/// One convolution of the decoder: `3×3×3`, stride 1, `same` spatial
-/// padding, and the NON-causal time padding of `LTX2VideoCausalConv3d`
-/// under `causal=False` — one frame each side, read from the clip's own
-/// first and last frames (`torch.cat([x[:, :, :1], x, x[:, :, -1:]])`).
-/// No cache: the decoder holds nothing between fires.
 fn conv(x: &Value, g: &Value, c: &VaeConv) -> (Value, Value) {
     spatial::conv3d(
         x,
@@ -936,37 +673,20 @@ fn conv(x: &Value, g: &Value, c: &VaeConv) -> (Value, Value) {
     )
 }
 
-/// `PerChannelRMSNorm → SiLU`: the scale-free RMS over the row (a voxel
-/// row's width IS the channel dim the reference reduces over), then SiLU
-/// in place on the fresh rows.
 fn norm_silu(x: &Value) -> Value {
     let width = u32::try_from(x.width()).expect("a VAE row is narrower than 2^32");
     ops::elemwise::silu(&ops::elemwise::rmsnorm_no_scale(x, width, VAE_EPS))
 }
 
-/// `LTX2VideoResnetBlock3d`, box-keeping and width-keeping: the grid in
-/// is the grid out, and the input is the residual as it is.
 fn resnet(x: &Value, g: &Value, r: &VaeResnet) -> Value {
     let (h, _) = conv(&norm_silu(x), g, &r.conv1);
     let (h, _) = conv(&norm_silu(&h), g, &r.conv2);
     ops::elemwise::add(x, &h)
 }
 
-/// The `vae.decode` arm over ONE WHOLE CLIP: the denormalisation, then
-/// `conv_in` → the mid block → four up blocks (each an upsampler conv, its
-/// trimming depth-to-space, then its resnets) → `norm_out`, SiLU,
-/// `conv_out` → the `(1, 4, 4)` depth-to-space → `pixels`, unclamped.
-///
-/// Public so a host-fed parity harness can trace the arm alone
-/// (`engine-cuda`'s `the_ltx_2_vae_answers_the_reference`) instead of
-/// loading the whole row to exercise 1.4 GB of it.
 pub fn vae_decode(arm: &Input<Facts>, vae: &Vae) -> Value {
     let mut g = arm.grid();
     let z = arm.voxels(port::VOXELS, VAE_Z, Dtype::Bf16);
-    // `z·latents_std + latents_mean`, the reference pipeline's step before
-    // `vae.decode`. `add` is the one fresh copy of a port rectangle this IR
-    // has (`2z`); the halving, the `(z − 0)·std` and the `+ mean` after it
-    // run in place on the copy, never on the port's own cell.
     let z = ops::elemwise::mul_scalar(0.5, &ops::elemwise::add(&z, &z));
     let z = ops::elemwise::standardize(&z, &vae.zero, &vae.latents_std);
     let z = ops::elemwise::add_bias(&vae.latents_mean, &z);
@@ -976,12 +696,6 @@ pub fn vae_decode(arm: &Input<Facts>, vae: &Vae) -> Value {
         x = resnet(&x, &g, r);
     }
     for up in &vae.up {
-        // `LTX2VideoUpsampler3d`: the conv lands `c_out·s_t·s_h·s_w`
-        // channels in the reference's own `(c, s_t, s_h, s_w)` order —
-        // `reshape(B, -1, s_t, s_h, s_w, T, H, W)` — which is the
-        // shuffle's `(c, r1, r2, r3)`, so no row permutation is needed;
-        // then the first `s_t − 1` frames of the result are dropped
-        // (`hidden_states[:, :, s_t − 1:]`), causal or not.
         let (y, gy) = conv(&x, &g, &up.upsampler);
         let (y, gy) = spatial::pixel_shuffle_trimming(&y, &gy, up.stride, up.stride[0] - 1);
         x = y;
@@ -993,11 +707,6 @@ pub fn vae_decode(arm: &Input<Facts>, vae: &Vae) -> Value {
 
     let x = norm_silu(&x);
     let (y, gy) = conv(&x, &g, &vae.conv_out);
-    // The 4×4 space-to-depth the VAE wraps its conv stack in, undone:
-    // `conv_out`'s rows are permuted at import into the shuffle's
-    // `(c, ph, pw)` order (the reference's un-patchify reads the checkpoint's
-    // channel `c·16 + pw·4 + ph`: its `permute(0, 1, 5, 2, 6, 4, 7, 3)` puts
-    // the LAST `p` of `reshape(.., p_t, p, p, ..)` on the height).
     let (pixels, gp) = spatial::pixel_shuffle(&y, &gy, [1, VAE_PATCH, VAE_PATCH]);
     seam::at(seam::PIXELS, &[&pixels, &gp]);
     pixels

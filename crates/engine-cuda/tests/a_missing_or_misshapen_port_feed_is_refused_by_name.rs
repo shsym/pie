@@ -1,14 +1,3 @@
-//! **A LANE WHOSE CLASS READS A DECLARED PORT AND FEEDS IT NO CHANNEL IS
-//! REFUSED AT SUBMIT, NAMING THE PORT; SO IS A FEED WHOSE CELL IS NOT THE
-//! LANE'S ROWS BY THE PORT'S WIDTH.** Nothing launches for either.
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_missing_or_misshapen_port_feed_is_refused_by_name
-//! ```
-//!
-//! Skips when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -31,7 +20,6 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(handles.instance, 1, &[0.3]);
     rig.publish(handles.instance, 2, &vec![0.0; rows as usize * 2]);
 
-    // (1) The latents port fed by nothing.
     let mut bare = lane(0, &handles, LaneStream::Text, 0);
     bare.ports.retain(|feed| feed.kind != PortKind::Latents);
     let refusal = rig
@@ -44,8 +32,6 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
         "the refusal names the port: {refusal}"
     );
 
-    // (2) The right port, fed from a cell of the wrong shape: the lane has
-    // three rows and the cell four.
     let wide = rig.lane(rows + 1);
     rig.publish(wide.instance, 0, &vec![0.0; (rows as usize + 1) * w]);
     rig.publish(wide.instance, 1, &[0.3]);
@@ -65,7 +51,6 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
         "the refusal names the port and the shapes: {refusal}"
     );
 
-    // (3) A port the plan does not declare.
     let mut stray = lane(0, &handles, LaneStream::Text, 0);
     rig.publish(handles.instance, 0, &vec![0.0; rows as usize * w]);
     stray.ports.push(engine::fire::PortFeed {

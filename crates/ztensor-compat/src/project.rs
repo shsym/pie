@@ -1,23 +1,8 @@
-//! What a foreign format hands back.
-//!
-//! A projection reads a file's own metadata and says three things: what
-//! tensors are in it and where ([`Catalog`]), which byte ranges the file
-//! occupies (so page exclusivity can be decided rather than guessed), and,
-//! for formats whose bytes are not simply lying there, how to produce the
-//! ones that have no address.
-//!
-//! It never builds a [`Manifest`](ztensor::format::Manifest). A safetensors
-//! file has no manifest; saying otherwise would be inventing a document
-//! nobody wrote.
-
 use ztensor::provide::{Catalog, Decode};
 use ztensor::{Result, Source, Store, Vocabulary};
 
 pub(crate) struct Projection {
     pub catalog: Catalog,
-    /// Every byte range the file is known to use, including its header and
-    /// any index. Left empty when the format cannot say, and then the store
-    /// never claims page exclusivity.
     pub occupied: Vec<(u64, u64)>,
     pub decoder: Option<Box<dyn Decode>>,
 }

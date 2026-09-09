@@ -1,7 +1,3 @@
-//! Dynamic linking for Wasm components: registers host-side proxy functions
-//! and resources so one component can import another's exports, translating
-//! resource handles and tracking cross-component borrows across the call.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -15,21 +11,14 @@ use wasmtime::{Engine, Store, StoreContextMut};
 
 use crate::inferlet::ProcessCtx;
 
-/// Phantom marker type for host-defined resource handles used in dynamic
-/// linking: when a component exports a resource type, `ProxyResource`
-/// instances manage it from the host side for cross-component passing.
 struct ProxyResource;
 
-/// Precomputed metadata for a forwarded function, consolidating all per-call data
-/// into a single Arc to minimize atomic reference count operations on the hot path.
 struct FuncForwardingInfo {
     arg_types: Vec<Type>,
     return_types: Vec<Type>,
     defined_resource_types: Arc<Vec<ResourceType>>,
 }
 
-/// Check if a type (recursively) contains any resource types (Own or Borrow).
-/// Used at registration time to precompute whether transformation is needed.
 fn type_contains_resource(ty: &Type) -> bool {
     match ty {
         Type::Own(_) | Type::Borrow(_) => true,
@@ -48,7 +37,6 @@ fn type_contains_resource(ty: &Type) -> bool {
     }
 }
 
-/// Categories of functions in the component model
 enum FuncCategory {
     Constructor { resource_name: String },
     Method { resource_name: String },
@@ -57,16 +45,11 @@ enum FuncCategory {
 }
 
 impl FuncCategory {
-    /// Categorize a function based on its name.
     fn from_name(func_name: &str) -> Self {
-        // Fast path: free functions don't start with '['
         if !func_name.starts_with('[') {
             return Self::FreeFunction;
         }
 
-        // Check in order of likelihood: method > static > constructor
-
-        // Method: [method]resource-name.method-name
         if let Some(resource_name) = func_name
             .strip_prefix("[method]")
             .and_then(|rest| rest.find('.').map(|pos| &rest[..pos]))
@@ -76,7 +59,6 @@ impl FuncCategory {
             };
         }
 
-        // Static method: [static]resource-name.method-name
         if let Some(resource_name) = func_name
             .strip_prefix("[static]")
             .and_then(|rest| rest.find('.').map(|pos| &rest[..pos]))
@@ -86,35 +68,21 @@ impl FuncCategory {
             };
         }
 
-        // Constructor: [constructor]resource-name
         if let Some(resource_name) = func_name.strip_prefix("[constructor]") {
             return Self::Constructor {
                 resource_name: resource_name.into(),
             };
         }
 
-        // Fallback case
         Self::FreeFunction
     }
 }
 
-/// When a call forwards from component A to component B, A's resource
-/// handles are host-defined proxy handles and must be transformed into the
-/// actual handles B defines. Cross-component borrows made during that
-/// transform are not auto-ended, so they are tracked here to be dropped
-/// after the call completes.
 struct TransformedArgs {
-    /// The transformed argument values
     args: SmallVec<[Val; 8]>,
-    /// Borrowed `ResourceAny` handles to drop after the call, ending the
-    /// cross-component borrow.
     borrows_to_end: SmallVec<[ResourceAny; 8]>,
 }
 
-/// Transform arguments from caller view to callee view.
-/// Only resources defined in the callee component are transformed from the host-defined
-/// proxy resource handle to the actual resource handle defined in the callee component.
-/// Cross-component borrows are tracked in borrows_to_end for cleanup after the call.
 fn transform_args_to_callee_view(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     args: &[Val],
@@ -149,9 +117,6 @@ fn transform_args_to_callee_view(
     })
 }
 
-/// Transform results from callee view to caller view.
-/// Only returned resources defined in the callee component are transformed to the host-defined
-/// proxy resource handle.
 fn transform_returns_to_caller_view(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     returns: SmallVec<[Val; 8]>,
@@ -179,9 +144,6 @@ fn transform_returns_to_caller_view(
     Ok(transformed_returns)
 }
 
-/// Transform resource handles from caller view to callee view, collecting any
-/// cross-component borrows that need to be ended after the call completes.
-/// This function recursively processes composite types to find all nested resource handles.
 fn recursive_transform_args_to_callee_view(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     val: Val,
@@ -192,9 +154,6 @@ fn recursive_transform_args_to_callee_view(
     match ty {
         Type::Borrow(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // Convert the proxy handle to the callee's own handle if it
-                // defines this resource type (cleanup happens inside
-                // `try_from_resource_any`, no explicit tracking needed here).
                 if callee_defined_resource_types.contains(resource_type) {
                     let host_resource: Resource<ProxyResource> =
                         Resource::try_from_resource_any(resource_any, &mut *store)?;
@@ -204,8 +163,6 @@ fn recursive_transform_args_to_callee_view(
                             wasmtime::Error::msg(format!("unknown resource rep={}", rep))
                         })?;
                     Ok(Val::Resource(guest_resource))
-                // Otherwise pass the proxy handle through, tracked as a
-                // cross-component borrow for cleanup after the call.
                 } else {
                     borrows_to_end.push(resource_any);
                     Ok(Val::Resource(resource_any))
@@ -218,8 +175,6 @@ fn recursive_transform_args_to_callee_view(
         },
         Type::Own(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // Convert to the callee's own handle if it defines this
-                // resource type; otherwise pass the proxy handle through.
                 if callee_defined_resource_types.contains(resource_type) {
                     let host_resource: Resource<ProxyResource> =
                         Resource::try_from_resource_any(resource_any, &mut *store)?;
@@ -238,7 +193,6 @@ fn recursive_transform_args_to_callee_view(
                 ty, other
             ))),
         },
-        // For composite types, recursively transform and collect any nested resource handles.
         Type::List(list_type) => match val {
             Val::List(values) => {
                 let element_type = list_type.ty();
@@ -422,13 +376,10 @@ fn recursive_transform_args_to_callee_view(
                 other
             ))),
         },
-        // For primitive types, no transformation or borrow tracking needed
         _ => Ok(val),
     }
 }
 
-/// Transform resource handles from callee view to caller view.
-/// This function recursively processes composite types to find all nested resource handles.
 fn recursive_transform_returns_to_caller_view(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     val: Val,
@@ -438,11 +389,7 @@ fn recursive_transform_returns_to_caller_view(
     match ty {
         Type::Own(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // Convert to a host-defined proxy handle if the callee
-                // defines this resource type.
                 if callee_defined_resource_types.contains(resource_type) {
-                    // Reuse an existing host rep for an already-known resource,
-                    // to preserve identity and avoid double-dropping.
                     let rep =
                         if let Some(existing) = store.data().rep_for_guest_resource(resource_any) {
                             existing
@@ -457,7 +404,6 @@ fn recursive_transform_returns_to_caller_view(
                     let host_resource_any =
                         ResourceAny::try_from_resource(host_resource, &mut *store)?;
                     Ok(Val::Resource(host_resource_any))
-                // Otherwise this is already the proxy handle; pass it through.
                 } else {
                     Ok(Val::Resource(resource_any))
                 }
@@ -643,13 +589,10 @@ fn recursive_transform_returns_to_caller_view(
                 other
             ))),
         },
-        // Primitive types pass through unchanged
         _ => Ok(val),
     }
 }
 
-/// Transform arguments to callee view, call the callee, end any
-/// cross-component borrows, then transform results back to caller view.
 async fn forward_call(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     callee_func: &Func,
@@ -696,8 +639,6 @@ async fn forward_call(
     Ok(())
 }
 
-/// Scans a library component's exports and registers functions that forward
-/// calls to the library instance.
 fn register_component_exports(
     engine: &Engine,
     linker: &mut Linker<ProcessCtx>,
@@ -707,10 +648,6 @@ fn register_component_exports(
 ) -> Result<(), wasmtime::Error> {
     let component_type = linker.substituted_component_type(library_component)?;
 
-    // First pass: collect all defined resource types across all interfaces.
-    // A resource is "defined" where it has constructors, methods, or static
-    // methods; one that only appears via `use other-interface.{type}` is a
-    // re-exported alias and must reuse that interface's proxy.
     let mut component_defined_resource_types: Vec<ResourceType> = Vec::new();
 
     for (_, export_item) in component_type.exports(engine) {
@@ -747,7 +684,6 @@ fn register_component_exports(
 
     let component_defined_resource_types = Arc::new(component_defined_resource_types);
 
-    // Second pass: register exports per interface, passing the component-wide set.
     for (interface_name, export_item) in component_type.exports(engine) {
         if let ComponentItem::ComponentInstance(instance_type) = export_item.ty {
             register_interface_exports(
@@ -765,7 +701,6 @@ fn register_component_exports(
     Ok(())
 }
 
-/// Register forwarding implementations for an interface.
 fn register_interface_exports(
     engine: &Engine,
     linker: &mut Linker<ProcessCtx>,
@@ -792,7 +727,6 @@ fn register_interface_exports(
         ))
     })?;
 
-    // Collect all resources and functions before registering anything.
     let mut resource_type_by_name: HashMap<String, ResourceType> = HashMap::new();
     let mut functions = Vec::new();
 
@@ -808,8 +742,6 @@ fn register_interface_exports(
         }
     }
 
-    // Resources this interface defines (imported ones via `use` have no
-    // constructor/method/static pattern here).
     let mut defined_resource_names: HashSet<String> = HashSet::new();
     for (func_name, _func_type) in functions.iter() {
         match FuncCategory::from_name(func_name) {
@@ -822,9 +754,6 @@ fn register_interface_exports(
         }
     }
 
-    // Only resources defined in this interface get a new proxy; a
-    // re-exported alias reuses its defining interface's proxy (a second one
-    // would be an incompatible resource type).
     for resource_name in resource_type_by_name.keys() {
         if !defined_resource_names.contains(resource_name) {
             continue;
@@ -851,8 +780,6 @@ fn register_interface_exports(
         )?;
     }
 
-    // Use the component-wide defined resource types so resources defined
-    // in any interface of this component translate correctly.
     for (func_name, func_type) in functions {
         let (_, func_idx) = library_instance
             .get_export(&mut *store, Some(&interface_idx), &func_name)
@@ -887,10 +814,6 @@ fn register_interface_exports(
     Ok(())
 }
 
-/// Register a function that forwards calls to the library instance. The
-/// common resource-free case gets a minimal closure capturing only the
-/// callee `Func`; a signature with resource types gets the full forwarding
-/// closure with argument/return transformation.
 fn register_call_forwarding(
     inst: &mut LinkerInstance<'_, ProcessCtx>,
     func_name: &str,
@@ -903,7 +826,6 @@ fn register_call_forwarding(
     let has_resource_returns = return_types.iter().any(type_contains_resource);
 
     if !has_resource_args && !has_resource_returns {
-        // Fast path: no resource types, forward directly with no transform.
         inst.func_new_async(func_name, move |mut store, _ty, args, returns| {
             Box::new(async move {
                 func.call_async(&mut store, args, returns).await?;
@@ -911,8 +833,6 @@ fn register_call_forwarding(
             })
         })
     } else {
-        // Slow path: resource types need transforming both ways, via the
-        // shared `FuncForwardingInfo`.
         let info = Arc::new(FuncForwardingInfo {
             arg_types,
             return_types,
@@ -927,8 +847,6 @@ fn register_call_forwarding(
     }
 }
 
-/// Instantiate library components in dependency order and register their
-/// exports so subsequent components can import them.
 pub(crate) async fn instantiate_libraries(
     engine: &Engine,
     linker: &mut Linker<ProcessCtx>,

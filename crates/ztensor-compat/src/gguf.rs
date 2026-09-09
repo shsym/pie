@@ -1,18 +1,3 @@
-//! GGUF → zTensor object model projection.
-//!
-//! Layout: `"GGUF"` magic, u32 version (2 or 3, little-endian), u64 tensor
-//! count, u64 metadata KV count, the KVs, the tensor infos, then the data
-//! section aligned to `general.alignment` (default 32).
-//!
-//! Projection choices:
-//! - Standard element types project to the leaf in canonical layout.
-//! - Quantized tensors keep their **logical shape** and get layout
-//!   `gguf.<type>/2`, the type the block format expresses (none for the
-//!   codebook types), the raw blocks verbatim as the blob, and the
-//!   `elems_per_block` / `block_bytes` attributes the layout requires. Nothing
-//!   is dequantized; unknown type ids reject the file (never reinterpret).
-//! - All metadata KVs (including tokenizer tables) become file attributes.
-
 use ztensor::format::cbor::Value;
 use ztensor::provide::Catalog;
 use ztensor::provide::{Entry, Location, Payload};
@@ -21,16 +6,12 @@ use ztensor::{Error, Leaf, Result, Store, StoreId};
 
 use crate::project::Projection;
 
-/// The cursor ran past the window we had read, not past the file. Only
-/// meaningful while the window is smaller than the file.
 const NEED_MORE: &str = "header extends past the bytes read so far";
 
 fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("gguf: {}", detail.into()))
 }
 
-/// ggml type id → ggml type name (ggml.h `ggml_type`). Block geometry comes
-/// from the core's `gguf.<type>/2` table, so only the numbering lives here.
 fn type_name(id: u32) -> Result<&'static str> {
     Ok(match id {
         0 => "f32",
@@ -71,7 +52,6 @@ fn type_name(id: u32) -> Result<&'static str> {
     })
 }
 
-/// What a ggml type projects to: a leaf, or a `gguf.<type>/2` layout row.
 enum Kind {
     Leaf(Leaf),
     Block(&'static Row),
@@ -95,8 +75,6 @@ impl Kind {
         }
     }
 }
-
-// ---- cursor -----------------------------------------------------------
 
 struct Cursor<'a> {
     data: &'a [u8],
@@ -132,7 +110,6 @@ impl<'a> Cursor<'a> {
             .map_err(|_| bad("invalid UTF-8 in string"))
     }
 
-    /// Parses one metadata value into a CBOR attribute value.
     fn meta_value(&mut self, vtype: u32, depth: u32) -> Result<Value> {
         if depth > 32 {
             return Err(bad("metadata nesting too deep"));
@@ -150,11 +127,6 @@ impl<'a> Cursor<'a> {
             9 => {
                 let elem_type = self.u32()?;
                 let count = self.u64()?;
-                // Even a 1-byte element type needs a byte on disk, so a
-                // count beyond the remaining bytes is a lie, and the
-                // materialized `Value`s are far larger than their encoding,
-                // so this bound is what keeps the projection proportional
-                // to the file.
                 let remaining = (self.data.len() - self.pos) as u64;
                 if count > remaining {
                     return Err(bad("array length exceeds remaining bytes"));
@@ -181,15 +153,6 @@ fn int_value(v: i64) -> Value {
     }
 }
 
-// ---- projection -------------------------------------------------------
-
-/// Reads the header, growing the window until it fits.
-///
-/// A GGUF header is metadata KVs plus tensor infos, and its size is only known
-/// once it has been parsed, and a tokenizer table can be megabytes. So the window
-/// doubles until the parse stops running off the end, which for a mapped file
-/// costs nothing and for an indexed one reads the header and not the 100 GB
-/// behind it.
 pub(crate) fn project(store: &Store) -> Result<Projection> {
     let file_len = store.len();
     if let Some(mapped) = store.bytes() {
@@ -207,9 +170,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
     }
 }
 
-/// `buf` is the file, or a prefix of it long enough to hold the header;
-/// `file_len` is always the whole file, since tensor bounds are checked
-/// against the file and not against what we happened to read.
 fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
     let mut c = Cursor { data: buf, pos: 0 };
     if c.take(4)? != b"GGUF" {
@@ -228,8 +188,6 @@ fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
     }
 
     let mut alignment = 32u64;
-    // A KV needs at least a 8-byte length + 4-byte type on disk; a count
-    // beyond that is a lie and must not drive the allocation.
     let mut attributes: Vec<(Value, Value)> =
         Vec::with_capacity(crate::safe::capacity(kv_count, 13, buf.len()));
     for _ in 0..kv_count {
@@ -258,7 +216,6 @@ fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
         if n_dims > 64 {
             return Err(bad(format!("tensor {name:?} has {n_dims} dims")));
         }
-        // ggml stores dims fastest-first; reverse to row-major.
         let mut shape = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
             shape.push(c.u64()?);
@@ -284,11 +241,10 @@ fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
     }
 
     let mut catalog = Catalog::new();
-    let mut ranges = vec![(0u64, data_start)]; // header region
+    let mut ranges = vec![(0u64, data_start)];
     for info in infos {
         let kind = Kind::of(info.type_id)?;
         let (epb, block_bytes) = kind.geometry();
-        // Blocks are per-row in ggml: the fastest dim must divide evenly.
         let fastest = info.shape.last().copied().unwrap_or(1);
         if fastest % epb != 0 {
             return Err(bad(format!(
@@ -331,7 +287,7 @@ fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
                         offset: abs,
                         len: byte_size,
                     }),
-                    digest: None, // gguf carries none
+                    digest: None,
                     blocks: None,
                 },
             )
@@ -341,7 +297,6 @@ fn project_bytes(buf: &[u8], file_len: u64) -> Result<Projection> {
         }
     }
 
-    // Ranges must not overlap (offsets are writer-controlled).
     ranges.sort_unstable();
     ranges.dedup();
     for w in ranges.windows(2) {

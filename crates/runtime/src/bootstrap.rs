@@ -67,68 +67,35 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
     pub model: ModelConfig,
-    /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
-    /// Hard cap on the number of concurrent processes.
-    /// `None` means no limit; `Some(n)` caps admission to `n`.
     pub max_concurrent_processes: Option<usize>,
-    /// Whether to apply host-side snapshot optimization to Python components.
-    /// Disable via `python_snapshot = false` in the runtime config or the
-    /// `--no-snapshot` CLI flag.
     pub python_snapshot: bool,
 }
 
-/// Runtime tuning — tokio worker pool + wasmtime engine pool +
-/// per-instance security policies (filesystem / network). Every field is
-/// required; Python is the source of truth for defaults.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Number of tokio worker threads.
     pub worker_threads: usize,
 
-    /// Concurrent-inferlet cap (sets all four wasmtime `total_*` caps).
     pub wasm_max_instances: u32,
-    /// Per-inferlet linear-memory cap, in MiB.
     pub wasm_max_memory_mb: usize,
-    /// RAM kept warm per slot to skip remapping on respawn, in MiB.
     pub wasm_warm_memory_mb: usize,
-    /// Prepared-but-idle inferlet slots kept ready for fast respawn.
     pub wasm_warm_slots: u32,
 
-    /// Mount per-process scratch dir at `/scratch` with full read+write.
     pub allow_fs: bool,
-    /// Base dir under which per-process scratch dirs are created, as
-    /// `<base>/<process_id>`.
     pub fs_scratch_dir: PathBuf,
 
-    /// Expose the host network to inferlets (`wasi:sockets` + `wasi:http`).
     pub allow_network: bool,
-    /// Allowlist of `cidr[:port]` / `cidr:lo-hi`. `["*"]` = no restriction.
-    /// Only filters `wasi:sockets`; `wasi:http` bypasses the per-socket hook.
     pub network_allowed_hosts: Vec<String>,
 
-    /// Per-upload cap on cumulative bytes (program installs +
-    /// `session.send_file` blobs), in MiB.
     pub max_upload_mb: usize,
-    /// Concrete py-runtime root passed in by the embedding worker.
     pub py_runtime_dir: PathBuf,
 }
 
 pub struct ModelConfig {
     pub name: String,
-    /// Catalog id the engine loaded, as it reported it. The only model fact
-    /// this bundle carries; the chat template, family label etc. are read
-    /// off the catalog row it names. Empty for an engine not yet on the
-    /// catalog, and `register` says so rather than guessing a template.
     pub model_id: String,
     pub kv_page_size: usize,
-    /// The tokenizer file, for a model served from a HuggingFace snapshot.
-    /// Only consulted when `metadata.tokenizer` is `None`: a served `.zt`
-    /// carries its tokenizer compiled, so this holds the artifact's own path.
     pub tokenizer_path: PathBuf,
-    /// The served model's compiled metadata, lifted once by the worker.
-    /// Not optional: the descriptor inside it is where the runtime's model
-    /// facts come from, for a `.zt` and for a snapshot alike.
     pub metadata: ModelMetadata,
     pub engines: Vec<EngineConfig>,
     pub scheduler: SchedulerConfig,
@@ -137,7 +104,6 @@ pub struct ModelConfig {
 pub struct EngineConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
-    /// Which `copy_kv` directions this engine serves.
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
@@ -154,8 +120,6 @@ pub struct EngineConfig {
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
-    /// Which descriptor ports it resolves on the device, in the port
-    /// registry's own numbering.
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     pub engine_backend: crate::engine::EngineBox,
@@ -163,19 +127,10 @@ pub struct EngineConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
-    /// How long a lane holding the frame wait-set may go without submitting
-    /// before the leash drops it from the wait-set. Not a verdict. See
-    /// `crate::scheduler::configured_submit_deadline`.
     pub submit_deadline_us: u64,
-    /// How long a lane may stay silent in total before its process is
-    /// terminated. See `crate::scheduler::configured_silence_timeout`.
     pub silence_timeout_secs: u64,
-    /// Waves per frame (k). See `crate::scheduler::configured_frame_size`.
     pub frame_size: u32,
-    /// Frames the runtime keeps posted to the engine. See
-    /// `crate::scheduler::frame::configured_dispatch_depth`.
     pub frame_dispatch_depth: u32,
 }
 
@@ -210,8 +165,6 @@ pub async fn bootstrap_with_listener(
     config: Config,
     _listener: tokio::net::TcpListener,
 ) -> Result<BootstrapHandle> {
-    // Edge-rpc does not use the WebSocket listener; this shim takes one and
-    // ignores it so a caller that still binds a socket compiles.
     bootstrap_inner(config).await
 }
 
@@ -224,8 +177,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     let wasm_engine = init_wasmtime(&config.runtime);
 
-    // Must load before the linker and program services spawn, so both read
-    // from shared runtime state rather than loading their own copies.
     python::runtime::init(
         &wasm_engine,
         &config.runtime.py_runtime_dir,
@@ -238,9 +189,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         config.cache_dir.clone(),
     );
 
-    // Compile per-instance security policies once. Network policy
-    // parsing fails fast on bad config (typo'd CIDRs, `"*"` mixed with
-    // rules, etc.) — better here than on the first inferlet launch.
     let fs_policy = FsPolicy {
         allow: config.runtime.allow_fs,
         base_dir: config.runtime.fs_scratch_dir.clone(),
@@ -265,18 +213,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler,
     } = config.model;
 
-    // Admission defaults to the engine's `max_forward_requests` (R): a
-    // forward carries at most R rows and at most one fire per process.
-    //
-    // Also clamped by the RS seat pool: `frame_dispatch_depth` (D) frames
-    // stay posted per lane, each holding a slot, so one admitted seat costs
-    // D slots. This clamp applies even to an explicit operator setting: a
-    // seat count the pool cannot physically seat is a request failure with
-    // extra steps.
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
-    // Kept with its page pool so the warning below can report both numbers
-    // that produced the seat count.
     let rs_pool = engine_configs
         .iter()
         .filter(|d| d.rs_cache_slots > 0)
@@ -312,28 +250,23 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     process::init_admission(admission_cap);
 
-    // RS working-set caps from the engine handshake (uniform across a
-    // model's engines, so take [0]).
     let rs_caps = {
         let d0 = engine_configs.first();
         let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
         model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
             buffer_page_size: if is_rs { kv_page_size as u32 } else { 0 },
-            fold_granularity: 1, // token-causal; 0-RS models never read it
+            fold_granularity: 1,
         }
     };
     let eta_caps = model::EtaCaps {
         has_lora: !engine_configs.is_empty() && engine_configs.iter().all(|d| d.has_lora),
         has_mtp_logits: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_mtp_logits),
-        // One depth for the deployment: every engine states the same head
-        // or the runtime advertises none.
         mtp_depth: match engine_configs.first().map(|d| d.mtp_depth) {
             Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
             _ => 0,
         },
-        // Likewise one block drafter for the deployment, or none.
         draft_block: match engine_configs.first().map(|d| d.draft_block) {
             Some(rows) if engine_configs.iter().all(|d| d.draft_block == rows) => rows,
             _ => 0,
@@ -366,8 +299,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
     let arena_max_context: Vec<usize> =
         engine_configs.iter().map(|d| d.limits.max_context).collect();
-    // Whether engine 0 can physically move KV bytes to/from host swap —
-    // arms the suspend rung.
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.kv_copy.device_to_host && d.kv_copy.host_to_device);
@@ -377,8 +308,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| {
             engine::register_engine_backend(
                 engine::EngineSpec {
-                    // Overwritten by `register_engine_backend` from the
-                    // backend itself; see `EngineSpec::device_domain`.
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
@@ -389,8 +318,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect();
 
-    // Register this model's per-engine typed stores (KvStore/RsStore) in the
-    // standalone registry, read straight from `cfg.engines[]`.
     let _ = engine_count;
     let arena_model_idx = crate::store::registry::register_model_with_swap(
         kv_page_size as u32,
@@ -400,12 +327,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_max_context,
     );
 
-    // Residency planner: always installed. KV pool exhaustion is FCFS
-    // eviction/restore, never an inferlet error. Eviction arms by
-    // capability: an engine that advertises D2H+H2D KV copies gets
-    // planner-driven eviction; one that cannot degrades to pool-only
-    // planning. Uncontended fires never touch the planner beyond two
-    // atomic loads.
     crate::planner::init_planner(
         arena_model_idx,
         0,
@@ -413,9 +334,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             crate::planner::RegistryPool::new(arena_model_idx, 0, kv_swap_capable),
         )),
     );
-    // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
-    // per tick while anything is queued, so a stalling run reports whether
-    // pages are MOVING (churn) or FROZEN (liveness). Off by default.
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -431,9 +349,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
                     continue;
                 }
-                // `println!`, not `tracing`: the embedded (pyo3) server
-                // boots with `skip_tracing` and installs no subscriber, so
-                // a tracing event here would go nowhere.
                 println!(
                     "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
@@ -501,8 +416,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
-    // Wait-all on every platform; see `scheduler::frame::SEAL_DEFAULT_READY`
-    // for the measurements behind it. `PIE_SEAL_MODE=ready` opts out.
     crate::scheduler::set_seal_default_ready(false);
     crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
         scheduler.submit_deadline_us,
@@ -510,9 +423,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));
-    // Both are guest-visible through `model.frame-size()` /
-    // `model.channel-capacity()`, so must be installed before anything
-    // touches the scheduler.
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(
@@ -521,10 +431,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler.request_timeout_secs,
     )
     .await?;
-    // Elasticity is a side effect of admission: a frame's union demand is
-    // committed atomically by the engine before any of it runs, so the pools
-    // hold what has been asked for. The engine reports the high water via
-    // `LoadFacts::pool_high_water_bytes`.
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
@@ -536,16 +442,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     })
 }
 
-/// Boot-time checks for the values pie's Python layer cannot validate
-/// itself: filesystem-side effects (cache dir) and worker-handshake outputs
-/// (tokenizer file, engine capability numbers).
 fn verify_config(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
     let model = &config.model;
-    // An artifact carries its tokenizer inside it, so there is no file to
-    // check for; only the tokenizer half is asked about.
     ensure!(
         model.metadata.tokenizer.is_some() || model.tokenizer_path.exists(),
         "Model {:?}: tokenizer not found at {:?}",
@@ -577,31 +478,15 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Per-component ceiling on the wasmtime resource classes a component
-/// multiplies (one core-instance slot per linked module, one table slot per
-/// module with a table). Measured over every inferlet pie ships: 3 core
-/// instances / 2 tables / 1 memory / 1 fiber stack each. Declaring the
-/// ceiling makes an over-large guest fail deterministically at instantiation
-/// instead of silently shrinking capacity. Headroom over that is cheap: the
-/// pools cost reserved address space, not committed memory.
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
-    // Async host calls / fibers need no explicit flags: the Component Model
-    // Async feature is on by default.
 
-    // `wasm_max_instances` caps concurrent inferlets; each pool below is
-    // sized to seat that many.
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    // One per inferlet: one component instance, one store, one linear
-    // memory, one async fiber stack. Expensive pools — a memory slot
-    // reserves a whole wasm32 range — so must not be inflated.
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
     pooling_config.total_stacks(runtime.wasm_max_instances);
-    // Several per inferlet, however many core modules the component was
-    // linked from; sizing these at `wasm_max_instances` undercounts them.
     pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
     pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
     pooling_config.total_core_instances(
@@ -626,7 +511,6 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
-/// Initialize the tracing subscriber with optional file logging and OTLP export.
 fn init_tracing(
     log_dir: &Option<PathBuf>,
     verbose: bool,

@@ -1,21 +1,8 @@
-//! The shader sources, as static text — the one thing a Metal driver cannot
-//! get from a [`Fire`](crate::Fire) alone: `newLibraryWithSource:` is the
-//! only compile door available without Xcode, so the sources travel inside
-//! the rlib rather than as an offline `.metallib`.
-//!
-//! `newLibraryWithSource:` has no header search path, so a `#include
-//! "../third_party/…"` inside a source resolves to nothing; [`resolve`]
-//! flattens includes relative to the including file's directory.
-
-/// Where the sources live in the source tree, for `include_str!`.
 macro_rules! source_root {
     () => {
         concat!(env!("CARGO_MANIFEST_DIR"), "/kernels")
     };
 }
-/// Every `.metal` file this crate ships, by the path a [`Fire`](crate::Fire)
-/// names it with — third-party headers included, since they are what the
-/// `#include` lines resolve to.
 pub const SOURCES: &[(&str, &str)] = &[
     ("attn/attn_sink.metal", include_str!(concat!(source_root!(), "/attn/attn_sink.metal"))),
     ("layout/keepalive.metal", include_str!(concat!(source_root!(), "/layout/keepalive.metal"))),
@@ -26,6 +13,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("attn/merge_lse.metal", include_str!(concat!(source_root!(), "/attn/merge_lse.metal"))),
     ("attn/mla.metal", include_str!(concat!(source_root!(), "/attn/mla.metal"))),
     ("attn/ple.metal", include_str!(concat!(source_root!(), "/attn/ple.metal"))),
+    ("attn/ragged.metal", include_str!(concat!(source_root!(), "/attn/ragged.metal"))),
     ("attn/pool.metal", include_str!(concat!(source_root!(), "/attn/pool.metal"))),
     ("attn/score.metal", include_str!(concat!(source_root!(), "/attn/score.metal"))),
     ("attn/sdpa_paged.metal", include_str!(concat!(source_root!(), "/attn/sdpa_paged.metal"))),
@@ -51,10 +39,22 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("elemwise/norm_rms.metal", include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal"))),
     ("elemwise/norm_standardize.metal", include_str!(concat!(source_root!(), "/elemwise/norm_standardize.metal"))),
     ("elemwise/norm_vector.metal", include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal"))),
+    ("elemwise/modulate.metal", include_str!(concat!(source_root!(), "/elemwise/modulate.metal"))),
+    ("elemwise/pointwise.metal", include_str!(concat!(source_root!(), "/elemwise/pointwise.metal"))),
+    ("elemwise/res_blend.metal", include_str!(concat!(source_root!(), "/elemwise/res_blend.metal"))),
+    ("probe/nan_check.metal", include_str!(concat!(source_root!(), "/probe/nan_check.metal"))),
+    ("elemwise/rope_axes.metal", include_str!(concat!(source_root!(), "/elemwise/rope_axes.metal"))),
+    ("elemwise/sinusoid.metal", include_str!(concat!(source_root!(), "/elemwise/sinusoid.metal"))),
     ("elemwise/rope_mrope.metal", include_str!(concat!(source_root!(), "/elemwise/rope_mrope.metal"))),
     ("elemwise/rope_neox.metal", include_str!(concat!(source_root!(), "/elemwise/rope_neox.metal"))),
     ("icb/rebind.metal", include_str!(concat!(source_root!(), "/icb/rebind.metal"))),
     ("layout/argmax.metal", include_str!(concat!(source_root!(), "/layout/argmax.metal"))),
+    ("spatial/grid.metal", include_str!(concat!(source_root!(), "/spatial/grid.metal"))),
+    ("spatial/rule.metal", include_str!(concat!(source_root!(), "/spatial/rule.metal"))),
+    ("spatial/conv.metal", include_str!(concat!(source_root!(), "/spatial/conv.metal"))),
+    ("spatial/norm.metal", include_str!(concat!(source_root!(), "/spatial/norm.metal"))),
+    ("spatial/attn.metal", include_str!(concat!(source_root!(), "/spatial/attn.metal"))),
+    ("spatial/resample.metal", include_str!(concat!(source_root!(), "/spatial/resample.metal"))),
     ("layout/topk.metal", include_str!(concat!(source_root!(), "/layout/topk.metal"))),
     ("layout/blit.metal", include_str!(concat!(source_root!(), "/layout/blit.metal"))),
     ("layout/deinterleave.metal", include_str!(concat!(source_root!(), "/layout/deinterleave.metal"))),
@@ -65,6 +65,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("layout/ple_combine.metal", include_str!(concat!(source_root!(), "/layout/ple_combine.metal"))),
     ("layout/row_gather.metal", include_str!(concat!(source_root!(), "/layout/row_gather.metal"))),
     ("linear/gemm_dense.metal", include_str!(concat!(source_root!(), "/linear/gemm_dense.metal"))),
+    ("linear/lane_gemm.metal", include_str!(concat!(source_root!(), "/linear/lane_gemm.metal"))),
     ("linear/lora.metal", include_str!(concat!(source_root!(), "/linear/lora.metal"))),
     ("linear/mlp_gated.metal", include_str!(concat!(source_root!(), "/linear/mlp_gated.metal"))),
     ("linear/mlp_packed.metal", include_str!(concat!(source_root!(), "/linear/mlp_packed.metal"))),
@@ -83,7 +84,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("third_party/mlx_steel_transforms.metal", include_str!(concat!(source_root!(), "/third_party/mlx_steel_transforms.metal"))),
 ];
 
-/// The text of one shader file, by the path a `Fire` names.
 #[must_use]
 pub fn source(file: &str) -> Option<&'static str> {
     SOURCES
@@ -92,18 +92,6 @@ pub fn source(file: &str) -> Option<&'static str> {
         .map(|(_, text)| *text)
 }
 
-/// Resolve `file`'s `#include "…"` lines against [`SOURCES`], recursively,
-/// and return one flat translation unit.
-///
-/// Angle-bracket includes (`<metal_stdlib>`) are the toolchain's and pass
-/// through untouched. A quoted include is resolved relative to the including
-/// file's directory, once: a header pulled in twice is emitted once, which
-/// is what the sources' own `#pragma once`-less style requires.
-///
-/// # Errors
-///
-/// The name of the first file — the root or an include — this crate does not
-/// ship.
 pub fn resolve(file: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut seen = Vec::new();
@@ -130,14 +118,12 @@ fn expand(file: &str, out: &mut String, seen: &mut Vec<String>) -> Result<(), St
     Ok(())
 }
 
-/// The target of a `#include "…"` line, or `None` for anything else.
 fn quoted_include(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix("#include")?.trim_start();
     let rest = rest.strip_prefix('"')?;
     rest.split_once('"').map(|(target, _)| target)
 }
 
-/// `dir` joined with a possibly-`../`-prefixed relative path, normalized.
 fn join(dir: &str, target: &str) -> String {
     let mut parts: Vec<&str> = if dir.is_empty() {
         Vec::new()
@@ -155,4 +141,3 @@ fn join(dir: &str, target: &str) -> String {
     }
     parts.join("/")
 }
-

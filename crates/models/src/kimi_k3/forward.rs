@@ -14,7 +14,6 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// True for rows whose request routed to a registered adapter; a fire with no such rows costs nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -70,7 +69,6 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        // plan[0] is the decode schedule, plan[1] the prefill schedule; each is built from its own arm.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan = [
             ops::attn::mla_plan(&input_d, m.mla_heads, m.kv_lora_rank),
@@ -97,7 +95,6 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // Must run after all_reduce: correcting a tp-split partial product would sum the correction tp times.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -174,8 +171,6 @@ impl ForwardHybrid for Model {
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let logits = ops::linear::lm_head(&x, &m.head);
-        // This rank landed its COLUMNS of the logits; the plan wants all of
-        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
         if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
         } else {
@@ -214,7 +209,6 @@ fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: 
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
-    // Must split by the same predicate `forward` used to build plan[0]/plan[1].
     let one = Facts::qo_one();
     let (dq, p) = q.split(&one);
     let (dpe, ppe) = q_pe.split(&one);

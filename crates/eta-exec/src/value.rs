@@ -1,9 +1,6 @@
 use eta_ir::Dtype;
 use eta_ir::container::ChanDType;
 
-/// The element type a channel's cells actually hold. `ChanDType::Act` is
-/// the late-bound activation type; this host plane materializes it as
-/// `F32`, which is what its reference interpreter computes in.
 #[must_use]
 pub fn concrete_dtype(dtype: ChanDType) -> Dtype {
     match dtype {
@@ -12,15 +9,6 @@ pub fn concrete_dtype(dtype: ChanDType) -> Dtype {
     }
 }
 
-/// What a [`Dtype`] outside ETA's set means to this plane: nothing, and it
-/// cannot get here. [`Value`]'s four variants are the four dtypes ETA
-/// computes in. Panics rather than substituting `F32`: a plan reaching this
-/// point already passed `eta_ir::infer::body_types`, which refuses an
-/// unsupported result dtype by name.
-///
-/// # Panics
-///
-/// Always.
 #[cold]
 pub fn no_lane(dtype: Dtype) -> ! {
     panic!("{dtype:?} is not a dtype ETA computes in; this plane has no lane for it")
@@ -157,7 +145,6 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
-        // a dtype this plane has no lane for; see `no_lane`.
         _ => return None,
     })
 }

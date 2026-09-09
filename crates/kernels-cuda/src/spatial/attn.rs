@@ -1,20 +1,3 @@
-//! `Attention`: the conv VAE's mid-block attention — one head as wide as
-//! the row, over the BLOCK a [`Segment`] names: `y = softmax(q·kᵀ ·
-//! sm_scale) · v` with `q`, `k`, `v`, `y` all `[rows, C]` bf16 on the voxel
-//! axis and the blocks read off the lane table. A plain online-softmax
-//! walk over the block's keys (`spatial/attn.cuh`), not the ragged FA2
-//! template, which is stamped at head widths 64/128/256 while a VAE's head
-//! is its whole channel row.
-//!
-//! A block is a whole lane (the image VAEs' mid block) or a run of frames
-//! inside one ([`Segment::Frames`]; Wan 2.2's mid block attends one frame
-//! at a time). Nothing here knows which family asked.
-//!
-//! Numerics: fp32 scores (the logits pre-scaled by `sm_scale · log2 e` and
-//! exponentiated with `exp2`), fp32 running max and sum, fp32 accumulation
-//! over the values, one rounding at the store — the reference's
-//! `upcast_softmax` attention, off by the summation order alone.
-
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated};
 use crate::spatial::lanes_of;
@@ -26,35 +9,16 @@ const OP: &str = "spatial.attention";
 
 const BLOCK: u32 = 128;
 
-/// The row widths the kernel is stamped at, each with the QUERIES PER WARP
-/// it is stamped with: a warp lane holds `C / 32` channels of every one of
-/// its queries twice over (the pre-scaled query and the accumulator), so
-/// `QPW · C / 32` is the register state either side and the product is held
-/// at 32 or below — four queries a warp at 256 channels, one at 1024. A
-/// wider group at 1024 spills to local memory and runs several times
-/// slower.
-///
-/// 640 is Wan 2.2's ENCODER mid block. Its per-lane slice is 20 channels,
-/// which is neither a whole number of 16-byte words nor aligned, so that
-/// instantiation moves bf16 scalars; the other three keep the vector path.
 const WIDTHS: [(u32, u32); 4] = [(256, 4), (512, 2), (640, 1), (1024, 1)];
 
-/// Which rows of a lane one query attends — the kernel's half of
-/// `model_ir::VoxelSegment`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Segment {
-    /// Every voxel of the lane: one attention block per clip.
     #[default]
     Lane,
-    /// The run of `n` consecutive frames the query's own frame falls in;
-    /// a lane whose frame count is not a multiple leaves a short run at the
-    /// end. `Frames(1)` is one block per frame.
     Frames(u32),
 }
 
 impl Segment {
-    /// What the kernel takes: `0` for the whole lane, `n` for a run of `n`
-    /// frames.
     fn frames(self) -> u32 {
         match self {
             Segment::Lane => 0,
@@ -63,12 +27,6 @@ impl Segment {
     }
 }
 
-/// `y = softmax(q·kᵀ · sm_scale) · v` per block of `grid`, the block being
-/// a whole lane or a run of its frames ([`Segment`]).
-///
-/// `q`, `k`, `v`: `[rows, C]` bf16 at one shape, `C` one of
-/// 256/512/640/1024, 16-byte aligned; `grid`: `[lanes, 4]` i32; `o`: `[rows, C]` bf16. Rows
-/// no lane claims land zeros.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx,

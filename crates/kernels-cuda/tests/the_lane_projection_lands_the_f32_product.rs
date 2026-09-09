@@ -1,10 +1,3 @@
-//! `linear::lane_gemm::act_x_wt` — the projection a lane vector's chain runs
-//! over an f32 activation — lands `act · w^T` accumulated in f32, in the
-//! activation's own element, against a host reference over the same
-//! operands; the bf16 activation and the bf16 result agree to a rounding.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_lane_projection_lands_the_f32_product`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -18,10 +11,7 @@ const ROWS: usize = 5;
 const K: usize = 96;
 const N: usize = 40;
 
-/// f32 accumulation in a different order than the host's: a few ulps at
-/// `|y| ~ 3`.
 const F32_TOLERANCE: f32 = 2e-5;
-/// One bf16 rounding of the answer.
 const BF16_TOLERANCE: f32 = 2e-2;
 
 fn reference(act: &[f32], w: &[f32]) -> Vec<f32> {
@@ -36,6 +26,11 @@ fn reference(act: &[f32], w: &[f32]) -> Vec<f32> {
         }
     }
     y
+}
+
+fn the_lane_projection_lands_the_f32_product_every_case() {
+    the_f32_activation_lands_the_f32_product();
+    a_bf16_activation_lands_a_bf16_product();
 }
 
 #[test]
@@ -65,7 +60,6 @@ fn the_f32_activation_lands_the_f32_product() {
     }
 }
 
-#[test]
 fn a_bf16_activation_lands_a_bf16_product() {
     let mut rng = Lcg::seeded(23);
     let (act_bits, act) = rng.row(ROWS * K);

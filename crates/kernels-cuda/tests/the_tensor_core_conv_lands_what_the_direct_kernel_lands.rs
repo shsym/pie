@@ -1,13 +1,3 @@
-//! **THE `mma.sync` CONVOLUTION LANDS THE FMA CONVOLUTION'S ANSWER** to
-//! within bf16 rounding on a decoder-sized block: `C_in = C_out = 64`,
-//! `3x3x3` causal with a two-frame cache and a bias, two lanes whose row
-//! ranges straddle the 128-row tiles, and a channel count off the 128-wide
-//! column tile. The two kernels sum K in different orders, so the claim is
-//! "within one bf16 ulp plus fp32 noise", not "bit-equal". And `conv3d`
-//! itself, asked without a path, takes the tensor cores on such a shape.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_tensor_core_conv_lands_what_the_direct_kernel_lands`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -83,6 +73,12 @@ fn run(c_in: usize, c_out: usize, boxes: &[Box3], conv: Conv3d) {
     );
 }
 
+fn the_tensor_core_conv_lands_what_the_direct_kernel_lands_every_case() {
+    the_two_kernels_agree_over_a_causal_cached_block();
+    the_two_kernels_agree_off_the_tile_boundaries();
+    the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape();
+}
+
 #[test]
 fn the_two_kernels_agree_over_a_causal_cached_block() {
     run(
@@ -100,7 +96,6 @@ fn the_two_kernels_agree_over_a_causal_cached_block() {
     );
 }
 
-#[test]
 fn the_two_kernels_agree_off_the_tile_boundaries() {
     run(
         40,
@@ -117,7 +112,6 @@ fn the_two_kernels_agree_off_the_tile_boundaries() {
     );
 }
 
-#[test]
 fn the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape() {
     let (c_in, c_out) = (32usize, 40usize);
     let boxes = [Box3::new(2, 5, 9)];

@@ -1,51 +1,3 @@
-//! **THE LTX-2.5 ROWS TRACE, CLASSIFY AND BAKE: THREE ARMS UNDER ONE PLAN,
-//! FOUR STREAMS IN ONE FIRE, SIX ATTENTIONS A BLOCK, AND A ROTARY LADDER
-//! THAT RUNS ACROSS THE ROW RATHER THAN DOWN A HEAD.**
-//!
-//! ```text
-//! cargo test -p models --test the_ltx_2_rows_bake
-//! ```
-//!
-//! `ltx25` is the first catalog row whose denoise reading carries FOUR
-//! streams of two different widths in one attention group — a video lane at
-//! 4096, an audio lane at 2048, and the two text contexts each keyed to its
-//! own modality — and the first whose rope is
-//! [`RopeForm::SplitLadder`](model_dsl::RopeForm::SplitLadder), one
-//! frequency ladder across the whole row with the axes handed out
-//! round-robin along it. `ltx25-mini` is the parity fixture
-//! `scripts/imagegen/ltx2_golden.py --mini` writes. What is asserted:
-//!
-//! ```text
-//! (a) every row traces on every platform, holding no kv space and no state
-//!     (the flagship's non-causal VAE decoder included: a clip is one fire)
-//! (b) the seams are one `velocity` (merged over the two modalities), two
-//!     `hidden` (one per connector), one `pixels` on the flagship alone, and
-//!     never `out`
-//! (c) the ports the trace reads are the ports the facts declare, at the
-//!     facts' widths and kind-relative indices, and the named ports resolve
-//!     to `model::port`
-//! (d) the (reading, stream) lanes the facts list classify into distinct
-//!     classes where every merge resolves
-//! (e) six ragged reads per block — the two self-attentions over their own
-//!     stream's group CSR, the two prompt cross-attentions into the two
-//!     context selections, and the cross-modal pair, each reading the OTHER
-//!     stream's CSR — plus one per connector layer over its lane CSR
-//! (f) every rope is the one-ladder form at theta 1e4: the video rows' three
-//!     axes over `dim/6` frequencies each with a two-slot identity pad, the
-//!     audio rows' and the cross-modal pair's one axis with none; the text
-//!     cross-attentions turn nothing
-//! (g) every row bakes on every platform under a voxel ladder, the flagship
-//!     alone a voxel plan, and the flagship refuses to bake without one
-//! (h) the generative facts: three readings dense from 0 (four on the
-//!     flagship, `vae.decode` last), the latent space (128, 1x1x1, /32, /8),
-//!     and the eight pinned distilled sigmas
-//! (i) the modulation is a per-lane f32 vector over a bf16 trunk — twelve
-//!     scale-shift sites a block and one per head — every gated fold aliases
-//!     its residual, and every attention ends in a per-head sigmoid gate
-//! (j) every per-block table is folded into a COPY of the vector its stream's
-//!     adaLN head hands the whole stack, never in place on the vector itself
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
@@ -91,7 +43,18 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
-/// (a), (b)
+fn the_ltx_2_rows_bake_every_case() {
+    every_row_traces_on_every_platform_holding_nothing_between_fires();
+    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_lane_the_facts_list_classifies_into_its_own_class();
+    the_attentions_pair_as_the_architecture_says();
+    every_rope_is_one_ladder_across_the_row();
+    every_row_bakes_on_every_platform();
+    the_generative_facts_state_the_readings_the_latent_and_the_schedule();
+    every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares();
+    the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
+}
+
 #[test]
 fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
     for sku in ROWS {
@@ -152,8 +115,6 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
     traced
 }
 
-/// (c)
-#[test]
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -210,8 +171,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
                 vec![Stream::Reference]
             )
         );
-        // EVERY lane binds a timestep: the two context lanes modulate their
-        // own rows from the prompt timestep.
         assert_eq!(
             at("timestep"),
             (model::port::TIMESTEP, PortKind::LaneVector, 1, vec![])
@@ -236,7 +195,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, d.channels);
-        // The two connectors read ONE packed-text rectangle at one index.
         for name in ["refine.video", "refine.audio"] {
             let refine = facts.readings.iter().find(|r| r.name == name).unwrap();
             let (index, port) = refine.port("text").expect("the packed trunk rows");
@@ -268,8 +226,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     }
 }
 
-/// (d)
-#[test]
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -297,8 +253,6 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
             seen.len(),
             "{sku}: two lanes share a class: {seen:?}"
         );
-        // Four denoise lanes, one text lane per connector, and the
-        // flagship's one decode lane.
         assert_eq!(
             seen.len(),
             6 + usize::from(is_flagship(sku)),
@@ -307,8 +261,6 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
     }
 }
 
-/// (e)
-#[test]
 fn the_attentions_pair_as_the_architecture_says() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -333,7 +285,6 @@ fn the_attentions_pair_as_the_architecture_says() {
         let refine_v = word(REFINE_VIDEO, Stream::Text);
         let refine_a = word(REFINE_AUDIO, Stream::Text);
 
-        // (query stream, key stream) -> how many reads pair them.
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;
         for node in &plan.nodes {
@@ -352,7 +303,6 @@ fn the_attentions_pair_as_the_architecture_says() {
             let (q_sel, q_kind) = selection_of(*q_indptr);
             let (kv_sel, _) = selection_of(*kv_indptr);
             if q_kind == "lane" {
-                // A connector lane attends its own rows.
                 connector_reads += 1;
                 assert_eq!(q_indptr, kv_indptr, "{sku}: a connector reads itself");
                 assert!(q_sel.holds(refine_v) || q_sel.holds(refine_a));
@@ -403,8 +353,6 @@ fn the_attentions_pair_as_the_architecture_says() {
     }
 }
 
-/// (f)
-#[test]
 fn every_rope_is_one_ladder_across_the_row() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -432,9 +380,6 @@ fn every_rope_is_one_ladder_across_the_row() {
         }
         let layers = d.layers as usize;
         let conn = d.conn_layers as usize;
-        // Per block: the two self-attentions and the cross-modal pair, q and
-        // k apiece. Per connector layer: q and k. The text cross-attentions
-        // turn nothing.
         let mut want: BTreeMap<([u32; 4], u32), usize> = BTreeMap::new();
         *want.entry((d.rope_dims(), d.head_dim)).or_default() += 2 * layers;
         *want
@@ -451,7 +396,6 @@ fn every_rope_is_one_ladder_across_the_row() {
             .or_default() += 2 * conn;
         assert_eq!(seen, want, "{sku}");
 
-        // The video ladder pads two slots; a one-axis ladder pads none.
         assert_eq!(model::rope_pad(d.dim(), model::ROPE_AXES), 2, "{sku}");
         assert_eq!(
             model::rope_pad(d.audio_dim(), model::AUDIO_ROPE_AXES),
@@ -479,15 +423,10 @@ fn budget() -> model_compiler::Budget {
     }
 }
 
-/// (g)
-#[test]
 fn every_row_bakes_on_every_platform() {
     for platform in PLATFORMS {
         for sku in ROWS {
             let plan = trace(sku, platform);
-            // The flagship's decode arm grows a latent clip by 8192 voxels
-            // per latent voxel (three `(2, 2, 2)`/`(2, 1, 1)`/`(1, 2, 2)`
-            // shuffles and the 4x4 un-patchify), so its ladder is small.
             let budgets = model_compiler::Budgets::of(budget())
                 .with_voxels(model_compiler::VoxelLadder::new(256, 2));
             let compiled = model_compiler::compile_axes(
@@ -520,8 +459,6 @@ fn every_row_bakes_on_every_platform() {
     );
 }
 
-/// (h)
-#[test]
 fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for sku in ROWS {
         let facts = row(sku).generative.as_ref().expect("facts");
@@ -576,8 +513,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     }
 }
 
-/// What the runtime's `validate_generative` demands, restated here so the
-/// facts are checked where they are written.
 fn validate(facts: &models::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
@@ -593,14 +528,6 @@ fn validate(facts: &models::Generative) {
     }
 }
 
-/// (j)
-///
-/// `elementwise.add_bias` folds ITS BIAS IN PLACE (the IR aliases `out_out`
-/// onto `out`). One adaLN head serves all 48 blocks, so a block that added
-/// its own table straight onto that shared vector would hand block `n + 1`
-/// the sum of every table before it. The text copies first; this is the
-/// claim that it still does.
-#[test]
 fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -618,7 +545,6 @@ fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
             if !lane_shaped(*out) {
                 continue;
             }
-            // How many nodes read the rectangle this fold writes over?
             let readers = plan
                 .nodes
                 .iter()
@@ -637,8 +563,6 @@ fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
             folded += 1;
         }
         let d = dims(sku);
-        // Per block: four tables a stream. Outside them: the two heads' own
-        // `[temb | temb]` folds and the eight adaLN projections' biases.
         assert!(
             folded >= 8 * d.layers as usize,
             "{sku}: {folded} lane-vector folds for {} blocks",
@@ -647,8 +571,6 @@ fn every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares() {
     }
 }
 
-/// (i)
-#[test]
 fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -692,8 +614,6 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
                 "{sku}: the broadcast is the fire's token->lane table"
             );
         }
-        // Twelve sites a block (three per stream, one per context lane, two
-        // per stream for the cross-modal pair) and one per head.
         assert_eq!(modulates, 12 * d.layers as usize + 2, "{sku}");
 
         let mut gates = 0usize;

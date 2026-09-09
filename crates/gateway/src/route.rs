@@ -1,13 +1,3 @@
-//! Worker selection + dispatch: the gateway data-plane router. Per turn the
-//! gateway runs `admission -> route -> dispatch`; this module owns route and
-//! dispatch-with-retry, [`admission`](crate::admission) owns the first, and
-//! [`RoutingHandle`] single-sources the cluster-table read. Selection runs
-//! over `Healthy ∩ connected` workers, preferring a session's soft-affinity
-//! (rendezvous-hashed) worker or falling back to power-of-two-choices;
-//! dispatch walks the ordered candidates until one accepts, retrying on
-//! reject/redirect/transport failure since the gateway's pick is only a
-//! hint and the worker has final admission.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,25 +9,13 @@ use worker_api::{Accepted, Request};
 
 use crate::admission::{AdmissionConfig, AdmissionDecision, admit};
 
-/// A soft-affinity key — an opaque hash of the logical session, minted by
-/// the session layer (stable across a session's turns).
 pub type AffinityKey = u64;
 
-/// Upper bound on dispatch attempts per turn, so a fully-rejecting or
-/// flapping fleet cannot spin the retry loop.
 const MAX_DISPATCH_ATTEMPTS: usize = 8;
 
-/// What `route` needs from the worker connection registry: dispatch one
-/// turn to a specific, currently-connected worker. A one-method seam so
-/// `route` compiles and tests independent of the registry mechanism; any
-/// `Err` means the same thing (advance to the next candidate), distinct
-/// from a worker's own [`Accepted`] answer.
 pub trait WorkerDispatch {
-    /// The registry's dispatch error (e.g. `not-connected` / `transport`).
     type Err: std::fmt::Display;
 
-    /// Dispatch `req` to worker `id`. `Ok(Accepted)` is the worker's *answer*
-    /// (accept / reject / redirect); `Err` is a registry/transport failure.
     fn dispatch(
         &self,
         id: WorkerId,
@@ -45,27 +23,15 @@ pub trait WorkerDispatch {
     ) -> impl std::future::Future<Output = Result<Accepted, Self::Err>> + Send;
 }
 
-/// The outcome of a successful dispatch: which worker bound the turn (so
-/// the session can target [`cancel`]/[`set_priority`] at it) plus the
-/// worker's `Accepted` answer.
-///
-/// [`cancel`]: worker_api::WorkerControl::cancel
-/// [`set_priority`]: worker_api::WorkerControl::set_priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dispatched {
-    /// The worker the turn is now bound to.
     pub worker_id: WorkerId,
-    /// The worker's accept answer (its `Accepted::Ok { worker }`).
     pub accepted: Accepted,
 }
 
-/// Why a turn could not be placed on any worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
-    /// No `Healthy ∩ connected` worker existed to try (empty/stale table, or no
-    /// worker has dialed in yet).
     NoCandidate,
-    /// Every candidate rejected or failed within the attempt budget.
     Exhausted { attempts: usize },
 }
 
@@ -87,29 +53,14 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
-// ─────────────────────────────── routing handle ───────────────────────────────
-
-/// The gateway's routing/admission brain. Holds the controller's pushed
-/// [`RoutingTable`] and the live `connected`-worker snapshot, and drives
-/// the per-turn sequence. Constructed from injected watch receivers, never
-/// dials the controller itself, so it is fully test-injectable; cloning is
-/// cheap (two watch receivers).
 #[derive(Clone)]
 pub struct RoutingHandle {
-    /// Latest routing table (worker roster + coarse load), pushed by the
-    /// controller backend via `watch_gateway` (or a stub in tests).
     routing: watch::Receiver<RoutingTable>,
-    /// Live set of dialed-in workers, bumped by the worker registry on
-    /// dial-in / drop. The hot-path membership filter for selection.
     connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
-    /// Thresholds for the coarse admission gate.
     admission: AdmissionConfig,
 }
 
 impl RoutingHandle {
-    /// Build from the routing-table watch (controller backend) and the
-    /// connected-worker watch (worker registry). Uses the default admission
-    /// thresholds; see [`with_admission`](Self::with_admission).
     pub fn new(
         routing: watch::Receiver<RoutingTable>,
         connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
@@ -121,22 +72,15 @@ impl RoutingHandle {
         }
     }
 
-    /// Override the coarse admission thresholds.
     pub fn with_admission(mut self, admission: AdmissionConfig) -> Self {
         self.admission = admission;
         self
     }
 
-    /// Coarse cluster admission; see [`admission`](crate::admission). Takes
-    /// the turn's [`Request`] for forward-compatibility; v1 gates only on
-    /// the cluster's coarse load.
     pub fn admit(&self, _req: &Request) -> AdmissionDecision {
         admit(&self.routing.borrow(), &self.admission)
     }
 
-    /// Compute this turn's ordered worker candidates (most-preferred first)
-    /// for the given soft-affinity key — `None` for a fresh one-shot
-    /// (power-of-two). A pure read of the routing + connected watches.
     pub fn select_worker(&self, affinity: Option<AffinityKey>) -> Vec<WorkerId> {
         let table = self.routing.borrow();
         let connected = self.connected.borrow();
@@ -144,19 +88,12 @@ impl RoutingHandle {
         select_candidates(&table, &connected, None, affinity, &mut rng)
     }
 
-    /// Route + dispatch the turn with worker-final-admission retry: walk
-    /// the ordered candidates, dispatching `req` to each until one accepts.
-    /// Reject, redirect (v1 treats it like reject), or a registry/transport
-    /// error all advance to the next candidate. `req` is cloned per
-    /// attempt, so retries never double-bind the gateway-minted `ReqId`.
     pub async fn dispatch_with_retry<W: WorkerDispatch>(
         &self,
         workers: &W,
         req: &Request,
         affinity: Option<AffinityKey>,
     ) -> Result<Dispatched, RouteError> {
-        // Snapshot candidates first; the watch borrows must not be held across
-        // the dispatch awaits.
         let candidates = {
             let table = self.routing.borrow();
             let connected = self.connected.borrow();
@@ -177,11 +114,9 @@ impl RoutingHandle {
                         accepted,
                     });
                 }
-                // Worker declined, or redirected (v1: not honored). Try the next.
                 Ok(Accepted::Reject) | Ok(Accepted::Redirect { .. }) => {
                     tracing::debug!(%id, req_id = %req.req_id, "worker declined turn; trying next candidate");
                 }
-                // Registry/transport failure: not-connected or no-ack.
                 Err(e) => {
                     tracing::debug!(%id, req_id = %req.req_id, error = %e, "dispatch failed; trying next candidate");
                 }
@@ -191,10 +126,6 @@ impl RoutingHandle {
     }
 }
 
-// ───────────────────────────── selection core (pure) ─────────────────────────────
-
-/// Coarse load ordering key — lower is less loaded. Tie-broken on `WorkerId` for
-/// a deterministic total order (stable fallback tails across calls).
 fn load_key(w: &RoutableWorker) -> (u8, u32, u64) {
     (
         w.coarse_load.kv_pressure_bucket,
@@ -203,26 +134,18 @@ fn load_key(w: &RoutableWorker) -> (u8, u32, u64) {
     )
 }
 
-/// splitmix64 finalizer — a strong 64-bit mixer for rendezvous (HRW) scoring and
-/// the power-of-two RNG.
 fn mix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
 }
 
-/// Rendezvous (highest-random-weight) score of a worker for an affinity
-/// key. Deterministic and stable under churn: when the top worker leaves,
-/// the next-highest score is the natural fallback.
 fn hrw_score(key: u64, worker: WorkerId) -> u64 {
     mix64(key ^ mix64(worker.0))
 }
 
-/// Process-global RNG state for power-of-two-choices, seeded per-process so that
-/// gateway replicas don't herd on an identical pick sequence.
 fn next_rand() -> u64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
-    // Lazily seed from the process's randomized `RandomState` on first use.
     let mut s = STATE.load(Ordering::Relaxed);
     if s == 0 {
         use std::hash::{BuildHasher, Hasher};
@@ -230,7 +153,6 @@ fn next_rand() -> u64 {
             .build_hasher()
             .finish()
             | 1;
-        // Best-effort: a race just means two threads seed; both seeds are fine.
         STATE.store(seed, Ordering::Relaxed);
         s = seed;
     }
@@ -238,11 +160,6 @@ fn next_rand() -> u64 {
     mix64(prev.wrapping_add(s))
 }
 
-/// Ordered worker candidates for one turn (most-preferred first). Filters
-/// `Healthy ∩ connected ∩ model?` (`want_model` is an optional hook, `None`
-/// for the spine), then orders: `affinity = Some(key)` -> stable HRW
-/// ranking, warmest-first; `affinity = None` -> power-of-two-choices
-/// primary + load-ordered tail.
 fn select_candidates(
     table: &RoutingTable,
     connected: &HashSet<WorkerId>,
@@ -264,14 +181,10 @@ fn select_candidates(
     }
 
     match affinity {
-        // Soft affinity: a stable per-session HRW ranking, warmest first —
-        // a worker going unavailable just promotes the deterministic next.
         Some(key) => {
             eligible.sort_by_key(|w| (std::cmp::Reverse(hrw_score(key, w.id)), w.id.0));
             eligible.iter().map(|w| w.id).collect()
         }
-        // No session to keep warm: power-of-two-choices primary, then
-        // load-ordered fallbacks.
         None => {
             let primary_pos = p2c_pick(&eligible, rng);
             let primary = eligible.remove(primary_pos);
@@ -283,15 +196,12 @@ fn select_candidates(
     }
 }
 
-/// Power-of-two-choices: sample two distinct candidates uniformly, return the
-/// index of the less-loaded one. With a single candidate, that one.
 fn p2c_pick(eligible: &[&RoutableWorker], rng: &mut dyn FnMut() -> u64) -> usize {
     let n = eligible.len();
     if n == 1 {
         return 0;
     }
     let i = (rng() % n as u64) as usize;
-    // Draw the second from [0, n-1) then skip over `i` to keep it uniform + distinct.
     let mut j = (rng() % (n as u64 - 1)) as usize;
     if j >= i {
         j += 1;
@@ -311,8 +221,6 @@ mod tests {
     use ids::{ReqId, SessionId, TenantId};
     use std::sync::Mutex;
     use worker_api::Priority;
-
-    // ── fixtures ──
 
     fn worker(id: u64, model: &str, health: Health, kv: u8, inflight: u32) -> RoutableWorker {
         RoutableWorker {
@@ -336,17 +244,16 @@ mod tests {
         ids.iter().map(|&i| WorkerId(i)).collect()
     }
 
-    /// Deterministic scripted RNG for power-of-two tests.
     fn scripted(seq: Vec<u64>) -> impl FnMut() -> u64 {
         let mut it = seq.into_iter();
         move || it.next().unwrap_or(0)
     }
 
-    // ── selection: affinity (HRW) ──
-
-    // ── selection: no affinity (power-of-two) ──
-
-    // ── selection: filtering ──
+    fn route_every_case() {
+        filters_unhealthy_disconnected_and_model();
+        filters_executor_roles();
+        empty_when_nothing_eligible();
+    }
 
     #[test]
     fn filters_unhealthy_disconnected_and_model() {
@@ -356,7 +263,7 @@ mod tests {
             worker(3, "other", Health::Healthy, 0, 0), // wrong model
             worker(4, "m", Health::Healthy, 0, 0),     // ✓ only eligible
         ]);
-        let conn = connset(&[1, 3, 4]); // 2 omitted
+        let conn = connset(&[1, 3, 4]);
         let mut rng = scripted(vec![]);
         assert_eq!(
             select_candidates(&t, &conn, Some("m"), Some(7), &mut rng),
@@ -364,7 +271,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn filters_executor_roles() {
         let mut prefill = worker(1, "m", Health::Healthy, 0, 0);
         prefill.role = Role::Prefill;
@@ -380,7 +286,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn empty_when_nothing_eligible() {
         let t = table(vec![worker(1, "m", Health::Unreachable, 0, 0)]);
         let conn = connset(&[1]);
@@ -388,8 +293,6 @@ mod tests {
         assert!(select_candidates(&t, &conn, Some("m"), Some(1), &mut rng).is_empty());
         assert!(select_candidates(&t, &conn, None, None, &mut rng).is_empty());
     }
-
-    // ── dispatch_with_retry (against a stub WorkerDispatch) ──
 
     fn req() -> Request {
         Request {
@@ -406,7 +309,6 @@ mod tests {
         }
     }
 
-    /// Stub registry: per-worker scripted dispatch answers, recording the order.
     struct StubRegistry {
         answers: std::collections::HashMap<WorkerId, Result<Accepted, String>>,
         calls: Mutex<Vec<WorkerId>>,
@@ -424,8 +326,6 @@ mod tests {
     }
 
     fn handle_with(table_v: RoutingTable, connected: &[u64]) -> RoutingHandle {
-        // Senders are dropped at end of scope; `watch::Receiver::borrow()` still
-        // reads the last-sent value, which is all the routing reads need.
         let (_rt, rr) = watch::channel(table_v);
         let (_ct, cr) = watch::channel(Arc::new(connset(connected)));
         RoutingHandle::new(rr, cr)
@@ -463,8 +363,6 @@ mod tests {
                 .collect(),
         );
         let h = handle_with(t, &[1, 2, 3]);
-        // Use the deterministic HRW order so the accepting worker is last — this
-        // forces the loop to advance past both a transport error and a reject.
         let order = h.select_worker(Some(99));
         assert_eq!(order.len(), 3);
         let (first, second, accepting) = (order[0], order[1], order[2]);
@@ -485,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_no_candidate_when_none_connected() {
         let t = table(vec![worker(1, "m", Health::Healthy, 0, 0)]);
-        let h = handle_with(t, &[]); // nothing dialed in
+        let h = handle_with(t, &[]);
         let reg = StubRegistry {
             answers: Default::default(),
             calls: Mutex::new(Vec::new()),

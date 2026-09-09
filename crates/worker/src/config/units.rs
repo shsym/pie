@@ -1,16 +1,3 @@
-//! Unit-carrying value types: [`Duration`] and [`ByteSize`].
-//!
-//!
-//! A duration or a size is written with its unit -- `"50ms"`, `"4GiB"` --
-//! rather than carried in the field name. A unit in the name and a number in
-//! the value can disagree silently, cannot be read without knowing the schema,
-//! and drifts: `_us` beside `_secs` beside `_s`, and `_mb` beside `_gb`.
-
-/// A duration written with its unit: `"50ms"`, `"120s"`, `"2m"`.
-///
-/// Accepted units: `ns`, `us`, `ms`, `s`, `m`, `h`. A bare number is refused
-/// rather than assumed to be seconds -- assuming is how `_us` and `_secs` came
-/// to live in one table.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,11 +69,6 @@ impl Serialize for Duration {
     }
 }
 
-/// A byte size written with its unit: `"256MiB"`, `"4GiB"`.
-///
-/// Binary units only (`B`, `KiB`, `MiB`, `GiB`, `TiB`), because that is what
-/// the `_mb`/`_gb` fields this replaces always meant -- each multiplied by
-/// 1024*1024, never 1000*1000.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteSize(u64);
 
@@ -163,20 +145,20 @@ impl Serialize for ByteSize {
 mod tests {
     use super::*;
 
+    fn units_every_case() {
+        a_bare_number_is_refused_rather_than_assumed();
+        decimal_units_are_refused_for_sizes();
+    }
+
     #[test]
     fn a_bare_number_is_refused_rather_than_assumed() {
-        // Assuming a unit is how `_us` and `_secs` came to live in one table.
         let err = parse_duration("120").unwrap_err();
         assert!(err.contains("has no unit"), "got: {err}");
         let err = parse_byte_size("256").unwrap_err();
         assert!(err.contains("has no unit"), "got: {err}");
     }
 
-    #[test]
     fn decimal_units_are_refused_for_sizes() {
-        // The `_mb`/`_gb` fields this replaces always meant MiB/GiB -- each
-        // multiplied by 1024*1024, never 1000*1000. Accepting "MB" would let a
-        // config mean 5% less than it says.
         let err = parse_byte_size("256MB").unwrap_err();
         assert!(err.contains("binary units only"), "got: {err}");
     }

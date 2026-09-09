@@ -1,14 +1,3 @@
-//! Minimal CBOR codec for the zTensor manifest.
-//!
-//! Implements exactly the subset the spec permits (§3.1): unsigned and
-//! negative integers, byte strings, text strings, arrays, maps, false/true/
-//! null, and floats. Definite lengths only, no tags, depth ≤ 32.
-//!
-//! RFC 8949 core deterministic encoding is enforced in both directions: the
-//! encoder emits shortest-form heads, sorts map keys by their encoded bytes,
-//! and rejects duplicates; the decoder requires shortest-form heads and
-//! strictly ascending key order (which also catches duplicates).
-
 use crate::error::{Error, Result, Rule};
 
 pub const MAX_DEPTH: u32 = 32;
@@ -16,12 +5,10 @@ pub const MAX_DEPTH: u32 = 32;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Uint(u64),
-    /// Negative integer with value `-1 - n` (CBOR major type 1).
     Nint(u64),
     Bytes(Vec<u8>),
     Text(String),
     Array(Vec<Value>),
-    /// Entries in any order; the encoder sorts by encoded key bytes.
     Map(Vec<(Value, Value)>),
     Bool(bool),
     Null,
@@ -57,7 +44,6 @@ impl Value {
         }
     }
 
-    /// Looks up a key in a map value.
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.as_map()?
             .iter()
@@ -66,10 +52,6 @@ impl Value {
     }
 }
 
-/// Builds an attributes map: `cbor::map([("group", 32u64), ("who", "me")])`.
-///
-/// Attributes are always a map of text keys (spec §3.1/§3.5), so this is the
-/// shape every caller needs and the one they should not have to spell out.
 pub fn map<K: Into<String>, V: Into<Value>>(entries: impl IntoIterator<Item = (K, V)>) -> Value {
     Value::Map(
         entries
@@ -136,10 +118,6 @@ impl<T: Into<Value>> From<Vec<T>> for Value {
         Value::Array(items.into_iter().map(Into::into).collect())
     }
 }
-
-// =======================================================================
-// Encoding
-// =======================================================================
 
 pub fn encode(v: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -217,7 +195,6 @@ fn encode_into(v: &Value, out: &mut Vec<u8>, depth: u32) -> Result<()> {
     Ok(())
 }
 
-/// Shortest float encoding that preserves the value (deterministic profile).
 fn encode_float(x: f64, out: &mut Vec<u8>) {
     if x.is_nan() {
         out.push(0xf9);
@@ -250,7 +227,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     }
     let e = exp - 127 + 15;
     if e >= 0x1f {
-        return sign | 0x7c00; // overflows half range; roundtrip check filters
+        return sign | 0x7c00;
     }
     if e <= 0 {
         if e < -10 {
@@ -285,10 +262,6 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     };
     f32::from_bits(bits)
 }
-
-// =======================================================================
-// Decoding
-// =======================================================================
 
 pub fn decode(input: &[u8]) -> Result<Value> {
     let mut d = Decoder { input, pos: 0 };
@@ -327,7 +300,6 @@ impl<'a> Decoder<'a> {
         Ok(s)
     }
 
-    /// Reads a head for major types 0-5, enforcing shortest form.
     fn head_arg(&mut self, ai: u8) -> Result<u64> {
         let arg = match ai {
             0..=23 => ai as u64,
@@ -382,10 +354,6 @@ impl<'a> Decoder<'a> {
                 20 => Ok(Value::Bool(false)),
                 21 => Ok(Value::Bool(true)),
                 22 => Ok(Value::Null),
-                // Floats must be canonical: the single NaN 0xf9 0x7e00, and
-                // the shortest width that preserves the value. Without this,
-                // decode-accepted values are not closed under re-encoding
-                // (e.g., two NaN payloads collapse into duplicate map keys).
                 25 => {
                     let h = u16::from_be_bytes(self.take(2)?.try_into().unwrap());
                     let x = f16_bits_to_f32(h);
@@ -481,8 +449,6 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Bounds a declared element count by the remaining input (each element
-    /// occupies at least `min_bytes`), preventing huge pre-allocations.
     fn checked_len(&self, arg: u64, min_bytes: usize) -> Result<usize> {
         let max = (self.remaining() / min_bytes) as u64;
         if arg > max {
@@ -504,30 +470,39 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), v);
     }
 
+    fn cbor_every_case() {
+        scalars();
+        maps_sorted_and_deduped();
+        rejects_unsorted_and_dup_on_decode();
+        rejects_tags_and_indefinite();
+        rejects_non_canonical_floats();
+        a_declared_length_is_checked_before_it_is_believed();
+        nesting_stops_at_the_limit();
+        fuzz_regression_nan_map_keys();
+    }
+
     #[test]
     fn scalars() {
         roundtrip(Value::Uint(0));
         roundtrip(Value::Uint(23));
         roundtrip(Value::Uint(24));
         roundtrip(Value::Uint(u64::MAX));
-        roundtrip(Value::Nint(0)); // -1
+        roundtrip(Value::Nint(0));
         roundtrip(Value::Bool(true));
         roundtrip(Value::Null);
         roundtrip(Value::Text("hello".into()));
         roundtrip(Value::Bytes(vec![1, 2, 3]));
         roundtrip(Value::Float(1.5));
         roundtrip(Value::Float(1.1));
-        roundtrip(Value::Float(65504.0)); // max f16
+        roundtrip(Value::Float(65504.0));
     }
 
-    #[test]
     fn maps_sorted_and_deduped() {
         let v = Value::Map(vec![
             (Value::Text("bb".into()), Value::Uint(1)),
             (Value::Text("a".into()), Value::Uint(2)),
         ]);
         let bytes = encode(&v).unwrap();
-        // decoder accepts (encoder sorted: "a" < "bb" by encoded bytes)
         let back = decode(&bytes).unwrap();
         let m = back.as_map().unwrap();
         assert_eq!(m[0].0.as_text().unwrap(), "a");
@@ -539,9 +514,7 @@ mod tests {
         assert!(encode(&dup).is_err());
     }
 
-    #[test]
     fn rejects_unsorted_and_dup_on_decode() {
-        // {"b": 0, "a": 0}, which is the wrong order
         let bytes = [0xa2, 0x61, b'b', 0x00, 0x61, b'a', 0x00];
         assert!(matches!(
             decode(&bytes),
@@ -550,7 +523,6 @@ mod tests {
                 ..
             })
         ));
-        // {"a": 0, "a": 0}
         let bytes = [0xa2, 0x61, b'a', 0x00, 0x61, b'a', 0x00];
         assert!(matches!(
             decode(&bytes),
@@ -561,31 +533,22 @@ mod tests {
         ));
     }
 
-    #[test]
     fn rejects_tags_and_indefinite() {
-        assert!(decode(&[0xc0, 0x00]).is_err()); // tag 0
-        assert!(decode(&[0x9f, 0xff]).is_err()); // indefinite array
-        assert!(decode(&[0x18, 0x05]).is_err()); // non-shortest uint 5
+        assert!(decode(&[0xc0, 0x00]).is_err());
+        assert!(decode(&[0x9f, 0xff]).is_err());
+        assert!(decode(&[0x18, 0x05]).is_err());
     }
 
-    #[test]
     fn rejects_non_canonical_floats() {
-        assert!(decode(&[0xf9, 0x7e, 0x01]).is_err()); // NaN with payload
-        assert!(decode(&[0xf9, 0xfe, 0x00]).is_err()); // -NaN
-        assert!(decode(&[0xfa, 0x7f, 0xc0, 0x00, 0x00]).is_err()); // f32 NaN
-        assert!(decode(&[0xfa, 0x3f, 0xc0, 0x00, 0x00]).is_err()); // 1.5 fits f16
-        assert!(decode(&[0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0]).is_err()); // 1.5 fits f16
-        assert!(decode(&[0xf9, 0x3e, 0x00]).is_ok()); // canonical 1.5
-        assert!(decode(&[0xf9, 0x7e, 0x00]).is_ok()); // canonical NaN
+        assert!(decode(&[0xf9, 0x7e, 0x01]).is_err());
+        assert!(decode(&[0xf9, 0xfe, 0x00]).is_err());
+        assert!(decode(&[0xfa, 0x7f, 0xc0, 0x00, 0x00]).is_err());
+        assert!(decode(&[0xfa, 0x3f, 0xc0, 0x00, 0x00]).is_err());
+        assert!(decode(&[0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(decode(&[0xf9, 0x3e, 0x00]).is_ok());
+        assert!(decode(&[0xf9, 0x7e, 0x00]).is_ok());
     }
 
-    /// A declared length never drives an allocation.
-    ///
-    /// The bug this forecloses is the one every binary decoder gets caught by:
-    /// reading a length from the input and reserving that much before checking
-    /// that the bytes are actually there, so nine bytes ask for sixteen
-    /// exabytes. Every length here is bounded by what remains to be read.
-    #[test]
     fn a_declared_length_is_checked_before_it_is_believed() {
         for major in [
             2u8, /* bytes */
@@ -594,8 +557,6 @@ mod tests {
             5,   /* map */
         ] {
             for declared in [u64::MAX, 1 << 40, 1 << 20, 300, 25] {
-                // The shortest head for this length, so the determinism rule
-                // cannot fire first and the length check is what is on trial.
                 let mut input = Vec::new();
                 head(major, declared, &mut input);
                 let err = decode(&input).expect_err("a lie about length must be refused");
@@ -608,12 +569,10 @@ mod tests {
         }
     }
 
-    /// Nesting is bounded exactly at the documented depth, on both sides.
-    #[test]
     fn nesting_stops_at_the_limit() {
         let nest = |depth: usize| {
-            let mut v = vec![0x81u8; depth]; // array(1), repeated
-            v.push(0x00); // and a uint at the bottom
+            let mut v = vec![0x81u8; depth];
+            v.push(0x00);
             v
         };
         decode(&nest(MAX_DEPTH as usize)).expect("the limit itself is legal");
@@ -621,9 +580,6 @@ mod tests {
         assert_eq!(err.rule(), Some(Rule::CborDepth));
     }
 
-    /// Regression: fuzz_cbor crash on a map with two distinct NaN-payload
-    /// float keys decoded fine but re-encoded into duplicate keys.
-    #[test]
     fn fuzz_regression_nan_map_keys() {
         let input = [
             0xa2, 0xfb, 0xff, 0xff, 0xff, 0x05, 0x3b, 0x8f, 0xfb, 0xfb, 0xfb, 0xfb, 0xfb, 0xfb,

@@ -1,12 +1,3 @@
-//! ATEM: Muse Glimmer's channelled turn format.
-//!
-//! `<|begin_of_text|>` once at the head, then
-//! `<|start|>{role}<|message|>{text}<|eot|>` per turn. The assistant's
-//! header names a recipient: ` to=self` opens a reasoning channel that ends
-//! in `<|eom|>` (end of message, the turn goes on), ` to=user` the reply,
-//! ` to={tool}` a call; a turn ends in `<|eot|>`. Tool results come back as
-//! `<|start|>tool {name}<|message|><tool_output name="{name}">…</tool_output><|eot|>`.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -14,12 +5,8 @@ use tokenizer::Tokenizer;
 use crate::decode::{GenericChatDecoder, NoopToolDecoder, ThinkingDecoder};
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
-/// What ends a turn: `<|eot|>` (the model's own end of turn) and the
-/// vocabulary's end of text. `<|eom|>` is NOT one — it closes a message
-/// inside a turn that continues.
 pub const STOP_TOKENS: &[&str] = &["<|eot|>", "<|end_of_text|>"];
 
-/// Every other marker the format spells, for a tokenizer contract to check.
 pub const MARKERS: &[&str] = &["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"];
 
 pub struct Atem {
@@ -31,9 +18,7 @@ pub struct Atem {
     eot: u32,
     eom: u32,
     stop_ids: Vec<u32>,
-    /// ` to=self<|message|>` — what follows the cue when the model reasons.
     reasoning_open: Vec<u32>,
-    /// `<|start|>assistant` — the model picks the recipient itself.
     generation_prefix: Vec<u32>,
 }
 
@@ -64,8 +49,6 @@ impl Atem {
             bos: special(&tokenizer, "<|begin_of_text|>"),
             system_prefix: header("system"),
             user_prefix: header("user"),
-            // A replayed reply names its recipient, as the reference template
-            // writes it (`recipient` defaults to `user`).
             assistant_prefix: header("assistant to=user"),
             eot,
             eom,
@@ -83,8 +66,6 @@ impl Atem {
         tokens
     }
 
-    /// The turn that opens a conversation, and the only place `<|begin_of_text|>`
-    /// is written.
     fn opening(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = vec![self.bos];
         tokens.extend(self.turn(prefix, msg));
@@ -97,11 +78,6 @@ impl Instruct for Atem {
         vec![self.bos]
     }
 
-    /// A system message carries two lines the model was trained to see at
-    /// its end, as the reference template writes them: the reasoning
-    /// strength (`high` unless the message states one) and the recipient
-    /// list. A caller steers the reasoning by writing its own
-    /// `Reasoning strength: low.` line.
     fn system(&self, msg: &str) -> Vec<u32> {
         let mut body = msg.to_string();
         if !msg.to_ascii_lowercase().contains("reasoning strength") {

@@ -42,65 +42,49 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# --------------------------------------------------------------------------------------
-# config
-# --------------------------------------------------------------------------------------
-
 CONFIG: Dict = {
     "model_type": "mini_dit",
     "version": 1,
     "seed": 0,
-    # deterministic init (torch.Generator(seed), parameters visited in sorted-name order):
-    #   Linear weight [out,in]     ~ N(0, (init_gain / sqrt(in))^2)   -- variance preserving
-    #   bias                       ~ N(0, init_bias_std^2)
-    #   QK-norm / LayerNorm gains  = 1 + N(0, init_bias_std^2)
-    #   blocks.2.mod_table         ~ N(0, init_table_std^2)
     "init_gain": 1.0,
     "init_bias_std": 0.02,
     "init_table_std": 0.5,
 
-    # trunk
     "hidden_size": 256,
     "num_heads": 4,
     "head_dim": 64,
     "block_types": ["single", "double", "cross"],
     "mlp_ratio": 2.0,
-    "mlp_hidden": 512,               # SwiGLU intermediate = hidden_size * mlp_ratio
+    "mlp_hidden": 512,
     "qk_norm": "rms",
     "rms_eps": 1e-6,
-    "ln_eps": 1e-6,                  # LayerNorm-no-affine inside blocks and final layer
+    "ln_eps": 1e-6,
 
-    # rope
-    "rope_axes_dims": [16, 24, 24],  # sums to head_dim
+    "rope_axes_dims": [16, 24, 24],
     "rope_theta": 10000.0,
-    "rope_form": "interleaved",      # pairs are (x[2i], x[2i+1]) inside each axis slice
+    "rope_form": "interleaved",
     "rope_axes": ["t", "h", "w"],
 
-    # timestep
     "timestep_embed_dim": 256,
     "timestep_max_period": 10000.0,
-    "timestep_flip_sin_to_cos": False,   # order is [sin(all) , cos(all)]
+    "timestep_flip_sin_to_cos": False,
 
-    # conditioning
-    "text_dim": 256,                 # text tokens arrive already at hidden width
+    "text_dim": 256,
     "text_len": 8,
-    "context_dim": 512,              # cross-attn context width (block 2 only)
+    "context_dim": 512,
     "context_len": 16,
 
-    # latent / patching
     "in_channels": 16,
     "out_channels": 16,
     "patch_size": 2,
-    "latent_shape": [16, 16, 16],    # (C, H, W)
-    "image_tokens": 64,              # (H/p) * (W/p)
-    "patch_features": 64,            # C * p * p  -- x_embedder in / final proj out
+    "latent_shape": [16, 16, 16],
+    "image_tokens": 64,
+    "patch_features": 64,
 
-    # sequence layout
-    "joint_order": ["text", "image"],   # blocks 0 and 1; block 2 sees image tokens only
+    "joint_order": ["text", "image"],
     "text_positions": "(i, 0, 0)",
     "image_positions": "(0, h, w)",
 
-    # modulation chunk orders (exact, load-bearing)
     "mod_order_single": ["shift_msa", "scale_msa", "gate_msa",
                          "shift_mlp", "scale_mlp", "gate_mlp"],
     "mod_order_double": ["shift_msa", "scale_msa", "gate_msa",
@@ -111,13 +95,11 @@ CONFIG: Dict = {
     "modulate_form": "x * (1 + scale) + shift",
     "residual_form": "x = x + gate * y",
 
-    # euler schedule (flow matching)
     "euler_steps": 4,
     "euler_sigmas": [1.0, 0.75, 0.5, 0.25, 0.0],
     "euler_t_scale": 1000.0,
     "euler_update": "x <- x + (sigma[i+1] - sigma[i]) * v",
 
-    # fixed dump inputs
     "dump_batch": 2,
     "dump_timesteps": [500.0, 250.0],
     "dump_input_seed": 1234,
@@ -135,11 +117,6 @@ assert CONFIG["in_channels"] * CONFIG["patch_size"] ** 2 == CONFIG["patch_featur
 DEFAULT_OUT = os.environ.get("PIE_IMAGEGEN_GOLDEN", "/root/.cache/pie-imagegen/golden")
 DEFAULT_OUT = os.path.join(DEFAULT_OUT, "mini-dit")
 
-
-# --------------------------------------------------------------------------------------
-# dtype policy -- how a bf16 engine would round
-# --------------------------------------------------------------------------------------
-
 class Policy:
     """`fp32` is exact fp32 everywhere.  `bf16` rounds to bf16 at every op boundary a
     bf16 serving engine would: weights are bf16, every Linear in/out is bf16, but
@@ -153,11 +130,6 @@ class Policy:
     def cast(self, x: torch.Tensor) -> torch.Tensor:
         return x.to(self.dt)
 
-
-# --------------------------------------------------------------------------------------
-# primitives
-# --------------------------------------------------------------------------------------
-
 def sinusoid(t: torch.Tensor, dim: int, max_period: float) -> torch.Tensor:
     """[N] -> [N, dim].  Half sin then half cos, fp32.  (Elementwise::Sinusoid in D3.)"""
     half = dim // 2
@@ -165,23 +137,19 @@ def sinusoid(t: torch.Tensor, dim: int, max_period: float) -> torch.Tensor:
     ang = t.to(torch.float64)[:, None] * freqs[None, :]
     return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1).float()
 
-
 def layernorm_no_affine(x: torch.Tensor, eps: float) -> torch.Tensor:
     xf = x.float()
     mu = xf.mean(-1, keepdim=True)
     var = xf.var(-1, unbiased=False, keepdim=True)
     return (xf - mu) * torch.rsqrt(var + eps)
 
-
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     xf = x.float()
     return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
 
-
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """x [B,N,D]; shift/scale [B,D].  fp32."""
     return x.float() * (1.0 + scale.float()[:, None, :]) + shift.float()[:, None, :]
-
 
 def rope_cos_sin(pos: torch.Tensor, dims: List[int], theta: float):
     """pos [N, len(dims)] float -> (cos, sin) each [N, head_dim//2] fp32.
@@ -194,7 +162,6 @@ def rope_cos_sin(pos: torch.Tensor, dims: List[int], theta: float):
     ang = torch.cat(angs, dim=-1)
     return torch.cos(ang).float(), torch.sin(ang).float()
 
-
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """x [B,H,N,DH]; cos/sin [N,DH//2].  Interleaved: pairs (x[2i], x[2i+1]).  fp32 math."""
     b, h, n, d = x.shape
@@ -203,7 +170,6 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     c, s = cos[None, None], sin[None, None]
     return torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1).reshape(b, h, n, d)
 
-
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pol: Policy) -> torch.Tensor:
     """[B,H,N,DH] x [B,H,M,DH] x [B,H,M,DH] -> [B,H,N,DH].  scores+softmax in fp32."""
     scale = q.shape[-1] ** -0.5
@@ -211,20 +177,13 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pol: Policy) ->
     p = torch.softmax(scores, dim=-1)
     return torch.matmul(pol.cast(p), pol.cast(v))
 
-
 def split_heads(x: torch.Tensor) -> torch.Tensor:
     b, n, _ = x.shape
     return x.reshape(b, n, H, DH).permute(0, 2, 1, 3).contiguous()
 
-
 def merge_heads(x: torch.Tensor) -> torch.Tensor:
     b, h, n, d = x.shape
     return x.permute(0, 2, 1, 3).reshape(b, n, h * d).contiguous()
-
-
-# --------------------------------------------------------------------------------------
-# modules (nn.Module only so that state_dict() gives the safetensors names verbatim)
-# --------------------------------------------------------------------------------------
 
 class SelfAttnW(nn.Module):
     def __init__(self):
@@ -233,7 +192,6 @@ class SelfAttnW(nn.Module):
         self.norm_q = nn.Parameter(torch.ones(DH))
         self.norm_k = nn.Parameter(torch.ones(DH))
         self.out = nn.Linear(D, D, bias=True)
-
 
 class CrossAttnW(nn.Module):
     def __init__(self, ctx_dim: int):
@@ -244,7 +202,6 @@ class CrossAttnW(nn.Module):
         self.norm_k = nn.Parameter(torch.ones(DH))
         self.out = nn.Linear(D, D, bias=True)
 
-
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -252,14 +209,12 @@ class SwiGLU(nn.Module):
         self.up_proj = nn.Linear(D, FF, bias=True)
         self.down_proj = nn.Linear(FF, D, bias=True)
 
-
 class SingleBlock(nn.Module):
     def __init__(self):
         super().__init__()
         self.adaLN = nn.Linear(D, 6 * D, bias=True)
         self.attn = SelfAttnW()
         self.mlp = SwiGLU()
-
 
 class DoubleBlock(nn.Module):
     def __init__(self):
@@ -271,17 +226,15 @@ class DoubleBlock(nn.Module):
         self.img_mlp = SwiGLU()
         self.txt_mlp = SwiGLU()
 
-
 class CrossBlock(nn.Module):
     def __init__(self, ctx_dim: int):
         super().__init__()
-        self.mod_table = nn.Parameter(torch.zeros(6, D))     # Wan's scale_shift_table
+        self.mod_table = nn.Parameter(torch.zeros(6, D))
         self.adaLN = nn.Linear(D, 6 * D, bias=True)
         self.self_attn = SelfAttnW()
         self.norm_cross = nn.LayerNorm(D, eps=CONFIG["ln_eps"], elementwise_affine=True)
         self.cross_attn = CrossAttnW(ctx_dim)
         self.mlp = SwiGLU()
-
 
 class MiniDiT(nn.Module):
     def __init__(self):
@@ -291,7 +244,6 @@ class MiniDiT(nn.Module):
         self.final_adaLN = nn.Linear(D, 2 * D, bias=True)
         self.final_proj = nn.Linear(D, CONFIG["patch_features"], bias=True)
 
-    # ---- deterministic init ------------------------------------------------------
     def init_deterministic(self):
         gain = CONFIG["init_gain"]
         bstd = CONFIG["init_bias_std"]
@@ -302,7 +254,6 @@ class MiniDiT(nn.Module):
                 p.data = CONFIG["init_table_std"] * r
             elif name.endswith("norm_q") or name.endswith("norm_k") \
                     or name == "blocks.2.norm_cross.weight":
-                # gains: 1 + small noise, so a dropped gain is visible
                 p.data = 1.0 + bstd * r
             elif p.ndim == 2:
                 p.data = (gain / math.sqrt(p.shape[1])) * r
@@ -310,27 +261,20 @@ class MiniDiT(nn.Module):
                 p.data = bstd * r
         return self
 
-
-# --------------------------------------------------------------------------------------
-# patchify / unpatchify  (exact index algebra -- token i = h*(W/p) + w)
-# --------------------------------------------------------------------------------------
-
 def patchify(latent: torch.Tensor) -> torch.Tensor:
     """[B,C,Hs,Ws] -> [B, (Hs/p)*(Ws/p), C*p*p], feature order (c, ph, pw)."""
     p = CONFIG["patch_size"]
     b, c, hs, ws = latent.shape
     x = latent.reshape(b, c, hs // p, p, ws // p, p)
-    x = x.permute(0, 2, 4, 1, 3, 5)                       # (B, Hp, Wp, C, p, p)
+    x = x.permute(0, 2, 4, 1, 3, 5)
     return x.reshape(b, (hs // p) * (ws // p), c * p * p).contiguous()
-
 
 def unpatchify(tokens: torch.Tensor, c: int, hs: int, ws: int) -> torch.Tensor:
     p = CONFIG["patch_size"]
     b = tokens.shape[0]
     x = tokens.reshape(b, hs // p, ws // p, c, p, p)
-    x = x.permute(0, 3, 1, 4, 2, 5)                       # (B, C, Hp, p, Wp, p)
+    x = x.permute(0, 3, 1, 4, 2, 5)
     return x.reshape(b, c, hs, ws).contiguous()
-
 
 def image_positions(hs: int, ws: int) -> torch.Tensor:
     p = CONFIG["patch_size"]
@@ -339,25 +283,17 @@ def image_positions(hs: int, ws: int) -> torch.Tensor:
     z = torch.zeros_like(hh)
     return torch.stack([z, hh, ww], dim=-1).reshape(hp * wp, 3).float()
 
-
 def text_positions(n: int) -> torch.Tensor:
     i = torch.arange(n).float()
     z = torch.zeros(n)
     return torch.stack([i, z, z], dim=-1)
 
-
-# --------------------------------------------------------------------------------------
-# forward with full instrumentation
-# --------------------------------------------------------------------------------------
-
 class Dump(dict):
     def put(self, key: str, t: torch.Tensor):
         self[key] = t.detach().float().cpu().numpy()
 
-
 def lin(m: nn.Linear, x: torch.Tensor, pol: Policy) -> torch.Tensor:
     return torch.nn.functional.linear(pol.cast(x), pol.cast(m.weight), pol.cast(m.bias))
-
 
 def swiglu(m: SwiGLU, x: torch.Tensor, pol: Policy) -> torch.Tensor:
     g = lin(m.gate_proj, x, pol)
@@ -365,12 +301,11 @@ def swiglu(m: SwiGLU, x: torch.Tensor, pol: Policy) -> torch.Tensor:
     h = pol.cast(torch.nn.functional.silu(g.float()) * u.float())
     return lin(m.down_proj, h, pol)
 
-
 def forward(model: MiniDiT,
-            latent: torch.Tensor,      # [B, C, Hs, Ws] fp32
-            text: torch.Tensor,        # [B, Lt, D]
-            context: torch.Tensor,     # [B, Lc, context_dim]
-            timestep: torch.Tensor,    # [B]
+            latent: torch.Tensor,
+            text: torch.Tensor,
+            context: torch.Tensor,
+            timestep: torch.Tensor,
             pol: Policy,
             dump: Dump | None = None,
             prefix: str = "") -> torch.Tensor:
@@ -383,7 +318,6 @@ def forward(model: MiniDiT,
     P("in.latent", latent); P("in.text", text); P("in.context", context)
     P("in.timestep", timestep)
 
-    # ---- positions + rope tables -------------------------------------------------
     txt_pos = text_positions(lt)
     img_pos = image_positions(hs, ws)
     P("in.txt_pos", txt_pos); P("in.img_pos", img_pos)
@@ -393,20 +327,17 @@ def forward(model: MiniDiT,
     P("rope.cos_txt", cos_t); P("rope.sin_txt", sin_t)
     P("rope.cos_img", cos_i); P("rope.sin_img", sin_i)
 
-    # ---- timestep embedding (sinusoid -> SiLU -> Linear inside each adaLN) --------
     temb = sinusoid(timestep, CONFIG["timestep_embed_dim"], CONFIG["timestep_max_period"])
     P("temb", temb)
     temb_act = pol.cast(torch.nn.functional.silu(temb))
     P("temb_silu", temb_act)
 
-    # ---- patch embed -------------------------------------------------------------
     patches = patchify(latent)
     P("patches", patches)
     img = lin(model.x_embedder, patches, pol)
     P("x_embed", img)
     txt = pol.cast(text)
 
-    # =================================================================== block 0
     blk: SingleBlock = model.blocks[0]
     mod = lin(blk.adaLN, temb_act, pol).float()
     P("b0.mod", mod)
@@ -414,7 +345,7 @@ def forward(model: MiniDiT,
     for nm, t in zip(CONFIG["mod_order_single"], (sh_a, sc_a, g_a, sh_m, sc_m, g_m)):
         P(f"b0.mod.{nm}", t)
 
-    x = torch.cat([txt, img], dim=1)                       # [B, Lt+Li, D]  text first
+    x = torch.cat([txt, img], dim=1)
     P("b0.in", x)
     h = pol.cast(modulate(layernorm_no_affine(x, CONFIG["ln_eps"]), sh_a, sc_a))
     P("b0.norm1_out", h)
@@ -442,7 +373,6 @@ def forward(model: MiniDiT,
     txt, img = x[:, :lt], x[:, lt:]
     P("b0.out_txt", txt); P("b0.out_img", img)
 
-    # =================================================================== block 1
     dblk: DoubleBlock = model.blocks[1]
     imod = lin(dblk.img_adaLN, temb_act, pol).float()
     tmod = lin(dblk.txt_adaLN, temb_act, pol).float()
@@ -467,7 +397,6 @@ def forward(model: MiniDiT,
     P("b1.img_q_rope", iq); P("b1.img_k_rope", ik); P("b1.img_v", iv)
     P("b1.txt_q_rope", tq); P("b1.txt_k_rope", tk); P("b1.txt_v", tv)
 
-    # joint attention over [txt || img], same order as block 0
     jq = torch.cat([tq, iq], dim=2); jk = torch.cat([tk, ik], dim=2); jv = torch.cat([tv, iv], dim=2)
     ja = attention(jq, jk, jv, pol)
     P("b1.joint_attn_heads", ja)
@@ -488,17 +417,16 @@ def forward(model: MiniDiT,
     txt = pol.cast(txt.float() + t_g_m[:, None, :] * tm.float())
     P("b1.out_img", img); P("b1.out_txt", txt)
 
-    # =================================================================== block 2
     cblk: CrossBlock = model.blocks[2]
     proj = lin(cblk.adaLN, temb_act, pol).float().reshape(b, 6, D)
     P("b2.mod_proj", proj)
-    mod2 = cblk.mod_table.float()[None] + proj                       # Wan: table + temb proj
+    mod2 = cblk.mod_table.float()[None] + proj
     P("b2.mod", mod2)
     sh_a, sc_a, g_a, sh_f, sc_f, g_f = [mod2[:, i] for i in range(6)]
     for nm, t in zip(CONFIG["mod_order_cross"], (sh_a, sc_a, g_a, sh_f, sc_f, g_f)):
         P(f"b2.mod.{nm}", t)
 
-    x = img                                                          # image tokens only
+    x = img
     P("b2.in", x)
     h = pol.cast(modulate(layernorm_no_affine(x, CONFIG["ln_eps"]), sh_a, sc_a))
     P("b2.norm1_out", h)
@@ -513,7 +441,6 @@ def forward(model: MiniDiT,
     x = pol.cast(x.float() + g_a[:, None, :] * a.float())
     P("b2.x_after_self", x)
 
-    # cross-attention: LayerNorm WITH affine, no modulation, no rope (Wan contract)
     hc = pol.cast(torch.nn.functional.layer_norm(
         x.float(), (D,), cblk.norm_cross.weight.float(), cblk.norm_cross.bias.float(),
         CONFIG["ln_eps"]))
@@ -528,7 +455,7 @@ def forward(model: MiniDiT,
     P("b2.cross_attn_heads", ca)
     ca = lin(cblk.cross_attn.out, merge_heads(ca), pol)
     P("b2.cross_attn_out", ca)
-    x = pol.cast(x.float() + ca.float())                             # ungated residual
+    x = pol.cast(x.float() + ca.float())
     P("b2.x_after_cross", x)
 
     h = pol.cast(modulate(layernorm_no_affine(x, CONFIG["ln_eps"]), sh_f, sc_f))
@@ -538,7 +465,6 @@ def forward(model: MiniDiT,
     x = pol.cast(x.float() + g_f[:, None, :] * m.float())
     P("b2.out", x)
 
-    # =================================================================== final
     fmod = lin(model.final_adaLN, temb_act, pol).float()
     f_sh, f_sc = fmod.chunk(2, dim=-1)
     P("final.mod", fmod); P("final.mod.shift", f_sh); P("final.mod.scale", f_sc)
@@ -550,11 +476,6 @@ def forward(model: MiniDiT,
     P("velocity", vel)
     return vel
 
-
-# --------------------------------------------------------------------------------------
-# fixed inputs
-# --------------------------------------------------------------------------------------
-
 def fixed_inputs():
     g = torch.Generator().manual_seed(CONFIG["dump_input_seed"])
     b = CONFIG["dump_batch"]
@@ -565,15 +486,9 @@ def fixed_inputs():
     timestep = torch.tensor(CONFIG["dump_timesteps"], dtype=torch.float32)
     return latent, text, context, timestep
 
-
-# --------------------------------------------------------------------------------------
-# entry points
-# --------------------------------------------------------------------------------------
-
 def build() -> MiniDiT:
     torch.manual_seed(CONFIG["seed"])
     return MiniDiT().init_deterministic().eval()
-
 
 def cmd_init(out_dir: str):
     from safetensors.torch import save_file
@@ -581,7 +496,7 @@ def cmd_init(out_dir: str):
     sd = {k: v.detach().contiguous().float() for k, v in m.state_dict().items()}
     n = sum(v.numel() for v in sd.values())
     save_file(sd, os.path.join(out_dir, "mini_dit.safetensors"),
-              metadata={"format": "pt"})  # single key: byte-stable header
+              metadata={"format": "pt"})
     cfg = dict(CONFIG)
     cfg["num_parameters"] = int(n)
     cfg["tensors"] = {k: list(v.shape) for k, v in sorted(sd.items())}
@@ -590,7 +505,6 @@ def cmd_init(out_dir: str):
     print(f"[init] {n} params -> {out_dir}/mini_dit.safetensors, config.json")
     for k in sorted(sd):
         print(f"       {k:44s} {tuple(sd[k].shape)}")
-
 
 @torch.no_grad()
 def cmd_dump(out_dir: str):
@@ -603,7 +517,6 @@ def cmd_dump(out_dir: str):
         path = os.path.join(out_dir, f"mini_dit_dump_{name}.npz")
         np.savez(path, **d)
         print(f"[dump/{name}] {len(d)} tensors -> {path}")
-
 
 @torch.no_grad()
 def cmd_euler(out_dir: str):
@@ -632,7 +545,6 @@ def cmd_euler(out_dir: str):
         np.savez(path, **d)
         print(f"[euler/{name}] {len(d)} tensors -> {path}   final |x| = {x.abs().mean():.6f}")
 
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -652,7 +564,6 @@ def main():
         cmd_dump(a.out_dir)
     if a.all or a.euler:
         cmd_euler(a.out_dir)
-
 
 if __name__ == "__main__":
     main()

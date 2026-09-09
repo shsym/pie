@@ -1,7 +1,3 @@
-//! `LogStream`: a WASI-compatible stream that routes WASM guest stdout/stderr
-//! either through the process actor, or to `tracing` when no client is
-//! attached.
-
 use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
@@ -17,17 +13,12 @@ use crate::inferlet::process;
 
 use super::ProcessId;
 
-/// Where a `LogStream`'s bytes are routed.
 #[derive(Clone)]
 enum Dest {
-    /// Per-process actor channel, drained by an attached client.
     Process(ProcessId),
-    /// pie-worker's `tracing` log, tagged with the program name for triage.
-    /// Used when no client session is attached.
     Log(Arc<str>),
 }
 
-/// A WASI-compatible output stream that routes guest stdout/stderr.
 #[derive(Clone)]
 pub struct LogStream {
     dest: Dest,
@@ -63,7 +54,6 @@ impl LogStream {
         }
     }
 
-    /// Dispatch output to its destination.
     fn write_bytes(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -78,8 +68,6 @@ impl LogStream {
                 }
             }
             Dest::Log(program) => {
-                // Strip the trailing newline so each `eprintln!`/`println!`
-                // becomes one clean tracing event rather than an empty extra line.
                 let content = String::from_utf8_lossy(bytes);
                 let text = content.trim_end_matches(['\n', '\r']);
                 if text.is_empty() {
@@ -94,8 +82,6 @@ impl LogStream {
         }
     }
 }
-
-// WASI trait implementations
 
 impl StdoutStream for LogStream {
     fn p2_stream(&self) -> Box<dyn OutputStream> {
@@ -130,7 +116,6 @@ impl OutputStream for LogStream {
 #[async_trait]
 impl Pollable for LogStream {
     async fn ready(&mut self) {
-        // Always ready — no backpressure.
     }
 }
 

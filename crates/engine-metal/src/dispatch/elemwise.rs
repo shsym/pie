@@ -1,9 +1,6 @@
-//! The `elementwise` family: `impl DispatchElementwise for Run<'_>`, holding
-//! the norm arms plus the absorbed `rope`, `gate`, and `hc` groups.
-
 use kernels_metal::{Tensor, elemwise};
 use model_exec::{DispatchElementwise, KernelError};
-use model_ir::{Elementwise, MropeForm, Operands};
+use model_ir::{Elementwise, ModulateForm, MropeForm, Operands, RopeForm};
 
 use crate::run::Run;
 
@@ -14,8 +11,6 @@ impl DispatchElementwise for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-metal`'s error vocabulary, lifted by
-    /// [`kernel`](crate::error::kernel) above.
     fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_metal::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
@@ -72,7 +67,6 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            // Fused: the centred row is never rounded between ops.
             Elementwise::Layernorm {
                 x,
                 weight,
@@ -87,35 +81,169 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            // No shipped shader for these; refuse by name.
-            Elementwise::LayernormNoScale { .. }
-            | Elementwise::Clamp { .. }
-            | Elementwise::ClampLearned { .. }
-            // CUDA's load-time chain fusions (`model_ir::fuse::residual_chains`);
-            // this engine never runs that pass, so it never sees these.
-            | Elementwise::RmsnormResidualAdd { .. }
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::norm::layernorm_no_scale(
+                self.ctx(),
+                self.tensor(*x),
+                *eps,
+                self.tensor(*y),
+            ),
+            Elementwise::Clamp { x, lo, hi, x_out: _ } => {
+                elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x))
+            }
+            Elementwise::Modulate {
+                x,
+                m,
+                lane_of_row,
+                form,
+                y,
+            } => elemwise::modulate::modulate(
+                self.ctx(),
+                match form {
+                    ModulateForm::ScaleShift => elemwise::modulate::Form::ScaleShift,
+                    ModulateForm::Scale => elemwise::modulate::Form::Scale,
+                    ModulateForm::TanhGate => elemwise::modulate::Form::TanhGate,
+                },
+                self.tensor(*x),
+                match lane_of_row {
+                    Some(_) => self.uncut(*m),
+                    None => self.tensor(*m),
+                },
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                self.tensor(*y),
+            ),
+            Elementwise::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                r_out: _,
+            } => elemwise::modulate::gated_residual_add(
+                self.ctx(),
+                self.tensor(*r),
+                match lane_of_row {
+                    Some(_) => self.uncut(*g),
+                    None => self.tensor(*g),
+                },
+                self.tensor(*y),
+                lane_of_row.map(|lanes| self.tensor(lanes)),
+                self.tensor(*r),
+            ),
+            Elementwise::Sinusoid {
+                t,
+                dim,
+                max_period,
+                flip_sin_cos,
+                scale,
+                y,
+            } => elemwise::sinusoid::sinusoid(
+                self.ctx(),
+                self.tensor(*t),
+                *dim,
+                *max_period,
+                *flip_sin_cos,
+                *scale,
+                self.tensor(*y),
+            ),
+            Elementwise::Silu { x, x_out: _ } => {
+                elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x))
+            }
+            Elementwise::Gelu { x, tanh, x_out: _ } => {
+                if !*tanh {
+                    return Err(kernels_metal::Error::Backend {
+                        op: "elementwise.gelu",
+                        detail: "the erf gelu has no shader here; the tanh approximation \
+                                 (`gelu(x, tanh = true)`) is what every DiT under study runs"
+                            .to_string(),
+                    });
+                }
+                elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
+            }
+            Elementwise::Tanh { x, x_out: _ } => {
+                elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
+            }
+            Elementwise::Mul { x, y, z } => elemwise::pointwise::mul(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+            Elementwise::Add { x, y, z } => elemwise::pointwise::add(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+            Elementwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form,
+                rotary_dim,
+                head_dim,
+                x_out: _,
+            } => elemwise::rope_axes::rope_axes(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*positions),
+                *dims,
+                *thetas,
+                match form {
+                    RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
+                    RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
+                    RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                    RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
+                },
+                *rotary_dim,
+                *head_dim,
+                self.tensor(*x),
+            ),
+            Elementwise::RelativeBucketBias {
+                embedding,
+                max_len,
+                num_buckets,
+                max_distance,
+                bidirectional,
+                y,
+            } => elemwise::pointwise::relative_bucket_bias(
+                self.ctx(),
+                self.tensor(*embedding),
+                *max_len,
+                *num_buckets,
+                *max_distance,
+                *bidirectional,
+                self.tensor(*y),
+            ),
+            Elementwise::GateSigmoidMulHeads {
+                x,
+                gate,
+                head_dim,
+                scale,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul_heads(
+                self.ctx(),
+                self.tensor(*gate),
+                *head_dim,
+                *scale,
+                self.tensor(*x),
+            ),
+            Elementwise::ClampLearned { x, lo, hi, x_out: _ } => {
+                elemwise::pointwise::clamp_learned(
+                    self.ctx(),
+                    self.tensor(*lo),
+                    self.tensor(*hi),
+                    self.tensor(*x),
+                )
+            }
+            Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
-            // M0: the generative families' conditioning ops (D6/D7) are
-            // CUDA-first; refused by name here in this phase.
-            | Elementwise::Modulate { .. }
-            | Elementwise::GatedResidualAdd { .. }
             | Elementwise::NormModulate { .. }
             | Elementwise::GatedResidualNormModulate { .. }
-            | Elementwise::Sinusoid { .. }
-            | Elementwise::RelativeBucketBias { .. }
-            | Elementwise::Silu { .. }
-            | Elementwise::Gelu { .. }
-            | Elementwise::Tanh { .. }
-            | Elementwise::Mul { .. }
-            | Elementwise::Add { .. }
-            | Elementwise::RopeAxes { .. }
-            | Elementwise::GateSigmoidMulHeads { .. }
             => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             | Elementwise::EmbedScaleAddSelect { .. }
             | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            // qwen4's gated-residual family.
             Elementwise::RmsnormGroupedPlusOne {
                 x,
                 weight,
@@ -172,7 +300,6 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*y),
             ),
-            // Both gate curves: qwen4's GatedDeltaNet uses the sigmoid one.
             Elementwise::RmsnormGated {
                 x,
                 gate,
@@ -232,8 +359,6 @@ impl Run<'_> {
                 out,
                 out_out: _,
             } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
-            // Per-column affine (x - bias) * scale, in place; its own entry
-            // since scale reads one device-held scalar.
             Elementwise::Standardize {
                 x,
                 bias,
@@ -259,11 +384,43 @@ impl Run<'_> {
                 proj,
                 y,
             } => {
-                let blocks: Vec<Tensor> = blocks.iter().map(|b| self.tensor(*b)).collect();
+                let planes: Vec<Tensor> = blocks.iter().map(|b| self.tensor(*b)).collect();
+                let Some(first) = planes.first().copied() else {
+                    return Err(kernels_metal::Error::Backend {
+                        op: "elementwise.res_blend",
+                        detail: "a blend of no candidate blocks".to_string(),
+                    });
+                };
+                let elem = u64::from(first.width)
+                    * model_compiler::arena::elem_bytes(first.dtype).unwrap_or(2);
+                let plane_bytes = u64::from(first.rows) * elem;
+                let mut want = self.handles().get(first.buf).map(|row| row.offset());
+                for plane in &planes {
+                    let at = self.handles().get(plane.buf).map(|row| row.offset());
+                    if at != want || plane.rows != first.rows || plane.width != first.width {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "elementwise.res_blend",
+                            detail: "the candidate blocks do not land as one stacked run; \
+                                     the kernel walks `blocks + (j · rows + t) · hidden` and \
+                                     cannot gather scattered slots"
+                                .to_string(),
+                        });
+                    }
+                    want = want.map(|at| at + plane_bytes);
+                }
+                let stacked = Tensor::new(
+                    first.buf,
+                    first.rows.saturating_mul(
+                        u32::try_from(planes.len()).unwrap_or(u32::MAX),
+                    ),
+                    first.width,
+                    first.dtype,
+                );
                 elemwise::norm::res_blend(
                     self.ctx(),
                     self.tensor(*prefix),
-                    &blocks,
+                    stacked,
+                    u32::try_from(planes.len()).unwrap_or(u32::MAX),
                     self.tensor(*weight),
                     *eps,
                     self.tensor(*proj),
@@ -328,7 +485,6 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            // Gemma's tower: contiguous channel blocks, `rotate_half` inside each.
             Elementwise::RopeMrope {
                 q,
                 k,
@@ -350,8 +506,6 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            // Contiguous sections, each restarting the frequency ladder at a
-            // denominator that is sum(sections), not the head.
             Elementwise::RopeMrope {
                 q,
                 k,

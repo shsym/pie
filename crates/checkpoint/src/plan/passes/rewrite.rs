@@ -1,10 +1,3 @@
-//! Physical-layout rewrite passes: coalesce per-buffer writes into
-//! arena-relative bulk copies and hoist them ahead of the transforms.
-//!
-//! Both passes merge adjacent writes, and both do it through
-//! [`try_merge_bulk_extent_write`], because by the time anything here has
-//! run an `ExtentWrite` that could be merged is already a `BulkExtentWrite`.
-
 use std::collections::HashSet;
 
 use crate::error::{Error, OrOverflow, Result};
@@ -18,13 +11,6 @@ pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result
     if program.schedule.is_empty() {
         return Ok(0);
     }
-    // coalescing serves a device arena: one H2D covering adjacent buffers
-    // beats one copy per tensor. A host-executed plan has the opposite
-    // interest: the streaming executor owns each buffer separately and
-    // frees it at its last use, and cannot honour an instruction that
-    // addresses the arena by offset. A device-targeted plan compiled for
-    // streaming execution instead leaves this pass out of the pipeline
-    // entirely, so the guard below only ever sees the host-targeted plan.
     if program.target.backend == BackendKind::Unknown {
         return Ok(0);
     }
@@ -81,8 +67,6 @@ pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> 
     }
     let old_instrs = program.instrs.clone();
     let mut pending_bulk: Vec<StorageInstr> = Vec::new();
-    // allocations and fills must happen before a byte is written: a fill
-    // after the write it was meant to precede erases it.
     let mut prologue: Vec<StorageInstr> = Vec::new();
     let mut rest: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
@@ -133,8 +117,6 @@ pub(super) fn flush_pending_bulk(
             source.file_offset + source.stride.base_offset,
             *dest_offset,
         ),
-        // named rather than left to a wildcard, so a future variant that
-        // belongs here fails to compile rather than sorting silently to the end.
         StorageInstr::Allocate { .. }
         | StorageInstr::Fill { .. }
         | StorageInstr::ExtentWrite { .. }

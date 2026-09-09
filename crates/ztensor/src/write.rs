@@ -1,15 +1,3 @@
-//! `.zt` writing.
-//!
-//! Append-only: magic, then blobs at aligned offsets, then the manifest blob,
-//! then the footer. The default mode produces **canonical form** (spec §6.4):
-//! 64 KiB placement, sorted insertion, an xxh3 digest on every object, and
-//! blob sharing for byte-identical objects.
-//!
-//! [`Writer::object`] builds any object: a leaf or a group type, bytes in
-//! hand or planes handed over one by one, local or a reference into another
-//! file. [`Writer::stream`] takes the bytes a chunk at a time, and
-//! [`Writer::add`] is a shorthand over `object` for the common case.
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -29,12 +17,8 @@ use crate::format::{
 use crate::read::Source;
 use crate::vocab::Vocabulary;
 
-/// Hands out a fresh ticket for every [`Sink`] ever opened, in this process,
-/// so a sink can only drive the writer that opened it.
 static NEXT_SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Writer-side violations of reader rules surface as `InvalidInput` carrying
-/// the rule's own message.
 fn invalid(e: Error) -> Error {
     match e {
         Error::Reject { detail, .. } => Error::InvalidInput(detail),
@@ -51,11 +35,6 @@ fn check_alignment(align: u64) -> Result<()> {
     Ok(())
 }
 
-// =======================================================================
-// options
-// =======================================================================
-
-/// How to write.
 pub struct Options {
     canonical: bool,
     align: Option<u64>,
@@ -75,27 +54,16 @@ impl Default for Options {
 }
 
 impl Options {
-    /// Canonical form (the default): 64 KiB placement, ascending insertion,
-    /// a digest on every object, raw blobs only, no block digests, single
-    /// file.
-    ///
-    /// Turn it off to insert in any order, encode blobs, add block digests,
-    /// or reference other files. Placement is *not* part of what you give
-    /// up: a non-canonical writer still defaults to 64 KiB. Use
-    /// [`align`](Self::align) to choose something else.
     pub fn canonical(mut self, canonical: bool) -> Self {
         self.canonical = canonical;
         self
     }
 
-    /// Placement alignment: a power of two ≥ 4096. Defaults to 64 KiB.
     pub fn align(mut self, align: u64) -> Self {
         self.align = Some(align);
         self
     }
 
-    /// Block digests (spec §6.2) on every object this writer writes, in
-    /// windows of `size` bytes. Needs `.canonical(false)`.
     pub fn blocks(mut self, size: u64) -> Self {
         self.blocks = Some(size);
         self
@@ -106,27 +74,16 @@ impl Options {
         self
     }
 
-    /// Writes to `path` directly.
     pub fn create(self, path: impl AsRef<Path>) -> Result<Writer> {
         self.build(path.as_ref().to_path_buf(), None)
     }
 
-    /// Writes to a sibling partial file and moves it into place on
-    /// [`Writer::finish`]. See [`Writer::publish`].
     pub fn publish(self, path: impl AsRef<Path>) -> Result<Writer> {
         let final_path = path.as_ref().to_path_buf();
         let partial = partial_path(&final_path);
         self.build(partial, Some(final_path))
     }
 
-    /// Adds to an existing `.zt` without rewriting the blobs already in it.
-    ///
-    /// Writing starts past the end of the file, as spec §2.5 requires. New
-    /// blobs are placed at the alignment the file already uses, read back
-    /// from its offsets; `.align()` overrides it. This is not atomic: until
-    /// [`finish`](Writer::finish) puts a footer at the new end, no reader
-    /// will open the file. Canonical form forbids unreferenced blobs, so
-    /// this needs `.canonical(false)`.
     pub fn append(self, path: impl AsRef<Path>) -> Result<Writer> {
         if self.canonical {
             return Err(Error::InvalidInput(
@@ -218,9 +175,6 @@ impl Options {
     }
 }
 
-/// The alignment a file was written at, read back from its offsets: the
-/// largest power of two dividing all of them, clamped to the range the
-/// format uses.
 fn inherited_alignment(manifest: &Manifest, manifest_at: u64) -> u64 {
     fn gcd(a: u64, b: u64) -> u64 {
         if b == 0 {
@@ -250,10 +204,6 @@ fn partial_path(final_path: &Path) -> PathBuf {
     final_path.with_file_name(format!(".{name}.{}.partial", std::process::id()))
 }
 
-// =======================================================================
-// writer
-// =======================================================================
-
 pub struct Writer {
     out: Option<BufWriter<File>>,
     path: PathBuf,
@@ -263,13 +213,9 @@ pub struct Writer {
     canonical: bool,
     blocks: Option<u64>,
     manifest: Manifest,
-    /// (digest, length) -> offset of a previously written blob. Hash matches
-    /// are confirmed byte-for-byte before sharing.
     dedup: HashMap<(Digest, u64), u64>,
     last_name: Option<String>,
-    /// The ticket of the [`Sink`] currently open on this writer, if any.
     open_sink: Option<u64>,
-    /// Set when adding to a file this writer did not create.
     appending: bool,
     vocab: Arc<Vocabulary>,
 }
@@ -286,19 +232,14 @@ impl std::fmt::Debug for Writer {
 }
 
 impl Writer {
-    /// A canonical-form writer over `path`.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         Options::default().create(path)
     }
 
-    /// A canonical-form writer that publishes atomically: bytes go to a
-    /// partial file beside `path`, and [`finish`](Self::finish) renames it
-    /// into place.
     pub fn publish(path: impl AsRef<Path>) -> Result<Self> {
         Options::default().publish(path)
     }
 
-    /// Adds to an existing `.zt`. See [`Options::append`].
     pub fn append(path: impl AsRef<Path>) -> Result<Self> {
         Options::default().canonical(false).append(path)
     }
@@ -307,14 +248,10 @@ impl Writer {
         Options::default()
     }
 
-    /// Sets file-level attributes.
     pub fn set_attributes(&mut self, attributes: cbor::Value) {
         self.manifest.attributes = Some(attributes);
     }
 
-    /// The one-liner: a tensor of one leaf, bytes in hand.
-    ///
-    /// `data` must be exactly `⌈product(shape) × bits(leaf) / 8⌉` bytes.
     pub fn add(
         &mut self,
         name: impl Into<String>,
@@ -325,12 +262,6 @@ impl Writer {
         self.object(name, |o| o.shape(shape).term(leaf).bytes(data))
     }
 
-    /// Registers an external shard under `name`.
-    ///
-    /// The name is a label you choose, never a path; see spec §7.1 for its
-    /// character set. The identity comes from
-    /// [`shard_identity`](crate::read::shard_identity). Canonical form is
-    /// single-file, so this needs `.canonical(false)`.
     pub fn add_shard(&mut self, name: impl Into<String>, shard: &Shard) -> Result<()> {
         if self.canonical {
             return Err(Error::InvalidInput(
@@ -357,9 +288,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Overlay convenience: references `object` (taken from another file's
-    /// manifest) through the shard registered under `shard`, writing
-    /// nothing. The object's blob must be local in the source manifest.
     pub fn link(&mut self, name: impl Into<String>, object: &Object, shard: &str) -> Result<()> {
         if object.blob.shard.is_some() {
             return Err(Error::InvalidInput(
@@ -375,12 +303,6 @@ impl Writer {
         self.object(name, |o| o.linked(linked))
     }
 
-    /// Copies every tensor of a [`Source`] into this file. This is the
-    /// conversion path for every supported format.
-    ///
-    /// Reads decoded bytes and writes them raw, so a canonical writer turns
-    /// *any* source into a canonical, bit-reproducible `.zt` file. File
-    /// attributes are copied unless already set.
     pub fn ingest(&mut self, source: &Source) -> Result<()> {
         if self.manifest.attributes.is_none() {
             self.manifest.attributes = source.attributes().cloned();
@@ -404,8 +326,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Writes the manifest blob and footer, then flushes. A publishing writer
-    /// also fsyncs and renames into place. Returns the file size.
     pub fn finish(mut self) -> Result<u64> {
         if self.open_sink.is_some() {
             return Err(Error::InvalidInput(
@@ -445,8 +365,6 @@ impl Writer {
         Ok(self.offset)
     }
 
-    /// Abandons the file: a publishing writer removes its partial, a plain one
-    /// removes what it has written, an appending one leaves the file alone.
     pub fn abandon(mut self) {
         if self.appending {
             self.discard_buffer();
@@ -463,15 +381,12 @@ impl Writer {
         }
     }
 
-    // ---- blob placement ----
-
     fn out(&mut self) -> Result<&mut BufWriter<File>> {
         self.out
             .as_mut()
             .ok_or_else(|| Error::InvalidInput("writer is already finished".into()))
     }
 
-    /// Writes a blob, or shares an existing one when the bytes are identical.
     fn write_or_share_blob(
         &mut self,
         data: &[u8],
@@ -480,8 +395,6 @@ impl Writer {
         self.write_or_share_segments(&[(0, data)], blocks)
     }
 
-    /// Writes planes back to back with canonical padding, hashing as it goes.
-    /// Shares an identical blob already written, as `bytes` would.
     fn write_planes(
         &mut self,
         planes: &[&[u8]],
@@ -498,7 +411,6 @@ impl Writer {
         self.write_or_share_segments(&segments, blocks)
     }
 
-    /// A blob given as segments, each so many zero bytes then a slice.
     fn write_or_share_segments(
         &mut self,
         segments: &[(usize, &[u8])],
@@ -542,7 +454,6 @@ impl Writer {
         Ok(true)
     }
 
-    /// Whether two ranges of the file hold the same bytes.
     fn ranges_equal(&mut self, a: u64, b: u64, len: u64) -> Result<bool> {
         self.out()?.flush()?;
         let mut file = File::open(&self.path)?;
@@ -563,8 +474,6 @@ impl Writer {
         Ok(true)
     }
 
-    /// Cuts the file back to `to`, which must be at or past the last
-    /// committed blob.
     fn truncate(&mut self, to: u64) -> Result<()> {
         let out = self.out()?;
         out.flush()?;
@@ -580,7 +489,6 @@ impl Writer {
         Ok(target)
     }
 
-    /// Advances to the next aligned offset without writing anything.
     fn reserve_blob(&mut self) -> Result<u64> {
         let target = self.aligned_offset()?;
         self.pad_to(target)?;
@@ -608,8 +516,6 @@ impl Writer {
         self.offset = target;
         Ok(())
     }
-
-    // ---- shared checks ----
 
     fn check_canonical_name(&self, name: &str) -> Result<()> {
         if self.canonical && !name.is_ascii() && !unicode_normalization::is_nfc(name) {
@@ -665,22 +571,12 @@ impl Drop for Writer {
 
 const ZEROS: [u8; 4096] = [0u8; 4096];
 
-// =======================================================================
-// object builder
-// =======================================================================
-
 enum Payload<'d> {
-    /// Bytes in hand, decoded.
     Bytes(&'d [u8]),
-    /// One slice per plane of the type, to be laid out canonically.
     Planes(Vec<&'d [u8]>),
-    /// Bytes already put through their encoding profile.
     Encoded(Vec<u8>),
-    /// A length to be streamed later.
     Length(u64),
-    /// A byte range of a registered shard.
     External { shard: String, at: Range<u64> },
-    /// A whole object taken from another file's manifest ([`Writer::link`]).
     Linked(Object),
     Missing,
 }
@@ -698,23 +594,6 @@ impl Payload<'_> {
     }
 }
 
-/// Describes one object.
-///
-/// A plain description with no writer behind it: it is handed to
-/// [`Writer::object`] or [`Writer::stream`], which is what turns it into
-/// bytes.
-///
-/// ```no_run
-/// # use ztensor::{Leaf, Term, Writer};
-/// # fn f(w: &mut Writer, codes: &[u8], scales: &[u8], biases: &[u8]) -> ztensor::Result<()> {
-/// let term = Term::parse("g64_u4_bf16_b_bf16")?;
-/// w.object("q", |o| {
-///     o.shape([4096u64, 4096])
-///         .term(term)
-///         .planes([codes, scales, biases])
-/// })
-/// # }
-/// ```
 pub struct ObjectBuilder<'d> {
     shape: Vec<u64>,
     term: Option<Term>,
@@ -747,65 +626,48 @@ impl<'d> ObjectBuilder<'d> {
         self
     }
 
-    /// The type: a [`Leaf`] or a parsed [`Term`].
     pub fn term(mut self, term: impl Into<Term>) -> Self {
         self.term = Some(term.into());
         self
     }
 
-    /// A named layout. Absent means the canonical layout.
     pub fn layout(mut self, layout: impl Into<String>) -> Self {
         self.layout = Some(layout.into());
         self
     }
 
-    /// One object-level attribute. Not to be mixed with
-    /// [`attributes`](Self::attributes).
     pub fn attr(mut self, key: impl Into<String>, value: impl Into<cbor::Value>) -> Self {
         self.pairs.push((cbor::Value::Text(key.into()), value.into()));
         self
     }
 
-    /// Object-level attributes, wholesale. Not to be mixed with
-    /// [`attr`](Self::attr).
     pub fn attributes(mut self, attributes: cbor::Value) -> Self {
         self.attributes = Some(attributes);
         self
     }
 
-    /// Stores the blob through an encoding profile. Canonical form is raw by
-    /// definition, so this needs `.canonical(false)`.
     pub fn encoding(mut self, encoding: impl Into<String>) -> Self {
         self.encoding = Some(encoding.into());
         self
     }
 
-    /// The digest of an [`external`](Self::external) blob whose bytes this
-    /// writer will not see. Everything this writer writes is hashed as it
-    /// goes.
     pub fn digest(mut self, digest: Digest) -> Self {
         self.digest = Some(digest);
         self
     }
 
-    /// The decoded bytes, laid out already.
     pub fn bytes(self, data: &'d [u8]) -> Self {
         self.payload(Payload::Bytes(data))
     }
 
-    /// One slice per plane of the type, in canonical order; the writer lays
-    /// them out with the canonical padding between them. Needs a term and no
-    /// named layout.
     pub fn planes(self, planes: impl IntoIterator<Item = &'d [u8]>) -> Self {
         self.payload(Payload::Planes(planes.into_iter().collect()))
     }
 
-    /// The blob's decoded byte length, to be streamed. See [`Writer::stream`].
     pub fn length(self, length: u64) -> Self {
         self.payload(Payload::Length(length))
     }
 
-    /// A byte range of a registered shard: nothing is written.
     pub fn external(self, shard: impl Into<String>, bytes: Range<u64>) -> Self {
         self.payload(Payload::External {
             shard: shard.into(),
@@ -831,8 +693,6 @@ impl<'d> ObjectBuilder<'d> {
     }
 }
 
-/// Validates a description against the writer and produces the object with
-/// its blob offset left at zero, plus the payload to write.
 fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<(Object, Payload<'d>)> {
     let ObjectBuilder {
         shape,
@@ -972,8 +832,6 @@ fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<
     Ok((object, payload))
 }
 
-/// What a reader would check of the object: it says what its bytes are, its
-/// attributes are well-formed, and the size equation and layout rules hold.
 fn validate_object(writer: &Writer, name: &str, object: &Object) -> Result<()> {
     if object.term.is_none() && object.layout.is_none() {
         return Err(Error::InvalidInput(format!(
@@ -1031,8 +889,6 @@ fn validate_external(manifest: &Manifest, blob: &Blob) -> Result<()> {
 }
 
 impl Writer {
-    /// Writes one object, described by `describe`. The bytes must be in hand
-    /// (or external); see [`stream`](Self::stream) otherwise.
     pub fn object<'d>(
         &mut self,
         name: impl Into<String>,
@@ -1063,12 +919,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Opens an object for streaming. The description must give the blob's
-    /// [`length`](ObjectBuilder::length).
-    ///
-    /// The returned [`Sink`] is a token, not a borrow: it is passed back to
-    /// [`Sink::write`] and consumed by [`Sink::close`]. For an
-    /// [`io::Write`](std::io::Write), see [`Sink::attach`].
     pub fn stream<'d>(
         &mut self,
         name: impl Into<String>,
@@ -1096,8 +946,6 @@ impl Writer {
     }
 }
 
-/// Hashes a blob as it is written: the whole-blob xxh3 and, when asked, one
-/// xxh3 per block window.
 struct BlobHasher {
     whole: Hasher,
     block: Option<(u64, Hasher, u64, Vec<Vec<u8>>)>,
@@ -1141,14 +989,6 @@ impl BlobHasher {
     }
 }
 
-// =======================================================================
-// streaming
-// =======================================================================
-
-/// An open streamed object.
-///
-/// Dropping without [`close`](Self::close) leaves the object out of the
-/// manifest and the writer refusing further objects.
 pub struct Sink {
     ticket: u64,
     name: String,
@@ -1170,24 +1010,18 @@ impl std::fmt::Debug for Sink {
 }
 
 impl Sink {
-    /// Bytes written so far.
     pub fn written(&self) -> u64 {
         self.written
     }
 
-    /// Bytes still to write.
     pub fn remaining(&self) -> u64 {
         self.declared - self.written
     }
 
-    /// Borrows this sink and its writer together as an
-    /// [`io::Write`](std::io::Write).
     pub fn attach<'a>(&'a mut self, writer: &'a mut Writer) -> Attached<'a> {
         Attached { sink: self, writer }
     }
 
-    /// Appends bytes. The first call places the blob at the next aligned
-    /// offset. Writing past the declared length is an error.
     pub fn write(&mut self, writer: &mut Writer, chunk: &[u8]) -> Result<()> {
         self.check_owner(writer)?;
         if !self.started {
@@ -1212,9 +1046,6 @@ impl Sink {
         Ok(())
     }
 
-    /// Completes the object and adds it to the manifest. A blob identical to
-    /// one already written is dropped in favour of sharing it, as `bytes`
-    /// would have.
     pub fn close(self, writer: &mut Writer) -> Result<()> {
         self.check_owner(writer)?;
         if self.written < self.declared {
@@ -1264,8 +1095,6 @@ impl Sink {
     }
 }
 
-/// A [`Sink`] and its [`Writer`], borrowed together as an
-/// [`io::Write`](std::io::Write).
 pub struct Attached<'a> {
     sink: &'a mut Sink,
     writer: &'a mut Writer,

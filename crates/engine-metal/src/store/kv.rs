@@ -1,5 +1,3 @@
-//! What the plan says about its own caches: the rows' readings and the readings the schedules are carved for. Page arithmetic lives in [`model_exec::store::kv`] and is re-exported below; this shell's own `probe` reads a schedule's reading off the launches that consume it.
-
 use model_ir::{Trace, ValueId};
 
 use crate::error::{Fault, Result};
@@ -8,32 +6,25 @@ pub use model_exec::store::kv::{
     Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
 };
 
-/// Compute one fire's geometry. Errs [`Fault::Ceiling`] for a lane past the pool's slots or its slot's page block.
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
     Ok(model_exec::store::kv::geometry(paging, seats)?)
 }
 
-/// As [`geometry`], against a caller-supplied page table; also errs for stated pages that don't cover the tokens.
 pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Result<Geometry> {
     Ok(model_exec::store::kv::geometry_with(paging, seats, tables)?)
 }
 
-/// A value's row width. Errs [`Fault::Unbound`] for a value its plan doesn't declare, a host struct, or a symbolic dim.
 pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
     Ok(model_exec::store::kv::width_of(trace, value)?)
 }
 
-/// Everything the plan restates about its own caches, keyed two ways.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
-    /// Per `Trace::caches` row: what one page holds. `None` for a row no attention op reads.
     pub rows: Vec<Option<SpaceFacts>>,
-    /// Per `Trace::values` id: the reading one attention schedule is carved for. `None` if not a plan struct some launch consumes.
     pub plans: Vec<Option<SpaceFacts>>,
 }
 
 impl Facts {
-    /// The facts a cache row's pool is sized at. Errs [`Fault::Unbound`] for a row no attention op reads.
     pub fn row(&self, at: usize, name: &str) -> Result<SpaceFacts> {
         self.rows
             .get(at)
@@ -47,15 +38,12 @@ impl Facts {
     }
 }
 
-/// Read every cache row's and every attention schedule's facts off the plan.
-/// Errs [`Fault::Unbound`] on a row with two widths, a plan value read at two readings, or a non-whole-heads q rectangle.
 pub fn probe(trace: &Trace) -> Result<Facts> {
     let mut out = Facts {
         rows: vec![None; trace.caches.len()],
         plans: vec![None; trace.values.len()],
     };
 
-    // pass one: the rows. kv_heads is stated by prefill arms alone; a row only a decode reads carries zero.
     for node in &trace.nodes {
         let Some(read) = reads(&node.op) else {
             continue;
@@ -100,7 +88,6 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
         }
     }
 
-    // pass two: the schedules. A plan value is carved for one reading; its kv head count comes from the row.
     for node in &trace.nodes {
         let Some(read) = reads(&node.op) else {
             continue;

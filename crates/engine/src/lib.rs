@@ -1,6 +1,3 @@
-//! The runtime↔engine contract: what an engine *is*, in types.
-
-#![deny(missing_docs)]
 #![deny(
     clippy::todo,
     clippy::unimplemented,

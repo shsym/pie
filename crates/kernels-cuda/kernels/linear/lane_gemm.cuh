@@ -4,18 +4,6 @@
 
 namespace pie::linear {
 
-/// **THE LANE-AXIS PROJECTION** (`.wiki/imagegen/design.md` D6): `y = act ·
-/// w^T` for the few rows a lane chain has — one per request — where `act`
-/// stays f32 (the timestep embedding, its `silu`) and the tensor-core gemm's
-/// bf16 activation contract does not apply. `[rows, k] × [n, k]^T → [rows,
-/// n]`, every element f32-accumulated with `fmaf` and rounded once at the
-/// store, so a host `mul_add` chain over the same operands agrees.
-///
-/// One warp per `(row, column)`: the lanes stride over `k`, coalesced on
-/// both the activation row and the weight row, and the partials shuffle down
-/// to lane zero. The grid is `(ceil(n / warps), rows)`, a plain function of
-/// the lane count, and nothing here reads a seat: a lane-shaped launch grids
-/// at the fire's lane carve and computes every lane the carve admits.
 template <class TA, class TW, class TY>
 __global__ void lane_gemm(
     const TA* __restrict__ act,

@@ -1,11 +1,4 @@
-//! The guest-program plane: the ETA host half. Adopts a launch package, runs
-//! the channel ring, and interprets ops, with no device API call anywhere in
-//! this crate. Does not name the runtime<->engine contract; the launch
-//! package it adopts is `eta_compiler::codegen::launch`'s.
-//!
-//! Every `pub use` below lifts a module's items into the crate root.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-// overrides the workspace's deny(missing_docs): this plane keeps no per-item docs.
 #![allow(missing_docs)]
 #![deny(
     clippy::todo,
@@ -54,8 +47,6 @@ pub use lane::{
     Record as LaneRecord, SLOT_BYTES as LANE_SLOT_BYTES, Shape as LaneShape,
 };
 pub use meta::{Malformed, channel_effects};
-/// The op evaluator itself, so a backend can diff its device form against the
-/// oracle op by op rather than only through a whole `step`.
 pub use op::eval_op;
 pub use params::{OpParams, Runtime as OpRuntime};
 pub use plan::{Boundaries, ExecPlan, StagePlan, adopt_launch_package, adopt_launch_package_with};

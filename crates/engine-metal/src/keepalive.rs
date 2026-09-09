@@ -1,13 +1,3 @@
-//! **THE KEEP-ALIVE QUEUE** (on by default; `keepalive=off` turns it
-//! off): a streamed decode
-//! fire cuts its command buffer after every router and waits while the host
-//! copies expert seats — forty-odd idle gaps of a few milliseconds per token,
-//! and the GPU's clocks fall into them. Measured on dsv4: a trivial spinner
-//! in another process took the fire's device time from 149 to 86 ms and the
-//! token from 232 to 180 ms. This is that spinner inside the shell: one
-//! simdgroup of dependent FMAs on its own command queue, dispatched back to
-//! back while a fire has been enqueued recently, asleep otherwise.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -15,35 +5,24 @@ use crate::device::Context;
 use crate::error::Result;
 
 pub struct KeepAlive {
-    /// `Instant`-free clock: milliseconds since start of the last enqueue.
     last: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     epoch: std::time::Instant,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// How long after the last enqueue the spinner keeps going: the gap between
-/// one token's fire and the next is host turnaround (well under this).
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const LINGER_MS: u64 = 250;
 
-/// The spinner's inner loop count, tuned so one dispatch is a few hundred
-/// microseconds — short enough that the real fire's next command buffer is
-/// never far behind it. `diagnostics = "keepalive-iters=<n>"` moves it.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const DEFAULT_ITERS: u32 = 20_000;
 
 impl KeepAlive {
-    /// On unless the boot document turns it off (`diagnostics =
-    /// "keepalive=off"`). Measured per token on the same prompt: dsv4
-    /// 237 → 163 ms, qwen38 75 → 57 ms, GLM 320 → 337 ms (its host copies
-    /// dominate and the spinner competes for bandwidth).
     #[must_use]
     pub fn wanted() -> bool {
         crate::diag::on().keepalive
     }
 
-    /// Note that a fire is being enqueued now.
     pub fn touch(&self) {
         self.last
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -82,19 +61,6 @@ impl KeepAlive {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }
-                    // ONE AUTORELEASE POOL PER SPIN. `commandBuffer` and
-                    // `computeCommandEncoder` hand back AUTORELEASED objects, and
-                    // a thread Rust spawned has no pool draining under it — so
-                    // every buffer this loop ever made stayed alive, holding its
-                    // driver-side backing, for as long as the process ran. At a
-                    // few hundred microseconds a spin that is thousands a second
-                    // while the GPU is warm: measured at +118 MB of
-                    // `IOAccelerator` across 1733 requests, climbing ~16 MB a
-                    // minute and never plateauing. `leaks` sees none of it,
-                    // because every one is still reachable from the pool.
-                    //
-                    // The pool returns whether to keep spinning rather than
-                    // breaking out of it: a `break` cannot cross the closure.
                     let spun = objc2::rc::autoreleasepool(|_| {
                         let Some(buffer) = carry.queue.commandBuffer() else { return false };
                         let Some(encoder) = buffer.computeCommandEncoder() else { return false };
@@ -111,8 +77,6 @@ impl KeepAlive {
                         encoder.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
                         encoder.endEncoding();
                         buffer.commit();
-                        // Waited for INSIDE the pool: the drain must not run while
-                        // the device still holds this buffer.
                         buffer.waitUntilCompleted();
                         true
                     });

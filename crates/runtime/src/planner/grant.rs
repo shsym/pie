@@ -1,18 +1,9 @@
-//! The owned reservation shapes the planner deals in. A grant owns concrete
-//! device page ids and RS slot ids; store preparation functions drain exactly
-//! the prefix they consume through [`AllocationGrant::lend_kv`]/
-//! [`AllocationGrant::lend_rs`] while the Drop guard stays armed — consumed
-//! capacity leaves through a store transaction, surplus returns through
-//! Drop, and nothing is ever hand-released.
-
 use std::sync::Arc;
 
 use super::PoolPort;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsSlotId;
 
-/// A fire's sized ask: device pages and RS folded slots together, so a fire
-/// never half-succeeds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Demand {
     pub kv_pages: u32,
@@ -25,8 +16,6 @@ impl Demand {
     }
 }
 
-/// Reserved device page ids. Dropping returns whatever remains to the pool
-/// through the port; draining (prefix lending) is the only other way out.
 pub struct DevicePageReservation {
     pages: Vec<PhysicalKvPageId>,
     port: Option<Arc<dyn PoolPort>>,
@@ -65,8 +54,6 @@ impl DevicePageReservation {
         self.pages.len()
     }
 
-    /// Fold another reservation from the same port into this one (the
-    /// planner's head-first accumulation). `other` drops empty afterwards.
     pub(super) fn absorb(&mut self, mut other: DevicePageReservation) {
         if self.port.is_none() {
             self.port = other.port.clone();
@@ -74,8 +61,6 @@ impl DevicePageReservation {
         self.pages.append(&mut other.pages);
     }
 
-    /// Split up to `count` pages off as their own reservation (serving the
-    /// queue head out of the accumulation). Pure bookkeeping — no port call.
     pub(super) fn donate(&mut self, count: usize) -> DevicePageReservation {
         let n = count.min(self.pages.len());
         DevicePageReservation {
@@ -84,8 +69,6 @@ impl DevicePageReservation {
         }
     }
 
-    /// Prefix-lend the pages to a store preparation (`prepare_restore`):
-    /// the callee drains exactly what it consumes while Drop stays armed.
     pub(super) fn lend(&mut self) -> &mut Vec<PhysicalKvPageId> {
         &mut self.pages
     }
@@ -102,8 +85,6 @@ impl Drop for DevicePageReservation {
     }
 }
 
-/// Reserved RS folded-slot ids; same ownership protocol as
-/// [`DevicePageReservation`].
 pub struct RsSlotReservation {
     slots: Vec<RsSlotId>,
     port: Option<Arc<dyn PoolPort>>,
@@ -144,9 +125,6 @@ impl Drop for RsSlotReservation {
     }
 }
 
-/// One acquisition's result: everything the fire needs, owned together.
-/// Acquired once, lent by exact prefix during the build, disposed once —
-/// disposal IS the rollback.
 #[derive(Debug)]
 pub struct AllocationGrant {
     demand: Demand,
@@ -159,8 +137,6 @@ impl AllocationGrant {
         Self { demand, kv, rs }
     }
 
-    /// A grant carrying nothing, for zero-demand fires: the build path is
-    /// uniform (everything goes through prefix lending) and disposal is free.
     pub fn empty() -> Self {
         Self {
             demand: Demand::default(),
@@ -169,28 +145,22 @@ impl AllocationGrant {
         }
     }
 
-    /// The ask this grant satisfied.
     pub fn demand(&self) -> Demand {
         self.demand
     }
 
-    /// Reserved device pages not yet consumed by a store preparation.
     pub fn remaining_kv(&self) -> usize {
         self.kv.pages.len()
     }
 
-    /// Reserved RS slots not yet consumed by a store preparation.
     pub fn remaining_rs(&self) -> usize {
         self.rs.slots.len()
     }
 
-    /// Prefix-lend the device pages: store preparation drains exactly what
-    /// it consumes while the Drop guard stays armed.
     pub fn lend_kv(&mut self) -> &mut Vec<PhysicalKvPageId> {
         &mut self.kv.pages
     }
 
-    /// Prefix-lend the RS slots — same protocol as [`Self::lend_kv`].
     pub fn lend_rs(&mut self) -> &mut Vec<RsSlotId> {
         &mut self.rs.slots
     }

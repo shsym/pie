@@ -1,14 +1,3 @@
-//! The `lora` sink: resolving a launch package's adapter channels into bank
-//! bytes, and the host-side slot residency table that pins them.
-//!
-//! Runs entirely between fires, on the host: channel bytes are converted to
-//! the bank dtype once, at bind, and never read again on the device.
-//!
-//! Refuses: the scale form (`adapter_scale`, no `AdapterScale` op exists), a
-//! sink argument that is not a channel read, a seed whose element count is
-//! not `layers x rank x hidden`, a rank wider than the bank seats, an unseeded
-//! channel, and a site the load's banks do not declare.
-
 use std::collections::BTreeMap;
 
 use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
@@ -17,35 +6,21 @@ use eta_ir::op::tags;
 use crate::error::{Fault, Result};
 use crate::weights::{AdapterPlane, BankSeat};
 
-/// The sink's name in the package's name table.
 pub const LORA: &str = "lora";
 
-/// Which projection an adapter corrects.
-///
-/// The spelling is the contract, duplicated in four places (guest `Site`,
-/// model text, CUDA resolver, this one) since they cannot share a type
-/// across the crate boundary; an unknown spelling is refused, not guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Site {
-    /// The query projection.
     Q,
-    /// The key projection.
     K,
-    /// The value projection.
     V,
-    /// The mixer's output projection; the site an untagged bank means.
     O,
-    /// The fused gate/up projection of the feed-forward sublayer.
     GateUp,
-    /// Its down projection.
     Down,
 }
 
 impl Site {
-    /// The vocabulary, in bit order.
     pub const ALL: [Site; 6] = [Site::Q, Site::K, Site::V, Site::O, Site::GateUp, Site::Down];
 
-    /// How a bank name and a manifest spell it.
     #[must_use]
     pub const fn spelled(self) -> &'static str {
         match self {
@@ -58,8 +33,6 @@ impl Site {
         }
     }
 
-    /// Matches `inferlet::eta::adapter::Site::bit()`; rides the `lora` sink's
-    /// placement constant.
     #[must_use]
     pub const fn bit(self) -> u32 {
         match self {
@@ -72,13 +45,11 @@ impl Site {
         }
     }
 
-    /// A spelling, or `None` for a word outside the vocabulary.
     #[must_use]
     pub fn parse(word: &str) -> Option<Site> {
         Site::ALL.into_iter().find(|site| site.spelled() == word)
     }
 
-    /// The vocabulary as a message names it.
     #[must_use]
     pub fn vocabulary() -> String {
         Site::ALL
@@ -88,7 +59,6 @@ impl Site {
             .join(", ")
     }
 
-    /// How a message spells "at this site", including the absent one.
     #[must_use]
     pub fn stated(site: Option<Site>) -> String {
         match site {
@@ -98,36 +68,27 @@ impl Site {
     }
 }
 
-/// The bank name's role: everything after an optional `layer.{l}[.{site}].`
-/// prefix. A middle segment outside the site vocabulary is not a site, so
-/// e.g. `layer.3.mixer.lora_a`'s role is the whole string.
 #[must_use]
 pub fn role_of(bank: &str) -> &str {
     parsed(bank).map_or(bank, |(_, _, role)| role)
 }
 
-/// Which layer a bank name puts itself at, or zero for an unnumbered one.
 #[must_use]
 pub fn layer_of(bank: &str) -> u64 {
     parsed(bank).map_or(0, |(layer, _, _)| layer)
 }
 
-/// Which site a bank declares it corrects, or `None` for the text's own
-/// default site (unstated, not "no site" — keeps untagged loads unchanged).
 #[must_use]
 pub fn site_of(bank: &str) -> Option<Site> {
     parsed(bank).and_then(|(_, site, _)| site)
 }
 
-/// `layer.{l}[.{site}].{role}`, read once — the whole grammar in one place.
 fn parsed(bank: &str) -> Option<(u64, Option<Site>, &str)> {
     let (head, role) = bank.rsplit_once('.')?;
     let last = head.rsplit('.').next()?;
-    // `layer.{l}.{role}`, tried first.
     if let Some(layer) = numbered(last) {
         return Some((layer, None, role));
     }
-    // `layer.{l}.{site}.{role}`; anything else falls through to `None`.
     let site = Site::parse(last)?;
     let (rest, _) = head.rsplit_once('.')?;
     let layer = numbered(rest.rsplit('.').next()?)?;
@@ -141,18 +102,13 @@ fn numbered(part: &str) -> Option<u64> {
     }
 }
 
-/// Which plane of an adapter a sink argument is. Positional in the closed
-/// language (`lora(a, b, sites)`), spelled as [`role_of`]'s bank-name suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// `A`: `[layers, rank, hidden]`, rank-major.
     A,
-    /// `B`: `[layers, hidden, rank]`, out-major (HF's native orientation).
     B,
 }
 
 impl Role {
-    /// The bank-name suffix this role fills.
     #[must_use]
     pub const fn bank(self) -> &'static str {
         match self {
@@ -162,27 +118,14 @@ impl Role {
     }
 }
 
-/// One program's `lora` sink, as the resolver reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sink {
-    /// Which stage carries it.
     pub stage: usize,
-    /// The dense channel index each plane's weights are seeded into, in role
-    /// order.
     pub planes: Vec<(Role, u32)>,
-    /// The trace-known placement constant: the site bits the guest asked
-    /// for, [`Site::bit`]'s numbering.
     pub sites: u32,
 }
 
 impl Sink {
-    /// Which site this guest asked for, or `None` for no placement stated.
-    /// One sink corrects one site; more than one bit set is refused.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Adapter`] for a nonzero placement constant not equal to
-    /// exactly one site's bit.
     pub fn site(&self) -> Result<Option<Site>> {
         match self.sites {
             0 => Ok(None),
@@ -205,14 +148,6 @@ impl Sink {
     }
 }
 
-/// Does this program carry an adapter, and which channels are its weights?
-/// `Ok(None)` means no stage declares the sink.
-///
-/// # Errors
-///
-/// [`Fault::Adapter`] for a sink this shell cannot serve: the scale form, an
-/// argument that is not a channel read, or an arity outside the closed
-/// language's two forms.
 pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
     let Some(stage) = package.plans.iter().position(|plan| plan.needs.lora) else {
         return Ok(None);
@@ -242,8 +177,6 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
                  that stage's body names it"
             ))
         })?;
-    // Arity selects the form: three args is `lora(a, b, sites)`, two is
-    // `adapter_scale(l, sites)`. The last arg is the placement constant in both.
     let (weights, sites_arg) = match call.args.as_slice() {
         [a, b, sites] => (vec![(Role::A, *a), (Role::B, *b)], *sites),
         [_, _] => {
@@ -277,7 +210,6 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
                     role.bank()
                 ))
             })?;
-        // A channel read or take is accepted; a computed value is not.
         if !matches!(
             source.source,
             ValueOrigin::ChannelRead | ValueOrigin::ChannelTake
@@ -305,19 +237,6 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
     }))
 }
 
-/// Converts one seeded cell into per-layer bank bytes.
-///
-/// `wire` is the f32 cell the guest seeded. `seats` is the load's bank
-/// table; banks carrying `role` are sorted by layer and each gets one
-/// full-capacity plane, rounded from f32 to the bank's own element width.
-/// `site` is checked only against banks that declare one.
-///
-/// # Errors
-///
-/// [`Fault::Adapter`] for a role this load declares no bank for, a site its
-/// banks do not declare, banks of one role that are not one shape, a cell
-/// whose length is not `layers x rank x hidden` f32 elements, or a rank the
-/// bank cannot seat.
 pub fn planes_of(
     role: Role,
     site: Option<Site>,
@@ -332,8 +251,6 @@ pub fn planes_of(
         .iter()
         .filter(|seat| role_of(&seat.name) == role.bank())
         .collect();
-    // If no bank of this role names a site, the ask is unchecked; once one
-    // bank names a site, the load has an opinion and the ask must match it.
     let sited = of_role.iter().any(|seat| site_of(&seat.name).is_some());
     let want = match sited {
         true => site,
@@ -399,7 +316,6 @@ pub fn planes_of(
             seat.elem, seat.name
         )));
     }
-    // `A` is `[rank, hidden]` (rank leading), `B` is `[hidden, rank]`.
     let bank_rank = seat.rows.min(seat.cols);
     let hidden = seat.rows.max(seat.cols);
     let layers = banks.len() as u64;
@@ -428,8 +344,6 @@ pub fn planes_of(
     let mut out = Vec::with_capacity(banks.len());
     for (layer, bank) in banks.iter().enumerate() {
         let source = &wire[layer * stride * 4..(layer + 1) * stride * 4];
-        // Zero-padded per orientation: `A`'s unused ranks are trailing rows,
-        // `B`'s are a stride inside every row (see `AdapterPlane`).
         let mut plane = vec![0u8; slot];
         match role {
             Role::A => {
@@ -453,7 +367,6 @@ pub fn planes_of(
     Ok(out)
 }
 
-/// One f32 out of a wire cell.
 fn f32_at(wire: &[u8], at: usize) -> f32 {
     let bytes = [
         wire[at * 4],
@@ -464,7 +377,6 @@ fn f32_at(wire: &[u8], at: usize) -> f32 {
     f32::from_le_bytes(bytes)
 }
 
-/// f32 to bf16, round to nearest even (matches the weight loader's conversion).
 #[must_use]
 pub fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -472,73 +384,44 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-/// Where one bind's bytes came from.
 #[derive(Debug, Clone, Copy)]
 pub enum Source<'a> {
-    /// An instance's own full-capacity planes (private-adapter path).
     Own {
-        /// Which instance; its slot is never shared.
         instance: u64,
-        /// The planes.
         planes: &'a [AdapterPlane<'a>],
     },
-    /// A directory in the deployment's mount, named as the guest spells it.
-    /// Keyed by [`crate::blob::Stamp`], so every instance naming it lands on
-    /// one slot and pays one copy.
     Shared {
-        /// The adapter's name, resolved against
-        /// [`crate::serve::Shell::mount_adapters`]'s root.
         name: &'a str,
     },
 }
 
-/// What a bind answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
-    /// The slot every lane of this instance routes to.
     pub slot: u32,
-    /// Did this bind name a file in the mount?
     pub shared: bool,
-    /// Did this bind pay the landing, or join one already resident?
     pub landed: bool,
-    /// What the slot is held under (see [`crate::serve::Shell::release_adapter`]).
     pub key: Key,
 }
 
-/// The key a slot is held under. An instance id is private (never two
-/// instances share one); a blob stamp is shared (two instances naming one
-/// file compute one stamp).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {
-    /// One instance's private adapter.
     Instance(u64),
-    /// One file in the mount, by identity (path + files' stamp).
     Shared(crate::blob::Stamp),
 }
 
-/// The residency table: which of the banks' slots are pinned, by what. Pure
-/// host state, checkable with no GPU; the landing happens in a closure at
-/// the call site ([`crate::serve::Shell::bind_adapter`]).
 #[derive(Debug, Default)]
 pub struct Slots {
-    /// How many slots the banks seat: the smallest capacity any declared
-    /// bank states, since an adapter occupies one slot of every bank.
     seats: u32,
-    /// Key -> (slot, how many live binds hold it).
     held: BTreeMap<Key, (u32, u32)>,
 }
 
-/// What an acquire answered.
 #[derive(Debug, Clone, Copy)]
 pub struct Grant {
-    /// The slot.
     pub slot: u32,
-    /// Did this acquire seat it, or join one already held?
     pub fresh: bool,
 }
 
 impl Slots {
-    /// A table over `seats` slots, holding none.
     #[must_use]
     pub fn new(seats: u32) -> Slots {
         Slots {
@@ -547,25 +430,16 @@ impl Slots {
         }
     }
 
-    /// How many slots the banks seat.
     #[must_use]
     pub fn seats(&self) -> u32 {
         self.seats
     }
 
-    /// How many are pinned right now.
     #[must_use]
     pub fn live(&self) -> usize {
         self.held.len()
     }
 
-    /// Pin a slot for `key`. A key already held takes its own slot back and
-    /// its refcount rises; a fresh key takes the lowest free slot.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::AdapterSlots`] when every slot is pinned by a live bind
-    /// (refused rather than evicted, since a pinned slot may be mid-fire).
     pub fn acquire(&mut self, key: Key) -> Result<Grant> {
         if let Some((slot, count)) = self.held.get_mut(&key) {
             *count += 1;
@@ -582,16 +456,10 @@ impl Slots {
         Ok(Grant { slot, fresh: true })
     }
 
-    /// Undo an acquire that could not be landed, so no key is left pointing
-    /// at bytes that never arrived.
     pub fn abandon(&mut self, key: &Key) {
         self.release_key(key);
     }
 
-    /// Give a bind back; at the last release the slot is free again. Unlike
-    /// the CUDA twin, this frees at zero holds rather than keeping an LRU
-    /// occupant seated (landing here is a unified-memory memcpy, not a
-    /// transfer to amortise).
     pub fn release(&mut self, key: &Key) {
         self.release_key(key);
     }
@@ -612,7 +480,6 @@ impl Slots {
 
 #[cfg(test)]
 mod tests {
-    //! Pins the lora sink resolution and slot residency arithmetic.
     use super::*;
     use eta_compiler::codegen::launch::{LaunchOp, LaunchStage, LaunchStagePlan, LaunchValue};
 
@@ -627,7 +494,6 @@ mod tests {
         }
     }
 
-    // Two layers of an `A` bank at rank 2, hidden 3.
     fn a_seats() -> Vec<BankSeat> {
         vec![seat("layer.0.lora_a", 2, 3), seat("layer.1.lora_a", 2, 3)]
     }
@@ -640,7 +506,6 @@ mod tests {
         bf16_bits(value).to_le_bytes()
     }
 
-    /// Read a bf16 plane back as f32.
     fn as_f32(plane: &[u8]) -> Vec<f32> {
         plane
             .chunks_exact(2)
@@ -648,8 +513,17 @@ mod tests {
             .collect()
     }
 
-    /// A `[layers, rank, hidden]` cell is L contiguous rectangles; the L
-    /// banks of the role take one each, in layer order.
+    fn adapter_every_case() {
+        a_layered_cell_becomes_one_plane_per_layer_bank();
+        the_correction_is_b_times_a_times_x_at_the_landed_orientation();
+        the_sink_answers_its_two_channels_in_role_order();
+        the_placement_constant_is_one_site_or_a_refusal();
+        a_package_with_no_sink_answers_none();
+        the_residency_pins_releases_and_refuses_by_name();
+        one_blob_is_one_slot_however_many_instances_name_it();
+        an_abandoned_acquire_leaves_the_slot_free();
+    }
+
     #[test]
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
         let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
@@ -662,26 +536,18 @@ mod tests {
         assert_eq!(planes[0].1.len(), 12, "a plane is one whole slot");
     }
 
-    /// The rank-r correction as arithmetic: `y += B·(A·x)`, matching what
-    /// `linear/lora.metal` computes over the planes this resolver lands.
-    #[test]
     fn the_correction_is_b_times_a_times_x_at_the_landed_orientation() {
-        // rank 2, hidden 3, one layer.
         let seats_a = vec![seat("layer.0.lora_a", 2, 3)];
         let seats_b = vec![seat("layer.0.lora_b", 3, 2)];
-        // A is [rank, hidden] = [[1,2,3],[4,5,6]]
         let a_cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        // B is [hidden, rank] = [[1,0],[0,1],[1,1]]
         let b_cell = wire(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
         let a = as_f32(&planes_of(Role::A, None, &a_cell, &seats_a).expect("A").remove(0).1);
         let b = as_f32(&planes_of(Role::B, None, &b_cell, &seats_b).expect("B").remove(0).1);
         let x = [1.0f32, 1.0, 1.0];
-        // The waist: A·x, rank-major.
         let waist: Vec<f32> = (0..2)
             .map(|r| (0..3).map(|h| a[r * 3 + h] * x[h]).sum::<f32>())
             .collect();
         assert_eq!(waist, vec![6.0, 15.0], "A·x over the rank rows");
-        // The correction: B·waist, out-major.
         let delta: Vec<f32> = (0..3)
             .map(|o| (0..2).map(|r| b[o * 2 + r] * waist[r]).sum::<f32>())
             .collect();
@@ -732,9 +598,6 @@ mod tests {
         package
     }
 
-    /// The two channels come back in role order, with the placement
-    /// constant beside them.
-    #[test]
     fn the_sink_answers_its_two_channels_in_role_order() {
         let sink = sink_of(&package_with(vec![0, 1, 2]))
             .expect("a readable sink")
@@ -744,8 +607,6 @@ mod tests {
         assert_eq!(sink.sites, 0b1000, "the trace-known placement constant");
     }
 
-    /// The placement constant reads back as one site.
-    #[test]
     fn the_placement_constant_is_one_site_or_a_refusal() {
         let sink = sink_of(&package_with(vec![0, 1, 2]))
             .expect("a readable sink")
@@ -770,8 +631,6 @@ mod tests {
         assert!(why.to_string().contains("ONE site"), "{why}");
     }
 
-    /// A package with no sink is the ordinary answer and costs nothing.
-    #[test]
     fn a_package_with_no_sink_answers_none() {
         assert_eq!(
             sink_of(&LaunchPackage::default()).expect("no sink is not an error"),
@@ -779,9 +638,6 @@ mod tests {
         );
     }
 
-    /// A slot is pinned by a live bind and reclaimed by a release; a full
-    /// table refuses by name rather than evicting.
-    #[test]
     fn the_residency_pins_releases_and_refuses_by_name() {
         let mut slots = Slots::new(2);
         let first = slots.acquire(Key::Instance(1)).expect("a free slot");
@@ -790,7 +646,6 @@ mod tests {
         assert_ne!(first.slot, second.slot, "two instances are two slots");
         let why = slots.acquire(Key::Instance(3)).expect_err("both are pinned");
         assert!(why.to_string().contains('2'), "names the capacity: {why}");
-        // The same key comes back to its own slot without seating a new one.
         let again = slots.acquire(Key::Instance(1)).expect("its own slot");
         assert_eq!(again.slot, first.slot);
         assert!(!again.fresh, "a held key does not re-land");
@@ -802,7 +657,6 @@ mod tests {
         assert_eq!(reused.slot, first.slot, "the lowest free slot is taken");
     }
 
-    /// One stamp, built by hand so this pin needs no filesystem.
     fn stamp(at: &str, bytes: u64) -> crate::blob::Stamp {
         crate::blob::Stamp {
             at: at.to_string(),
@@ -810,9 +664,6 @@ mod tests {
         }
     }
 
-    /// N instances of one blob occupy one slot; a private adapter shares
-    /// with nobody.
-    #[test]
     fn one_blob_is_one_slot_however_many_instances_name_it() {
         let mut slots = Slots::new(2);
         let alice = Key::Shared(stamp("/mnt/alice-v2", 128));
@@ -830,14 +681,12 @@ mod tests {
         assert_ne!(private.slot, first.slot);
         assert!(private.fresh);
 
-        // A rewritten file is a new identity, and the table is full.
         let rewritten = Key::Shared(stamp("/mnt/alice-v2", 129));
         let why = slots
             .acquire(rewritten)
             .expect_err("a new identity wants a seat and both are pinned");
         assert!(why.to_string().contains('2'), "names the capacity: {why}");
 
-        // Three binds hold the shared slot, so it takes three releases.
         slots.release(&alice);
         slots.release(&alice);
         assert_eq!(slots.live(), 2, "two holds are gone and one remains");
@@ -849,8 +698,6 @@ mod tests {
         assert_eq!(after.slot, first.slot);
     }
 
-    /// An abandoned acquire holds nothing.
-    #[test]
     fn an_abandoned_acquire_leaves_the_slot_free() {
         let mut slots = Slots::new(1);
         let grant = slots.acquire(Key::Instance(7)).expect("the only slot");

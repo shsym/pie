@@ -16,13 +16,10 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// A lane whose rows routed to a registered adapter; the zero-row class
-    /// lets `engine::fire::walk` skip the correction entirely.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
 
-    /// Lanes that want the draft head run over their rows.
     pub fn drafts() -> Predicate {
         Predicate::fact(2)
     }
@@ -51,20 +48,16 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            // Cached row width is `kv_down`'s output width (the MLA latent, `at.kv_down.dim(0)`), not `heads * head_dim`.
             c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)]);
             if let Some(p) = &at.pool {
                 let pool = c.kv_space(self.kv);
                 c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
             }
-            // Indexer cache: one `index_head_dim`-wide row per cell, written only at boundary cells since index keys are pooled per block, not per token.
             if let Some(ix) = &at.indexer {
                 let index = c.kv_space(self.kv);
                 c.kv(index, ix.keys.clone(), [ix.head_dim as u64]);
             }
         }
-        // The draft head's kv row: the same latent width as a trunk layer's,
-        // in the trunk's page-id space — it attends the same sequence.
         if let Some(mtp) = &self.mtp {
             c.kv(
                 kv,
@@ -80,7 +73,6 @@ impl ForwardHybrid for Model {
         let hy = &m.hyper;
 
         let positions = inputs.positions();
-        // Built off the whole inputs, not one class's arm, so no reader falls outside its guard.
         let kv_heads = kv_heads(m);
         let plan_p =
             ops::attn::plan_prefill(&inputs, m.heads, kv_heads, m.head_dim, Some(m.window));
@@ -105,11 +97,6 @@ impl ForwardHybrid for Model {
             );
         }
 
-        // **THE TRUNK COLLAPSE.** Flash folds its `M` streams under `M`
-        // learned sigmoid gates (`hc_head`: `rmsnorm(streams) · hc_head.fn^T`
-        // scaled and based, sigmoid, `+ hc_eps`, weighted sum — no post, no
-        // combiner, no Sinkhorn); the toy, which ships no trunk plane, sums
-        // them.
         let y = match &m.hc_head {
             Some(hc) => {
                 let normed = ops::elemwise::hc_rmsnorm_f32(&streams, hy.norm_eps);
@@ -134,20 +121,11 @@ impl ForwardHybrid for Model {
             }
         };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
-        // Flash ships a distinct `lm_head`; the toy ties the embedding.
         let logits = match &m.head {
             Some(head) => ops::linear::lm_head(&x, head),
             None => ops::linear::lm_head(&x, &m.embed),
         };
 
-        // **THE DRAFT HEAD**, over the draft window's rows, off the trunk's
-        // STREAMS before the collapse (the official `MTPBlock.forward` takes
-        // the residual, not the readout): each stream is normed and projected
-        // by `h_proj`, the next token's embedding is normed, projected by
-        // `e_proj` and added to every stream, one block runs, and the head's
-        // own hyper head and norm read out through the base `lm_head`. Row
-        // alignment is the runtime's: lane row `r` carries the token one
-        // position past the streams the trunk leaves at `r`.
         if let (Some(mtp), Some(head)) = (&m.mtp, &m.head) {
             let (input_mtp, _) = inputs.split(&Facts::drafts());
             let plan_mtp =
@@ -156,12 +134,6 @@ impl ForwardHybrid for Model {
             let (dpos, _) = positions.split(&Facts::drafts());
             let (dlogits, _) = logits.split(&Facts::drafts());
 
-            // **THE HEAD'S TOKEN IS THE TRUNK'S ARGMAX.** The module is
-            // trained on `(streams_i, t_{i+1}) → t_{i+2}`, and inside a
-            // verify fire the only `t_{i+1}` a row can name is the token the
-            // trunk just chose there — which is also what the verifier reads
-            // (`reduce_argmax`), so the chain at the row it accepts is the
-            // chain that continues its next window.
             let mut token = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dstreams;
             let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
@@ -175,22 +147,11 @@ impl ForwardHybrid for Model {
                 let h = ops::linear::matmul_grouped(&h, &mtp.h_proj, &routes, hy.streams);
                 let fused = ops::elemwise::residual_add(&e, &h);
 
-                // Step 0 is the module as trained and writes its cache row;
-                // every later step is the same module chained on its own
-                // streams and its own argmax, attending READ-ONLY over the
-                // prefix at the row's own position: it appends no key, so
-                // the true row step 0 wrote stays, and it sees the prefix
-                // up to that row rather than its own chain — the
-                // approximation this depth buys its extra tokens with.
                 let out = layer(
                     m,
                     &input_mtp,
                     &plan_mtp,
                     &dpos,
-                    // Unsplit, as the trunk hands it: the correction inside
-                    // splits its own operands on the adapter fact, and a
-                    // routes column already cut on the draft fact would be a
-                    // second arm.
                     &adapter_routes,
                     &mtp.block,
                     None,
@@ -217,8 +178,6 @@ impl ForwardHybrid for Model {
                 hidden = out;
                 chain.push(draft);
             }
-            // The token plane: every step's argmax side by side, `[rows,
-            // depth]`, what `mtp_drafts` reads.
             let steps: Vec<&Value> = chain.iter().collect();
             seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
@@ -227,10 +186,6 @@ impl ForwardHybrid for Model {
     }
 }
 
-/// **ONE FLASH BLOCK OVER THE STREAMS**: the attention sublayer and the MoE
-/// sublayer, each gated in and folded back under its own hyper mix. The
-/// trunk runs it forty-three times over the fire's rows; the draft head runs
-/// it once, over the draft window's rows, against its own cache row.
 #[allow(clippy::too_many_arguments)]
 fn layer(
     m: &Model,
@@ -242,8 +197,6 @@ fn layer(
     next: Option<&super::model::Layer>,
     streams: &Value,
     ids: &Value,
-    // Read-only: a draft chain step attends over what the caches hold and
-    // appends nothing — no key, no compressed entry, no index key.
     chain: bool,
 ) -> Value {
     let hy = &m.hyper;
@@ -255,7 +208,6 @@ fn layer(
     let write_offset = inputs.write_offset(&at.kv);
 
     let (x, post_mix, comb_mix) = gate(streams, &w.attn_mix, hy);
-    // Flash carries a per-sublayer pre-norm beside the hyper mix.
     let x = match &w.attn_norm {
         Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
         None => x,
@@ -306,8 +258,6 @@ fn layer(
 
     let (o, lse) = match &at.pool {
         Some(p) => {
-            // wkv/wgate are `coff * head_dim` wide (the state's row pitch); pool_state_write scatters them
-            // into the source cache's cell so a later boundary can reach back past this fire.
             let ape = p.compressor.as_ref().map(|c| {
                 if !chain {
                     let state_kv = ops::linear::matmul(&x, &c.wkv);
@@ -333,7 +283,6 @@ fn layer(
             let (bpos, breq, brope) = boundaries(pos, &row_valid, p.ratio);
             let pooled =
                 ops::attn::pool_gather(&bpos, &breq, pages, ape, m.head_dim, p.ratio, m.act);
-            // Ropes at the compressed row's position (`brope`, block's first token), not `pos` (block's last token on a boundary row).
             let pooled = match &p.compressor {
                 Some(c) => ops::elemwise::rmsnorm(&pooled, &c.norm, c.norm_eps),
                 None => pooled,
@@ -358,7 +307,6 @@ fn layer(
                     &entry_offset,
                 );
             }
-            // Scores this layer's compressed rows and selects the top-`index_topk` for the pooled reader; the sliding window is fixed, only the compressed set grows with context.
             let selection = at.indexer.as_ref().map(|ix| {
                 indexer(
                     &x,
@@ -404,11 +352,6 @@ fn layer(
         None => (o, lse),
     };
     let o = ops::attn::sink(&o, &lse, &at.sink, m.head_dim);
-    // **THE VALUE CARRIED THE KEY'S ROPE, AND IT COMES BACK OUT.**
-    // MLA's cached latent is both key and value, so the rope lanes
-    // of every attended row arrive rotated by that row's position and
-    // the output is un-rotated at the query's own (`apply_rotary_emb(
-    // o[..., -rd:], freqs_cis, True)`, the official `Attention.forward`).
     let o = ops::elemwise::rope_partial_last_yarn(
         &o,
         pos,
@@ -421,8 +364,6 @@ fn layer(
     );
     seam::at(seam::ATTN_OUT, &[&o]);
 
-    // The o-projection: on flash `wo_a` is `[o_groups · o_lora, heads · head_dim / o_groups]` and
-    // each slice of the head plane projects through its own band (the official `einsum("bsgd,grd->bsgr")`).
     let o = if at.o_groups > 1 {
         let routes = ops::linear::group_routes(&o, at.o_groups);
         ops::linear::matmul_grouped(&o, &at.o_down, &routes, at.o_groups)
@@ -456,12 +397,8 @@ fn layer(
     ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix)
 }
 
-/// How many experts a route prediction ranks: the tier scores its top 6, 8, 12 and 16 against the router's true six.
 const PREDICT_K: u32 = 16;
 
-/// The route prediction for the next layer: `next`'s mlp gate, norm and router applied to `streams` after this
-/// layer's attention fold and before its experts land. The streamed tier reads it at this layer's segment cut.
-/// `None` where `next` routes by table or by nothing.
 fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper) -> Option<Value> {
     let next = next?;
     let Mlp::MoeFlash {
@@ -484,7 +421,6 @@ fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper)
     ))
 }
 
-/// `ids` is the token-id column; only the flash MoE hash gate reads it (a lookup keyed by token id, not by `x`).
 fn mlp(
     x: &Value,
     ids: &Value,
@@ -545,9 +481,6 @@ fn mlp(
             renorm,
             scaling,
         } => {
-            // `noaux_tc` bias layers rank the sqrt-softplus scores plus a correction bias. Hash layers CHOOSE via
-            // `ffn.gate.tid2eid`, a `[vocab, top_k]` token-id lookup, but their weights are still the gate's scores
-            // at the chosen experts (the official `Gate.forward`), so the router is read on every layer.
             let (routes, weights) = match gate {
                 Gate::Bias { bias } => {
                     let hint = predict_next(streams, next, hy);
@@ -583,7 +516,6 @@ fn mlp(
                 ),
                 shared_down,
             );
-            // Which routed op runs depends on the bank's declared dtype (bf16 vs. quantized).
             let select = |act: &Value, bank: &Weight| {
                 if matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
                     ops::linear::moe_matmul_select(act, bank, &routes, *top_k)
@@ -591,8 +523,6 @@ fn mlp(
                     ops::linear::moe_matmul_select_quant(act, bank, &routes, *top_k)
                 }
             };
-            // Fused bank: one routed matmul over the packed activation. Split pair: two routed matmuls, one per
-            // plane, then combined — needed when the two halves use different quantization points.
             let act = match gate_up {
                 GateUp::Fused(bank) => {
                     ops::linear::mlp_swiglu_clamp(&select(x, bank), *inter, *limit)
@@ -607,8 +537,6 @@ fn mlp(
     }
 }
 
-/// kv head count, derived from the cached row width over the head width. The toy caches a full
-/// `[heads, head_dim]` plane (answer: `heads`); flash caches the MLA latent, one shared entry per token (answer: 1).
 fn kv_heads(m: &Model) -> u32 {
     let Some(w) = m.layers.first() else {
         return m.heads;
@@ -623,8 +551,6 @@ fn kv_heads(m: &Model) -> u32 {
     u32::try_from(row / head).expect("a head count inside u32")
 }
 
-/// The indexer's keys come from its own compressor, one pooled entry per `ratio` tokens; the selected reader narrows only the compressed branch.
-/// Scoring: `I(t, s) = sum_h w_h * relu(q_h . k_s)`; the query is `wq_b * q_a` off the same normed q-lora the main q-up reads.
 #[allow(clippy::too_many_arguments)]
 fn indexer(
     x: &Value,
@@ -641,7 +567,6 @@ fn indexer(
     chain: bool,
 ) -> Value {
     let c = &ix.compressor;
-    // Pooling ratio from the indexer's own `ape`, matching the blocks the attention compressor pools.
     let ratio = c.ape.dim(0);
     let ratio = u32::try_from(ratio).expect("a pooling ratio inside u32");
 
@@ -668,7 +593,6 @@ fn indexer(
         act,
     );
     let k = ops::elemwise::rmsnorm(&k, &c.norm, c.norm_eps);
-    // The key ropes at the compressed row's position (`boundary_rope`, block's first token); the query below ropes at its own per-token position.
     let k = ops::elemwise::rope_partial_last_yarn(
         &k,
         boundary_rope,
@@ -705,7 +629,6 @@ fn indexer(
     ops::attn::index_topk(&q, &weights, keys, ix.heads, ix.head_dim, ix.top_k, ratio)
 }
 
-/// `hc_gates` splits a `2M + M^2` row into pre weights, post weights, and the Sinkhorn combiner, from `rmsnorm(streams) * hc_fn^T` (projected by `hc_project` when a `fn` plane exists).
 fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
@@ -724,8 +647,6 @@ fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     )
 }
 
-/// The three boundary columns, decode and prefill merged: the cell each pooled entry is cached at, its lane, and the compressed row's rope position.
-/// Cache cell is `(c + 1) * ratio - 1` (window close); rope position is the block start `c * ratio` — the two differ.
 fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
     let (one, many) = positions.split(&Facts::qo_one());
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);

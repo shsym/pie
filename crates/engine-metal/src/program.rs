@@ -1,7 +1,3 @@
-//! The guest-program plane, Metal half: ETA at the model fire's boundary
-//! (prologue/epilogue, never mid-graph). `compile.rs`, `launch.rs` and
-//! `session.rs` own compilation, device rings, and instance lifetime.
-
 pub mod compile;
 pub mod launch;
 pub mod ports;
@@ -26,56 +22,34 @@ pub use ports::Envelope;
 pub use session::{Blocked, Fired, Launched, Session, seeds_of};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
-/// One registered program: what the host planned, and what compiled from it.
 #[derive(Debug)]
 pub struct Program {
-    /// The plane's own handle for it.
     pub id: u64,
-    /// The host's content hash a re-registration is recognised by.
     pub hash: u64,
-    /// The adopted launch package: channel decls, stages, and derived
-    /// per-stage value indexes.
     pub plan: ExecPlan,
-    /// The compiled regions, one table per stage.
     pub compiled: Compiled,
 }
 
-/// The shell's guest-program plane: compile cache, registered programs,
-/// and bound instances. Needs only a bound [`Context`] — no weights, no
-/// arena, no `CompiledModel`.
 #[derive(Debug)]
 pub struct Plane {
     cache: Cache,
-    /// Compiled pipelines every stage's regions are encoded with, owned
-    /// by the plane (unlike CUDA's `CUfunction`) so guest and model
-    /// shaders share one compile-once cache.
     pipelines: crate::device::Pipelines,
     programs: BTreeMap<u64, Program>,
     by_hash: BTreeMap<u64, u64>,
     instances: BTreeMap<u64, Bound>,
-    /// Device-only rings keyed by the caller's channel id (a program
-    /// names channels by dense slot, which differs per instance). Only
-    /// `HostRole::None` channels are here.
     channels: BTreeMap<u64, Arc<SharedRing>>,
-    /// One [`launch::Batch`] per (program, stage, key): the shared lane
-    /// table and scratch pool the program's instances launch a stage through
-    /// together. Grown on demand, kept for the program's life.
     batches: BTreeMap<(u64, usize, launch::BatchKey), launch::Batch>,
     next_program: u64,
     next_instance: u64,
 }
 
 impl Default for Plane {
-    /// A plane with an empty compile cache; unlike CUDA there is no cubin
-    /// directory (a compiled MSL library never leaves the process).
     fn default() -> Plane {
         Plane::new()
     }
 }
 
 impl Plane {
-    /// An empty plane; unlike CUDA's `Disk`, this half has no persistent
-    /// cache tier.
     #[must_use]
     pub fn new() -> Plane {
         Plane {
@@ -91,22 +65,11 @@ impl Plane {
         }
     }
 
-    /// What the compile tiers have been doing.
     #[must_use]
     pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
     }
 
-    /// Adopt a registration and compile its regions, answering the
-    /// program id. A program already registered under the same hash
-    /// answers its existing id and compiles nothing. Uses
-    /// [`eta_exec::Boundaries::METAL`].
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Fire`] when the package is not adoptable, [`Fault::Compile`]
-    /// when a region does not compile here — a deterministic refusal is
-    /// remembered, a retryable one is not.
     pub fn register(
         &mut self,
         context: &Context,
@@ -140,23 +103,11 @@ impl Plane {
         Ok(id)
     }
 
-    /// What was registered under `id`.
     #[must_use]
     pub fn program(&self, id: u64) -> Option<&Program> {
         self.programs.get(&id)
     }
 
-    /// Bind an instance of `program_id`: allocate its rings, carve every
-    /// stage's fire-path buffers, and seed the guest-seeded channels.
-    /// `channels` names this instance's channels by global id in
-    /// declaration order; a slot naming a registered channel adopts its
-    /// shared ring, every other slot gets its own cut.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown program, a bad seed, or a shared
-    /// ring past its [`MAX_ATTACHMENTS`] seats or wrong geometry; and
-    /// whatever the allocations said.
     pub fn bind(
         &mut self,
         context: &Context,
@@ -181,7 +132,6 @@ impl Plane {
         ) {
             Ok(session) => session,
             Err(why) => {
-                // An instance that did not bind holds no seat.
                 release_seats(&adopted);
                 return Err(why);
             }
@@ -195,20 +145,12 @@ impl Plane {
                 session,
                 geometry,
                 shared: adopted,
+                ids: channels.to_vec(),
             },
         );
         Ok(id)
     }
 
-    /// Cut the one ring a device-only channel owns, keyed by the
-    /// caller's id. Every instance naming this id attaches to the same
-    /// [`SharedRing`] rather than carving a copy; a second registration
-    /// of the same id is refused.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an id already registered, and whatever the
-    /// reservation said.
     pub fn register_channel(
         &mut self,
         context: &Context,
@@ -230,23 +172,50 @@ impl Plane {
         Ok(())
     }
 
-    /// Forget channel `id`'s registration. The ring itself is an `Arc`
-    /// every attached instance also holds, freed only when the last
-    /// holder drops. Answers whether there was one.
     pub fn close_channel(&mut self, id: u64) -> bool {
         self.channels.remove(&id).is_some()
     }
 
-    /// The ring registered under `id`, if any — what a fire reads a lane's
-    /// channel-fed input off.
     #[must_use]
     pub fn channel(&self, id: u64) -> Option<&Arc<SharedRing>> {
         self.channels.get(&id)
     }
 
-    /// Which other instances share a ring with one of `instances` — the
-    /// set a fence must widen to, since a shared ring's counters advance
-    /// a frame after the fire that moved them.
+    pub fn feed_cell(
+        &self,
+        instance: u64,
+        id: u64,
+    ) -> Result<(&crate::device::Buffer, u64, u64, eta_ir::Dtype)> {
+        let bound = self.instances.get(&instance).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("float-port feed of unbound instance {instance}"),
+            )
+        })?;
+        let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "float-port feed names channel {id}, which instance {instance} does \
+                     not carry"
+                ),
+            )
+        })?;
+        bound
+            .session
+            .feed_cell(dense as u32)?
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!(
+                        "float-port feed channel {id} of instance {instance} holds no \
+                         committed cell; a port is fed from the cell the instance's own \
+                         `take` would read this fire, so publish one before submitting"
+                    ),
+                )
+            })
+    }
+
     #[must_use]
     pub fn cohort(&self, instances: &[u64]) -> Vec<u64> {
         let held: Vec<&Arc<SharedRing>> = instances
@@ -262,7 +231,6 @@ impl Plane {
             if instances.contains(id) {
                 continue;
             }
-            // Identity, not equality: same allocation, via `Arc::ptr_eq`.
             if bound.shared.iter().flatten().any(|mine| {
                 held.iter().any(|theirs| Arc::ptr_eq(mine, theirs))
             }) {
@@ -272,9 +240,6 @@ impl Plane {
         cohort
     }
 
-    /// Take one seat on every shared ring this binding names, in the
-    /// program's dense channel order. A refusal gives back the seats
-    /// taken before it.
     fn seats_for(
         &self,
         plan: &ExecPlan,
@@ -283,8 +248,6 @@ impl Plane {
         let mut adopted: Vec<Option<Arc<SharedRing>>> =
             Vec::with_capacity(plan.package.channels.len());
         for dense in 0..plan.package.channels.len() {
-            // A channel this plane never registered gets `None` — its ring
-            // is cut inside the session instead.
             let Some(ring) = channels.get(dense).and_then(|id| self.channels.get(id)) else {
                 adopted.push(None);
                 continue;
@@ -298,14 +261,6 @@ impl Plane {
         Ok(adopted)
     }
 
-    /// What instance `id`'s descriptor ports resolve to right now, or
-    /// `None` when its class says the host resolves them. The class
-    /// decides which of the nine ports are read (`ports::resolves`).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance, one whose program is
-    /// gone, and whatever [`ports::resolve`] said.
     pub fn envelope(&self, id: u64) -> Result<Option<Envelope>> {
         let bound = self
             .instances
@@ -329,31 +284,20 @@ impl Plane {
             .map(Some)
     }
 
-    /// The class instance `id` was bound in.
     #[must_use]
     pub fn geometry_of(&self, id: u64) -> Option<GeometryClass> {
         self.instances.get(&id).map(|bound| bound.geometry)
     }
 
-    /// One instance's rings and cursors, for publishing into and taking out of.
     #[must_use]
     pub fn instance(&self, id: u64) -> Option<&Session> {
         self.instances.get(&id).map(|bound| &bound.session)
     }
 
-    /// One instance, mutably.
     pub fn instance_mut(&mut self, id: u64) -> Option<&mut Session> {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
-    /// Point one intrinsic of instance `id` at a device buffer — e.g. a
-    /// program reading `IntrinsicId::Logits` is pointed at a model
-    /// fire's readout buffer. `width`/`dtype` are checked, not obeyed.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance, and whatever the
-    /// session's own bind said about the rectangle.
     pub fn bind_intrinsic(
         &mut self,
         id: u64,
@@ -370,15 +314,6 @@ impl Plane {
             .bind_intrinsic(intrinsic, base, offset, width, dtype)
     }
 
-    /// The first channel of instance `id` whose declared requirement a
-    /// fire right now would not meet, or `None` when ready. Asked before
-    /// launch, since an epilogue attachment fires after the forward has
-    /// already written the lane's KV.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance, or one whose program
-    /// is gone.
     pub fn ready(&self, id: u64) -> Result<Option<session::Blocked>> {
         let bound = self
             .instances
@@ -396,17 +331,7 @@ impl Plane {
         Ok(bound.session.readiness(&program.plan))
     }
 
-    /// Fire instance `id` once: readiness, then every stage's regions,
-    /// then one commit.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance, and whatever the
-    /// launches said. A blocked or refused program is a [`Fired`], not
-    /// an error.
     pub fn fire(&mut self, context: &Context, id: u64) -> Result<Fired> {
-        // Looked up through the instance's own record, so a caller can't
-        // fire one program against another's rings.
         let bound = self
             .instances
             .get_mut(&id)
@@ -425,14 +350,6 @@ impl Plane {
             .fire(context, &self.pipelines, &program.compiled, &program.plan)
     }
 
-    /// Encode instance `id`'s whole pass into a command buffer someone
-    /// else owns, without committing it — the attached spelling of
-    /// [`Plane::fire`].
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance or one with a pass
-    /// already airborne, and whatever the encode said.
     pub fn stage_into(&mut self, frame: &Frame, id: u64) -> Result<Launched> {
         let bound = self
             .instances
@@ -452,26 +369,6 @@ impl Plane {
             .stage_into(frame, &program.compiled, &program.plan)
     }
 
-    /// Read the verdict of instance `id`'s airborne pass and commit its
-    /// cursors. The caller owes proof the command buffer landed (see
-    /// [`Session::settle_launched`]).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance or one whose program is
-    /// gone, and whatever the status reads said.
-    /// Stage every instance in `ids` into `frame` — the batched twin of
-    /// [`Plane::stage_into`]. Each instance is gated and its cells resolved
-    /// alone; then, per program and per stage, the instances that share a
-    /// [`launch::BatchKey`] are laid into one [`launch::Batch`] and each
-    /// region is encoded once for all of them. Answers one [`Launched`] per
-    /// id, in order. If any instance is refused, nothing is encoded and the
-    /// airborne ones are left marked for the caller to abandon, exactly as
-    /// a refusal mid-loop left them before.
-    ///
-    /// # Errors
-    ///
-    /// As [`Plane::stage_into`], plus a batch whose members disagree.
     pub fn stage_batched(
         &mut self,
         device: &Context,
@@ -523,19 +420,12 @@ impl Plane {
                 if stage.regions.is_empty() {
                     continue;
                 }
-                // Each member's tables for this stage, grouped by what the
-                // grouped kernel strides by. `iter_mut` hands out disjoint
-                // borrows; the member order inside a group is the id order.
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
                     BTreeMap::new();
                 for (id, bound) in self.instances.iter_mut() {
                     if !members.contains(id) {
                         continue;
                     }
-                    // An instance on a shared ring is ordered against the
-                    // ring's other attachments by the FIFO they fire in, and a
-                    // batch would run it beside them in one dispatch: it
-                    // launches alone, as every instance did before batches.
                     let shares = bound
                         .shared
                         .iter()
@@ -549,8 +439,6 @@ impl Plane {
                 }
                 for (key, mut group) in groups {
                     let Some(key) = key else {
-                        // No grouped seat, or a shared ring: this stage runs on
-                        // the instance's own tables, one at a time, as it always did.
                         for prepared in group {
                             #[cfg(target_vendor = "apple")]
                             prepared.zero_scratch_on(frame)?;
@@ -604,19 +492,12 @@ impl Plane {
         bound.session.settle_launched(&program.plan)
     }
 
-    /// Drop instance `id`'s airborne mark without reading a verdict, for
-    /// a staging whose command buffer will not be committed. No-op for
-    /// an instance this plane does not carry.
-    ///
-    /// See [`Session::abandon_launched`] for what the caller owes.
     pub fn abandon_launched(&mut self, id: u64) {
         if let Some(bound) = self.instances.get_mut(&id) {
             bound.session.abandon_launched();
         }
     }
 
-    /// Whether instance `id` has a pass in a command buffer that has not been
-    /// settled. `false` for an instance this plane does not carry.
     #[must_use]
     pub fn is_airborne(&self, id: u64) -> bool {
         self.instances
@@ -624,14 +505,37 @@ impl Plane {
             .is_some_and(|bound| bound.session.is_airborne())
     }
 
-    /// Whether instance `id`'s program reads the draft column. A load
-    /// whose model text declares no draft head has none to point at;
-    /// `serve::prepare` refuses such an attachment by name.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance, or one whose program
-    /// is gone.
+    pub fn needs_pixels(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} names program {}, which is gone", bound.program_id),
+            )
+        })?;
+        Ok(program.plan.needs_pixels)
+    }
+
+    pub fn needs_logits(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
+            )
+        })?;
+        Ok(program.plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits))
+    }
+
     pub fn needs_mtp_logits(&self, id: u64) -> Result<bool> {
         let bound = self
             .instances
@@ -649,12 +553,6 @@ impl Plane {
         Ok(program.plan.needs_mtp_logits)
     }
 
-    /// Whether instance `id`'s program reads the `mtp_drafts` intrinsic —
-    /// the token plane, bound at its own rectangle beside the logits.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown instance or a program that is gone.
     pub fn needs_mtp_drafts(&self, id: u64) -> Result<bool> {
         let bound = self
             .instances
@@ -672,13 +570,6 @@ impl Plane {
         Ok(program.plan.needs_mtp_drafts)
     }
 
-    /// Whether instance `id`'s program reads the `attn_score` intrinsic.
-    /// [`Plane::needs_mtp_logits`]'s twin.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an instance this plane does not carry, or
-    /// one whose program is gone.
     pub fn needs_attn_scores(&self, id: u64) -> Result<bool> {
         let bound = self
             .instances
@@ -696,8 +587,6 @@ impl Plane {
         Ok(program.plan.needs_attn_scores)
     }
 
-    /// How many score planes instance `id` declared, or `None` for one
-    /// that reads no score rectangle.
     #[must_use]
     pub fn declared_score_planes(&self, id: u64) -> Option<u32> {
         let bound = self.instances.get(&id)?;
@@ -712,31 +601,15 @@ impl Plane {
             .max()
     }
 
-    /// Drop instance `id`, freeing its rings and its stage buffers.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when there is no such instance — closing twice is a
-    /// caller's bug, not a no-op.
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
         let bound = self
             .instances
             .remove(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        // Seats go back; the rings do not necessarily go with them.
         release_seats(&bound.shared);
         Ok(())
     }
 
-    /// Drop program `id`, dropping this plane's share of its libraries.
-    /// Advisory, not protective (Metal has no unload verb; ARC keeps a
-    /// bound [`Session`]'s [`Compiled`] alive), but stays since a caller
-    /// closing a program with instances still bound has lost track of them.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when there is no such program, or instances
-    /// are still bound to it.
     pub fn close_program(&mut self, id: u64) -> Result<()> {
         let program = self
             .programs
@@ -765,24 +638,15 @@ impl Plane {
     }
 }
 
-/// One bound instance and the program it is an instance of; a struct
-/// (not two maps) so an instance can't be fired against the wrong plan.
 #[derive(Debug)]
 struct Bound {
     program_id: u64,
     session: Session,
-    /// How much of the fire geometry this instance's descriptor resolves
-    /// on the device — kept for [`Plane::envelope`] to gate on.
     geometry: GeometryClass,
-    /// This instance's share of every ring belonging to a channel, dense
-    /// declaration order, `None` for a channel with its own ring. Lets
-    /// closing give seats back and [`Plane::cohort`] find who else moves
-    /// a ring this instance reads.
     shared: Vec<Option<Arc<SharedRing>>>,
+    ids: Vec<u64>,
 }
 
-/// Give back every seat this instance's channels hold — the inverse of
-/// `attach` in [`Plane::seats_for`].
 fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
     for ring in shared.iter().flatten() {
         ring.detach();

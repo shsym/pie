@@ -1,31 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// **THE GATHER THAT INTERPOLATES** — the Metal mirror of `kernels-cuda`'s
-/// `::pie::layout::embed_weighted` (`.wiki/alto/multimodal.md` §9.2).
-///
-/// `y[r] = sum over t of weights[r, t] * table[ids[r, t]]`, one thread per
-/// output element: `tid.x` the column of the gathered row, `tid.y` the row.
-///
-/// The vision towers store one learned position grid at `num_grid_per_side^2`
-/// and resample it to each image's own grid; upstream writes that as
-/// `(pos_embed(interp_indices) * interp_weights[:, :, None]).sum(1)` over
-/// `[patches, taps]` indices and weights, which is this expression with the
-/// sum moved inside. Four taps for bilinear, sixteen for bicubic — read off
-/// the operand rather than stated, because the operand carries it. gemma's
-/// separable table is read at TWO taps with weights of one, which is the same
-/// expression at `taps == 2`.
-///
-/// **THE ACCUMULATION IS f32 AND THE WEIGHTS ARRIVE f32.** Upstream
-/// multiplies a float weight into a float-promoted embedding and sums; a bf16
-/// running sum over four taps would round four times, and a bf16 WEIGHT would
-/// move the resample by more than the gather it feeds. Only the write is in
-/// the model element.
-///
-/// **OUT-OF-RANGE IDS CLAMP TO ROW ZERO**, which is `embed.metal`'s own rule
-/// one file over: a gather with an index it cannot honour reads a defined row
-/// rather than an address, and the vector was checked host-side before the
-/// launch.
 template <typename T>
 [[kernel]] void embed_weighted(
     const device int* ids       [[buffer(0)]],

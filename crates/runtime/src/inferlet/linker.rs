@@ -1,7 +1,3 @@
-//! Linker service: singleton service owning the pre-configured wasmtime Engine, three immutable base-linker variants, and generation-keyed `InstancePre`s.
-//! Dynamic dependencies clone the appropriate base before adding store-bound definitions; no-dependency programs share a single-flight `InstancePre`.
-//! Instantiations run concurrently: the actor is only the spawn point, each Instantiate message spawns an independent task over the shared Engine. Base-linker and `InstancePre` cells are shared behind short-held map mutexes; expensive construction is single-flight and happens outside those mutexes.
-
 pub(super) mod dynamic;
 
 use std::collections::{HashMap, hash_map::Entry};
@@ -20,11 +16,8 @@ use super::program::{self, InstalledComponent, ProgramName};
 use super::python::runtime as py_runtime;
 use super::sandbox::{FsPolicy, InstancePolicy, NetworkPolicy};
 
-// ---- Singleton Actor --------------------------------------------------------
-
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the linker service with the given engine.
 pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy) {
     let policy = InstancePolicy { fs, network };
     SERVICE
@@ -32,9 +25,6 @@ pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy) {
         .expect("linker already spawned");
 }
 
-// ---- Public API (message wrappers) ------------------------------------------
-
-/// Link and instantiate a program with its dependencies.
 pub async fn instantiate(
     process_id: ProcessId,
     username: String,
@@ -57,8 +47,6 @@ pub(crate) fn invalidate(program_name: &ProgramName) {
         program_name: program_name.clone(),
     });
 }
-
-// ---- State ------------------------------------------------------------------
 
 type InstancePreKey = (ProgramName, u64);
 type InstancePreCell = Arc<OnceCell<InstancePre<ProcessCtx>>>;
@@ -119,7 +107,6 @@ impl Linker {
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
         wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
 
-        // wasm32-wasip3 std still imports the rc-versioned insecure-seed name.
         {
             let mut root = linker.root();
             let mut random = root
@@ -134,8 +121,6 @@ impl Linker {
                 .expect("Failed to shim get-insecure-seed");
         }
 
-        // p3 HTTP is always linked and enforces policy through ProcessCtx. The
-        // legacy p2 HTTP surface must be absent when networking is denied.
         if policy.network.allow {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");
@@ -143,7 +128,6 @@ impl Linker {
 
         host::add_to_linker(&mut linker)?;
 
-        // full_modules/stripped_modules are process-global, compiled once from the runtime directory at bootstrap.
         for (name, module) in variant.shared_modules() {
             linker.root().module(name, module).unwrap_or_else(|error| {
                 panic!("Failed to register shared module '{name}': {error}")
@@ -222,7 +206,6 @@ impl Linker {
         let component = main.component;
         let cacheable_instance_pre = dependency_components.is_empty();
 
-        // stripped shared modules when snapshotted (their data/start sections are baked into the image), full modules otherwise so CPython can initialize normally.
         let linker_variant = LinkerVariant::for_program(python_runtime.is_some(), any_snapshotted);
         let py_runtime_dir_for_ctx = python_runtime.is_some().then(py_runtime::dir).flatten();
 
@@ -236,7 +219,6 @@ impl Linker {
         .await?;
         let mut store = Store::new(&engine, process_ctx);
 
-        // lazy, single-flight per variant.
         let base_linker =
             Self::base_linker(&engine, &policy, &base_linker_cache, linker_variant).await?;
 
@@ -272,7 +254,6 @@ impl Linker {
         Ok((store, instance))
     }
 
-    /// Resolve dependency components and reconcile the python-runtime version declared across the main program and its dependencies; also tracks whether any is snapshotted. Errs on conflicting python-runtime declarations.
     async fn resolve_dependencies_and_runtime(
         program_name: &ProgramName,
         main: &InstalledComponent,
@@ -320,8 +301,6 @@ impl Linker {
     }
 }
 
-// ---- Messages ---------------------------------------------------------------
-
 enum Message {
     Instantiate {
         process_id: ProcessId,
@@ -347,7 +326,6 @@ impl ServiceHandler for Linker {
                 output,
                 response,
             } => {
-                // spawn, don't await: the actor loop stays a dispatch point.
                 let engine = self.engine.clone();
                 let policy = self.policy.clone();
                 let base_cache = Arc::clone(&self.base_linker_cache);
@@ -376,4 +354,3 @@ impl ServiceHandler for Linker {
         }
     }
 }
-

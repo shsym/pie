@@ -1,15 +1,7 @@
-//! ETA execution planning: the backend-neutral middle end. Given a bound
-//! trace, normalizes each stage, derives its signature, classifies value
-//! domains, partitions the op DAG into regions, and lays out the lane-table
-//! ABI. Entry points are infallible since [`eta_ir::validate::bind`] has
-//! already settled arity, SSA dominance, value-id range and stage ordering.
-
 mod compile;
 pub use compile::{is_row_vector, same_rows, value_rows};
 pub mod lane_table;
 
-// Spelled out rather than `pub use compile::*`, which made every `pub` item
-// under `compile` part of this crate's API whether or not anything used it.
 pub use compile::{
     COMPILER_VERSION, ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex,
     NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind,

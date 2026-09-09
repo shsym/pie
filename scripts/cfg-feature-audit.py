@@ -101,15 +101,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# `feature = "name"` appearing inside a cfg-ish attribute. Both `cfg` and
-# `cfg_attr` are matched; so is the `all(...)`/`any(...)`/`not(...)`
-# nesting, since the inner `feature = "x"` is found by scanning the
-# balanced extent of the outer `cfg(`.
 CFG_OPEN = re.compile(r"\bcfg(?:_attr)?\s*\(")
 FEATURE = re.compile(r'feature\s*=\s*"([^"]*)"')
 LINE_COMMENT = re.compile(r"//[^\n]*")
 BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
-
 
 def strip_comments(src: str) -> str:
     """Blank out comments, preserving byte offsets so spans stay valid.
@@ -119,7 +114,6 @@ def strip_comments(src: str) -> str:
     """
     src = BLOCK_COMMENT.sub(lambda m: " " * len(m.group(0)), src)
     return LINE_COMMENT.sub(lambda m: " " * len(m.group(0)), src)
-
 
 def cfg_spans(src: str) -> list[tuple[int, int]]:
     """The balanced extent of every `cfg(`/`cfg_attr(` in `src`."""
@@ -135,7 +129,6 @@ def cfg_spans(src: str) -> list[tuple[int, int]]:
         spans.append((m.end(), i))
     return spans
 
-
 def features_used(path: Path) -> dict[str, set[Path]]:
     """Feature names named by a `cfg` in `path`, to the files naming them."""
     src = strip_comments(path.read_text(errors="replace"))
@@ -145,7 +138,6 @@ def features_used(path: Path) -> dict[str, set[Path]]:
             used.setdefault(m.group(1), set()).add(path)
     return used
 
-
 def features_declared(manifest: dict) -> set[str]:
     """`[features]` keys plus the implicit feature of each optional dep."""
     declared = set(manifest.get("features", {}))
@@ -154,7 +146,6 @@ def features_declared(manifest: dict) -> set[str]:
             if isinstance(spec, dict) and spec.get("optional"):
                 declared.add(spec.get("package", name))
                 declared.add(name)
-    # Target-specific dependency tables carry optional deps too.
     for target in (manifest.get("target") or {}).values():
         for section in ("dependencies", "dev-dependencies", "build-dependencies"):
             for name, spec in (target.get(section) or {}).items():
@@ -163,33 +154,8 @@ def features_declared(manifest: dict) -> set[str]:
                     declared.add(name)
     return declared
 
-
-# Directories this audit does not descend into.
-#
-# `.claude` is the same exclusion the root `Cargo.toml` carries, and for a
-# harder version of the same reason. That directory holds whole `git
-# worktree` checkouts of THIS repository, one per agent, so a walk that
-# descends finds every manifest in the tree again once per worktree, and
-# the count is a multiple of however many worktrees exist rather than a
-# property of the tree. Measured on the box this was written on: 3,612
-# manifests pruned down to 79, and 5.8 seconds of walking down to 0.01 --
-# before the old code went on to read and TOML-parse all 3,612 and glob
-# `*.rs` beneath each, which is where the wait actually was. It also
-# attributed another checkout's crates to this one. The root manifest
-# excludes the directory so cargo cannot adopt a worktree's packages as
-# members; this excludes it so the audit cannot report a worktree's `cfg`
-# as this tree's, and so it finishes.
-#
-# `target` and `.git` were already filtered, but only AFTER `rglob` had
-# descended into them and produced the paths: the files were skipped and
-# the walk was still paid for. Pruning is where that belongs, and none of
-# the three can hold a manifest this audit is about.
-# A build directory is never source. `target` is cargo's default; a sweep
-# run with `--target-dir target-vk` (or any other name) writes generated
-# crates there too, and those carry `cfg`s for features they never see.
 PRUNE = {".claude", ".git"}
 PRUNE_PREFIX = "target"
-
 
 def manifests() -> list[Path]:
     """Every `Cargo.toml` in the tree, without descending into `PRUNE`."""
@@ -203,7 +169,6 @@ def manifests() -> list[Path]:
         if "Cargo.toml" in files:
             found.append(Path(parent) / "Cargo.toml")
     return sorted(found)
-
 
 def packages() -> list[tuple[str, Path, dict]]:
     """Every manifest in the tree that names a package, root included."""
@@ -219,17 +184,12 @@ def packages() -> list[tuple[str, Path, dict]]:
             found.append((name, manifest_path.parent, manifest))
     return found
 
-
 def main() -> int:
     problems: list[str] = []
     scanned = 0
     found = packages()
     directories = [directory for _, directory, _ in found]
     for name, directory, manifest in found:
-        # The root package lives at the repo root, so a naive walk of its
-        # directory would sweep every crate under `crates/` and attribute
-        # their features to it. A file belongs to the NEAREST enclosing
-        # package, so skip anything inside a nested one.
         nested = [
             other
             for other in directories
@@ -238,10 +198,6 @@ def main() -> int:
         declared = features_declared(manifest)
         used: dict[str, set[Path]] = {}
         for source in sorted(directory.rglob("*.rs")):
-            # The same prune the manifest walk takes, for the same reason: the
-            # root package's directory IS the repo root, so an unpruned rglob
-            # reads every agent worktree under `.claude` and reports another
-            # checkout's crate as this one's dead cfg.
             parts = source.relative_to(directory).parts
             if PRUNE.intersection(parts) or any(
                 part.startswith(PRUNE_PREFIX) for part in parts
@@ -283,7 +239,6 @@ def main() -> int:
         f"every cfg feature is declared."
     )
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

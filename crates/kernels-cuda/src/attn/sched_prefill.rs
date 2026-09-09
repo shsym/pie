@@ -1,9 +1,3 @@
-//! The fa2 prefill work split: tiles the packed query axis, binary-searches
-//! the kv chunk size that fills the grid, and stages the tile/merge index
-//! vectors the prefill kernel and the cascade merge walk. A native
-//! reimplementation of FlashInfer's host planner (see
-//! [`sched`](crate::attn::sched)).
-
 use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, Live, PrefillPlanInfo, Sizes};
@@ -12,29 +6,17 @@ use crate::jit::refuse;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// Host copy of the query indptr — `[batch_size + 1]`.
     pub qo_indptr: &'a [i32],
-    /// Host copy of the kv page indptr — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// The row and lane counts this schedule is carved for: the graph
-    /// shape's tile arithmetic, every allocation, and the padding.
     pub total_num_rows: u32,
     pub batch_size: u32,
-    /// How far in the fire's lane order the `o_indptr` allocation reaches
-    /// ([`plan::Shape::lane_offset`](crate::attn::plan::Shape)); `layout`
-    /// sizes that vector `[lane_offset + batch_size + 1]`.
     pub lane_offset: u32,
-    /// What this fire actually brought ([`Live`]): the ids work items are
-    /// staged under (`live.lane_offset + r`), the row unsplit `o_indptr`
-    /// entries count from (`live.row_offset`), and the live indptr walk.
     pub live: Live,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub page_size: u32,
     pub enable_cuda_graph: bool,
-    /// The sliding extent as the device reads it — `window - 1`, already
-    /// validated by `plan::window_left`; `None` is the full reading.
     pub window_left: Option<u32>,
 }
 
@@ -62,12 +44,6 @@ impl Request<'_> {
     }
 }
 
-/// FlashInfer's CTA tile chooser for the fa2 prefill query axis. Its answer
-/// picks the kernel symbol (`PrefillPlan::cta_tile_q` selects
-/// `NUM_MMA_Q`/`NUM_WARPS_Q`/`NUM_WARPS_KV`), so it must be a function of the
-/// carved row/lane counts, not the fire's live ones. A smaller-than-carved
-/// fire replaying the wider tile costs performance but not correctness:
-/// every tile computes the same attention over the same rows.
 #[must_use]
 const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, cc_major: u32) -> u32 {
     if head_dim >= 512 {
@@ -85,8 +61,6 @@ const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, cc_major: u
     }
 }
 
-/// The smallest kv chunk (in pages) whose work items still fit the grid,
-/// and whether that chunking actually splits anything.
 fn search_kv_chunk_size(
     enable_cuda_graph: bool,
     max_batch_size_if_split: u32,
@@ -116,10 +90,6 @@ fn search_kv_chunk_size(
     (enable_cuda_graph || low < max_kv_len, low)
 }
 
-/// The graph shape's tile and work-item count, at a stated row and lane
-/// count. The graph shape assumes the worst single request: all rows on one
-/// lane, the rest empty — which makes the tile a function of the carved
-/// counts rather than of how this fire split its rows.
 fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) -> (u32, u64) {
     let batch = u64::from(batch.max(1));
     let max_seq_len = u64::from(rows).saturating_sub(batch - 1);
@@ -128,12 +98,6 @@ fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) 
     (tile, tiles)
 }
 
-/// The tile and padded work-item count a graph-shaped schedule would pad to,
-/// at a stated row and lane ceiling: `(cta_tile_q, padded_batch_size)`,
-/// which the float grant is a function of. Exported so the engine can size
-/// its grant from this arithmetic (`engine_cuda::inputs`'s
-/// `prefill_float_bytes`) rather than restate it. `lanes` is the lane
-/// ceiling, `rows` the row ceiling.
 #[must_use]
 pub fn graph_padding(
     rows: u32,
@@ -146,20 +110,16 @@ pub fn graph_padding(
     let kv_heads = num_kv_heads.max(1);
     let group = u64::from((num_qo_heads / kv_heads).max(1));
     let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim, device.cc_major);
-    // `schedule`'s `max_batch_size_if_split`, which is the floor the padding
-    // takes when the tiles do not reach it.
     let floor = u64::from(2 * device.num_sm.max(1)) / u64::from(kv_heads);
     (tile, floor.max(tiles))
 }
 
-/// The computed schedule: pure data, laid out and staged by [`plan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
     pub new_batch_size: u32,
     pub padded_batch_size: usize,
     pub cta_tile_q: u32,
-    /// The chunk width in tokens, as the staged scalar spells it.
     pub kv_chunk_size: u64,
     pub request_indices: Vec<i32>,
     pub qo_tile_indices: Vec<i32>,
@@ -171,8 +131,6 @@ pub struct Schedule {
 #[allow(clippy::too_many_lines)]
 pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     req.check(op)?;
-    // The two indptrs bound this fire's rectangle (live lane count); the
-    // carved `batch_size` is what the graph shape and padding size at.
     let batch = req.live.requests as usize;
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
     let kv_pages = spans(op, "kv_indptr", req.kv_indptr, batch)?;
@@ -207,8 +165,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         (tile, tiles)
     };
 
-    // A window shortens every prefix to the pages the sliding extent can
-    // actually touch.
     let effective_kv_lens: Vec<u64> = kv_pages
         .iter()
         .map(|&pages| {
@@ -235,10 +191,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let mut qo_tile_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
     let mut merge_indptr = vec![0i64];
-    // `o_indptr` is indexed by the absolute request id (`lane_offset + r`),
-    // so it begins with `lane_offset` dead (zero) entries; this window's own
-    // numbers sit at `lane_offset`. Decode's `o_indptr` stays window-local;
-    // see `sched_decode::schedule`.
     let mut o_indptr = vec![0i64; req.live.lane_offset as usize + 1];
     let mut new_batch_size: u64 = 0;
     for (request_idx, (&packed, &kv)) in
@@ -246,9 +198,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     {
         let num_tiles_q = packed.div_ceil(u64::from(cta_tile_q));
         let num_chunks_kv = kv.max(1).div_ceil(kv_chunk_size_in_pages);
-        // Every index pushed here is bounded by the work-item total, which
-        // the refusal below bounds at the device's i32 — the casts are
-        // plain.
         for q_tile_idx in 0..num_tiles_q {
             for kv_tile_idx in 0..num_chunks_kv {
                 new_batch_size += 1;
@@ -269,10 +218,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         );
     }
     let merge_indptr = narrow_all(op, "batch_prefill_merge_indptr", &merge_indptr)?;
-    // An unsplit schedule's `o_indptr` addresses a row of the fire's output
-    // plane, so it needs `row_offset` added (the fire's row, not the
-    // window's). A split schedule's numbers address the plan's own partial
-    // planes, which begin at zero regardless of window.
     let o_indptr: Vec<i64> = if split_kv {
         o_indptr
     } else {
@@ -317,8 +262,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     })
 }
 
-/// The offsets a schedule occupies in the granted workspace, assigned but
-/// not yet written.
 struct Laid {
     info: PrefillPlanInfo,
     int_bytes: usize,
@@ -346,8 +289,6 @@ fn layout(
     info.request_indices_offset = Some(ints.alloc(4 * padded, 16, "batch_prefill_request_indices")?);
     info.qo_tile_indices_offset = Some(ints.alloc(4 * padded, 16, "batch_prefill_qo_tile_indices")?);
     info.kv_tile_indices_offset = Some(ints.alloc(4 * padded, 16, "batch_prefill_kv_tile_indices")?);
-    // `[lane_offset + batch + 1]`, because the kernel indexes this one
-    // absolutely — see the vector's own note in `schedule`.
     info.o_indptr_offset = Some(ints.alloc(
         4 * (req.lane_offset as usize + req.batch_size as usize + 1),
         16,
@@ -419,8 +360,6 @@ fn stage(
         "batch_prefill_kv_chunk_size_ptr",
     )?;
     if req.enable_cuda_graph {
-        // The word the fold reads in place of its baked bound (`fa2_abi`'s
-        // `seq_len`): this fire's own row total, not the carved count.
         staging.put_i32(
             at(info.total_num_rows_offset),
             req.qo_indptr[req.live.requests as usize],
@@ -428,16 +367,11 @@ fn stage(
         )?;
     }
     if sched.split_kv {
-        // The staged vector is `[live rows + 1]`; `layout` allocated
-        // `[carved rows + 1]`. Nothing reads the tail.
         staging.put_i32s(
             at(info.merge_indptr_offset),
             &sched.merge_indptr,
             "batch_prefill_merge_indptr",
         )?;
-        // Padded work items are retired by a mask over the whole padded
-        // batch: `padded_batch_size` long, `false` past `new_batch_size`.
-        // The kernel checks the mask before reading `request_indices[bx]`.
         staging.put_bools(
             at(info.block_valid_mask_offset),
             (0..sched.padded_batch_size).map(|i| i < sched.new_batch_size as usize),
@@ -465,8 +399,6 @@ pub fn plan(
     })
 }
 
-/// The sizing pass: schedule and layout only, unbounded, so the engine can
-/// learn the workspace a plan would need before granting one.
 pub fn workspace_size(
     op: &'static str,
     req: &Request<'_>,

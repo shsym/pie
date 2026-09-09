@@ -1,15 +1,3 @@
-//! Partitioning the normalized op DAG into regions.
-//!
-//! Two partitions come out of every stage: a singleton partition (one region
-//! per op, the always-correct fallback) and a fused partition that groups ops
-//! sharing a schedule and lifts recognized dataflows -- nucleus sampling,
-//! top-k, sort, scan, matmul -- into library calls.
-//!
-//! Recognizing those dataflows is a separate question with its own file. A
-//! single-op lift is a tag lookup ([`library_op_for_tag`]); the multi-op ones
-//! are pattern matches over the DAG, and they live in [`super::nucleus`].
-//! This file only asks what to do with a match once it has one.
-
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,115 +10,63 @@ use super::nucleus::LibraryMatch;
 use super::symbolic::Dimension;
 
 eta_ir::declare_tagged_enum! {
-    /// How a region is scheduled on a device.
-    ///
-    /// Enumerated into the C header as `PtirScheduleTemplate`.
     pub enum ScheduleTemplate {
-        /// The region only moves channel traffic and emits no arithmetic.
         Effects = 0, "effects";
-        /// One cooperative thread array per row — the default for compute.
         OneCtaPerRow = 1, "one_cta_per_row";
-        /// A row reduction wide enough (last dim > 32768) to split
-        /// hierarchically across blocks.
         HierarchicalRow = 2, "hierarchical_row";
-        /// The region is a library call, scheduled by that kernel.
         Library = 3, "library";
     }
 }
 
 eta_ir::declare_tagged_enum! {
-    /// A region a backend implements with a library kernel rather than
-    /// generated code. Enumerated into the C header as `PtirLibraryOp`; the
-    /// wire numbering is the `= 0` ... `= 5` written below, so tags are
-    /// explicit rather than left to declaration order.
     #[derive(serde::Serialize, serde::Deserialize)]
     pub enum LibraryOp {
-        /// Fused nucleus (top-p) sampling: softmax, top-p mask, Gumbel noise,
-        /// then argmax.
         NucleusSample = 0, "nucleus_sample";
-        /// Top-k selection ([`Op::TopK`]).
         TopK = 1, "top_k";
-        /// Descending sort ([`Op::SortDesc`]).
         Sort = 2, "sort";
-        /// A prefix scan — [`Op::CumSum`] or [`Op::CumProd`].
         Scan = 3, "scan";
-        /// Matrix multiply ([`Op::MatMul`]).
         MatMul = 4, "matmul";
-        /// A second-party kernel or sink call ([`Op::KernelCall`] /
-        /// [`Op::SinkCall`]).
         SecondParty = 5, "second_party";
     }
 }
 
-/// Whether a region is emitted as generated code or dispatched to a library.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum RegionKind {
-    /// Emitted as generated device code.
     #[default]
     Generated,
-    /// Dispatched to the named [`LibraryOp`] kernel.
     Library(LibraryOp),
 }
 
-/// A channel write performed by a region.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSink {
-    /// The stage-local channel slot written, indexing
-    /// [`NormalizedStage::channel_bindings`].
     pub channel_slot: ChannelSlot,
-    /// The value whose contents are put into the channel.
     pub value: ValueId,
 }
 
-/// One schedulable unit of a partition: a set of ops, its device schedule, and
-/// the values crossing its boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
-    /// Whether the region is generated or a library call.
     pub kind: RegionKind,
-    /// The device schedule chosen for the region.
     pub schedule: ScheduleTemplate,
-    /// Positions in the stage's op list.
     pub nodes: Vec<NodeIndex>,
-    /// Values the region reads from outside itself.
     pub inputs: Vec<ValueId>,
-    /// Values the region defines that something outside it reads.
     pub outputs: Vec<ValueId>,
-    /// Channel writes ([`Op::ChanPut`]) performed inside the region.
     pub sinks: Vec<ChannelSink>,
-    /// A multi-row value naming the region's row geometry, when every op
-    /// in it works row by row (see [`node_geometry`]): a backend may then
-    /// launch one block per row, each block seeing only its row of every
-    /// multi-row value. For a `top_k`/`sort_desc` library region it names
-    /// the sorted input, for the same purpose. `None`: one block per lane.
     pub row_value: Option<ValueId>,
-    /// When the geometry's rows are symbolic, the STATIC row count the
-    /// program's own arithmetic equates with it (`add([rows, v],
-    /// [256, v])`): a value with that many static rows is of the geometry
-    /// too. See [`row_alias`].
     pub row_alias: Option<u64>,
 }
 
-/// Which of a stage's two partitions a [`RegionPartition`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PartitionKind {
-    /// One region per op; always correct, never fused.
     Singleton = 0,
-    /// Ops grouped by schedule with library dataflows lifted out.
     Fused = 1,
 }
 
-/// A stage partitioned into regions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionPartition {
-    /// Which partition this is.
     pub kind: PartitionKind,
-    /// The regions, in stage op order.
     pub regions: Vec<Region>,
-    /// Legacy wire bit retained for decoder compatibility. Revision 6 plans
-    /// never request whole-stage fallback.
     pub whole_stage_fallback: bool,
 }
 
@@ -158,19 +94,12 @@ pub(crate) fn fused_partition(
     let matches_by_end: BTreeMap<NodeIndex, &LibraryMatch> = library_matches
         .iter()
         .map(|candidate| {
-            // Every pattern names at least one node (an empty match would
-            // describe a library call over no ops).
             (
                 *candidate.nodes.last().expect("library match has nodes"),
                 candidate,
             )
         })
         .collect();
-    // Row geometries some arithmetic op works in. A multi-row value only an
-    // intrinsic copy or a constant touches (the one-row sampler's
-    // `[rows, vocab]` logits, reshaped to a vector at once) is not one:
-    // its ops stay in the one-block run with their consumers, where the
-    // direct-argmax path finds them.
     let alias = row_alias(stage, index);
     let geometries: Vec<(Geometry, Option<ValueId>)> = (0..stage.ops.len() as u32)
         .map(NodeIndex)
@@ -194,12 +123,9 @@ pub(crate) fn fused_partition(
             (Geometry::Rows { fixed, extent }, witness) if arithmetic.contains(&(fixed, extent)) => {
                 (Geometry::Rows { fixed, extent }, witness)
             }
-            // One block per lane, fused with its neighbours as always.
             _ => (Geometry::Single, None),
         }
     };
-    // A scalar constant joins whatever run it sits in: every block of a row
-    // run writes the same word.
     let joins_any = |node: NodeIndex| stage.ops[node.index()].tag() == eta_ir::op::tags::CONST
         && geometries[node.index()].0 == Geometry::Single;
 
@@ -226,8 +152,6 @@ pub(crate) fn fused_partition(
             continue;
         }
 
-        // Generated ops fuse while they share a class: one row geometry the
-        // launch splits by rows, or the one-block run.
         if joins_any(node) && run.is_some() {
             generated.push(node);
             continue;
@@ -238,14 +162,10 @@ pub(crate) fn fused_partition(
         }
         match run {
             None => run = Some((geometry, witness)),
-            // A run opened by vector-only ops learns its witness from the
-            // first multi-row op.
             Some((seen, None)) if witness.is_some() => run = Some((seen, witness)),
             _ => {}
         }
 
-        // The only ops worth refusing to fuse are all `library_op_for_tag`
-        // ops, already routed above, so nothing else can break the run here.
         generated.push(node);
     }
     flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
@@ -256,7 +176,6 @@ pub(crate) fn fused_partition(
     }
 }
 
-/// [`flush_generated_region`], stamping the run's row geometry witness.
 fn flush_generated_run(
     stage: &NormalizedStage,
     index: &StageIndex,
@@ -314,11 +233,6 @@ pub(crate) fn build_library_match_region(
     region
 }
 
-/// The library kernel a wire tag is routed to, or `None` when the fused
-/// generated kernel emits it inline. Keyed on the tag, not the `Op` variant
-/// or `Family` (a `Family` can mix library and generated ops), so a new op
-/// can be enumerated against [`eta_ir::op::OP_TABLE`] and classified rather
-/// than silently emitted inline.
 pub fn library_op_for_tag(tag: u8) -> Option<LibraryOp> {
     use eta_ir::op::tags;
     match tag {
@@ -338,18 +252,9 @@ pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: NodeIndex) -> 
     }
 }
 
-/// A stage's SSA layout and consumer map, computed once per stage and
-/// shared: `build_region` runs once per op, so recomputing this per call
-/// would be quadratic in stage size, and a stage body is guest-supplied
-/// (untrusted) length. Also the only place the node space and value space
-/// meet, keyed one way with typed accessors rather than three bare parallel
-/// slices.
 pub(crate) struct StageIndex {
-    /// First SSA id each op defines.
     bases: Vec<ValueId>,
-    /// Node that defines each SSA id.
     producer: Vec<NodeIndex>,
-    /// Nodes reading each SSA id.
     consumers: Vec<Vec<NodeIndex>>,
 }
 
@@ -369,17 +274,14 @@ impl StageIndex {
         }
     }
 
-    /// The node that defines `value`.
     pub(crate) fn producer(&self, value: ValueId) -> Option<NodeIndex> {
         self.producer.get(value as usize).copied()
     }
 
-    /// The first SSA id `node` defines.
     pub(crate) fn base(&self, node: NodeIndex) -> Option<ValueId> {
         self.bases.get(node.index()).copied()
     }
 
-    /// The nodes that read `value`.
     pub(crate) fn consumers(&self, value: ValueId) -> Option<&[NodeIndex]> {
         self.consumers.get(value as usize).map(Vec::as_slice)
     }
@@ -401,10 +303,6 @@ pub(crate) fn build_region(
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
     let mut sinks = Vec::new();
-    // A direct `top_k` reads its divisor itself (see [`direct_topk`]): the
-    // region names it an input, and the region producing it an output, so
-    // the value is materialised and stays alive until the kernel runs —
-    // the op graph alone says the divide's own region was its last reader.
     for (other, _) in stage.ops.iter().enumerate() {
         let other = NodeIndex(other as u32);
         let Some(DirectTopK { divisor: Some(divisor), .. }) = direct_topk(stage, index, other)
@@ -429,8 +327,6 @@ pub(crate) fn build_region(
             }
         }
         if let Op::ChanPut { chan, value } = *op {
-            // `chan` is already stage-local: `localize_stage` rewrote it
-            // before regions were formed.
             sinks.push(ChannelSink {
                 channel_slot: ChannelSlot(chan),
                 value,
@@ -451,10 +347,6 @@ pub(crate) fn build_region(
     let schedule = match kind {
         RegionKind::Library(_) => ScheduleTemplate::Library,
         RegionKind::Generated => {
-            // Channel-only traffic gets the effects-only schedule;
-            // `kernel_call`/`sink_call` are already routed to
-            // `RegionKind::Library`, so no other op here emits no arithmetic
-            // except channel ops.
             let has_compute = nodes
                 .iter()
                 .any(|node| stage.ops[node.index()].family() != Family::Channel);
@@ -496,12 +388,6 @@ pub(crate) fn build_region(
     }
 }
 
-/// The row geometry of one node, for the row-parallel launch of a generated
-/// region: the `(fixed rows, symbolic row extent)` every multi-row tensor
-/// it touches shares (`Rows`), no multi-row tensor at all (`Single` — the
-/// one-row sampler's every op, fused as before), or a node that touches a
-/// multi-row tensor and may not be split by rows (`Mixed`): one that mixes
-/// geometries, cannot say its row width, or reaches across rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Geometry {
     Single,
@@ -509,12 +395,6 @@ pub(crate) enum Geometry {
     Mixed,
 }
 
-/// A `top_k` whose operand is the logits plane itself (through reshapes),
-/// optionally divided by one element: the backend may rank the plane
-/// directly, applying the divide as it reads, and store no copy of the
-/// scaled value. `intrinsic` is the plane's node; `divisor` the one element,
-/// as the divide names it (the planner keeps that value alive, see
-/// [`build_region`]).
 pub(crate) struct DirectTopK {
     pub(crate) intrinsic: NodeIndex,
     pub(crate) divisor: Option<ValueId>,
@@ -567,10 +447,6 @@ pub(crate) fn direct_topk(
     (same_rows && plane.last() == ranked.last()).then_some(DirectTopK { intrinsic, divisor })
 }
 
-/// The rows of a value: the product of its leading dims, one of which may
-/// be symbolic. Rank 0 and rank 1 are one row. `None` when a rank-2+ value
-/// has a symbolic trailing dim (its row width is unknown) or two symbolic
-/// leading dims.
 pub fn value_rows(dims: &[Dimension]) -> Option<(u64, u32)> {
     let Some((last, leading)) = dims.split_last() else {
         return Some((1, u32::MAX));
@@ -602,9 +478,6 @@ pub fn value_rows(dims: &[Dimension]) -> Option<(u64, u32)> {
     Some((fixed, extent))
 }
 
-/// Whether `dims` is the rank-1 vector of a geometry's rows — the shape a
-/// row reduction writes one element of per row. `alias` is the static row
-/// count that stands for a symbolic geometry ([`row_alias`]).
 pub fn is_row_vector(dims: &[Dimension], fixed: u64, extent: u32, alias: Option<u64>) -> bool {
     match dims {
         [Dimension::Static(n)] => {
@@ -615,17 +488,10 @@ pub fn is_row_vector(dims: &[Dimension], fixed: u64, extent: u32, alias: Option<
     }
 }
 
-/// Whether a multi-row `shape` (from [`value_rows`]) is `geometry`, given
-/// `alias` — the static row count standing for the geometry's symbolic rows.
 pub fn same_rows(shape: (u64, u32), geometry: (u64, u32), alias: Option<u64>) -> bool {
     shape == geometry || (geometry.0 == 1 && alias.is_some_and(|n| shape == (n, u32::MAX)))
 }
 
-/// The one static row count a stage's arithmetic equates with a symbolic
-/// row extent: an op whose multi-row tensors are exactly `[role, w]` and
-/// `[n, w]` (the trace's own shape check let it through, so `role` was `n`
-/// when the trace ran) says `(role, n)`. `None` when no op does, or two
-/// disagree.
 pub(crate) fn row_alias(stage: &NormalizedStage, index: &StageIndex) -> Option<(u32, u64)> {
     let mut found: Option<(u32, u64)> = None;
     for node in (0..stage.ops.len() as u32).map(NodeIndex) {
@@ -657,13 +523,6 @@ pub(crate) fn row_alias(stage: &NormalizedStage, index: &StageIndex) -> Option<(
     found
 }
 
-/// The ops a row-parallel block may run on its row alone: elementwise maps
-/// (an operand of one element broadcasts), row reductions, broadcasts,
-/// constants, the intrinsic copy, the keyed RNG (its key is the element's
-/// position, which the backend offsets by the row) and `gather_row`. Not:
-/// `iota` and the masks (they generate by absolute position), reshape
-/// (it re-rows), gathers/scatters/transposes/pivots (they reach across
-/// rows), and channel traffic (a copy of the whole cell).
 fn row_parallel_tag(tag: u8) -> bool {
     use eta_ir::op::tags;
     matches!(
@@ -709,7 +568,6 @@ fn row_parallel_tag(tag: u8) -> bool {
     )
 }
 
-/// [`Geometry`] of `node`, with a multi-row value witnessing it.
 pub(crate) fn node_geometry(
     stage: &NormalizedStage,
     index: &StageIndex,
@@ -719,8 +577,6 @@ pub(crate) fn node_geometry(
     use eta_ir::op::tags;
     let op = &stage.ops[node.index()];
     let base = index.base(node).unwrap_or_default();
-    // A static row count the stage equates with a symbolic one reads as
-    // the symbolic geometry.
     let canonical = |shape: (u64, u32)| match (shape, alias) {
         ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
         _ => shape,
@@ -759,14 +615,6 @@ pub(crate) fn node_geometry(
     }
     let whitelisted = row_parallel_tag(op.tag());
     let Some((fixed, extent)) = rows else {
-        // No multi-row tensor. A row block can still own one element of a
-        // per-row VECTOR (what a row reduction writes) in an elementwise
-        // map or a keyed draw — that is what keeps `-h`, `select(accept,
-        // ..)` and the like inside the row run. The geometry is only known
-        // once some multi-row op names it, so this is a candidate that
-        // `fused_partition` confirms against the arithmetic geometries; a
-        // reduction of a vector reads across the rows and stays one block.
-        // Everything else is one row's work, fused as it always was.
         if whitelisted
             && !matches!(
                 op.tag(),
@@ -799,11 +647,6 @@ pub(crate) fn node_geometry(
     if !whitelisted {
         return (Geometry::Mixed, None);
     }
-    // A reduction's per-row result is a vector of the rows; any other rank-1
-    // operand or result must be that vector too (the broadcast source, the
-    // `gather_row` index), or the op reads across rows — except a one-element
-    // vector, and a draw's `[key, counter]` state, which every block reads
-    // whole.
     let state = matches!(op.tag(), tags::RNG | tags::RNG_KEYED);
     if vectors.iter().any(|&v| {
         stage.value_types.get(v as usize).is_none_or(|t| {

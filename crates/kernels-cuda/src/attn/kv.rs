@@ -1,8 +1,3 @@
-//! The paged kv writers and the quantized-page maintenance around them: the
-//! bf16 and quantized appenders, the envelope update that shadows appended
-//! keys, the active-page dequant prelude the fa2 entries run, and the mla
-//! latent writer the mla/index appends share.
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -13,7 +8,6 @@ const FILE: &str = "attn/kv.cuh";
 
 const BLOCK: u32 = 256;
 
-/// The quantization schemes the pool row's `scheme_byte` can spell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KvScheme {
@@ -47,21 +41,17 @@ fn scheme_of(op: &'static str, pool: &KvPool) -> Result<KvScheme, Error> {
     })
 }
 
-/// The `__nv_fp8_interpretation_t` the fp8 paths read: e4m3, the only kind
-/// this plane configures.
 const FP8_E4M3: u32 = 0;
 
 const fn fp4_block_size(block_size: i32) -> i32 {
     if block_size > 0 { block_size } else { 16 }
 }
 
-/// Whether the pool stores native bf16 pages.
 #[must_use]
 pub fn native_bf16(pool: &KvPool) -> bool {
     pool.keys.dtype == Dtype::Bf16
 }
 
-/// An upper bound on the pages an append of `total_tokens` rows can touch.
 #[must_use]
 pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -> i32 {
     if page_size <= 0 {
@@ -70,9 +60,6 @@ pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -
     (total_tokens + page_size - 1) / page_size + num_requests
 }
 
-/// The `(kv_heads, head_dim)` split the pool row's strides spell for an
-/// appended row. Strides are engine facts the validator never sees, so
-/// disagreement is refused, not asserted.
 pub(crate) fn head_split(
     op: &'static str,
     pool: &KvPool,
@@ -101,8 +88,6 @@ pub(crate) fn head_split(
     Ok((row / head_dim, head_dim))
 }
 
-/// The lane count an indptr spells: `rows - 1`, refused when degenerate or
-/// the wrong dtype (the boundary vector is driver-assembled, not validated).
 pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
     if indptr.dtype != Dtype::I32 {
         return Err(refuse(
@@ -120,10 +105,6 @@ pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
     stated(op, lanes)
 }
 
-/// Appends `k`/`v` rows into the pool's pages, addressed by the op's
-/// per-token write descriptors (`write_page`/`write_offset`). Dispatches on
-/// the pool's storage: native bf16 (with the envelope shadow when the
-/// scheme keeps one), or the quantized writer the scheme byte names.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_kv_to_pages(
     ctx: &Ctx,
@@ -150,16 +131,11 @@ pub(crate) fn write_kv_to_pages(
             head_dim,
         )
     } else {
-        // Quantized writers still re-derive each token's cell from the
-        // read-side page tables, so this pair is unread here.
         let _ = (write_page, write_offset);
         write_kv_quantised(ctx, op, k, v, indptr, pool, kv_heads, head_dim)
     }
 }
 
-/// The explicit-descriptor write: each token row lands in the one
-/// `(write_page[t], write_offset[t])` cell the op states. `indptr` is only
-/// the envelope refresh's lane walk.
 #[allow(clippy::too_many_arguments)]
 fn write_kv_bf16(
     ctx: &Ctx,
@@ -194,7 +170,6 @@ fn write_kv_bf16(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
-            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )?;
@@ -215,7 +190,6 @@ fn write_kv_bf16(
     Ok(())
 }
 
-/// Refreshes the bf16 key envelopes over the pages an append touched.
 #[allow(clippy::too_many_arguments)]
 fn envelope_update_appended(
     ctx: &Ctx,
@@ -257,7 +231,6 @@ fn envelope_update_appended(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
-            // Live-lanes word bounds the request walk when a body replay armed one.
             ctx.stage(),
         ],
     )
@@ -297,8 +270,6 @@ fn write_kv_quantised(
                 kv_heads.arg(),
                 head_dim.arg(),
                 FP8_E4M3.arg(),
-                // The staged-geometry seat: the region's live-rows word when a
-                // body replay armed one, and the null seat (`ABSENT`) otherwise.
                 ctx.stage(),
             ],
         ),
@@ -329,8 +300,6 @@ fn write_kv_quantised(
                     pool.page_size.arg(),
                     kv_heads.arg(),
                     head_dim.arg(),
-                    // The staged-geometry seat: the region's live-rows word when a
-                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
                     ctx.stage(),
                 ],
             )
@@ -361,8 +330,6 @@ fn write_kv_quantised(
                     kv_heads.arg(),
                     head_dim.arg(),
                     block_size.arg(),
-                    // The staged-geometry seat: the region's live-rows word when a
-                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
                     ctx.stage(),
                 ],
             )
@@ -390,8 +357,6 @@ fn active_geometry(
     )
 }
 
-/// Dequantizes this fire's active pages into the bf16 shadow the fa2
-/// kernels read. A no-op on native pools.
 pub(crate) fn dequant_active(
     ctx: &Ctx,
     op: &'static str,
@@ -487,9 +452,6 @@ pub(crate) fn dequant_active(
     }
 }
 
-/// Writes latent rows (`ckv` beside its rope plane) into an mla-shaped
-/// pool. Shared by `attention.mla_kv_append` and `attention.index_kv_append`
-/// (which passes a null rope plane of zero width).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_mla_to_pages(
     ctx: &Ctx,

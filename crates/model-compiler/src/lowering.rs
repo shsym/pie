@@ -1,15 +1,8 @@
-//! Chooses each region's lowering (`If`, `Switch`, or always-launch): a
-//! region is conditionalized only if its window can be empty, its body is
-//! fat enough to amortize the evaluation point, and skipping it profits over
-//! that point's fixed cost.
-
 use model_ir::{ClassTable, Def, Trace, ValueId};
 
 use crate::compiled::{Lowering, Region};
 use crate::budget::{Budget, DeviceProfile};
 
-/// What one region's nodes cost, per the profile's family table; used by
-/// both the fork and conditional cost gates so they agree.
 pub(crate) fn region_us(trace: &Trace, region: &Region, profile: &DeviceProfile) -> f32 {
     region
         .nodes
@@ -19,8 +12,6 @@ pub(crate) fn region_us(trace: &Trace, region: &Region, profile: &DeviceProfile)
         .sum()
 }
 
-/// How many nodes a region holds — the count the profit gate is about, since
-/// always-launch pays one empty launch per node and not per region.
 fn nodes(region: &Region) -> f32 {
     #[allow(clippy::cast_precision_loss)]
     {
@@ -28,11 +19,6 @@ fn nodes(region: &Region) -> f32 {
     }
 }
 
-/// Choose each region's lowering, in place. `regions` comes out stamped with
-/// [`Region::lowering`]; everything else is untouched.
-///
-/// `fat_region_us` at [`f32::INFINITY`] turns this off: no body is ever fat
-/// enough, so every region stays [`Lowering::AlwaysLaunch`].
 pub(crate) fn lower(
     trace: &Trace,
     regions: &mut [Region],
@@ -45,8 +31,6 @@ pub(crate) fn lower(
         return;
     }
 
-    // SWITCH first: a group claims its members before they're offered an
-    // `IF` of their own.
     let mut claimed = vec![false; regions.len()];
     for group in switch_groups(trace, regions, classes, budget, profile) {
         for (arm, &at) in group.members.iter().enumerate() {
@@ -71,7 +55,6 @@ pub(crate) fn lower(
         if !fat(trace, region, profile) {
             continue;
         }
-        // One body: `arms` is 1, the per-arm term charged once.
         if !profits(nodes(region), 1, profile) {
             continue;
         }
@@ -79,32 +62,20 @@ pub(crate) fn lower(
     }
 }
 
-/// Is the body worth an evaluation point that is paid whether it is taken
-/// or not?
 fn fat(trace: &Trace, region: &Region, profile: &DeviceProfile) -> bool {
     region_us(trace, region, profile) >= profile.fat_region_us
 }
 
-/// Are the launches this skips worth more than the evaluation point that
-/// skips them? `skipped` counts launches, not regions; strict comparison so
-/// a zeroed profile decides nothing.
 fn profits(skipped: f32, arms: u8, profile: &DeviceProfile) -> bool {
     let paid = profile.cond_fixed_us + profile.cond_per_arm_us * f32::from(arms);
     skipped * profile.empty_launch_us > paid
 }
 
-/// One SWITCH group: the merge it came from and the regions that are its arms,
-/// in arm order.
 struct Group {
     merge: ValueId,
     members: Vec<usize>,
 }
 
-/// Every run of consecutive regions that is exactly one merge's arms, is
-/// fat, profits, and provably has at most one live arm per fire.
-///
-/// Arms must be consecutive and in ascending order; an arm that split into
-/// two regions is not a group and stays always-launch.
 fn switch_groups(
     trace: &Trace,
     regions: &[Region],
@@ -112,8 +83,6 @@ fn switch_groups(
     budget: &Budget,
     profile: &DeviceProfile,
 ) -> Vec<Group> {
-    // Which region defines each value, so arms can be looked up by their
-    // defining region.
     let mut region_of = vec![usize::MAX; trace.nodes.len()];
     for (at, region) in regions.iter().enumerate() {
         for node in region.nodes.clone() {
@@ -149,11 +118,8 @@ fn switch_groups(
             .map(|(arm, _)| defines.get(arm.0 as usize).copied().unwrap_or(usize::MAX))
             .collect();
         if members.iter().any(|&at| at == usize::MAX) {
-            continue; // an arm no region defines: a weight, an input, a nested merge.
+            continue;
         }
-        // `members` must be the ascending run itself, not merely its sorted
-        // image: an out-of-order group would bracket the wrong nodes at
-        // record time (the walk opens/closes by arm number).
         if members.windows(2).any(|pair| pair[1] != pair[0] + 1) {
             continue;
         }
@@ -167,16 +133,9 @@ fn switch_groups(
         {
             continue;
         }
-        // Exclusivity must hold of the regions, not just the arms:
-        // `fire_exclusive` is about a merge, but a region can carry extra
-        // nodes and so a wider mask than its arm's own guard. Two members
-        // with overlapping masks can both have rows in one fire, and SWITCH
-        // runs only one body.
         if !pairwise_disjoint(regions, &members) {
             continue;
         }
-        // A SWITCH skips every arm but the fattest one (the pessimistic
-        // estimate of "the one taken").
         let launches: f32 = members.iter().map(|&at| nodes(&regions[at])).sum();
         let widest = members
             .iter()
@@ -194,8 +153,6 @@ fn switch_groups(
     groups
 }
 
-/// Do no two of these regions have rows in the same fire? Two members are
-/// simultaneously live exactly when their masks intersect.
 fn pairwise_disjoint(regions: &[Region], members: &[usize]) -> bool {
     for (at, &left) in members.iter().enumerate() {
         for &right in &members[at + 1..] {
@@ -207,9 +164,6 @@ fn pairwise_disjoint(regions: &[Region], members: &[usize]) -> bool {
     true
 }
 
-/// Can a fire hold two live arms of this merge? True when `max_lanes == 1`
-/// (one lane, hence one class, hence one arm per fire) or when every class
-/// resolves the merge to the same arm.
 fn fire_exclusive(classes: &ClassTable, merge: ValueId, budget: &Budget) -> bool {
     if budget.max_lanes <= 1 {
         return true;
@@ -226,4 +180,3 @@ fn fire_exclusive(classes: &ClassTable, merge: ValueId, budget: &Budget) -> bool
     }
     true
 }
-

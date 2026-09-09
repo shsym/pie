@@ -10,11 +10,6 @@ kernel void blit_bfloat16(
   dst[tid] = src[tid];
 }
 
-// A run of 32-bit words, one thread each. The recurrent buffer's scatter and
-// gather (`engine_metal::rs`) are memcpys between an activation rectangle and
-// a page slab, both minted at 4-byte-aligned offsets; a kernel rather than a
-// blit encoder so the move sits in the compute encoder's own order, between
-// the dispatch that wrote the rows and the one that reads them.
 kernel void rs_copy_words(
     const device uint* src [[buffer(0)]],
     device uint* dst [[buffer(1)]],

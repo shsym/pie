@@ -53,17 +53,11 @@ DEFAULT_SKU = "flux2-mini-bf16-kv-bf16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# The golden is fp32 (`flux2_golden.py --mini` runs on CPU in float32); pie
-# runs the same weights cast to bf16 with bf16 activations, so the gate is
-# the bf16 drift of a four-block trunk with 128-wide heads, the same order as
-# mini-dit's (README §3).
 TOLERANCES = ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"]
-
 
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "flux2_mini_config.json")) as f:
         return json.load(f)
-
 
 def numbered(out: str, stem: str) -> list[str]:
     pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.json$")
@@ -74,23 +68,18 @@ def numbered(out: str, stem: str) -> list[str]:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
 
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
-
 def cases(args) -> list[str]:
     """Write one `case_{b}.json` per batch element; answer their paths."""
     cfg = config(args.golden)
     dump = np.load(os.path.join(args.golden, "flux2_mini.npz"))
     h, w = cfg["img_hw"]
     s_img = h * w
-    hs = dump["mini.in.hidden_states"]            # [B, S_img + refs, 128]
-    img_ids = dump["mini.in.img_ids"]             # [B, S_img + refs, 4]
-    txt_ids = dump["mini.in.txt_ids"]             # [B, L, 4]
-    ctx = dump["mini.in.encoder_hidden_states"]   # [B, L, joint_attention_dim]
-    timestep = dump["mini.in.timestep"]           # [B], in [0, 1]
-    guidance = dump["mini.in.guidance"]           # [B]
+    hs = dump["mini.in.hidden_states"]
+    img_ids = dump["mini.in.img_ids"]
+    txt_ids = dump["mini.in.txt_ids"]
+    ctx = dump["mini.in.encoder_hidden_states"]
+    timestep = dump["mini.in.timestep"]
+    guidance = dump["mini.in.guidance"]
     refs = int(dump["mini.in.num_ref_tokens"])
     assert hs.shape[1] == s_img + refs, (hs.shape, s_img, refs)
     assert cfg["config"]["guidance_embeds"], "the miniature carries a guidance embedder"
@@ -110,9 +99,6 @@ def cases(args) -> list[str]:
             "text_positions": txt_ids[b].reshape(-1).astype(np.float32).tolist(),
             "image_positions": img_ids[b, :s_img].reshape(-1).astype(np.float32).tolist(),
             "reference_positions": img_ids[b, s_img:].reshape(-1).astype(np.float32).tolist(),
-            # The port takes the scheduler timestep `σ·1000` (the reference
-            # multiplies its [0, 1] timestep by 1000 itself); the guidance
-            # scale goes in raw.
             "timestep": float(timestep[b]) * 1000.0,
             "guidance": float(guidance[b]),
         }
@@ -122,11 +108,6 @@ def cases(args) -> list[str]:
         written.append(path)
     print(f"[case] {len(written)} batch element(s), {s_img} target + {refs} reference rows -> {args.out}")
     return written
-
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
 
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
@@ -149,7 +130,6 @@ def wasm(inferlet: str) -> str:
     if not present:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
-
 
 def run(args) -> None:
     paths = numbered(args.out, "case")
@@ -187,11 +167,6 @@ def run(args) -> None:
             f.write(done.stdout)
         print(f"[run] batch {b} -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -203,7 +178,6 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
-
 
 def collect(args) -> str:
     paths = numbered(args.out, "pie")
@@ -217,18 +191,12 @@ def collect(args) -> str:
     path = os.path.join(args.out, "flux2_mini_pie.npz")
     np.savez(path, **{"mini.out.0": mine})
 
-    # The golden's target rows beside it, under the same key.
     dump = np.load(os.path.join(args.golden, "flux2_mini.npz"))
     theirs = dump["mini.out.0"][:, :rows]
     target = os.path.join(args.out, "flux2_mini_target.npz")
     np.savez(target, **{"mini.out.0": theirs.astype(np.float32)})
     print(f"[collect] {mine.shape} from {len(docs)} batch element(s) -> {path}; golden target rows -> {target}")
     return path
-
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
 
 def compare(args) -> int:
     mine = os.path.join(args.out, "flux2_mini_pie.npz")
@@ -242,7 +210,6 @@ def compare(args) -> int:
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -273,7 +240,6 @@ def main() -> int:
         collect(args)
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

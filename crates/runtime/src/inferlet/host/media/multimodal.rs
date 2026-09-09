@@ -1,13 +1,3 @@
-//! Host-side image, video and audio preprocessing — the arithmetic that
-//! turns encoded bytes into the patches, positions and log-mel frames a
-//! model was trained on. `media.rs` is the only caller in this crate.
-//!
-//! Image preprocessing lives in `models::media` (with goldens pinning it
-//! against the reference processors). What is left here is what the
-//! front-ends do not do: GIF demuxing, and gemma's audio front-end.
-//! Dispatch is off the served model's `arch_name` —
-//! `models::media::vision_front_end` and [`audio_arch_supported`].
-
 use image::DynamicImage;
 
 pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, String> {
@@ -38,7 +28,6 @@ pub fn audio_arch_supported(arch: &str) -> bool {
     arch.eq_ignore_ascii_case("gemma4")
 }
 
-/// The same, for an audio span.
 #[must_use]
 pub fn audio_placeholder() -> &'static str {
     "<audio_soft_token>"

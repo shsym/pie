@@ -1,21 +1,3 @@
-//! `Modulate`: adaLN's three shapes, the gated residual, and the two fused
-//! forms that fold a norm into the first of them.
-//!
-//! A DiT block is a norm, a modulation, an attention or an MLP, and a gated
-//! write back into the residual. The norms and the projections were already
-//! here; this file is the rest — `x·(1+s)+b`, `x·(1+s)`, `tanh(g)·x`,
-//! `r += g·y` — plus [`norm_modulate`] and [`gated_residual_norm_modulate`],
-//! which land what a norm entry followed by one of these lands, in one pass
-//! over the row.
-//!
-//! **Numerics.** Every arm reads bf16, computes in f32, and rounds once at
-//! the store; the scale and the shift are one `fmaf`, so a host reference
-//! must use a fused multiply-add too. The fused pair writes the residual with
-//! exactly the rounding [`gated_residual_add`] writes and reduces the norm's
-//! moments over THAT rounded row, so the residual is bit-equal to the unfused
-//! chain's; the normed row stays in f32 through the modulation, so it lands
-//! about one bf16 ulp from the chain's (nearer the f32 ideal, not further).
-
 use crate::error::Error;
 use dtype::Dtype;
 
@@ -28,17 +10,10 @@ const FILE: &str = "elemwise/modulate.cuh";
 
 const BLOCK: u32 = 256;
 
-/// Which of the three modulation shapes an entry fires. The `m` rectangle is
-/// `[.., 2·width]` for [`ScaleShift`](Form::ScaleShift) — scale first, shift
-/// second — and `[.., width]` for the other two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
-    /// `o = x·(1+s) + b`.
     ScaleShift,
-    /// `o = x·(1+s)`.
     Scale,
-    /// `o = tanh(g)·x` — Z-Image's gate, whose `tanh(0) = 0` keeps the
-    /// adaLN-Zero init while bounding the gate.
     TanhGate,
 }
 
@@ -51,7 +26,6 @@ impl Form {
         }
     }
 
-    /// How many `width`-wide vectors this form reads out of `m`.
     const fn vectors(self) -> u32 {
         match self {
             Form::ScaleShift => 2,
@@ -60,16 +34,10 @@ impl Form {
     }
 }
 
-/// Which norm a fused entry runs in front of the modulation. The modulation
-/// is the affine, so two of the three carry no weight of their own.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NormKind {
-    /// `(x − mean(x))·rsqrt(var(x) + eps)`, two reductions.
     LayerNormNoAffine { eps: f32 },
-    /// `x·rsqrt(mean(x²) + eps)`.
     RmsNormNoScale { eps: f32 },
-    /// `x·rsqrt(mean(x²) + eps)·w`, for the sites that keep a bank in front
-    /// of the modulation.
     RmsNorm { weight: Tensor, eps: f32 },
 }
 
@@ -98,8 +66,6 @@ impl NormKind {
     }
 }
 
-/// The lane map as an argument: a `[rows]` i32 plane, or the null seat that
-/// means "`m` is indexed by the row".
 fn lane_map(op: &'static str, lane_of_row: Option<Tensor>, rows: u32) -> Result<ArgValue, Error> {
     let Some(map) = lane_of_row else {
         return Ok(ArgValue::ABSENT);
@@ -126,13 +92,6 @@ fn lane_map(op: &'static str, lane_of_row: Option<Tensor>, rows: u32) -> Result<
     Ok(map.arg())
 }
 
-/// The `m` rectangle's element and width check, shared by every arm,
-/// answering the element the kernel is stamped with for it: the rows'
-/// own, or `float` for a vector that arrives from a lane chain kept in f32
-/// (`IMAGEGEN_CONTRACT.md` §3: `m`/`g` are f32 or `x`'s dtype). Its ROW
-/// count is checked by the caller instead: with a lane map bound the rows
-/// are lanes and only the map's values name them, so nothing here can count
-/// them.
 fn modulation(
     op: &'static str,
     m: Tensor,
@@ -166,7 +125,6 @@ fn modulation(
     Ok(tm)
 }
 
-/// The three unfused arms' one body.
 fn fire(
     ctx: &Ctx,
     op: &'static str,
@@ -207,22 +165,11 @@ fn fire(
             o.arg(),
             stated(op, width)?.arg(),
             stated(op, form.vectors() * width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// `o = x·(1+s) + b`, adaLN's shape. `m` is `[lanes, 2·width]` (scale first,
-/// shift second) read through `lane_of_row`, or `[rows, 2·width]` when no map
-/// is bound. `o` may alias `x`.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
-/// degenerate rectangle, a modulation plane of the wrong width or dtype, or a
-/// lane map that is not one i32 per row.
 pub fn scale_shift(
     ctx: &Ctx,
     x: Tensor,
@@ -241,11 +188,6 @@ pub fn scale_shift(
     )
 }
 
-/// `o = x·(1+s)`, the shift-less half of [`scale_shift`]; `m` is `[.., width]`.
-///
-/// # Errors
-///
-/// As [`scale_shift`].
 pub fn scale(
     ctx: &Ctx,
     x: Tensor,
@@ -264,11 +206,6 @@ pub fn scale(
     )
 }
 
-/// `o = tanh(g)·x`; `m` is `[.., width]`.
-///
-/// # Errors
-///
-/// As [`scale_shift`].
 pub fn tanh_gate(
     ctx: &Ctx,
     x: Tensor,
@@ -287,15 +224,6 @@ pub fn tanh_gate(
     )
 }
 
-/// `r_out = r + g·y`, the gated residual write a DiT sub-block ends with.
-/// `g` is `[lanes, width]` read through `lane_of_row`, or `[rows, width]`
-/// without it. `r_out` may alias `r` — that is the in-place form.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
-/// degenerate rectangle, a gate plane of the wrong width or dtype, a lane map
-/// that is not one i32 per row, or operands that do not share one shape.
 pub fn gated_residual_add(
     ctx: &Ctx,
     r: Tensor,
@@ -333,25 +261,11 @@ pub fn gated_residual_add(
             lane_map(OP, lane_of_row, rows)?,
             r_out.arg(),
             stated(OP, width)?.arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// `o = norm(x)·(1+s) + b`: what a norm entry followed by [`scale_shift`]
-/// lands, one row reduction and one pass. `m` is `[.., 2·width]`, read the
-/// way [`scale_shift`] reads it.
-///
-/// The normed row stays in f32 into the modulation rather than round-tripping
-/// through bf16 the way the two launches do, so it lands about one bf16 ulp
-/// from them — on the near side.
-///
-/// # Errors
-///
-/// As [`scale_shift`], plus a refusal for an [`NormKind::RmsNorm`] weight
-/// that is not one scalar per column.
 pub fn norm_modulate(
     ctx: &Ctx,
     x: Tensor,
@@ -381,21 +295,11 @@ pub fn norm_modulate(
             stated(OP, width)?.arg(),
             stated(OP, 2 * width)?.arg(),
             norm.eps().arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The deferred-residual form: `r_out = r + g·y` and `o = norm(r_out)·(1+s)
-/// + b`, two outputs from one pass. What [`gated_residual_add`] then
-/// [`norm_modulate`] land — bit-equal on `r_out`, within about one bf16 ulp
-/// on `o`. `r_out` may alias `r`.
-///
-/// # Errors
-///
-/// As [`norm_modulate`] and [`gated_residual_add`].
 #[allow(clippy::too_many_arguments)]
 pub fn gated_residual_norm_modulate(
     ctx: &Ctx,
@@ -453,15 +357,11 @@ pub fn gated_residual_norm_modulate(
             stated(OP, width)?.arg(),
             stated(OP, 2 * width)?.arg(),
             norm.eps().arg(),
-            // Staged-geometry seat: live-rows word when a body replay armed
-            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
-/// The refusals the two fused arms share, and the three numbers their launch
-/// is spelled with.
 fn fused_shapes(
     op: &'static str,
     x: Tensor,

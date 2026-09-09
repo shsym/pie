@@ -2,25 +2,7 @@
 
 using namespace metal;
 
-// `Pool`: pooled (compressed) attention — the dsv4 compressor's KV-time-axis
-// pooling, ported organ-for-organ from `kernels-cuda/kernels/attn/pool.cuh`.
-// Every `ratio` tokens close a boundary whose pooled entry lands in its own
-// compressed cache; a later attention reads the compressed entries and
-// publishes a log-sum-exp plane the cascade merge folds against the dense
-// pass.
-//
-// The boundary kernels emit three columns: `out_pos` (the CELL the entry is
-// cached at — the block's LAST token, which is what the reader addresses at
-// `(c+1)*ratio - 1`), `out_req` (the lane), and `out_rope` (the COMPRESSED
-// ROW'S POSITION the entry is roped at — `(p / ratio) * ratio`, the block's
-// FIRST token, the reference's `rows = arange(0, cutoff, ratio)` in
-// `v4mlx/compressor.py`). The last column had no IR seat for as long as the
-// gated compressor was deferred and was dropped here; the compressor fires
-// now, so it is an output like the two beside it, and a text that roped at
-// `out_pos` instead is off by `ratio - 1` on every compressed key.
 
-// The paged-cell address: page-table indirection then the in-page slot, the
-// twin of `pool.cuh`'s `paged_slot`.
 inline size_t pool_paged_slot(
     const device uint* page_indices,
     const device uint* page_indptr,
@@ -29,10 +11,7 @@ inline size_t pool_paged_slot(
   return size_t(page) * size_t(page_size) + size_t(pos % page_size);
 }
 
-// ---- boundary kernels -----------------------------------------------------
 
-// Marks which decode rows close a pooling boundary. `row_valid` is the
-// CUDA-graph padding mask, an op-named input.
 [[kernel]] void pool_boundary_decode(
     const device int* positions   [[buffer(0)]],
     device int* out_pos           [[buffer(1)]],
@@ -52,8 +31,6 @@ inline size_t pool_paged_slot(
   out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 }
 
-// The prefill twin: boundaries within each request's ragged span. The owning
-// request is a binary search over the fire's `qo_indptr`.
 [[kernel]] void pool_boundary_prefill(
     const device int* positions    [[buffer(0)]],
     const device uint* qo_indptr   [[buffer(1)]],
@@ -86,25 +63,7 @@ inline size_t pool_paged_slot(
   out_req[t] = lo;
 }
 
-// ---- the rolling state's writer -------------------------------------------
 
-// Scatters this fire's compressor projections into the rolling state the
-// gather below pools out of: `state_kv[slot] = wkv·x` and
-// `state_score[slot] = wgate·x`, at `slot = w_page[i] * page_size + w_off[i]`
-// — the SOURCE cache's own cell for token row `i`, which is the cell
-// `kv_append_paged` writes the latent into in the same fire.
-//
-// **THE STATE IS ADDRESSED BY THE CACHE AND NOT BY THE FIRE**, which is the
-// whole reason this is a scatter and not a rectangle: a pooling window
-// closing at this fire's boundary reaches back `coff * ratio` positions, and
-// most of those tokens were written by earlier fires. `pool_paged_slot` in
-// the gather and this `slot` are the same arithmetic said two ways — the
-// gather has a `(req, pos)` and walks the page table, this has the write
-// descriptors the fire already carries for that row.
-//
-// One thread per `(column, row)`; `state_pitch` is the plane's row, which is
-// not always this layer's `width` (see the gather's note on two ratios in one
-// artifact).
 template <typename T>
 [[kernel]] void pool_state_write(
     const device T* kv             [[buffer(0)]],
@@ -138,16 +97,7 @@ template <typename T>
 
 instantiate_pool_state_write(bfloat16, bfloat)
 
-// ---- gather (the gated softmax pool) --------------------------------------
 
-// Pools the closing `2*ratio` window out of the rolling compressor state into
-// one per-boundary entry, with the learned gate: a softmax over the window's
-// score plane (`state_score` + the intra-block absolute-position embedding
-// `ape`) weighting the value plane (`state_kv`). One thread per (entry,
-// head-dim lane); the window is walked serially per thread.
-//
-// `has_ape` selects whether the absolute-position plane is folded into the
-// gate logits (the CUDA twin keyed on `ape != nullptr`).
 template <typename T>
 [[kernel]] void pool_gather_paged(
     const device T* state_kv       [[buffer(0)]],
@@ -163,11 +113,7 @@ template <typename T>
     const constant int& coff       [[buffer(10)]],
     const constant int& page_size  [[buffer(11)]],
     const constant int& has_ape    [[buffer(12)]],
-    // The ROW PITCH the two state slabs are laid out at, which is not always
-    // `coff * head_dim`: one artifact can hold pooled layers at two ratios
-    // (dsv4-flash carries ratio 4 and ratio 128), the reservation lays ONE
-    // plane at the widest of them, and a narrower gather must still stride by
-    // the plane's row and read its own `coff * head_dim` columns inside it.
+
     const constant int& state_pitch[[buffer(13)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
@@ -234,11 +180,7 @@ template <typename T>
 
 instantiate_pool_gather_paged(bfloat16, bfloat)
 
-// ---- store ----------------------------------------------------------------
 
-// Stores each pooled entry into its cell of the compressed cache. One thread
-// per (entry, head-dim lane); a masked-out boundary (`bpos < 0`) writes
-// nothing.
 template <typename T>
 [[kernel]] void pool_store_entries(
     const device T* entries        [[buffer(0)]],
@@ -269,17 +211,11 @@ template <typename T>
 
 instantiate_pool_store_entries(bfloat16, bfloat)
 
-// ---- attention over the compressed entries --------------------------------
 
 constant int POOL_ATTN_BLOCK = 128;
-// The widest head this threadgroup-resident flash reader holds in its q tile.
+
 constant int POOL_HEAD_MAX = 512;
 
-// One threadgroup per (query row, query head). The threadgroup streams the
-// `num_visible = (qpos+1)/ratio` compressed keys (the entry that closes each
-// window at position `(c+1)*ratio - 1`), runs an online-max / weighted-sum
-// flash softmax, and publishes `o` plus the base-2 log-sum-exp column the
-// cascade merge reads. Twin of `pool.cuh`'s `pool_lse_paged`.
 [[kernel]] void pool_lse_paged(
     const device bfloat* q            [[buffer(0)]],
     const device bfloat* comp_kv_pages[[buffer(1)]],
@@ -303,7 +239,7 @@ constant int POOL_HEAD_MAX = 512;
   const int tid = int(lid.x);
 
   threadgroup float q_smem[POOL_HEAD_MAX];
-  threadgroup float partials[4];  // POOL_ATTN_BLOCK / 32 simdgroups
+  threadgroup float partials[4];
   threadgroup float bcast[1];
 
   const int req = req_of_token[qi];
@@ -330,7 +266,6 @@ constant int POOL_HEAD_MAX = 512;
     return;
   }
 
-  // Pass 1: the row max over every visible compressed key.
   float local_max = -INFINITY;
   for (int c = tid; c < num_visible; c += POOL_ATTN_BLOCK) {
     const size_t slot = pool_paged_slot(
@@ -356,9 +291,6 @@ constant int POOL_HEAD_MAX = 512;
   const float row_max = bcast[0];
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Pass 2: the flash weighted sum. Each key's QK dot is reduced across the
-  // whole threadgroup; the running denominator and the per-thread output
-  // accumulators (one dim-tile per thread) build up over the keys.
   const int dims_per_thread = (head_dim + POOL_ATTN_BLOCK - 1) / POOL_ATTN_BLOCK;
   float acc[8] = {0};
   float local_z = 0.0f;
@@ -405,26 +337,6 @@ constant int POOL_HEAD_MAX = 512;
   }
 }
 
-// ---- the selected reader: the same attention over a chosen subset ---------
-//
-// **THE NSA FINE BRANCH.** `pool_lse_paged` above attends every compressed
-// row its query can see (`num_visible = (qpos+1)/ratio`); this one attends
-// only the rows `attention.index_topk` chose, `selection[qi*top_k + n]`,
-// ascending with `-1` padding the tail of a row that saw fewer keys than its
-// budget. Everything else is the same kernel: the same `(c+1)*ratio - 1`
-// cell arithmetic, the same two-pass online softmax, the same base-2
-// log-sum-exp `merge_lse` folds against the sliding-window branch, and the
-// same per-head `attn_sink` closing the merged pair downstream.
-//
-// **IT REDUCES TO THE DENSE READER EXACTLY.** `index_topk_paged`'s
-// `nkeys <= topk` arm publishes the identity `0..nkeys-1`, so a row inside
-// its budget walks the same keys in the same order and accumulates the same
-// sum. That is what makes the selected branch safe to fire on short
-// sequences, and it is the deviceless equality the tests pin.
-//
-// A selected id is bounded by the query's own visible count as well as by
-// the plane: an id at or past `num_visible` is SKIPPED rather than clamped,
-// which is `mla_naive_paged`'s `j < 0 || j >= j_end` guard in this geometry.
 [[kernel]] void pool_lse_selected_paged(
     const device bfloat* q            [[buffer(0)]],
     const device bfloat* comp_kv_pages[[buffer(1)]],
@@ -450,7 +362,7 @@ constant int POOL_HEAD_MAX = 512;
   const int tid = int(lid.x);
 
   threadgroup float q_smem[POOL_HEAD_MAX];
-  threadgroup float partials[4];  // POOL_ATTN_BLOCK / 32 simdgroups
+  threadgroup float partials[4];
   threadgroup float bcast[1];
 
   const int req = req_of_token[qi];
@@ -478,10 +390,8 @@ constant int POOL_HEAD_MAX = 512;
     return;
   }
 
-  // Pass 1: the row max over the SELECTED keys only.
   float local_max = -INFINITY;
-  // The selection row is ascending with its `-1` padding as one tail
-  // (`index_topk_paged`), so the first `-1` a thread meets ends its share.
+
   for (int n = tid; n < top_k; n += POOL_ATTN_BLOCK) {
     const int c = srow[n];
     if (c < 0) break;
@@ -509,9 +419,6 @@ constant int POOL_HEAD_MAX = 512;
   const float row_max = bcast[0];
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // A row whose whole selection was padding or out of range attends nothing;
-  // its branch contributes no mass and `-inf` is what the merge folds as
-  // "this branch saw no key", exactly as `num_visible <= 0` above.
   if (!isfinite(row_max)) {
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       o_row[d] = bfloat(0.0f);
@@ -522,8 +429,6 @@ constant int POOL_HEAD_MAX = 512;
     return;
   }
 
-  // Pass 2: the flash weighted sum, over the same selected keys in the same
-  // ascending order the selection carries.
   const int dims_per_thread = (head_dim + POOL_ATTN_BLOCK - 1) / POOL_ATTN_BLOCK;
   float acc[8] = {0};
   float local_z = 0.0f;

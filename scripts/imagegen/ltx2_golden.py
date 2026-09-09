@@ -51,8 +51,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from golden_common import Tap, md5, npz_keys, outdir  # noqa: E402
-from vendor.ltx_2.modeling import (  # noqa: E402
+from golden_common import Tap, md5, npz_keys, outdir
+from vendor.ltx_2.modeling import (
     LTX2Config,
     LTX2ConnectorConfig,
     LTX2TextConnectors,
@@ -62,9 +62,6 @@ from vendor.ltx_2.modeling import (  # noqa: E402
 MODEL = "ltx25"
 REPO = "Lightricks/LTX-2.5-Diffusers"
 
-# The miniature: two blocks, two heads a side at the REAL head widths (the
-# ragged attention kernel is stamped at 64/128/256), the real 128-channel
-# latents, a 16-wide caption.
 MINI = LTX2Config(
     num_layers=2,
     num_attention_heads=2,
@@ -89,15 +86,12 @@ MINI_CONN = LTX2ConnectorConfig(
     audio_layers=1,
 )
 
-# One job: a 3 x 4 x 6 latent grid (72 video rows), 8 audio rows, 16 text rows.
 LATENT_FRAMES, LATENT_H, LATENT_W = 3, 4, 6
 AUDIO_FRAMES = 8
 TEXT_ROWS = 16
 FPS = 24.0
-# The step the golden takes, in scheduler units (`sigma * 1000`).
 SIGMA = 0.909375
 AUDIO_SIGMA = 0.909375
-
 
 def seeded(module: torch.nn.Module, seed: int = 0) -> torch.nn.Module:
     """A fixture initialisation that DISCRIMINATES, re-drawn from one seed.
@@ -113,19 +107,11 @@ def seeded(module: torch.nn.Module, seed: int = 0) -> torch.nn.Module:
     g = torch.Generator().manual_seed(seed)
     for name, p in sorted(module.named_parameters()):
         if p.dim() >= 2 and "scale_shift_table" not in name and "registers" not in name:
-            # `nn.Linear`'s own kaiming-uniform bound.
             bound = math.sqrt(1.0 / p.shape[-1])
             p.data = ((torch.rand(p.shape, generator=g) * 2 - 1) * bound).to(dtype=p.dtype)
         elif "norm_q" in name or "norm_k" in name:
-            # An across-heads RMS gain sits at one; a gain of 0.06 would make
-            # every attention logit vanish and every softmax uniform, and the
-            # gate could then not tell a wrong rope from a right one.
             p.data = (1.0 + 0.02 * torch.randn(p.shape, generator=g)).to(dtype=p.dtype)
         elif "scale_shift_table" in name or "registers" in name:
-            # The modulation tables at unit scale, NOT the reference's
-            # `randn / sqrt(dim)`: every gate is then O(1) and a dropped or
-            # mis-sliced fold moves the answer instead of hiding under the
-            # tolerance. The trained tables are O(1) too.
             p.data = torch.randn(p.shape, generator=g).to(dtype=p.dtype)
         else:
             p.data = (torch.randn(p.shape, generator=g) / math.sqrt(p.shape[-1])).to(
@@ -133,26 +119,23 @@ def seeded(module: torch.nn.Module, seed: int = 0) -> torch.nn.Module:
             )
     return module
 
-
 def normalised(coords: torch.Tensor, maxima) -> np.ndarray:
     """The rope's own arithmetic, stopped one step early: the MIDPOINT of the
     latent cell in physical units, over its maximum, mapped to `[-1, 1]` and
     scaled by `pi/2`. That product is what pie's `positions` port takes, and
     what `RopeForm::SplitLadder` multiplies by `theta^(f/(F-1))`."""
     start, end = coords.chunk(2, dim=-1)
-    mid = ((start + end) / 2.0).squeeze(-1)  # [B, axes, T]
+    mid = ((start + end) / 2.0).squeeze(-1)
     axes = mid.shape[1]
     out = torch.stack(
         [(2.0 * mid[:, i] / float(maxima[i]) - 1.0) * (math.pi / 2.0) for i in range(axes)],
         dim=-1,
     )
-    return out.float().numpy()  # [B, T, axes]
-
+    return out.float().numpy()
 
 def connector_positions(rows: int, base_seq_len: int) -> np.ndarray:
     i = np.arange(rows, dtype=np.float64) / float(base_seq_len)
     return ((2.0 * i - 1.0) * (math.pi / 2.0)).astype(np.float32).reshape(rows, 1)
-
 
 def run_mini(d: str, device="cpu", dtype=torch.float32) -> None:
     from safetensors.torch import save_file
@@ -176,7 +159,6 @@ def run_mini(d: str, device="cpu", dtype=torch.float32) -> None:
     x_v = torch.randn(1, rows, MINI.in_channels, generator=g).to(device, dtype)
     x_a = torch.randn(1, AUDIO_FRAMES, MINI.audio_in_channels, generator=g).to(device, dtype)
 
-    # --- the connector pass: packed trunk rows in, the two contexts out ----
     stack = torch.randn(
         1, TEXT_ROWS, MINI_CONN.caption_channels * MINI_CONN.text_proj_in_factor, generator=g
     ).to(device, dtype)
@@ -189,7 +171,6 @@ def run_mini(d: str, device="cpu", dtype=torch.float32) -> None:
     tap.put("mini.conn.out.video", video_ctx)
     tap.put("mini.conn.out.audio", audio_ctx)
 
-    # --- the joint denoise step -------------------------------------------
     t_v = torch.full((1,), SIGMA * 1000.0, device=device, dtype=dtype)
     t_a = torch.full((1,), AUDIO_SIGMA * 1000.0, device=device, dtype=dtype)
     with torch.no_grad():
@@ -260,14 +241,8 @@ def run_mini(d: str, device="cpu", dtype=torch.float32) -> None:
         f"dit {sum(v.numel() for v in dit.state_dict().values())} params"
     )
 
-
-# The VAE golden's latent clip: 3 latent frames of 8 x 12 cells, which is
-# 17 frames of 256 x 384 pixels — small enough to keep the dump at 20 MB and
-# the parity fire under a second, big enough that every up block's shuffle,
-# every temporal trim and the un-patchify land on more than one cell.
 VAE_LATENT_FRAMES, VAE_LATENT_H, VAE_LATENT_W = 3, 8, 12
 VAE_SEED = 7
-
 
 def run_vae(d: str, device="cuda", shape=(VAE_LATENT_FRAMES, VAE_LATENT_H, VAE_LATENT_W)) -> None:
     """`AutoencoderKLLTX2Video` alone, fp32, over a fixed random latent.
@@ -305,22 +280,18 @@ def run_vae(d: str, device="cuda", shape=(VAE_LATENT_FRAMES, VAE_LATENT_H, VAE_L
     denorm = z * std / cfg.scaling_factor + mean
 
     with torch.no_grad():
-        x = vae.decode(denorm, return_dict=False)[0]        # [1, 3, 8T-7, 32H, 32W]
+        x = vae.decode(denorm, return_dict=False)[0]
 
     frames = int(x.shape[2])
     assert frames == 8 * t_lat - 7, f"{t_lat} latent frames should land {8 * t_lat - 7}, not {frames}"
     assert tuple(x.shape[-2:]) == (32 * h_lat, 32 * w_lat), tuple(x.shape)
 
-    # The default shape is THE gate's golden; another shape lands beside it
-    # under its own name, so `the_ltx_2_vae_answers_the_reference` can be
-    # pointed at it (`PIE_LTX2_VAE_GOLDEN=ltx2_vae_TxHxW`) without
-    # disturbing the row `gates.py` measures.
     default = shape == (VAE_LATENT_FRAMES, VAE_LATENT_H, VAE_LATENT_W)
     raw = os.path.join(d, "ltx2_vae" if default else f"ltx2_vae_{t_lat}x{h_lat}x{w_lat}")
     os.makedirs(raw, exist_ok=True)
     shapes = {}
     for key, t in (("latent", z[0]), ("denorm", denorm[0]), ("pixels", x[0])):
-        cthw = t.detach().float().cpu().numpy()             # [C, T, H, W]
+        cthw = t.detach().float().cpu().numpy()
         rows = np.ascontiguousarray(cthw.transpose(1, 2, 3, 0)).astype("<f4")
         rows.tofile(os.path.join(raw, f"{key}.f32"))
         shapes[key] = {"t": int(cthw.shape[1]), "h": int(cthw.shape[2]),
@@ -340,7 +311,6 @@ def run_vae(d: str, device="cuda", shape=(VAE_LATENT_FRAMES, VAE_LATENT_H, VAE_L
         Image.fromarray(u8.astype("uint8")).save(os.path.join(raw, f"frame{k:03d}.png"))
     print(f"  vae: latent {tuple(z.shape)} -> pixels {tuple(x.shape)} "
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}]")
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -363,8 +333,6 @@ def main() -> None:
             return
     print("== mini ==")
     run_mini(d, a.device)
-    # `golden_common.manifest` asks diffusers and transformers for their
-    # versions and this dump needs neither, so it writes its own.
     rows = [
         {"file": name, "bytes": os.path.getsize(os.path.join(d, name)), "md5": md5(os.path.join(d, name))}
         for name in sorted(os.listdir(d))
@@ -385,7 +353,6 @@ def main() -> None:
         )
     for r in rows:
         print(f"    {r['file']:<34} {r['bytes']:>12,}  {r['md5']}")
-
 
 if __name__ == "__main__":
     main()

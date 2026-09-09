@@ -1,10 +1,3 @@
-//! `norm::rmsnorm_residual_add` (the `rmsnorm → residual_add → scale →
-//! rmsnorm_plus_one` chain, one launch) lands each of its four planes
-//! within bf16 rounding of the four launches computed on the host, on the
-//! eight-wide path (a 2560-wide bf16 row, aligned) and on the scalar path
-//! (a row that is not a whole number of vectors), with and without a staged
-//! window.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -70,10 +63,6 @@ fn check(hidden: usize, window: Option<(u32, u32, u32)>) {
     let got_s: Vec<u16> = gpu.down(scaled_at, planes * hidden);
     let got_o: Vec<u16> = gpu.down(out_at, planes * hidden);
 
-    // A product that lands on a bf16 tie can round either way between the
-    // host's f32 and the device's (fma contraction, the moment's summation
-    // order), and a 1-ulp flip in `t` (~0.004 at |t| ~ 0.5) carries into
-    // every plane after it as an absolute error, so the bound is absolute.
     let close = |got: u16, want: f32, what: &str, r: usize, i: usize| {
         let g = from_bf16(got);
         assert!(
@@ -119,13 +108,17 @@ fn check(hidden: usize, window: Option<(u32, u32, u32)>) {
     }
 }
 
+fn the_fused_chain_lands_the_four_launches_every_case() {
+    the_eight_wide_chain_lands_the_four_launches();
+    the_scalar_chain_lands_the_four_launches();
+}
+
 #[test]
 fn the_eight_wide_chain_lands_the_four_launches() {
     check(2560, None);
     check(2560, Some((8, 5, 2)));
 }
 
-#[test]
 fn the_scalar_chain_lands_the_four_launches() {
     check(2564, None);
     check(1028, Some((8, 3, 1)));

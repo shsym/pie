@@ -1,5 +1,3 @@
-//! `CustomCuda`: the cuda-plane escape hatch's fused points.
-
 use kernels_cuda::custom;
 use model_exec::{DispatchCustomCuda, KernelError};
 use model_ir::CustomCuda;
@@ -7,14 +5,12 @@ use model_ir::CustomCuda;
 use crate::run::Run;
 
 impl DispatchCustomCuda for Run<'_> {
-    /// Write side uses the op's own `write_page`/`write_offset`; `positions` is the rope input.
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
         self.custom_cuda(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    /// Returns `kernels_cuda::Error`, lifted by [`kernel`](crate::error::kernel) in `dispatch` above.
     fn custom_cuda(&mut self, op: &CustomCuda) -> Result<(), kernels_cuda::Error> {
         match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite {
@@ -53,10 +49,6 @@ impl Run<'_> {
     }
 }
 
-/// `[engine] diagnostics = "nan-check"`: after every node, sample each tensor
-/// output and report the first non-finite value seen — the op, its layer, the
-/// value id. Under `ptr-trace` (`crate::record::PTR_TAG`) it also prints every
-/// node's operands and the device pointers behind them.
 impl model_exec::DispatchProbe for Run<'_> {
     fn probe(&mut self, node: &model_ir::Node) {
         use model_ir::Operands;
@@ -85,7 +77,6 @@ impl model_exec::DispatchProbe for Run<'_> {
                                 format!("{}:unslotted", id.0)
                             }
                             model_ir::Def::Weight(_) => format!("{}:planes", id.0),
-                            // Safe after the node dispatched: the kernel just resolved it.
                             model_ir::Def::Input(kind) => {
                                 let t = run.tensor(*id);
                                 let short = format!("{kind:?}").replace(' ', "");

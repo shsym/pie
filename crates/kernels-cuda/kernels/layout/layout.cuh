@@ -7,10 +7,6 @@ namespace pie::layout {
 template <class T>
 using Elem = ::pie::Elem<T>;
 
-// `e = table[ids]`, `e_scaled = e * a`, `y += e_scaled`, `y_scaled = y * b`:
-// the launches `embed`, `mul_scalar`, `residual_add` and `mul_scalar` land,
-// one element per thread, each intermediate rounded where its own launch
-// would round it (`mul_scalar` rounds its scalar to `T` first).
 __global__ void embed_scale_add(
     const i32* __restrict__ token_ids,
     const bf16* __restrict__ weight,
@@ -43,9 +39,6 @@ __global__ void embed_scale_add(
     y_scaled[at] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(yv) * b_rounded);
 }
 
-// `embed_scale_add` whose residual row is layer `col / width`'s slice of a
-// stacked `[rows][stacked_width]` table, read in place (the `select` that
-// copied the slice out folded away), and whose folded row lands in `y_out`.
 __global__ void embed_scale_add_select(
     const i32* __restrict__ token_ids,
     const bf16* __restrict__ weight,
@@ -94,14 +87,9 @@ __global__ void embed(
     if (idx >= num_tokens * per_row) return;
     const int n = idx / per_row;
     const int h = idx % per_row;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start. `token_ids` and `y` are row
-    // planes handed at their base and move with it; `weight` is the VOCAB
-    // bank, whose row axis is the id the vector yields, and never moves. The
-    // `idx >= num_tokens * per_row` bound above is the LAUNCH's, and stays.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const i32 tid_raw = token_ids[plane_row];
@@ -117,15 +105,6 @@ __global__ void embed(
     }
 }
 
-// `embed` over a VOCAB-BANDED table: this rank holds rows
-// `[vocab_offset, vocab_offset + local_vocab)`, so an id outside the band
-// reads nothing and lands zeros. Summing every rank's answer rebuilds the
-// whole row — Megatron's vocab-parallel embedding, and the reason the caller
-// must `collective.all_reduce` after this.
-//
-// Carries `embed`'s staged-geometry seat: a replay whose grid was carved at a
-// bucket ceiling retires its padded rows off `win[0]` and finds the live ones
-// at `win[1]`. Without it a graph replay would embed the padding.
 template <class T>
 __global__ void embed_vocab_shard(
     const i32* __restrict__ token_ids,
@@ -150,13 +129,6 @@ __global__ void embed_vocab_shard(
     }
 }
 
-// The permute that turns what `ncclAllGather` lands into what the IR asked
-// for: `[world][rows][width]` (each rank's whole rectangle, one after the
-// other) into `[rows][world * width]` (each rank's columns joined into every
-// row). One thread per destination element, so the write is coalesced and the
-// read is the strided side.
-//
-// At one row the two layouts are the same and the caller skips this entirely.
 template <class T>
 __global__ void gather_width_concat(
     const T* __restrict__ src,
@@ -171,8 +143,8 @@ __global__ void gather_width_concat(
 
     const long long r = idx / wide;
     const long long c = idx - r * wide;
-    const long long k = c / width;          // which rank's shard
-    const long long w = c - k * width;      // column inside it
+    const long long k = c / width;
+    const long long w = c - k * width;
     dst[idx] = src[(k * rows + r) * width + w];
 }
 
@@ -218,13 +190,9 @@ __global__ void split_q_gate(
     const int n = blockIdx.x;
     const int h = blockIdx.y;
     if (n >= N || h >= num_heads) return;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `packed`, `q_out` and
-    // `gate_out` are row planes handed at their base and move together. The
-    // `n >= N` bound above is the LAUNCH's, and stays on the raw index.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int twod = 2 * head_dim;
@@ -281,12 +249,9 @@ __global__ void split_rows(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `src` and the two halves
-    // are row planes handed at their base and move together.
+
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total = left_dim + right_dim;
@@ -302,8 +267,6 @@ __global__ void split_rows(
     }
 }
 
-// Eight elements per thread, many blocks per row: the cut falls on a vector
-// boundary, so each 16-byte vector lands whole on one side.
 template <class T>
 __global__ void split_rows_vec8(
     const T* __restrict__ src,
@@ -313,11 +276,7 @@ __global__ void split_rows_vec8(
     const u32* __restrict__ win)
 {
     constexpr int VEC = 8;
-    // Rows on `grid.x`, column tiles on `grid.y`: `gridDim.y` is capped at
-    // 65535 by every compute capability, and a 64k-row fire is a real
-    // composition (a 65536-token ceiling, a VAE's voxel rectangle), so the
-    // unbounded axis carries the rows. `grid.x` stays affine in rows, which
-    // is what the rebind laws fit.
+
     const int n = blockIdx.x;
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
     const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
@@ -343,13 +302,9 @@ __global__ void select(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: `table` is stacked slices
-    // PER ROW, so its row axis is this launch's, and `out` shares it. The
-    // `offset` picks a column and is untouched by the shift.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const T* src = table + (long long)row * stride + offset;
@@ -388,18 +343,11 @@ __global__ void split_qkv(
     i32 q_dim, i32 kv_dim,
     const u32* __restrict__ win)
 {
-    // ROWS RIDE `blockIdx.x`. They used to ride `y`, which caps at 65535 and
-    // silently truncated any fire taller than that; `split_rows` was moved
-    // for the same reason and this one was not. The width tiles took `y`
-    // instead, and a width needs far fewer blocks than a video fire needs
-    // rows.
+
     const int n = static_cast<int>(blockIdx.x);
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay carved at a
-    // bucket retires its padded rows off the LIVE-ROWS word the fire staged
-    // — one word, not `split_qkv_devwin`'s `(start, count)` pair below.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows START: `src` and the three
-    // destinations are row planes handed at their base and move together.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int stride = q_dim + 2 * kv_dim;
@@ -430,12 +378,9 @@ __global__ void split_qkv_devwin(
     const u32* __restrict__ devwin,
     i32 q_dim, i32 kv_dim)
 {
-    // Rows on `blockIdx.x`, as in `split_qkv` above and for its reason.
+
     const int n = static_cast<int>(blockIdx.x);
-    // `devwin` is the pre-staged device window pair, `(start, count)`:
-    // word 0 is a START. The staged-geometry seat's `win` is `(count,
-    // start)` — same pointer shape, opposite word order, and the rename
-    // is what keeps one from ever arming the other.
+
     const int w0 = static_cast<int>(devwin[0]);
     const int w1 = static_cast<int>(devwin[1]);
     if (n < w0 || n >= w0 + w1) return;
@@ -456,19 +401,6 @@ __global__ void split_qkv_devwin(
     }
 }
 
-/// **THE ROW MOVEMENT `Fallback::Copy` IS MADE OF** (palo design §3).
-///
-/// A windowed consumer P4 could not seat stands over several row intervals of
-/// the fire. `gather_rows` reads those rows out of the fire-wide rectangle
-/// and lays them down as one; `scatter_rows` puts the answers back where they
-/// came from. `index[i]` is the FIRE row the `i`-th compacted row stands at,
-/// and the two kernels are the same map read in the two directions — which is
-/// what makes the pair a permutation of bytes and not an arithmetic step.
-///
-/// `U` is a COPY UNIT and never a number: the caller picks the widest one the
-/// row's byte width and both addresses admit, so a bf16 activation and an f32
-/// log-sum-exp move through the same kernel and neither is rounded, promoted
-/// or canonicalised on the way.
 template <class U>
 __global__ void gather_rows(
     const U* __restrict__ wide,
@@ -502,23 +434,6 @@ __global__ void scatter_rows(
 }
 
 
-/// **THE SAME PERMUTATION, SEATED** (`.wiki/imagegen/design.md` D6's
-/// neighbours: a DiT packs `[text ‖ image ‖ refs]` into one joint sequence
-/// and unpacks the answer back into the streams it came from).
-///
-/// `pack_rows` is `o[i] = x[perm[i]]` and `unpack_rows` is `o[perm[i]] =
-/// x[i]` — the pair `gather_rows`/`scatter_rows` above already spells, with
-/// one difference that matters: these two are TRACED OPS over token rows, so
-/// they read the staged-geometry seat and the fallback copy does not. A
-/// `Fallback::Copy` moves a window the host cut; these move rows a graph
-/// body's replay must retire past `win[0]`.
-///
-/// `perm` is a row plane in the same frame as the launch's rows, so it moves
-/// with `win[1]`; the ROW IT NAMES is absolute, an index into the other
-/// rectangle, and never shifted.
-///
-/// `U` is a copy unit and never a number, exactly as above: no arithmetic, no
-/// dtype, so any element type moves unrounded.
 template <class U>
 __global__ void pack_rows(
     const U* __restrict__ x,

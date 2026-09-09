@@ -1,12 +1,3 @@
-//! Canonical byte forms fed to the signature hash. Not a wire format and
-//! nothing decodes them; they exist so [`super::signature`] and
-//! [`super::fold`] have one agreed spelling of a shape, a type, or an op.
-//!
-//! The layout is locked to the CUDA engine: `program_identity.hpp` walks
-//! the same fields in the same order to key its graph cache. Reordering a
-//! field here is an ABI break, not a refactor; bump
-//! [`super::COMPILER_VERSION`] if the bytes have to move.
-
 use alloc::vec::Vec;
 
 use eta_ir::container::{encode_op, put_u16, put_u32};
@@ -39,9 +30,6 @@ pub(crate) fn canonical_symbolic_type(bytes: &mut Vec<u8>, value_type: &Symbolic
     }
 }
 
-/// A shape with every runtime-varying extent flattened to zero. Batch shape
-/// must not enter a signature, so a symbolic dimension contributes a fixed
-/// zero rather than its current value.
 fn canonical_symbolic_shape(bytes: &mut Vec<u8>, value_type: &SymbolicType) {
     bytes.push(value_type.dims.len() as u8);
     for dimension in &value_type.dims {
@@ -55,13 +43,7 @@ fn canonical_symbolic_shape(bytes: &mut Vec<u8>, value_type: &SymbolicType) {
     }
 }
 
-/// An op in canonical form. Shape-bearing ops are respelled with their
-/// symbolic result shape so batch size stays out of the hash; everything
-/// else reuses the container's own op encoding ([`encode_op`]).
 pub(crate) fn canonical_op(bytes: &mut Vec<u8>, op: &Op, result_type: Option<&SymbolicType>) {
-    // every arm below is a shape-bearing op, which defines exactly one
-    // value; falling back to a default shape would hash two
-    // differently-shaped stages to the same signature.
     let result_type = || result_type.expect("shape-bearing op defines a value");
     match op {
         Op::Broadcast { value, .. } | Op::Reshape { value, .. } => {

@@ -235,12 +235,6 @@ template <typename T>
 
 instantiate_rope_freqs(bfloat16, bfloat)
 
-// The tail rotation, with the two facts a layer may state beside its theta:
-// `sign` (-1 un-rotates: the MLA attention output whose latent was both key
-// and value) and a YaRN ramp (`yarn_factor > 1`: the frequency ramp of the
-// reference's `precompute_freqs`, `low`/`high` derived host-side over the
-// rotated width — pairs below `low` keep their frequency, pairs above `high`
-// are divided by the factor, and the band between interpolates).
 template <typename T>
 [[kernel]] void rope_neox_last_mb(
     device T* x                       [[buffer(0)]],

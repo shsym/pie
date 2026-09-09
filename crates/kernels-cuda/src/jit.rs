@@ -1,8 +1,3 @@
-//! The launch plane: an entry names a jit unit and instantiation ([`Fire`]),
-//! marshals arguments ([`ArgValue`]), and hands both to [`Ctx`], which
-//! compiles the unit on first use, caches it, and enqueues the launch.
-//! Enqueue only, never sync: `Ok` means the launch is queued, not that it ran.
-
 pub mod abi;
 
 #[cfg(feature = "cuda")]
@@ -23,15 +18,11 @@ pub use root::{Headers, Root, Toolchain};
 
 use crate::error::Error;
 
-/// A device address on a 16-byte boundary — the vectorised paths' gate.
 #[must_use]
 pub const fn aligned16(addr: u64) -> bool {
     addr & 15 == 0
 }
 
-/// Interns a composed instantiation so it can live in [`Fire`]'s
-/// `&'static str`. Names are few and re-composed every fire, so the leak
-/// is bounded.
 #[must_use]
 pub fn symbol(name: &str) -> &'static str {
     use std::collections::HashMap;
@@ -50,9 +41,6 @@ pub fn symbol(name: &str) -> &'static str {
     leaked
 }
 
-/// A launch this backend cannot enqueue: degenerate/overflowing geometry, or
-/// an extent no instantiation is stamped for. Shape agreement is checked at
-/// trace time, not here.
 pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> Error {
     Error::Backend {
         op,
@@ -67,18 +55,14 @@ pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u3
     Ok(v)
 }
 
-/// An extent stated to a kernel that reads it as `int`.
 pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the kernel's int")))
 }
 
-/// [`nonzero`] then [`stated`]: a count that must exist and fit the
-/// kernel's `int`.
 pub(crate) fn count(op: &'static str, axis: &'static str, v: u32) -> Result<i32, Error> {
     stated(op, nonzero(op, axis, v)?)
 }
 
-/// The answer of a build with no CUDA runtime compiled in.
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn runtimeless(op: &'static str) -> Error {
     Error::Backend {
@@ -87,8 +71,6 @@ pub(crate) fn runtimeless(op: &'static str) -> Error {
     }
 }
 
-/// A raw driver/runtime refusal or a failed compile. [`Ctx::fire`] folds
-/// this into [`Error::Backend`] with the op's name.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug)]
 pub(crate) enum Fault {
@@ -100,9 +82,6 @@ pub(crate) enum Fault {
         unit: &'static str,
         log: String,
     },
-    /// A scratch slab asked to grow mid-capture: allocation is host work the
-    /// capture refuses (see [`Ctx::scratch`]). The old block retires rather
-    /// than frees, so baked addresses stay valid.
     Unwarmed {
         name: &'static str,
         have: usize,
@@ -137,8 +116,6 @@ impl Fault {
     }
 }
 
-/// Matches on the handle's dtype; any dtype not listed returns
-/// [`Error::DtypeUnsupported`] from the enclosing function.
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {

@@ -1,5 +1,3 @@
-//! The trace machinery: a `Recorder` accumulating a `Trace`, and the `Value` handles a forward pass passes around.
-
 use std::cell::{Cell, RefCell};
 use std::ops::Mul;
 use std::rc::Rc;
@@ -12,19 +10,12 @@ use model_ir::{
 use crate::declare::Weight;
 use crate::facts::Predicate;
 
-/// A `fresh` value's node index until an op claims it. It cannot be a real
-/// index, and an unclaimed sentinel survives to the validator, which names it
-/// — the trace does not guess at what a wrapper forgot.
 const UNCLAIMED: u32 = u32::MAX;
 
-/// Records one forward pass. Cloned freely — every `Value` carries one — and
-/// `finish` insists the trace let go of all of them.
 #[derive(Clone)]
 pub struct Recorder {
     inner: Rc<RefCell<Trace>>,
 
-    /// The layer the trace is inside, driven by `enter`/`leave` (the
-    /// `Layers` iterator in `forward.rs` is the usual engine).
     at: Rc<Cell<Option<u32>>>,
 }
 
@@ -45,8 +36,6 @@ impl Recorder {
         }
     }
 
-    /// Declare a value with a placeholder def; the next `push` that lists its
-    /// id among an op's outputs patches it to `Def::Op(node_index)`.
     pub fn fresh(&self, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();
         p.values.push(ValueDecl {
@@ -63,12 +52,6 @@ impl Recorder {
         }
     }
 
-    /// Append one node. `ins` are the condition-carrying operands: the node's
-    /// guard is the meet of their conds, and mixing arms of one split is a
-    /// panic here, at the line that mixed them. Outputs are read back through
-    /// the `Operands` derive and their placeholder defs patched — the field
-    /// marks stay the single source of truth for def-use, one more reason the
-    /// derive wires the recorder rather than the wrapper doing it by hand.
     pub fn push(&self, op: impl Into<Operation>, ins: &[&Value]) {
         let op = op.into();
         let cond = if joins_arms(&op) {
@@ -91,9 +74,6 @@ impl Recorder {
         let mut p = self.inner.borrow_mut();
         let index = p.nodes.len() as u32;
         for id in outs {
-            // Claim only placeholders. A wrapper naming a weight or another
-            // node's value as its output is a fault the validator gets to
-            // report in full, not something to paper over here.
             if let Some(decl) = p.values.get_mut(id.0 as usize)
                 && decl.def == Def::Op(UNCLAIMED)
             {
@@ -107,9 +87,6 @@ impl Recorder {
         });
     }
 
-    /// Intern a weight — one `Param` per stored plane, one `ValueId` per
-    /// weight name. The value's ty is the logical tensor; what a bank stores
-    /// is the params' business, what it multiplies as is the trace's.
     pub fn weight(&self, w: &Weight) -> ValueId {
         let mut p = self.inner.borrow_mut();
         let w = &w.placed(p.platform);
@@ -142,8 +119,6 @@ impl Recorder {
         ValueId((p.values.len() - 1) as u32)
     }
 
-    /// The value standing for one cache space — dedup'd by index, so a layer
-    /// touching its cache twice touches one id.
     pub fn cache(&self, name: &str) -> ValueId {
         let mut p = self.inner.borrow_mut();
         let index = p
@@ -155,8 +130,6 @@ impl Recorder {
         if let Some(seen) = p.values.iter().position(|v| v.def == Def::Cache(index)) {
             return ValueId(seen as u32);
         }
-        // Deliberately shapeless: a cache value is the pool pointer and
-        // nothing more. Its geometry enters the graph as `RuntimeInput::Geometry`.
         p.values.push(ValueDecl {
             def: Def::Cache(index),
             ty: Ty::Tensor {
@@ -167,8 +140,6 @@ impl Recorder {
         ValueId((p.values.len() - 1) as u32)
     }
 
-    /// The value the engine binds for `which`, declared once per input no
-    /// matter how many layers ask.
     pub fn input(&self, which: RuntimeInput, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();
         let id = match p.values.iter().position(|v| v.def == Def::Input(which)) {
@@ -196,9 +167,6 @@ impl Recorder {
         }
     }
 
-    /// State the block drafter this text carries — see
-    /// [`model_ir::BlockDrafter`]. Once per trace; a second statement must
-    /// agree with the first.
     pub fn block_drafter(&self, facts: model_ir::BlockDrafter) {
         let mut inner = self.inner.borrow_mut();
         match inner.drafter {
@@ -218,7 +186,6 @@ impl Recorder {
         });
     }
 
-    /// Whether `value` is already planted under a seam named `name`.
     #[must_use]
     pub fn seamed(&self, name: &str, value: &Value) -> bool {
         self.inner
@@ -236,9 +203,6 @@ impl Recorder {
         self.at.set(None);
     }
 
-    /// Unwrap the plan and run the validator — the trace's first error
-    /// surface. A bad trace panics with every fault sentence at once, so one
-    /// forgotten `#[out]` reads as itself and not as ten downstream mysteries.
     pub fn finish(self) -> Trace {
         let plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
@@ -254,9 +218,6 @@ impl Recorder {
         plan
     }
 
-    /// The guard a value settled under. Op outputs read their node's guard off
-    /// the plan itself — which is why `fresh` needs no cond up front and
-    /// `push` never has to reach into handles already given out.
     fn guard(&self, id: ValueId) -> Guard {
         let p = self.inner.borrow();
         match &p.values[id.0 as usize].def {
@@ -265,8 +226,6 @@ impl Recorder {
                 .get(*i as usize)
                 .map(|n| n.guard.clone())
                 .unwrap_or(Guard::Always),
-            // Merges carry their or-cond in the handle; inputs, weights and
-            // caches are bound before the first node and guard nothing.
             _ => Guard::Always,
         }
     }
@@ -287,9 +246,6 @@ fn intern(
             seen.shape == shape && seen.shard == shard && seen.dtype == dtype,
             "`{name}` is declared twice with two shapes"
         );
-        // Provenance is part of the declaration, not a decoration on it: the
-        // same name landed once from the checkpoint and once from the serving
-        // door is a plane whose contents depend on which statement ran last.
         assert!(
             seen.source == source,
             "`{name}` is declared twice, once from the checkpoint and once as \
@@ -318,15 +274,10 @@ pub(crate) fn cache_name(row: &CacheRow) -> &str {
     }
 }
 
-/// One traced value. Carries its ty so shape queries never re-borrow the
-/// plan, and reads its guard through the recorder — only a split arm
-/// overrides it.
 #[derive(Clone)]
 pub struct Value {
     rec: Recorder,
     id: ValueId,
-    /// `None` reads the producing node's guard off the plan; a split arm
-    /// carries its refinement here.
     over: Option<Guard>,
     ty: Ty,
 }
@@ -347,8 +298,6 @@ impl Value {
         &self.ty
     }
 
-    /// The leading dim — `Tokens` for fire-aligned activations, and what a
-    /// wrapper folds `top_k` into for routed rows.
     #[must_use]
     pub fn rows(&self) -> Dim {
         let Ty::Tensor { shape, .. } = &self.ty else {
@@ -359,7 +308,6 @@ impl Value {
             .unwrap_or_else(|| panic!("a rank-0 value has no rows"))
     }
 
-    /// The trailing dim, which for an activation is always a const width.
     #[must_use]
     pub fn width(&self) -> u64 {
         let Ty::Tensor { shape, .. } = &self.ty else {
@@ -391,14 +339,10 @@ impl Value {
         spec.arms(self)
     }
 
-    /// The φ: a `Def::Merge` value, not an op — the compiler resolves it to
-    /// slot aliasing and nothing ever dispatches it.
     #[must_use]
     pub fn merge(arms: Vec<Value>) -> Value {
         assert!(arms.len() >= 2, "a merge wants at least two arms");
         let rec = arms[0].rec.clone();
-        // Arms must agree on ty; the validator's MergeArmTy rule names the
-        // odd one out, so the first arm's ty stands for the merge here.
         let ty = arms[0].ty.clone();
         let joined = arms.iter().map(|a| (a.id, a.cond())).collect::<Vec<_>>();
         let cond = joined
@@ -406,16 +350,6 @@ impl Value {
             .skip(1)
             .fold(joined[0].1.clone(), |c, (_, a)| Guard::or(c, a.clone()))
             .simplified();
-        // **A MERGE NESTED IN AN OUTER SPLIT MUST COME BACK ON THAT SPLIT'S
-        // ARM.** `compatible` compares guards by equality, so a merge whose
-        // join is spelled `Or(And(G, p₁), .., And(G, pₙ))` reads as a
-        // different arm from a sibling still spelled `G`, and the next node
-        // over both panics as mixed arms — which is what a trunk guarded by
-        // one fact does to itself, since every attention layer merges. The
-        // arms of one split of a `G`-guarded value each carry `G`, and when
-        // their predicates cover the space their join IS `G`; recovering
-        // that spelling is what lets a guarded region contain a merge. The
-        // equivalence is checked by truth table, never assumed.
         let arms: Vec<Guard> = joined.iter().map(|(_, c)| c.clone()).collect();
         let shared = Guard::common(&arms);
         let cond = if matches!(shared, Guard::Always) || !shared.equivalent(&cond) {
@@ -438,10 +372,6 @@ impl Value {
         }
     }
 
-    /// The same value, read under exactly `cond` — a wrapper's tool for an
-    /// output that is defined on fewer rows than the node that writes it
-    /// runs over (a ragged attention's answer belongs to its queries' arm,
-    /// while the node spans the keys' arm too).
     pub(crate) fn under(&self, cond: Guard) -> Value {
         Value {
             rec: self.rec.clone(),
@@ -451,12 +381,6 @@ impl Value {
         }
     }
 
-    /// The same value, read without its producer's guard. For an in-place
-    /// output under a guard (e.g. `linear.lora_correct`'s `y_out`, which
-    /// aliases the `y` it adds to): the value is defined everywhere, only
-    /// the correction itself is narrow. Without this the guard would leak
-    /// into the residual stream and the next layer's split would refuse to
-    /// mix with it.
     #[must_use]
     pub fn everywhere(&self) -> Value {
         Value {
@@ -496,16 +420,10 @@ impl Mul<f32> for Value {
     }
 }
 
-/// What a split hands out arms of. One algorithm, two carriers: a [`Value`]
-/// arm is the same traced value read under a narrower guard, and an
-/// [`Input`](crate::Input) arm is the same handle under that guard.
 pub trait Refine: Sized {
     fn refined(&self, cond: Guard) -> Self;
 }
 
-/// How a spec cuts a carrier into arms: `&Predicate` gives the two-way
-/// yes/no pair, `[Predicate; N]` the priority-ordered n-way carving. The
-/// arm computation is written once, over any [`Refine`].
 pub trait SplitSpec {
     type Arms<T>;
     fn arms<T: Refine>(self, of: &T) -> Self::Arms<T>;
@@ -540,8 +458,6 @@ impl<const N: usize> SplitSpec for [Predicate; N] {
     }
 }
 
-/// A plane of a stored shard restated against what the plane actually holds:
-/// an mxfp4 codes plane cuts by blocks, not logical columns.
 fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
     let Shard::Cut { axis, segments } = shard else {
         return Shard::Replicated;
@@ -590,15 +506,6 @@ fn compatible(a: &Guard, b: &Guard) -> bool {
     matches!(a, Guard::Always) || matches!(b, Guard::Always) || a == b
 }
 
-/// **THE ONE OP WHOSE OPERANDS MAY COME FROM DIFFERENT ARMS.** Every other
-/// node runs over one class's window, and [`Recorder::push`] refuses two
-/// arms at the line that mixed them — the rule that keeps a class's rows
-/// the only rows its nodes touch. A ragged attention is the deliberate
-/// exception (D2): cross-attention reads its queries off one stream's
-/// rectangle and its keys off another's, and the node must run over BOTH
-/// windows, so its guard is the `Or` of its operands' guards rather than
-/// their meet. Nothing else spans classes; a second exception would be a
-/// second op that reads across a window, and would have to say so here.
 fn joins_arms(op: &Operation) -> bool {
     matches!(
         op,
@@ -606,13 +513,7 @@ fn joins_arms(op: &Operation) -> bool {
     )
 }
 
-/// The `Or` of the operands' guards, spelled the way [`Value::merge`]
-/// spells a join: a tautology collapses to `Always`, and arms of one outer
-/// split come back as that split's guard so the node reads as a sibling of
-/// the values around it.
 fn join(ins: &[&Value]) -> Guard {
-    // An `Always` operand (a runtime input, a weight) guards nothing and
-    // widens nothing: only the arm-carrying operands vote.
     let mut distinct: Vec<Guard> = Vec::new();
     for c in ins.iter().map(|v| v.cond()) {
         if !matches!(c, Guard::Always) && !distinct.contains(&c) {

@@ -1,8 +1,3 @@
-//! `linear.matmul` over an MLX affine bank (group 64, bf16 scale + zero
-//! point per group) at 8 and at 4 bits lands the dot with the DEQUANTIZED
-//! rows — at gemma-4-26B-A4B's router shape (`[128, 2816]`, the one U8g64
-//! plane in that text) and at a 4-bit projection's.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -93,12 +88,16 @@ fn check(bits: u32, n: usize, k: usize, rows: usize, seed: u64) {
     assert_eq!(bad, 0, "{bits}-bit: {bad} of {} outputs differ (worst relative error {worst:.4})", rows * n);
 }
 
+fn the_affine_dense_matmul_answers_the_dequantized_dot_every_case() {
+    the_router_shape_at_eight_bits();
+    a_projection_at_four_bits();
+}
+
 #[test]
 fn the_router_shape_at_eight_bits() {
     check(8, 128, 2816, 26, 0x61);
 }
 
-#[test]
 fn a_projection_at_four_bits() {
     check(4, 256, 2816, 26, 0x62);
 }

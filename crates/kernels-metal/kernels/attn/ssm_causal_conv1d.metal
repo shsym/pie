@@ -1,24 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// The depthwise causal convolution, DILATED. `dilation` spreads the taps: tap
-// `j` reads `dilation * (conv_width - 1 - j)` positions back, so the history a
-// lane has to keep is
-//
-//     hist = (conv_width - 1) * dilation + 1
-//
-// rows of `channels` and not `conv_width` of them — which is exactly the
-// rectangle `model::qwen_4`'s `caches()` declares for the PLE's own conv state
-// (`[(conv_kernel - 1) * dilation + 1, streams * hidden]`), and which collapses
-// back to `conv_width` at `dilation == 1`. Every index below is the CUDA
-// sibling's (`kernels-cuda/kernels/attn/ssm.cuh`,
-// `ssm_causal_conv1d_{update,chunked}_batched`) with its `dil` spelled out, so
-// the undilated arm is BIT-IDENTICAL to what this file served before: at
-// `dil == 1`, `hist == taps`, `(k * dil + 1) == (k + 1)`, and
-// `(hist + src) == (width + src)`.
-//
-// **THE STAGED-GEOMETRY `win` SEAT IS NOT PORTED**, for `ple.metal`'s reason:
-// the null path is the semantics and this plane has no recording to replay.
 
 inline float causal_conv1d_silu(float z) {
   return z / (1.0f + metal::exp(-z));
@@ -55,8 +37,6 @@ template <typename T>
   acc += fresh * float(weight[tap0 + taps - 1]);
   y[size_t(r) * chans + col] = T(causal_conv1d_silu(acc));
 
-  // The window shifts by ONE position — not by one tap — because the history
-  // is stored densely: a dilated read strides over it, a step does not.
   for (size_t k = 0; k + 1 < hist; ++k) {
     new_conv_state[slab + k * chans + col] =
         conv_state[slab + (k + 1) * chans + col];
@@ -137,17 +117,6 @@ instantiate_causal_conv1d(bfloat16, bfloat)
 
 instantiate_causal_conv1d_chunked(bfloat16, bfloat)
 
-// ── the committed form ───────────────────────────────────────────────────────
-//
-// The buffered recurrence's arm (`engine_metal::rs`). Lane `r` of the window
-// runs over an EXTENDED row run: `replay[lane0 + r]` buffered tokens gathered
-// ahead of its own `indptr[r+1] - indptr[r]` rows, laid end to end in `x`
-// (lane `r`'s run begins at `indptr[r] + sum_{j<r} replay[lane0 + j]`). Every
-// row lands an output; the state persists as of row `commit[lane0 + r] - 1`
-// and not one row further, so a speculative window is computed from the
-// state it should see and folded only as far as it was accepted. `commit`
-// of zero leaves the bank untouched. The tables are the FIRE's, indexed at
-// `lane0 + r`; the CSR is the window's own.
 template <typename T>
 [[kernel]] void causal_conv1d_committed(
     const device T* x              [[buffer(0)]],
@@ -208,9 +177,7 @@ template <typename T>
   if (keep <= 0) {
     return;
   }
-  // The new window: the last `hist` rows of (state ++ committed rows), staged
-  // before any of it is written because a short commit reads cells this loop
-  // also lands on.
+
   float next[64];
   for (int s = 0; s < hist && s < 64; ++s) {
     const int src = keep - hist + s;

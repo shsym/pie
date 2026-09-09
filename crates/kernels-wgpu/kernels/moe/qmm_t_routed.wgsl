@@ -1,9 +1,4 @@
-//#include "common/bf16.inc.wgsl"
-//#if defined(PIE_MXFP4)
-//#include "common/mxfp4.inc.wgsl"
-//#else
-//#include "common/affine.inc.wgsl"
-//#endif
+
 
 const PIE_BK = 32u;
 const PIE_BN = 32u;
@@ -25,7 +20,6 @@ struct Params {
 }
 @group(0) @binding(7) var<uniform> params: Params;
 
-//#if !defined(PIE_SCALARSTAGE)
 
 const PIE_QUADS = PIE_BN / 4u;
 const PIE_ROWS4 = u32(PIE_BM) / 4u;
@@ -68,7 +62,7 @@ fn main(
             xs[kk * PIE_ROWS4 + r / 4u][r & 3u] = pie_bf16_at(x[at >> 1u], at);
             xs[(kk + 1u) * PIE_ROWS4 + r / 4u][r & 3u] = pie_bf16_at(x[(at + 1u) >> 1u], at + 1u);
         }
-//#if defined(PIE_MXFP4)
+
 
         for (var i = flat; i < PIE_QUADS * 4u; i = i + PIE_THREADS) {
             let cq4 = i >> 2u;
@@ -98,7 +92,7 @@ fn main(
                 ws[(wi * 8u + j) * PIE_QUADS + cq4] = code * sc;
             }
         }
-//#else
+
         let cpw = u32(PIE_CODES_PER_WORD);
         let words_per_block = PIE_BK / cpw;
         let wpr = k * u32(PIE_BITS) / 32u;
@@ -135,7 +129,7 @@ fn main(
                 ws[(wi * cpw + q) * PIE_QUADS + cq4] = code * sc + bi;
             }
         }
-//#endif
+
         workgroupBarrier();
         for (var kk = 0u; kk < PIE_BK; kk = kk + 1u) {
             let wv = ws[kk * PIE_QUADS + cq];
@@ -151,7 +145,7 @@ fn main(
     for (var i = 0u; i < 4u; i = i + 1u) {
         let row = row0 + r0 + i;
         var v = acc[i];
-//#if defined(PIE_BIASED)
+
         let b0 = e * n + col;
         v = v + vec4<f32>(
             pie_bf16_at(bias[b0 >> 1u], b0),
@@ -159,7 +153,7 @@ fn main(
             pie_bf16_at(bias[(b0 + 2u) >> 1u], b0 + 2u),
             pie_bf16_at(bias[(b0 + 3u) >> 1u], b0 + 3u),
         );
-//#endif
+
         let at = row * n + col;
         if (col < n) {
             y[at >> 1u] = pie_pack_bf16(v.x, v.y);
@@ -169,7 +163,7 @@ fn main(
         }
     }
 }
-//#else
+
 const PIE_THREADS = 128u;
 
 const PIE_STRIDE = PIE_BK + 1u;
@@ -218,7 +212,7 @@ fn main(
             let at = (row0 + r) * k + k0 + kk;
             xs[r * PIE_STRIDE + kk] = pie_bf16_at(x[at >> 1u], at);
         }
-//#if defined(PIE_MXFP4)
+
 
         for (var i = flat; i < PIE_BN * 4u; i = i + PIE_THREADS) {
             let c = i >> 2u;
@@ -238,7 +232,7 @@ fn main(
                 }
             }
         }
-//#else
+
         let cpw = u32(PIE_CODES_PER_WORD);
         let words_per_block = PIE_BK / cpw;
         let wpr = k * u32(PIE_BITS) / 32u;
@@ -263,7 +257,7 @@ fn main(
                 }
             }
         }
-//#endif
+
         workgroupBarrier();
 
         for (var kk = 0u; kk < PIE_BK; kk = kk + 1u) {
@@ -283,36 +277,16 @@ fn main(
             let row = row0 + ty + m * PIE_ROW_LANES;
             var v0 = acc0[m];
             var v1 = acc1[m];
-//#if defined(PIE_BIASED)
+
             let b0 = e * n + col;
             v0 = v0 + pie_bf16_at(bias[b0 >> 1u], b0);
             v1 = v1 + pie_bf16_at(bias[(b0 + 1u) >> 1u], b0 + 1u);
-//#endif
+
             let at = row * n + col;
             y[at >> 1u] = pie_f32_to_bf16(v0) | (pie_f32_to_bf16(v1) << 16u);
         }
     }
 }
-//#endif
 
-// pie:instantiate mxfp4_qmm_t_routed_bf16_gs_32_b_4_bm_16 PIE_BM=16 PIE_MXFP4=1
-// pie:instantiate mxfp4_qmm_t_routed_bf16_gs_32_b_4_bm_32 PIE_BM=32 PIE_MXFP4=1
-// pie:instantiate mxfp4_qmm_t_routed_bf16_gs_32_b_4_bm_64 PIE_BM=64 PIE_MXFP4=1
-// pie:instantiate mxfp4_qmm_t_routed_bias_bf16_gs_32_b_4_bm_16 PIE_BM=16 PIE_MXFP4=1 PIE_BIASED=1
-// pie:instantiate mxfp4_qmm_t_routed_bias_bf16_gs_32_b_4_bm_32 PIE_BM=32 PIE_MXFP4=1 PIE_BIASED=1
-// pie:instantiate mxfp4_qmm_t_routed_bias_bf16_gs_32_b_4_bm_64 PIE_BM=64 PIE_MXFP4=1 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_4_bm_16 PIE_BM=16 PIE_GROUP=64 PIE_BITS=4
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_4_bm_32 PIE_BM=32 PIE_GROUP=64 PIE_BITS=4
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_4_bm_64 PIE_BM=64 PIE_GROUP=64 PIE_BITS=4
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_4_bm_16 PIE_BM=16 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_4_bm_32 PIE_BM=32 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_4_bm_64 PIE_BM=64 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_2_bm_16 PIE_BM=16 PIE_GROUP=64 PIE_BITS=2
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_2_bm_32 PIE_BM=32 PIE_GROUP=64 PIE_BITS=2
-// pie:instantiate affine_qmm_t_routed_bf16_gs_64_b_2_bm_64 PIE_BM=64 PIE_GROUP=64 PIE_BITS=2
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_2_bm_16 PIE_BM=16 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_2_bm_32 PIE_BM=32 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
-// pie:instantiate affine_qmm_t_routed_bias_bf16_gs_64_b_2_bm_64 PIE_BM=64 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
 
-// pie:instantiate mxfp4_qmm_t_routed_bias_scalar_bf16_gs_32_b_4_bm_32 PIE_BM=32 PIE_MXFP4=1 PIE_BIASED=1 PIE_SCALARSTAGE=1
-// pie:instantiate affine_qmm_t_routed_scalar_bf16_gs_64_b_4_bm_32 PIE_BM=32 PIE_GROUP=64 PIE_BITS=4 PIE_SCALARSTAGE=1
+

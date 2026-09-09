@@ -1,8 +1,3 @@
-//! Paged flash attention over the fire's kv pool: the fa2 lattice, the
-//! appenders, and the plan machinery those launches ride on. One entry per
-//! IR variant; kernel selection lives below the entries so a dispatch arm
-//! stays destructure → resolve → call.
-
 pub mod dynconv;
 
 pub mod fa2;
@@ -45,8 +40,6 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const BLOCK: u32 = 256;
 
-/// The attention entries never soft-cap: `attention.logit_softcap` is its
-/// own op, applied where the model says, as before.
 const NO_SOFT_CAP: f32 = 0.0;
 
 #[must_use]
@@ -74,7 +67,6 @@ const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
     Launch::grid([rows, heads, 1], [head_dim_block(head_dim), 1, 1])
 }
 
-/// The head count a row's width spells at a stated head width.
 fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
     if width == 0 || width % head_dim != 0 {
@@ -101,10 +93,6 @@ fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     );
 }
 
-/// The boundary vector must reach every lane the schedule names; checked
-/// (refused, not asserted) because a shorter vector reads past its end in
-/// release. `>=` and not `==`: a windowed launch's own rebased vector hits
-/// equality, but a plane-base launch's vector is the fire's whole length.
 fn lanes_carry(
     op: &'static str,
     q: &RaggedTensor,
@@ -140,8 +128,6 @@ fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64)
     }
 }
 
-/// The decode launch both entries share. The plan's agreement with the
-/// op's restated facts is the caller's duty ([`DecodePlan::accepts`]).
 #[allow(clippy::too_many_arguments)]
 fn fa2_decode(
     ctx: &Ctx,
@@ -159,11 +145,7 @@ fn fa2_decode(
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
-    // `decode.cuh` reads `q + q_indptr[batch_idx] * q_stride_n`, checked
-    // against a vector with fewer boundaries than the schedule names.
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-    // An unsplit decode writes `o` at the work item directly, with no shift
-    // for schedule-named fire lanes; refused rather than silently wrong.
     if plan.shape.lane_offset > 0 && !plan.info.split_kv {
         return Err(refuse(
             op,
@@ -222,11 +204,6 @@ fn fa2_decode(
     }
 }
 
-/// The prefill launch every prefill entry shares. The plan's agreement
-/// with the op's restated facts is the caller's duty
-/// ([`PrefillPlan::accepts`]); `mask` is `attention.masked`'s custom-mask
-/// pair (bits beside their span table), riding the params instead of the
-/// causal bound.
 #[allow(clippy::too_many_arguments)]
 fn fa2_prefill(
     ctx: &Ctx,
@@ -342,8 +319,6 @@ pub fn decode_lse(
     fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse), None)
 }
 
-/// The stated kv head count must be the one the plan was carved at; the
-/// boundaries ride in `q.indptr`.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx,
@@ -392,15 +367,6 @@ pub fn prefill_lse(
     )
 }
 
-/// Prefill against the op's `mask` (packed `u8` bits) instead of the causal
-/// bound, optionally inside a sliding window.
-///
-/// The window composes with the mask: the causal bound is already folded
-/// into the staged bits, the window is the model's own statement, and a key
-/// outside it is dropped regardless. The schedule's window must agree with
-/// the mask's, since `sched_prefill`'s kv chunking and the kernel's
-/// `num_kv_chunks` both derive from `window_left` — hence [`PrefillPlan::accepts`]
-/// is asked with the stated window rather than `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx,
@@ -415,12 +381,7 @@ pub fn masked(
 ) -> Result<(), Error> {
     const OP: &str = "attention.masked";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
-    // The op states no kv head count; the window must be the one the schedule
-    // carved its kv spans for, windowed or not.
     plan.accepts(OP, head_dim, None, window)?;
-    // MENLO-SEAM: the op names the mask bits, but their per-request span
-    // table has no IR seat — the engine binds it onto the plan at build
-    // (`plan_prefill`'s `mask_indptr`).
     let Some(mask_indptr) = plan.mask_indptr else {
         return Err(refuse(
             OP,
@@ -443,9 +404,6 @@ pub fn masked(
     )
 }
 
-/// What an `attention.*_rel` fire adds to its scores: the bias table (f32,
-/// one row per query row, `heads · extent` wide) and the log scaling past a
-/// position floor (`log_alpha` 0 is none).
 #[derive(Clone, Copy, Debug)]
 pub struct RelBias {
     pub bias: Tensor,
@@ -454,8 +412,6 @@ pub struct RelBias {
     pub log_alpha: f32,
 }
 
-/// The relative-bias table an `attention.*_rel` fire reads beside its
-/// queries: f32, one row per query row, `heads · extent` wide.
 fn rel_table(op: &'static str, bias: &Tensor, rows: u32, heads: u32, extent: u32) -> Result<(), Error> {
     if bias.dtype != Dtype::F32 {
         return Err(refuse(op, format!("the relative-bias table is {:?}, and the score adds f32", bias.dtype)));
@@ -473,8 +429,6 @@ fn rel_table(op: &'static str, bias: &Tensor, rows: u32, heads: u32, extent: u32
     Ok(())
 }
 
-/// Decode with a learned relative-position bias on every score
-/// (`Attention::DecodeRel`); see [`RelBias`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_rel(
     ctx: &Ctx,
@@ -492,7 +446,6 @@ pub fn decode_rel(
     fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, Some(rel))
 }
 
-/// Prefill with the same bias (`Attention::PrefillRel`); causal, no custom mask.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_rel(
     ctx: &Ctx,
@@ -511,9 +464,6 @@ pub fn prefill_rel(
     fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, Some(rel))
 }
 
-/// The sm90 plan's consumer seat. The schedule builder is real
-/// ([`plan::plan_prefill_sm90`]); the launcher is not part of this lattice
-/// and refuses.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_sm90(
     _ctx: &Ctx,
@@ -531,8 +481,6 @@ pub fn prefill_sm90(
     })
 }
 
-/// Folds attention-sink mass into `o` using its log-sum-exp, in place on
-/// `o`.
 pub fn sink(
     ctx: &Ctx,
     o: &mut Tensor,
@@ -559,13 +507,11 @@ pub fn sink(
             rows.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
-            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// Merges two attention outputs by their log-sum-exps.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_lse(
     ctx: &Ctx,
@@ -617,13 +563,11 @@ pub fn merge_lse(
             lse.arg(),
             heads.arg(),
             head_dim.arg(),
-            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// `x = cap * tanh(x / cap)`, in place on `x`.
 pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     const OP: &str = "attention.logit_softcap";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -649,9 +593,6 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     )
 }
 
-/// Appends `k`/`v` rows into the pool's pages, each row landing in the cell
-/// the op's `write_page`/`write_offset` descriptors state. Boundary-aware:
-/// the fire's shared indptr rides in `k` (the envelope refresh's lane walk).
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -669,7 +610,6 @@ pub fn kv_append(
     kv::write_kv_to_pages(ctx, OP, k.data, v, k.indptr, pool, write_page, write_offset)
 }
 
-/// Appends one plane shared as both k and v.
 pub fn kv_append_shared(
     ctx: &Ctx,
     plane: RaggedTensor,
@@ -691,12 +631,6 @@ pub fn kv_append_shared(
     )
 }
 
-/// The residual-block blend `elementwise.res_blend` launches: RMS-score the
-/// prefix and `B` candidate blocks, softmax, blend — one fused pass.
-///
-/// The kernel walks `blocks` as `B` stacked `[rows, hidden]` planes, so the
-/// block values must land adjacently; the arena hands them out that way,
-/// and anything else is refused rather than blended wrong.
 pub fn res_blend(
     ctx: &Ctx,
     prefix: Tensor,
@@ -708,7 +642,6 @@ pub fn res_blend(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.res_blend";
 
-    /// The device text's `kMaxBlocks`: the softmax scratch bound.
     const MAX_BLOCKS: usize = 32;
 
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -723,12 +656,6 @@ pub fn res_blend(
             ),
         ));
     }
-    // The kernel walks `blocks + (j * block_rows + row) * hidden` where
-    // `block_rows` is the window's row count (`y.rows`), but the true stride
-    // between stacked candidate planes is the plane's row capacity — which a
-    // `Tensor` cannot express (no height field). So a windowed fire whose
-    // planes are taller than its window is refused below, checked against
-    // the actual pointer gap, rather than blended off the wrong rows.
     let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
     for pair in blocks.windows(2) {
         if pair[1].ptr != pair[0].ptr.wrapping_add(plane_bytes) {
@@ -757,7 +684,6 @@ pub fn res_blend(
             hidden.arg(),
             rows.arg(),
             eps.arg(),
-            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )

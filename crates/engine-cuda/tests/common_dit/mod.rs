@@ -1,15 +1,3 @@
-//! The hand-written MM-DiT miniature the engine's D2/D3 tests fire: a text
-//! lane and an image lane per request, one joint `attention.ragged` over
-//! per-stream q/k/v merged into one rectangle, adaLN from a lane-vector
-//! timestep through `sinusoid` and a lane projection, `rope_axes` over guest
-//! positions, `pack_rows`/`unpack_rows` around the attention, and a
-//! `velocity` export — plus the host's f32 reading of the same arithmetic,
-//! the artifact of random weights it loads from, and the eta epilogue that
-//! reads the velocity back.
-//!
-//! Traced with `model_dsl` directly (no catalog family), loaded through the
-//! real `Engine` API.
-
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -37,20 +25,13 @@ use model_dsl::{
     RaggedMask, Request, RopeForm, Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 
-/// The residual width.
 pub const WIDTH: u32 = 32;
-/// One head of the ragged arm's smallest stamped width.
 pub const HEAD_DIM: u32 = 64;
-/// The timestep embedding's width.
 pub const FREQ: u32 = 16;
-/// `q · k` scale.
 pub const SM_SCALE: f32 = 0.125;
-/// The rope's per-axis bases.
 pub const THETA: f32 = 10_000.0;
-/// The name the trace and the artifact stamp share.
 pub const NAME: &str = "dit-mini";
 
-/// The facts: one stream bit (`text` = bit 0 set, `image` = bit 0 clear).
 pub struct StreamFacts(Stream);
 
 impl StreamFacts {
@@ -68,7 +49,6 @@ impl Classify for StreamFacts {
     }
 }
 
-/// The catalog-shaped classifier the engine is opened with.
 pub fn classify(request: &Request) -> u64 {
     StreamFacts::of(request).word()
 }
@@ -77,7 +57,6 @@ pub fn classify_for(_: &str) -> Option<model_ir::ClassifyFn> {
     Some(classify)
 }
 
-/// The block.
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
@@ -90,13 +69,10 @@ impl ForwardHybrid for DoubleBlock {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        // The float ports: latents per stream, a timestep per lane, two
-        // rope axes per row.
         let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
         let x_img = img.latents(1, WIDTH, Dtype::Bf16);
         let t = inputs.lane_vector(0, 1);
         let pos = inputs.axis_positions(0, 2);
-        // adaLN: sinusoid -> silu -> lane projection -> [Lanes, 2W] f32.
         let emb = ops::elemwise::sinusoid(&t, FREQ, THETA, true, 1.0);
         let emb = ops::elemwise::silu(&emb);
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
@@ -167,8 +143,6 @@ pub fn trace() -> Trace {
     trace_hybrid(NAME, &DoubleBlock, Platform::Cuda)
 }
 
-// ── numbers ───────────────────────────────────────────────────────────────
-
 pub fn to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     let round = 0x7fff + ((bits >> 16) & 1);
@@ -179,7 +153,6 @@ pub fn from_bf16(v: u16) -> f32 {
     f32::from_bits(u32::from(v) << 16)
 }
 
-/// Round through bf16.
 pub fn bf(x: f32) -> f32 {
     from_bf16(to_bf16(x))
 }
@@ -191,7 +164,6 @@ impl Lcg {
         Lcg(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
 
-    /// The next value in `[-1, 1)`.
     pub fn unit(&mut self) -> f32 {
         self.0 = self
             .0
@@ -202,8 +174,6 @@ impl Lcg {
     }
 }
 
-/// The weights, by plan name: `[out, in]` row-major, bf16-rounded f32,
-/// scaled by `1/sqrt(in)` so activations stay `O(1)`.
 pub struct Weights {
     pub planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
 }
@@ -231,8 +201,6 @@ impl Weights {
             .1
     }
 
-    /// Write the artifact the engine loads: every plane as a bf16 leaf
-    /// under the stamp the load checks.
     pub fn write(&self, dir: &Path) -> PathBuf {
         let path = dir.join(format!("cuda-{NAME}.zt"));
         let bytes: Vec<(String, Vec<u64>, Vec<u8>)> = self
@@ -272,16 +240,12 @@ pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String>
         .map_err(|why| why.to_string())
 }
 
-// ── the host reference ───────────────────────────────────────────────────
-
-/// One request's two lanes, as the host computes them.
 pub struct HostRequest {
     pub text: Vec<f32>,
     pub image: Vec<f32>,
     pub text_rows: usize,
     pub image_rows: usize,
     pub timestep: f32,
-    /// `(axis0, axis1)` per row, text rows then image rows.
     pub positions: Vec<[f32; 2]>,
 }
 
@@ -318,7 +282,6 @@ pub fn sinusoid(t: f32) -> Vec<f32> {
     let angles: Vec<f32> = (0..half)
         .map(|i| t * (-THETA.ln() * i as f32 / half as f32).exp())
         .collect();
-    // flip_sin_cos: [cos | sin].
     let mut row: Vec<f32> = angles.iter().map(|a| a.cos()).collect();
     row.extend(angles.iter().map(|a| a.sin()));
     row
@@ -328,8 +291,6 @@ pub fn silu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v / (1.0 + (-v).exp())).collect()
 }
 
-/// `layernorm_no_scale` then `modulate` (the fused pair): the normed row in
-/// f32, one bf16 rounding at the modulated store.
 pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
     let w = WIDTH as usize;
     let mut y = vec![0f32; rows * w];
@@ -364,8 +325,6 @@ pub fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
     }
 }
 
-/// Non-causal attention over one group's packed rows, f32 softmax, `P`
-/// rounded to bf16 as the tensor core reads it, output rounded once.
 pub fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
     let hd = HEAD_DIM as usize;
     let mut o = vec![0f32; rows * hd];
@@ -387,8 +346,6 @@ pub fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
     o
 }
 
-/// The velocity rows of one request: text rows then image rows, `[rows,
-/// WIDTH]` each, as the plan computes them.
 pub fn reference(weights: &Weights, request: &HostRequest) -> (Vec<f32>, Vec<f32>) {
     let w = WIDTH as usize;
     let hd = HEAD_DIM as usize;
@@ -411,7 +368,6 @@ pub fn reference(weights: &Weights, request: &HostRequest) -> (Vec<f32>, Vec<f32
     rope(&mut kt, request.text_rows, text_positions);
     rope(&mut qi, request.image_rows, image_positions);
     rope(&mut ki, request.image_rows, image_positions);
-    // The joint group: text rows then image rows (stream order).
     let rows = request.text_rows + request.image_rows;
     let cat = |a: &[f32], b: &[f32]| {
         let mut out = a.to_vec();
@@ -428,12 +384,6 @@ pub fn reference(weights: &Weights, request: &HostRequest) -> (Vec<f32>, Vec<f32
     (fold(&y_txt, &request.text), fold(&y_img, &request.image))
 }
 
-// ── the engine, the program, the channels ────────────────────────────────
-
-/// The epilogue: takes the latent cell, reads the velocity intrinsic, puts
-/// `latent + velocity` — the Euler step's shape — on the reader channel.
-/// Channels: 0 latent (writer), 1 timestep (writer), 2 positions (writer),
-/// 3 out (reader).
 pub fn epilogue(rows: u32) -> TraceContainer {
     let writer = |shape: Shape| ChannelDecl {
         shape,
@@ -476,7 +426,6 @@ pub fn epilogue(rows: u32) -> TraceContainer {
     }
 }
 
-/// The channel ids one lane's instance binds, and the instance.
 pub struct LaneHandles {
     pub instance: u64,
     pub latent: u64,
@@ -486,8 +435,6 @@ pub struct LaneHandles {
     pub rows: u32,
 }
 
-/// A loaded engine with a program per row count and a fresh channel id
-/// counter.
 pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
@@ -497,14 +444,10 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// Load the miniature at these budgets (graphs on, bodies armed, golden
-    /// checked — the load's default knobs).
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
         Rig::load_plan(trace(), weights, max_tokens, buckets)
     }
 
-    /// [`Rig::load`] over another plan traced under [`NAME`] (its weights
-    /// drawn for it).
     pub fn load_plan(plan: Trace, weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
         Rig::load_recording(
             plan,
@@ -515,11 +458,6 @@ impl Rig {
         )
     }
 
-    /// [`Rig::load_plan`] with the recording knob stated. `Recording::Bodies
-    /// { mem_megabytes: 0 }` serves bodies but lets the arming pass arm none,
-    /// so every fire captures its own body and WALKS it — which is what a
-    /// flagship whose readings the arming pass cannot synthesize does, and
-    /// the only state in which a launch resolves its own boundary vector.
     pub fn load_recording(
         plan: Trace,
         weights: &Weights,
@@ -578,8 +516,6 @@ impl Rig {
         id
     }
 
-    /// Compile and register any epilogue container against this load's
-    /// profile; `salt` keeps two programs' hashes apart.
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
         let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
@@ -616,14 +552,11 @@ impl Rig {
         id
     }
 
-    /// One lane's instance: its four channels registered and bound.
     pub fn lane(&mut self, rows: u32) -> LaneHandles {
         let program = self.program(rows);
         self.lane_of(program, rows, WIDTH)
     }
 
-    /// [`Rig::lane`] over a stated program, with an out channel `width`
-    /// wide.
     pub fn lane_of(&mut self, program: u64, rows: u32, width: u32) -> LaneHandles {
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
@@ -677,7 +610,6 @@ impl Rig {
     }
 }
 
-/// One lane of a submission, fed from its handles.
 pub fn lane(slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
     let port = match stream {
         LaneStream::Text => 0,

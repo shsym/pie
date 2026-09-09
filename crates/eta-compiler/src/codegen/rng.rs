@@ -1,23 +1,11 @@
-//! Deterministic backend projections of the canonical ETA RNG contract,
-//! printed from [`eta_ir::rng::RNG_FORMULA`] so device and host cannot drift.
-
 use core::fmt::Write;
 
 use eta_ir::rng::{NORMAL_PAIR_STRIDE, NORMAL_TWO_PI, RNG_FORMULA};
 
-/// The nearest `f32` to this text is exactly `UNIFORM_MAX`, so host and
-/// device agree bit for bit.
 const UNIFORM_MAX_LITERAL: &str = "0.99999994";
 
-/// The nearest `f32` to this text is exactly [`NORMAL_TWO_PI`], for the same
-/// reason [`UNIFORM_MAX_LITERAL`] is spelled out: a shortest-round-trip
-/// print of the constant is what host and device must both parse.
 const NORMAL_TWO_PI_LITERAL: &str = "6.2831855";
 
-/// The Box-Muller projection: `sqrt(-2*ln(u0)) * cos(2*pi*u1)` over the two
-/// uniform lanes `NORMAL_PAIR_STRIDE * index` and `+ 1`, expression for
-/// expression with `eta_ir::rng::hash_normal`. `sqrt`/`log`/`cos` are the
-/// backend's spellings of the three library calls.
 fn normal_body(sqrt: &str, log: &str, cos: &str, u32_ty: &str) -> String {
     debug_assert_eq!(
         NORMAL_TWO_PI_LITERAL.parse::<f32>().ok(),
@@ -40,7 +28,6 @@ fn normal_body(sqrt: &str, log: &str, cos: &str, u32_ty: &str) -> String {
     out
 }
 
-/// The `__device__` projection, as spliced into emitted CUDA sources.
 pub fn cuda_device_functions() -> String {
     let mut out = String::new();
     let (inline, u64_ty, u32_ty, u64_suffix) = (
@@ -94,12 +81,9 @@ pub fn cuda_device_functions() -> String {
     out
 }
 
-/// Renders the `ptir_rng.generated.metal` preamble — the same RNG contract in
-/// MSL, wrapped in an include guard.
 pub fn generate_msl_preamble() -> String {
     let mut out = String::from(
         "// ptir_rng.generated.metal — GENERATED from crates/eta-ir/src/rng.rs.\n\
-// DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract\n\
 #ifndef PIE_PTIR_RNG_GENERATED_METAL\n\
 #define PIE_PTIR_RNG_GENERATED_METAL\n\
 \n\
@@ -143,9 +127,8 @@ inline ulong ptir_rng_splitmix64(ulong x) {\n",
     let _ = writeln!(
         out,
         "inline float ptir_rng_hash_normal(ulong seed_eff, uint index) {{\n{}}}",
-        normal_body("sqrt", "precise::log", "precise::cos", "uint")
+        normal_body("metal::sqrt", "metal::precise::log", "metal::precise::cos", "uint")
     );
     out.push_str("#endif\n");
     out
 }
-

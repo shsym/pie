@@ -1,16 +1,3 @@
-//! Reading one source from several threads.
-//!
-//! A `Source` is `Send + Sync`, which is what lets a loader fan a checkpoint
-//! out across threads, the ordinary case for anything feeding a GPU. The part
-//! that has to be right for that claim is the opaque readers: a deflated zip
-//! entry has no address, so producing it means holding a lock over an archive
-//! and, for torch, over a cache of inflated storages.
-//!
-//! These tests are about contention on exactly those locks. What they check is
-//! that concurrent readers get the same bytes a single reader would, and that
-//! they finish. A deadlock here would look like a hung loader, which is the
-//! failure mode nobody can debug from a stack trace.
-
 #![cfg(feature = "npz")]
 
 use std::borrow::Cow;
@@ -31,8 +18,6 @@ fn npy(shape: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// An `.npz` whose entries are deflated, so every read goes through the
-/// archive lock rather than the mapping.
 fn deflated_npz(name: &str, tensors: &[(&str, u8, usize)]) -> PathBuf {
     let path = tmp(name);
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
@@ -47,10 +32,13 @@ fn deflated_npz(name: &str, tensors: &[(&str, u8, usize)]) -> PathBuf {
     path
 }
 
-/// Every thread reads every tensor, starting together.
-///
-/// The barrier is the point: without it the threads would arrive at the lock
-/// one after another and never contend.
+fn threads_every_case() {
+    threads_contending_on_an_opaque_reader_all_get_the_right_bytes();
+    one_hot_tensor_read_by_everyone_at_once();
+    mapped_and_opaque_tensors_are_read_side_by_side();
+    a_source_can_be_moved_to_another_thread();
+}
+
 #[test]
 fn threads_contending_on_an_opaque_reader_all_get_the_right_bytes() {
     let tensors: Vec<(&str, u8, usize)> = vec![
@@ -62,7 +50,6 @@ fn threads_contending_on_an_opaque_reader_all_get_the_right_bytes() {
     let path = deflated_npz("threads-npz.zt", &tensors);
     let src = Arc::new(ztensor_compat::open(&path).unwrap());
 
-    // Nothing here is mappable, so this exercises the lock.
     for (name, _, _) in &tensors {
         let caps = src.tensor(name).unwrap().caps();
         assert!(!caps.map && !caps.locate, "{name} should be opaque");
@@ -96,9 +83,6 @@ fn threads_contending_on_an_opaque_reader_all_get_the_right_bytes() {
     }
 }
 
-/// The same tensor from every thread at once: one entry, one lock, maximum
-/// contention on it.
-#[test]
 fn one_hot_tensor_read_by_everyone_at_once() {
     let path = deflated_npz("threads-hot.zt", &[("hot", 0x5A, 65536)]);
     let src = Arc::new(ztensor_compat::open(&path).unwrap());
@@ -121,12 +105,6 @@ fn one_hot_tensor_read_by_everyone_at_once() {
     }
 }
 
-/// Mapped and opaque tensors read side by side.
-///
-/// A mixed file is the realistic shape, a checkpoint where some entries were
-/// stored and some deflated. The two paths share nothing but the source,
-/// so this is where a mistake in that sharing would show.
-#[test]
 fn mapped_and_opaque_tensors_are_read_side_by_side() {
     let path = tmp("threads-mixed.zt");
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
@@ -172,9 +150,6 @@ fn mapped_and_opaque_tensors_are_read_side_by_side() {
     }
 }
 
-/// A source built on one thread and used on another, with no `Arc` at all.
-/// the `Send` half of the claim, which sharing alone does not exercise.
-#[test]
 fn a_source_can_be_moved_to_another_thread() {
     let path = deflated_npz("threads-moved.zt", &[("w", 0x77, 4096)]);
     let src = ztensor_compat::open(&path).unwrap();

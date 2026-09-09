@@ -1,8 +1,3 @@
-//! The module cache: each `(root, instantiation, arch)` compiles at most
-//! once per process, lands on disk keyed by everything that can change the
-//! cubin, and resolves to a loaded `CUfunction` for every fire after the
-//! first.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -46,9 +41,6 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
         code: -1,
     })?;
     let key = root.key(instantiation, arch);
-    // A loaded module belongs to the context it was loaded into, so the
-    // in-process slot is per device (the ranks of a tensor-parallel group
-    // share this process); the cubin on disk is per arch and shared.
     let mut ordinal: i32 = 0;
     let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
     if code != rt::cudaError::cudaSuccess {
@@ -163,9 +155,6 @@ fn entry_by_name(
     }
 }
 
-/// This instantiation's cubin, under the deployment's stated cache root. The
-/// root arrives through [`crate::disk`]; `None` is a process that stated
-/// none, and every instantiation then compiles.
 fn disk_path(key: &str) -> Option<PathBuf> {
     let digest = crate::source::fnv1a64(key.as_bytes());
     Some(crate::disk::dir(crate::disk::CUBINS)?.join(format!("{digest:016x}.cubin")))
@@ -211,7 +200,6 @@ fn put_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(&text.as_bytes()[..len as usize]);
 }
 
-/// Ensure this thread holds the primary context before any driver-API call.
 pub(crate) fn bind_context() -> Result<(), Fault> {
     use std::cell::Cell;
 
@@ -234,7 +222,6 @@ pub(crate) fn bind_context() -> Result<(), Fault> {
     Ok(())
 }
 
-/// The current device's `sm_XY`, probed once.
 #[must_use]
 pub fn arch() -> Option<&'static str> {
     use dr::CUdevice_attribute as Attr;

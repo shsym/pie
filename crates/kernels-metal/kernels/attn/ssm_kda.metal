@@ -33,7 +33,7 @@ template <typename T, int WIDTH, int DMAX>
   const size_t head = size_t(h) * size_t(d);
 
   float2 sums = float2(0.0f, 0.0f);
-  // q and k are L2-normed PER HEAD (the reference's `l2norm(q, dim=-1)`).
+
   for (int i = tid; i < d; i += WIDTH) {
     const float qv = float(mixed[row + head + size_t(i)]);
     const float kv = float(mixed[row + wide + head + size_t(i)]);
@@ -51,7 +51,7 @@ template <typename T, int WIDTH, int DMAX>
   const float kinv = metal::rsqrt(fold[0].y + norm_eps);
 
   const float alpha = metal::exp(a_log[h]);
-  // The reference recurrence's `scale`: q carries head_dim^-1/2.
+
   const float qscale = metal::rsqrt(float(d));
   for (int i = tid; i < d; i += WIDTH) {
     const size_t at = head + size_t(i);
@@ -59,7 +59,7 @@ template <typename T, int WIDTH, int DMAX>
     sk[i] = float(mixed[row + wide + at]) * kinv;
     const float z = float(f[size_t(n) * wide + at]) + dt_bias[at];
     if (gate_floor != 0.0f) {
-      // A floored decay (`gate_lower_bound`): log-gate = floor * sigmoid(alpha * z).
+
       sg[i] = metal::exp(gate_floor / (1.0f + metal::exp(-alpha * z)));
     } else {
       const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
@@ -132,7 +132,7 @@ template <typename T, int WIDTH, int DMAX>
   const size_t wide = size_t(plane);
   const size_t head = size_t(h) * size_t(d);
   const float alpha = metal::exp(a_log[h]);
-  // The reference recurrence's `scale`: q carries head_dim^-1/2.
+
   const float qscale = metal::rsqrt(float(d));
   device float* state =
       rstate + (size_t(slots[begin]) * size_t(heads) + size_t(h)) * size_t(d) *
@@ -142,7 +142,7 @@ template <typename T, int WIDTH, int DMAX>
     const size_t row = size_t(t) * 3 * wide;
 
     float2 sums = float2(0.0f, 0.0f);
-    // q and k are L2-normed PER HEAD (the reference's `l2norm(q, dim=-1)`).
+
     for (int i = tid; i < d; i += WIDTH) {
       const float qv = float(mixed[row + head + size_t(i)]);
       const float kv = float(mixed[row + wide + head + size_t(i)]);
@@ -165,7 +165,7 @@ template <typename T, int WIDTH, int DMAX>
       sk[i] = float(mixed[row + wide + at]) * kinv;
       const float z = float(f[size_t(t) * wide + at]) + dt_bias[at];
       if (gate_floor != 0.0f) {
-        // A floored decay (`gate_lower_bound`): log-gate = floor * sigmoid(alpha * z).
+
         sg[i] = metal::exp(gate_floor / (1.0f + metal::exp(-alpha * z)));
       } else {
         const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
@@ -201,14 +201,6 @@ template <typename T, int WIDTH, int DMAX>
   }
 }
 
-// ── the committed form ───────────────────────────────────────────────────────
-//
-// `kda_chunked` over the extended row run `causal_conv1d_committed`
-// describes (`gated_delta_committed`'s twin): the recurrence runs on a WORK
-// copy of the bank and the bank itself is written only as of row
-// `commit[lane0 + r] - 1`. Rows past the commit are computed (the speculative
-// window's outputs) from the state they should see and leave nothing behind.
-// `work` is one bank per fire lane, `[lane][heads][head_dim][head_dim]`.
 template <typename T, int WIDTH, int DMAX>
 [[kernel]] void kda_committed(
     const device T* mixed          [[buffer(0)]],

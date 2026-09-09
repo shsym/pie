@@ -1,7 +1,3 @@
-//! Process-owned membership inventory for KV/RS working sets and fire
-//! queues, plus the pid-keyed registry the planner probes through (victim
-//! quoting, eviction targeting, restore sizing).
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, RwLock, Weak};
 
@@ -19,8 +15,6 @@ pub(crate) struct ResidentPipeline {
 
 #[derive(Default)]
 pub(crate) struct ProcessResidency {
-    /// Every live KV working set, keyed by locus — the value is the
-    /// planner's weak suspend handle (fence + quiescence).
     pub(crate) kv_working_sets:
         HashMap<(usize, crate::engine::EngineId, WorkingSetId), KvSuspendHandle>,
     pub(crate) rs_working_sets: HashSet<(usize, crate::engine::EngineId, RsWorkingSetId)>,
@@ -34,7 +28,6 @@ pub(crate) struct ResidencySnapshot {
 }
 
 impl ProcessResidency {
-    /// The live pipeline queues (pruning entries whose queue is gone).
     pub(crate) fn pipelines(&mut self) -> Vec<PendingFires> {
         let pipelines: Vec<_> = self
             .pipelines
@@ -50,8 +43,6 @@ impl ProcessResidency {
         let departed_pipeline_ids = self
             .pipelines
             .iter()
-            // `close` is the side effect: it claims the departure exactly
-            // once, so a second teardown snapshot reports nothing.
             .filter(|pipeline| pipeline.scope.close())
             .map(|pipeline| pipeline.scope.scheduler_id())
             .collect();
@@ -62,9 +53,6 @@ impl ProcessResidency {
     }
 }
 
-/// pid → residency, for cross-layer probes that only know a process id
-/// (planner victim sizing, eviction execution). Weak entries; pruned on
-/// unregister and on probe misses.
 static RESIDENCIES: LazyLock<RwLock<HashMap<uuid::Uuid, Weak<Mutex<ProcessResidency>>>>> =
     LazyLock::new(Default::default);
 
@@ -90,7 +78,6 @@ fn with_residency<R: Default>(pid: uuid::Uuid, f: impl FnOnce(&mut ProcessReside
     }
 }
 
-/// The process's live KV working-set ids on `(model, engine)`.
 pub(crate) fn kv_working_set_ids(
     pid: uuid::Uuid,
     model: usize,
@@ -105,8 +92,6 @@ pub(crate) fn kv_working_set_ids(
     })
 }
 
-/// The planner's suspend handles for the process's KV working sets on
-/// `(model, engine)`.
 pub(crate) fn kv_suspend_handles(
     pid: uuid::Uuid,
     model: usize,
@@ -122,15 +107,10 @@ pub(crate) fn kv_suspend_handles(
     })
 }
 
-/// The process's live pipeline FIFOs (for the planner's detachable drain).
 pub(crate) fn pipelines_of(pid: uuid::Uuid) -> Vec<PendingFires> {
     with_residency(pid, |residency| residency.pipelines())
 }
 
-/// Whether every KV working set of `pid` on `(model, engine)` holds zero
-/// fire leases right now -- a racy snapshot used only as a victim-selection
-/// preference (skips the lease drain when evicting), never a correctness
-/// gate; the eviction's own fence + quiesce remains the seal.
 pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, engine: usize) -> bool {
     with_residency(pid, |residency| {
         residency
@@ -141,11 +121,6 @@ pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, engine: usize) -
     })
 }
 
-/// The per-process KV working sets on `(model, engine)`, gathered without
-/// touching the KV store lock. Split out of [`kv_reclaim_quotes`] so a
-/// caller needing an atomic decision can gather here first and take the
-/// store lock itself, preserving the tree-wide order (`RESIDENCIES` before
-/// the KV lock).
 pub(crate) fn kv_working_sets_for(
     pids: &[uuid::Uuid],
     model: usize,
@@ -167,10 +142,6 @@ pub(crate) fn kv_working_sets_for(
         .collect()
 }
 
-/// Quote `working_sets` against an already-locked store, keeping the
-/// result positional with the `pids` the sets came from. `budget` stops
-/// the quoting once the answers cover that many pages; positions past the
-/// cut come back `None`. Pass `u32::MAX` to quote every pid.
 pub(crate) fn quote_locked(
     kv: &crate::store::kv::KvStore,
     working_sets: Vec<Option<HashSet<WorkingSetId>>>,
@@ -178,16 +149,12 @@ pub(crate) fn quote_locked(
 ) -> Vec<Option<ReclaimQuote>> {
     let known: Vec<HashSet<WorkingSetId>> = working_sets.iter().flatten().cloned().collect();
     let mut quotes = kv.reclaim_quotes(&known, budget).into_iter();
-    // `and_then`, not `and`: eager evaluation would consume a quote for a
-    // `None` entry too, shifting every later position.
     working_sets
         .into_iter()
         .map(|entry| entry.and_then(|_| quotes.next()))
         .collect()
 }
 
-/// `None` for a process that is unknown or already tearing down — that is
-/// "no opinion", distinct from a quote of "frees nothing".
 pub(crate) fn kv_reclaim_quotes(
     pids: &[uuid::Uuid],
     model: usize,
@@ -202,4 +169,3 @@ pub(crate) fn kv_reclaim_quotes(
         quote_locked(kv, working_sets, budget)
     })
 }
-

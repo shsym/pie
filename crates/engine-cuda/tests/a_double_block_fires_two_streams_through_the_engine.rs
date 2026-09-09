@@ -1,23 +1,3 @@
-//! **A HAND-WRITTEN MM-DiT MINIATURE — two streams per request, one joint
-//! `attention.ragged` over merged per-stream q/k/v, adaLN from a lane-vector
-//! timestep, `rope_axes`, `pack_rows`/`unpack_rows`, a `velocity` export —
-//! FIRES THROUGH THE REAL `Engine` API WITH TWO REQUESTS (FOUR LANES) AND
-//! LANDS WHAT A HOST f32 REFERENCE COMPUTES, ON BOTH READBACK ROADS.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_double_block_fires_two_streams_through_the_engine
-//! ```
-//!
-//! The plan is `model_dsl` text (no catalog family); its weights are random
-//! and written to a serving artifact the engine loads under its default
-//! knobs, so the load's arming pass records bodies and diffs each against
-//! its eager walk (the golden) before the first fire. Every lane feeds its
-//! latents, its timestep and its rope positions from channel cells; the
-//! velocity comes back as `LaneReadout { seam: Velocity }` rows through
-//! `settle_frame`, and as `latent + velocity` through an eta epilogue that
-//! reads the `velocity()` intrinsic. Skips when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -28,7 +8,6 @@ use common_dit::{
 use engine::Engine;
 use engine::fire::{LaneStream, ReadoutSeam};
 
-/// One request's host-side inputs, random.
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
     let rows = text_rows + image_rows;
@@ -62,8 +41,6 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     let requests = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
     let want: Vec<(Vec<f32>, Vec<f32>)> = requests.iter().map(|r| reference(&weights, r)).collect();
 
-    // One instance per lane; the text lane and the image lane of a request
-    // share a group.
     let mut lanes = Vec::new();
     let mut attachments = Vec::new();
     let mut handles = Vec::new();
@@ -93,8 +70,6 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
                 .collect::<Vec<f32>>(),
         );
         let slot = (2 * at) as u32;
-        // Submitted image-first for one request, text-first for the other:
-        // the packed order is the group's, not the submission's.
         if at == 0 {
             lanes.push(lane(slot, &image, LaneStream::Image, at as u32));
             lanes.push(lane(slot + 1, &text, LaneStream::Text, at as u32));
@@ -122,13 +97,11 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         assert_eq!(readout.seam, ReadoutSeam::Velocity);
         assert_eq!(readout.width, WIDTH);
     }
-    // Submission order: [r0.image, r0.text, r1.text, r1.image].
     assert_close(&readouts[0].values, &want[0].1, "request 0 image velocity");
     assert_close(&readouts[1].values, &want[0].0, "request 0 text velocity");
     assert_close(&readouts[2].values, &want[1].0, "request 1 text velocity");
     assert_close(&readouts[3].values, &want[1].1, "request 1 image velocity");
 
-    // The epilogue's road: `latent + velocity` on each lane's out channel.
     let (r0_image, r0_text) = &handles[0];
     let (r1_text, r1_image) = &handles[1];
     let stepped = |values: &[f32], latent: &[f32]| -> Vec<f32> {

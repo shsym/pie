@@ -3,8 +3,6 @@ use eta_compiler::plan::Dimension;
 use eta_ir::Dtype;
 use eta_ir::types::{MAX_RANK, from_wire, wire_dtype};
 
-/// Which runtime quantity a symbolic axis resolves against. A rename of
-/// [`eta_compiler::plan::SymbolicExtent`], not a copy.
 pub use eta_compiler::plan::SymbolicExtent as Role;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,9 +99,6 @@ impl ValueDesc {
         super::value::wire_cell_bytes(self.dtype(), self.len as usize) as u64
     }
 
-    /// The element type this descriptor's `dtype` word names. `dtype` is a
-    /// `u32` because the struct is `#[repr(C)]` and read by a device kernel;
-    /// falls back to `F32` for a word no dtype claims.
     #[must_use]
     fn dtype(&self) -> Dtype {
         u8::try_from(self.dtype)

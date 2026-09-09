@@ -1,12 +1,7 @@
-//! Expands a lane's run-length [`Masking`] (per-extent or per-row) into the packed bit slab `attention.masked`'s custom-mask kernel reads: one bit per (query row, key) at `qo_idx * kv_len + kv_idx`, LSB-first, each lane starting on a byte boundary, ANDed with the causal bound the kernel does not otherwise apply — unless the lane is [`LaneMask::bidirectional`], the denoiser's reading, where every row keeps every key its runs keep. A mask longer than the lane's extent is clipped; shorter is `Fault::Mask`.
-
 use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
 
-/// Encodes a dense `[rows, keys]` bool rectangle into per-row run-length
-/// masks. `stride` is the rectangle's own key width (e.g. a reserved pool),
-/// not necessarily the lane's extent.
 #[must_use]
 pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     let rows = if stride == 0 { 0 } else { cells.len() / stride };
@@ -14,7 +9,6 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
         (0..rows)
             .map(|row| {
                 let mut runs: Vec<u32> = Vec::new();
-                // Alternating lengths, masked-out first (`Mask`'s encoding).
                 let mut keeping = false;
                 let mut run = 0u32;
                 for &kept in &cells[row * stride..(row + 1) * stride] {
@@ -35,33 +29,20 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     )
 }
 
-/// One lane's mask, with the geometry that says what shape it expands to.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneMask<'a> {
-    /// The lane's masking — one restriction over its extent or one per query
-    /// row — or `None` for a lane that carries none.
     pub mask: Option<&'a Masking>,
-    /// How many KV tokens the slot held BEFORE this fire.
     pub have: u32,
-    /// How many token rows this fire feeds it.
     pub rows: u32,
-    /// Lift the causal bound: a row keeps a key past its own position too.
     pub bidirectional: bool,
 }
 
-/// A fire's mask bits and their per-lane span table, ready to stage.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// The packed bits, every lane's `rows x kv` rectangle end to end, each
-    /// starting on a byte boundary.
     pub bits: Vec<u8>,
-    /// `[lanes + 1]`: each lane's byte offset into [`bits`](Staged::bits).
-    /// The last entry is the total, so a reader can bound the final lane.
     pub indptr: Vec<i32>,
 }
 
-/// Expand a fire's lane masks, in fire (seriated) row order. `Ok(None)` is a fire no lane put a mask on.
-/// Errs [`Fault::Mask`] for a mask shorter than the lane's post-append KV length (longer is accepted and clipped); [`Fault::MaskRows`] for a [`Masking::Rows`] whose row count doesn't match the lane's.
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
@@ -100,14 +81,12 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 }
             };
             match masking {
-                // Walked once; the same runs apply to every row.
                 Masking::Extent(mask) => {
                     let mut at_position = 0u64;
                     for (index, &run) in mask.runs.iter().enumerate() {
                         let end = at_position.saturating_add(u64::from(run)).min(kv);
                         if index % 2 == 1 {
                             for key in at_position..end {
-                                // query row q stands at absolute position have + q; a key past it is unwritten — unless the lane reads bidirectionally, when every row of the fire's own keys is written before any row attends.
                                 let first = if lane.bidirectional {
                                     0
                                 } else {
@@ -124,9 +103,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                         at_position = end;
                     }
                 }
-                // Walked once per row, under that row's own causal bound;
-                // a row's runs may only narrow what causality already
-                // allows, never widen it.
                 Masking::Rows(rows) => {
                     for (q, mask) in rows.iter().enumerate() {
                         let q = q as u64;
@@ -161,17 +137,20 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
 mod tests {
     use super::*;
 
-    /// Is `(q, k)` kept, read the way the device text reads it?
     fn keeps(staged: &Staged, lane: usize, kv: u64, q: u64, k: u64) -> bool {
         let base = staged.indptr[lane] as usize;
         let cell = q * kv + k;
         (staged.bits[base + (cell / 8) as usize] >> (cell % 8)) & 1 == 1
     }
 
-    /// The runs and the causal bound are ANDed, not chosen between.
+    fn mask_every_case() {
+        the_runs_and_the_causal_bound_intersect();
+        a_windowed_prefill_expands_row_by_row();
+        a_mask_short_of_its_lanes_extent_is_refused();
+    }
+
     #[test]
     fn the_runs_and_the_causal_bound_intersect() {
-        // 2 held + 3 new = 5; keep positions 1..4 (drop 0 and 4).
         let mask = Masking::Extent(Mask::new(vec![1, 3, 1], 5));
         let staged = stage(&[LaneMask {
             mask: Some(&mask),
@@ -189,9 +168,6 @@ mod tests {
         }
     }
 
-    /// A sliding window (row q keeps `[q-1, q]`) is not any single
-    /// `Masking::Extent`, so it needs the per-row form.
-    #[test]
     fn a_windowed_prefill_expands_row_by_row() {
         const N: u64 = 6;
         let rows: Vec<Mask> = (0..N)
@@ -221,7 +197,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn a_mask_short_of_its_lanes_extent_is_refused() {
         let mask = Masking::Extent(Mask::new(vec![0, 4], 4));
         let refused = stage(&[LaneMask {

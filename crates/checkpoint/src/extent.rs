@@ -1,18 +1,7 @@
-//! The one geometry type for a rectangular byte copy.
-//!
-//! [`Rect`] is two-sided (one copy, source and destination together, what the
-//! affine solver produces); [`Extent`] is one-sided (source or destination of
-//! an instruction, how the executor addresses memory). [`Rect::split`] is the
-//! only bridge, and the one place the dense-destination rule is enforced.
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, OrOverflow, Result};
 
-/// One level of a rectangular copy's loop nest. Element at `(i₀ … iₙ)` moves
-/// from `src_offset + Σ iₖ·src_strideₖ` to `dst_offset + Σ iₖ·dst_strideₖ`;
-/// innermost level always has unit strides. Counts/strides are bytes once a
-/// [`Rect`] is scaled by its encoding, logical elements before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dim {
     pub count: i64,
@@ -20,9 +9,6 @@ pub struct Dim {
     pub dst_stride: i64,
 }
 
-/// One side of a copy: a base offset and the loop nest over it.
-/// `element_bytes` is the contiguous inner block's size, hoisted out of
-/// `dims` since every executor wants it as the memcpy length.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extent {
     pub base_offset: u64,
@@ -31,8 +17,6 @@ pub struct Extent {
 }
 
 impl Extent {
-    /// One unbroken run of `bytes` bytes — the shape [`Extent::is_byte_run`]
-    /// recognises.
     pub fn byte_run(bytes: u64) -> Self {
         Self {
             base_offset: 0,
@@ -45,26 +29,18 @@ impl Extent {
         }
     }
 
-    /// Whether neither side skips: every stride, innermost out, is the
-    /// running dense extent. Asked before merging two copies.
     pub fn is_dense(&self) -> bool {
         self.walk_dense(|dim, stride| dim.src_stride == stride && dim.dst_stride == stride)
     }
 
-    /// The same question, asked of the destination alone.
     pub fn has_dense_destination(&self) -> bool {
         self.walk_dense(|dim, stride| dim.dst_stride == stride)
     }
 
-    /// Whether this is one unbroken run of bytes from offset zero — stronger
-    /// than [`Extent::is_dense`]: also needs the base folded in and elements
-    /// byte-sized, so the whole extent is a `{offset, len}` pair.
     pub fn is_byte_run(&self) -> bool {
         self.base_offset == 0 && self.element_bytes == 1 && self.dims.len() == 1 && self.is_dense()
     }
 
-    /// The dense row-major layout of `shape`, both sides packed — the shape
-    /// [`Extent::is_dense`] recognises.
     pub fn dense(shape: &[i64], element_bytes: u64) -> Self {
         let mut stride = i64::try_from(element_bytes).unwrap_or(i64::MAX);
         let mut dims = Vec::with_capacity(shape.len());
@@ -99,9 +75,6 @@ impl Extent {
     }
 }
 
-/// One rectangular copy, both sides at once, in bytes.
-/// `leaf` indexes the owning `Lowering`'s leaves — the tensor these bytes
-/// come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub leaf: usize,
@@ -111,7 +84,6 @@ pub struct Rect {
 }
 
 impl Rect {
-    /// A single contiguous byte range.
     pub fn span(leaf: usize, src_offset: u64, dst_offset: u64, bytes: u64) -> Self {
         Self {
             leaf,
@@ -129,16 +101,10 @@ impl Rect {
         self.dims.iter().map(|dim| dim.count).product::<i64>() as u64
     }
 
-    /// Whether this moves one unbroken block. The same question
-    /// [`Extent::is_byte_run`] answers, minus the base offsets a [`Rect`]
-    /// carries separately.
     pub fn is_byte_run(&self) -> bool {
         self.dims.len() == 1 && self.dims[0].src_stride == 1 && self.dims[0].dst_stride == 1
     }
 
-    /// Split into the source and destination extents an instruction carries.
-    /// Enforces that the destination stays dense: a copy whose destination
-    /// skips around is rejected rather than silently mis-lowered.
     pub fn split(&self) -> Result<(Extent, Extent)> {
         let bytes = self.bytes();
         if self.is_byte_run() {
@@ -195,4 +161,3 @@ impl Rect {
         ))
     }
 }
-

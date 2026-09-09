@@ -1,5 +1,3 @@
-//! Parsing and handling for inferlet manifest TOML files.
-
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
@@ -42,12 +40,10 @@ pub struct Package {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub package: Package,
-    /// name -> version
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runtime: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Parameter>,
-    /// name -> version
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, String>,
 }
@@ -87,7 +83,6 @@ impl Manifest {
             .collect()
     }
 
-    /// Declared python-runtime version, if this program requires one.
     pub fn python_runtime(&self) -> Option<&str> {
         self.runtime.get("python-runtime").map(String::as_str)
     }
@@ -115,4 +110,3 @@ impl Manifest {
         Self::parse(&manifest_content)
     }
 }
-

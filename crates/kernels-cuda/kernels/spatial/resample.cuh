@@ -1,27 +1,11 @@
 #pragma once
 
-// **THE VOXEL-AXIS RESHAPES: ADDRESSES, AND ONE MEAN.** Each kernel is one
-// thread per output element: find the output row's lane in the output
-// table, unravel its `(t, h, w)`, name the input voxel and channel under
-// the input table, copy. A row no lane claims lands zero. `avg_down` is
-// the one member that computes rather than copies: it widens the row the
-// way `pixel_unshuffle` does and averages runs of it in fp32.
-//
-// **CHANNEL ORDER OF THE SHUFFLES** is einops
-// `'b (c r1 r2 r3) t h w -> b c (t r1) (h r2) (w r3)'`, which is
-// `torch.pixel_shuffle`'s in two dimensions and the DiT patchify's
-// `'b c (h ph) (w pw) -> b (h w) (c ph pw)'` inverted: the block offsets
-// `(i1, i2, i3)` are the fast index under the channel,
-// `c_in = c * (r1*r2*r3) + (i1 * r2 + i2) * r3 + i3`.
 
 #include "prelude/device.cuh"
 #include "spatial/grid.cuh"
 
 namespace pie::spatial {
 
-/// Nearest-neighbour upsample by `(ft, fh, fw)`. `keep_first` is the causal
-/// video VAEs' time rule: frame 0 is emitted once and every later frame
-/// `ft` times, so `t_out = 1 + (t - 1) * ft`; otherwise `t_out = t * ft`.
 template <class T>
 __global__ __launch_bounds__(256) void upsample_nearest(
     const T* __restrict__ x,
@@ -53,12 +37,6 @@ __global__ __launch_bounds__(256) void upsample_nearest(
     y[e] = x[static_cast<long long>(src) * c + col];
 }
 
-/// Depth to space: `[rows, C * r1*r2*r3]` over `(t, h, w)` to `[rows *
-/// r1*r2*r3, C]` over `(t*r1 - trim_t, h*r2, w*r3)`. `c` is the OUTPUT
-/// width. `trim_t` is a causal temporal upsampler's ANCHOR DROP: the first
-/// `trim_t` frames of the shuffled result are not emitted, so output frame
-/// `o.t` reads shuffled frame `o.t + trim_t` (LTX-2.5's
-/// `LTXVideoUpsampler3d`). `trim_t == 0` is the plain shuffle.
 template <class T>
 __global__ __launch_bounds__(256) void pixel_shuffle(
     const T* __restrict__ x,
@@ -92,9 +70,6 @@ __global__ __launch_bounds__(256) void pixel_shuffle(
     y[e] = x[static_cast<long long>(src) * c_in + col * (r1 * r2 * r3) + block];
 }
 
-/// Space to depth, the inverse: `[rows, C]` over `(t, h, w)` to `[rows /
-/// (r1*r2*r3), C * r1*r2*r3]` over `(t/r1, h/r2, w/r3)`. `c` is the INPUT
-/// width.
 template <class T>
 __global__ __launch_bounds__(256) void pixel_unshuffle(
     const T* __restrict__ x,
@@ -131,20 +106,6 @@ __global__ __launch_bounds__(256) void pixel_unshuffle(
     y[e] = x[static_cast<long long>(src) * c + cin];
 }
 
-/// `AvgDown3D` (Wan 2.2's encoder residual shortcut): the time axis
-/// zero-padded IN FRONT to a multiple of `r1`, a channel-major space to
-/// depth by `(r1, r2, r3)`, then the MEAN of each `group` consecutive
-/// widened channels. `[rows, c]` in, `[rows_out, c * r1*r2*r3 / group]`
-/// out; `c` is the INPUT width, `o_grid` the `(ceil(t/r1), h/r2, w/r3)`
-/// boxes.
-///
-/// One thread per output element. Output channel `n` covers widened
-/// channels `[n*group, (n+1)*group)`, and widened channel `q` is
-/// `(c_in, i1, i2, i3)` read the way `pixel_unshuffle` reads it. The FRONT
-/// pad is what makes `i1` skippable: the padded frame index is
-/// `o.t * r1 + i1 - pad_t` and a negative one contributes a zero to the
-/// mean, exactly as `F.pad(x, (0,0,0,0,pad_t,0))` before the reshape does.
-/// fp32 accumulation, one rounding at the store.
 template <class T>
 __global__ __launch_bounds__(256) void avg_down(
     const T* __restrict__ x,
@@ -183,7 +144,7 @@ __global__ __launch_bounds__(256) void avg_down(
         const int i2 = (block / r3) % r2;
         const int i3 = block % r3;
         const int ti = o.t * r1 + i1 - pad_t;
-        if (ti < 0) continue;                 // a front-padded frame is zero
+        if (ti < 0) continue;
         const int src = ravel(ig, ti, o.h * r2 + i2, o.w * r3 + i3);
         acc += Elem<T>::to_f32(x[static_cast<long long>(src) * c + cin]);
     }

@@ -1,19 +1,10 @@
-//! The handle table: a `kernels_metal::Tensor`'s `u32` is an index into this
-//! table, one row per carved view. Weight rows are minted once at load;
-//! arena/pool/input rows are minted per fire and dropped at [`Handles::seal`]'s
-//! watermark by [`Handles::rewind`], at enqueue rather than settle.
-
 use std::cell::{Ref, RefCell};
 
 use super::alloc::{Buffer, Slab};
 use crate::error::{Fault, Result};
 
-/// The handle for an absent argument. Not 0, since 0 is a valid handle (the
-/// first row minted) and a null spelled as a valid index silently binds
-/// somebody else's bytes.
 pub const NIL: u32 = u32::MAX;
 
-/// One resolved view: which buffer, and how far into it.
 #[derive(Clone)]
 pub struct Binding {
     slab: Slab,
@@ -21,13 +12,11 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// The retained buffer this view lives in.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn slab(&self) -> &Slab {
         &self.slab
     }
 
-    /// Bytes from the buffer's base to this view's first element.
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
@@ -42,12 +31,9 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-/// Every view this load has minted, in minting order. Interior-mutable
-/// because `Run::tensor` mints while taking `&self`.
 #[derive(Default)]
 pub struct Handles {
     rows: RefCell<Vec<Binding>>,
-    /// Where the load-time rows end. Set once by [`Handles::seal`].
     sealed: std::cell::Cell<usize>,
 }
 
@@ -65,21 +51,11 @@ impl std::fmt::Debug for Handles {
 }
 
 impl Handles {
-    /// An empty table.
     #[must_use]
     pub fn new() -> Handles {
         Handles::default()
     }
 
-    /// Mint a handle for `len` bytes of `buffer` starting at `offset`. The
-    /// length is not stored (a `Tensor` states its own rectangle) but is
-    /// checked here, the last place a carve can be caught before a shader
-    /// dereferences past the reservation.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] when the view leaves its buffer, and when the
-    /// table would pass [`NIL`].
     pub fn bind(&self, buffer: &Buffer, offset: u64, len: u64) -> Result<u32> {
         buffer.span(offset, len)?;
         let mut rows = self.rows.borrow_mut();
@@ -98,23 +74,10 @@ impl Handles {
         Ok(at as u32)
     }
 
-    /// Copy `len` bytes out of the view `handle` names — a load-time read
-    /// of a shared-storage buffer (every buffer this shell allocates is
-    /// shared, see `Context::bind`).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a handle no row answers, [`Fault::Ceiling`]
-    /// when the read leaves the buffer.
     pub fn read(&self, handle: u32, len: u64) -> Result<Vec<u8>> {
         let binding = self.get(handle).ok_or_else(|| Fault::Unbound {
             what: format!("handle {handle}, which no row answers"),
         })?;
-        // The buffer only exists on Apple, and so does the copy into it: off
-        // Apple this function is a refusal and nothing is allocated. Split
-        // rather than allocated-then-discarded, which is what left `out`
-        // unused, `mut` needless and the tail unreachable — four warnings
-        // for one shape.
         #[cfg(not(target_vendor = "apple"))]
         {
             let _ = (binding, len);
@@ -148,12 +111,6 @@ impl Handles {
         }
     }
 
-    /// Mint a handle `skip` bytes further into whatever `handle` names.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a handle no row answers, [`Fault::Ceiling`]
-    /// when the cut leaves the buffer or the table is full.
     pub fn cut(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {
         let (slab, offset) = {
             let rows = self.rows.borrow();
@@ -184,7 +141,6 @@ impl Handles {
         Ok(at as u32)
     }
 
-    /// Resolve a handle. `None` for [`NIL`] and for a row past the table.
     #[must_use]
     pub fn get(&self, handle: u32) -> Option<Ref<'_, Binding>> {
         if handle == NIL {
@@ -197,32 +153,26 @@ impl Handles {
         Some(Ref::map(rows, |rows| &rows[handle as usize]))
     }
 
-    /// Declare everything minted so far to be load-lived. Called once, before
-    /// the first fire; a second call is a no-op.
     pub fn seal(&self) {
         if self.sealed.get() == 0 {
             self.sealed.set(self.rows.borrow().len());
         }
     }
 
-    /// Drop every handle minted since [`Handles::seal`].
     pub fn rewind(&self) {
         self.rows.borrow_mut().truncate(self.sealed.get());
     }
 
-    /// How many rows the table holds.
     #[must_use]
     pub fn len(&self) -> usize {
         self.rows.borrow().len()
     }
 
-    /// Whether the table is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.borrow().is_empty()
     }
 
-    /// Where the load-lived rows end.
     #[must_use]
     pub fn sealed(&self) -> usize {
         self.sealed.get()

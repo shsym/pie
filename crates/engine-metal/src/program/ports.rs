@@ -1,6 +1,3 @@
-//! Descriptor-port resolution, Metal half: reads ports from a guest
-//! instance's committed device-ring cells instead of the submission.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eta_exec::{ExecPlan, Value};
@@ -12,50 +9,28 @@ use crate::error::{Fault, Result};
 
 use super::launch::{ChannelShape, Cursor, Rings};
 
-/// Envelopes resolved, one per attached device-carried lane per fire.
-/// Process-global so a test can observe it.
 static RESOLVED: AtomicU64 = AtomicU64::new(0);
 
-/// How many descriptor-port envelopes this process has resolved. See [`RESOLVED`].
 #[must_use]
 pub fn resolved() -> u64 {
     RESOLVED.load(Ordering::Relaxed)
 }
 
-/// What one instance's descriptor ports resolved to, this fire. `None`
-/// means the program binds no such port. Vectors are per-instance, not
-/// per-lane; [`Envelope::qo_indptr`] is the CSR [`Envelope::lane`] cuts them by.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Envelope {
-    /// [`Port::EmbedIndptr`]: `[lanes + 1]` row bounds cutting the flat vectors into lanes.
     pub qo_indptr: Option<Vec<u32>>,
-    /// [`Port::EmbedTokens`]: ids this instance embeds, all lanes end to end.
     pub tokens: Option<Vec<u32>>,
-    /// [`Port::Positions`]: each id's position in its sequence.
     pub positions: Option<Vec<u32>>,
-    /// [`Port::KvLen`]: each lane's readable extent after this fire's writes land.
     pub kv_len: Option<Vec<u32>>,
-    /// [`Port::Pages`]: page ids every lane may address, cut by
-    /// [`Envelope::page_indptr`]. In guest (working-set-relative) space
-    /// until `serve::prepare` translates it.
     pub pages: Option<Vec<u32>>,
-    /// [`Port::PageIndptr`]: `[lanes + 1]` bounds cutting [`Envelope::pages`].
     pub page_indptr: Option<Vec<u32>>,
-    /// [`Port::WSlot`]: the page each token row is appended into, same guest
-    /// space as [`Envelope::pages`].
     pub w_slot: Option<Vec<u32>>,
-    /// [`Port::WOff`]: that row's offset inside that page.
     pub w_off: Option<Vec<u32>>,
-    /// [`Port::AttnMask`]: dense `[rows, keys]` bool rectangle, row-major,
-    /// at the pool's key width (may be wider than the extent).
     pub mask: Option<Vec<bool>>,
-    /// [`Port::RsFoldLen`]: how many buffered recurrent tokens each lane
-    /// folds this fire (`crate::rs`); `[lanes]`, or one entry for every lane.
     pub fold_len: Option<Vec<u32>>,
 }
 
 impl Envelope {
-    /// True when nothing was bound.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.qo_indptr.is_none()
@@ -69,15 +44,11 @@ impl Envelope {
             && self.mask.is_none()
     }
 
-    /// Whether this instance states its own page table (device-geometry
-    /// lanes do; decode-envelope lanes don't).
     #[must_use]
     pub fn owns_pages(&self) -> bool {
         self.pages.is_some() && self.page_indptr.is_some()
     }
 
-    /// How many lanes this instance carries: 1 unless it states its own
-    /// page table (device-geometry class only).
     #[must_use]
     pub fn lanes(&self) -> usize {
         match &self.qo_indptr {
@@ -86,15 +57,8 @@ impl Envelope {
         }
     }
 
-    /// Lane `at` of this instance's ports, for submission lane `source`
-    /// (named in refusals).
-    ///
-    /// # Errors
-    ///
-    /// A lane past the CSR, or a CSR that runs backwards.
     pub fn lane(&self, at: usize, source: usize) -> Result<LanePorts<'_>> {
         let rows = match &self.qo_indptr {
-            // CSR cuts the flat vectors only for classes with their own page table.
             Some(csr) if self.owns_pages() && csr.len() >= 2 => {
                 let (Some(&start), Some(&end)) = (csr.get(at), csr.get(at + 1)) else {
                     return Err(Fault::program(
@@ -119,7 +83,6 @@ impl Envelope {
                 }
                 start as usize..end as usize
             }
-            // No CSR: the instance is one lane and every flat vector is its.
             _ => 0..self.tokens.as_ref().map_or(0, Vec::len),
         };
         Ok(LanePorts {
@@ -130,7 +93,6 @@ impl Envelope {
         })
     }
 
-    /// How many token ROWS the whole instance's flat vectors span.
     fn spanned(&self) -> usize {
         match &self.qo_indptr {
             Some(csr) if self.owns_pages() && csr.len() >= 2 => {
@@ -141,37 +103,25 @@ impl Envelope {
     }
 }
 
-/// One lane's share of an instance's resolved descriptor ports.
-/// Every accessor cuts by this lane's CSR span and refuses rather than clamps.
 #[derive(Clone, Debug)]
 pub struct LanePorts<'a> {
     envelope: &'a Envelope,
-    /// Which lane of the INSTANCE this is.
     at: usize,
-    /// Its rows, as the instance's own token CSR cuts them.
     rows: std::ops::Range<usize>,
-    /// Which lane of the SUBMISSION it is, for the refusals to name.
     source: usize,
 }
 
 impl LanePorts<'_> {
-    /// See [`Envelope::owns_pages`].
     #[must_use]
     pub fn owns_pages(&self) -> bool {
         self.envelope.owns_pages()
     }
 
-    /// How many token rows this lane carries, per its instance's token CSR.
     #[must_use]
     pub fn rows(&self) -> u32 {
         u32::try_from(self.rows.end.saturating_sub(self.rows.start)).unwrap_or(u32::MAX)
     }
 
-    /// This lane's token ids, checked against its placed row count.
-    ///
-    /// # Errors
-    ///
-    /// Wrong id count, or a program that binds no token port.
     pub fn tokens_for(&self, rows: usize) -> Result<&[u32]> {
         let source = self.source;
         let Some(tokens) = &self.envelope.tokens else {
@@ -199,13 +149,6 @@ impl LanePorts<'_> {
         Ok(ids)
     }
 
-    /// This lane's positions, checked against `have .. have + rows` unless
-    /// this lane owns its own pages (device-geometry). No `positions` port
-    /// defaults to the natural run.
-    ///
-    /// # Errors
-    ///
-    /// A stated run that disagrees, on a lane whose pages are this shell's.
     pub fn positions_for(&self, have: u32, rows: usize) -> Result<Option<&[u32]>> {
         let Some(positions) = &self.envelope.positions else {
             return Ok(None);
@@ -235,8 +178,6 @@ impl LanePorts<'_> {
         Ok(Some(stated))
     }
 
-    /// This lane's device-decided recurrent fold length, or `None` if the
-    /// program binds no `rs_fold_len` port.
     #[must_use]
     pub fn fold_len(&self) -> Option<u32> {
         self.envelope
@@ -246,10 +187,8 @@ impl LanePorts<'_> {
             .copied()
     }
 
-    /// This lane's stated readable extent, or `None` if unbound.
     #[must_use]
     pub fn extent(&self) -> Option<u32> {
-        // A `[lanes]` cell states one entry per lane; falls back to the first.
         self.envelope
             .kv_len
             .as_ref()
@@ -257,11 +196,6 @@ impl LanePorts<'_> {
             .copied()
     }
 
-    /// Checks this lane's stated extent against what the seat will reach.
-    ///
-    /// # Errors
-    ///
-    /// A stated extent that disagrees.
     pub fn check_extent(&self, after: u32) -> Result<()> {
         let Some(stated) = self.extent() else {
             return Ok(());
@@ -282,12 +216,6 @@ impl LanePorts<'_> {
         Ok(())
     }
 
-    /// This lane's page table, in guest space, or `None` if unbound.
-    ///
-    /// # Errors
-    ///
-    /// One of `pages`/`page_indptr` bound without the other, a CSR shorter
-    /// than the instance's lanes, or a span the flat run doesn't cover.
     pub fn pages(&self) -> Result<Option<&[u32]>> {
         let source = self.source;
         match (&self.envelope.pages, &self.envelope.page_indptr) {
@@ -328,12 +256,6 @@ impl LanePorts<'_> {
         }
     }
 
-    /// This lane's explicit write descriptor `(page, offset)` per row, or
-    /// `None` when unbound and the seat's `have + row` arithmetic stands.
-    ///
-    /// # Errors
-    ///
-    /// One of `w_slot`/`w_off` bound without the other, or wrong length.
     pub fn writes(&self, rows: usize) -> Result<Option<(&[u32], &[u32])>> {
         let source = self.source;
         match (&self.envelope.w_slot, &self.envelope.w_off) {
@@ -364,14 +286,6 @@ impl LanePorts<'_> {
         }
     }
 
-    /// This lane's dense attention mask: `rows` rectangles of `stride`
-    /// bools, row-major, or `None` if unbound. Stride is the guest's build
-    /// width; clipping surplus is [`crate::mask`]'s rule.
-    ///
-    /// # Errors
-    ///
-    /// A rectangle that doesn't divide into the instance's rows, or a span
-    /// it doesn't cover.
     pub fn mask(&self, rows: usize) -> Result<Option<(&[bool], usize)>> {
         let source = self.source;
         let Some(dense) = &self.envelope.mask else {
@@ -411,7 +325,6 @@ impl LanePorts<'_> {
         Ok(Some((&dense[start..end], stride)))
     }
 
-    /// This lane's share of a member-wide per-row vector.
     fn slice<'v, T>(&self, flat: &'v [T], port: &str) -> Result<&'v [T]> {
         flat.get(self.rows.clone()).ok_or_else(|| {
             Fault::program(
@@ -429,13 +342,6 @@ impl LanePorts<'_> {
     }
 }
 
-/// Resolve one instance's descriptor ports out of its rings.
-///
-/// # Errors
-///
-/// A port names a channel the instance lacks, holds a non-integer (or, for
-/// [`Port::AttnMask`], non-bool) cell, an empty ring, or a const port with
-/// no folded value.
 pub fn resolve(
     plan: &ExecPlan,
     class: GeometryClass,
@@ -449,10 +355,8 @@ pub fn resolve(
         if !resolves(class, binding.port) {
             continue;
         }
-        // The mask is not an index vector, so it is read on its own arm.
         if binding.port == Port::AttnMask {
             if binding.is_const {
-                // Already lowered to run-length `Masking` on the submission.
                 continue;
             }
             out.mask = Some(read_bool_cell(
@@ -474,7 +378,6 @@ pub fn resolve(
             Port::WSlot => &mut out.w_slot,
             Port::WOff => &mut out.w_off,
             Port::RsFoldLen => &mut out.fold_len,
-            // Anything else has no reader on this path.
             _ => continue,
         };
         let value = if binding.is_const {
@@ -500,10 +403,6 @@ pub fn resolve(
     Ok(out)
 }
 
-/// Whether an instance bound in `class` resolves `port` off its own rings.
-/// Adds `EmbedIndptr`/`AttnMask` for the wide class only; a guest's own
-/// `pages`/`page_indptr` is working-set-relative and isn't read for a
-/// decode-envelope pass.
 #[must_use]
 pub fn resolves(class: GeometryClass, port: Port) -> bool {
     if class.ports().contains(port) {
@@ -514,7 +413,6 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
             && matches!(class, GeometryClass::DeviceGeometry | GeometryClass::DecodeEnvelope))
 }
 
-/// One port's committed cell, as geometry indices.
 fn read_cell(
     port: Port,
     channel: u32,
@@ -534,7 +432,6 @@ fn read_cell(
             ),
         ));
     }
-    // `head`: the committed cell is the one the guest's pass takes this fire.
     let cell = rings.read_cell(channel as usize, cursor.head)?;
     Ok(cell
         .chunks_exact(4)
@@ -542,8 +439,6 @@ fn read_cell(
         .collect())
 }
 
-/// One port's committed cell, as a dense rectangle of bools. Bit-packed
-/// LSB-first (`numel.div_ceil(8)` bytes), matching `eta_exec::encode_wire`.
 fn read_bool_cell(
     port: Port,
     channel: u32,
@@ -580,15 +475,12 @@ fn read_bool_cell(
     Ok(unpack_bits(&cell, shape.numel))
 }
 
-/// `numel` bool lanes out of packed bytes, LSB-first within each byte.
 fn unpack_bits(packed: &[u8], numel: usize) -> Vec<bool> {
     (0..numel)
         .map(|lane| packed[lane / 8] >> (lane % 8) & 1 != 0)
         .collect()
 }
 
-/// The cursor and shape one port's channel stands at. An empty ring
-/// (`head == tail`) is a refusal, not a zero — avoids embedding garbage.
 fn cell_of(
     port: Port,
     channel: u32,
@@ -621,11 +513,9 @@ fn cell_of(
     Ok((cursor, shape))
 }
 
-/// A folded constant, as geometry indices.
 fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
     match value {
         Value::U32(lanes) => Ok(lanes.clone()),
-        // Reinterpreted, not converted: -1 is a skip sentinel, not row zero.
         Value::I32(lanes) => Ok(lanes.iter().map(|&lane| lane as u32).collect()),
         other => Err(Fault::program(
             "program::ports",
@@ -643,9 +533,14 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
 mod tests {
     use super::Envelope;
 
-    
+    fn ports_every_case() {
+        an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers();
+        an_agreeing_extent_and_an_unbound_one_both_pass();
+        positions_are_checked_against_the_seat_only_where_the_seat_owns_the_pages();
+        half_a_page_family_and_half_a_write_descriptor_are_refused();
+        a_page_csr_that_runs_past_its_flat_run_is_refused_by_both_numbers();
+    }
 
-    /// Equality check against the seat; the message names both numbers.
     #[test]
     fn an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers() {
         let envelope = Envelope {
@@ -662,8 +557,6 @@ mod tests {
         assert!(text.contains('6'), "and what the fire reaches: {text}");
     }
 
-    /// Agreement is silent; so is an unbound `kv_len` port (not an omission).
-    #[test]
     fn an_agreeing_extent_and_an_unbound_one_both_pass() {
         Envelope {
             kv_len: Some(vec![6]),
@@ -681,8 +574,6 @@ mod tests {
         assert!(Envelope::default().is_empty());
     }
 
-    /// Positions are checked against the seat only when the seat owns pages.
-    #[test]
     fn positions_are_checked_against_the_seat_only_where_the_seat_owns_the_pages() {
         let carried = |pages: bool| Envelope {
             tokens: Some(vec![5]),
@@ -691,14 +582,12 @@ mod tests {
             page_indptr: pages.then(|| vec![0, 1]),
             ..Envelope::default()
         };
-        // The shell's pages: this fire writes row 20, the port says 3.
         let refusal = carried(false)
             .lane(0, 0)
             .expect("one lane")
             .positions_for(20, 1)
             .expect_err("a decode envelope may not renumber");
         assert!(format!("{refusal}").contains("positions"));
-        // The guest's pages: the same 3 is the position that reaches RoPE.
         assert_eq!(
             carried(true)
                 .lane(0, 0)
@@ -709,8 +598,6 @@ mod tests {
         );
     }
 
-    /// Half a page family or half a write descriptor is refused, not half-served.
-    #[test]
     fn half_a_page_family_and_half_a_write_descriptor_are_refused() {
         let pages_only = Envelope {
             pages: Some(vec![40]),
@@ -725,8 +612,6 @@ mod tests {
         assert!(slot_only.lane(0, 0).expect("one lane").writes(1).is_err());
     }
 
-    /// A page id outside the lane's CSR span is refused, not clamped.
-    #[test]
     fn a_page_csr_that_runs_past_its_flat_run_is_refused_by_both_numbers() {
         let envelope = Envelope {
             qo_indptr: Some(vec![0, 1]),

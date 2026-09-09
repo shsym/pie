@@ -1,13 +1,7 @@
-//! Pins the bank-name grammar's optional site segment: both spellings
-//! parse, an unknown middle word stays the role, manifest site selection
-//! and its refusals, and untagged text/manifests land unchanged bytes.
-
 use std::path::{Path, PathBuf};
 
 use engine_cuda::blob::{Adapters, Site};
 use engine_cuda::{BankSeat, layer_of, role_of, site_of};
-
-// the fixture
 
 const LAYERS: u64 = 2;
 const BANK_RANK: u64 = 4;
@@ -24,7 +18,6 @@ fn scratch(what: &str) -> PathBuf {
     at
 }
 
-/// One layer's bank pair: `A` rank-major, `B` out-major.
 fn pair(prefix: &str) -> [BankSeat; 2] {
     let slot = BANK_RANK * HIDDEN * ELEM;
     [
@@ -47,14 +40,12 @@ fn pair(prefix: &str) -> [BankSeat; 2] {
     ]
 }
 
-/// Banks a text that states its site — the mixer output.
 fn sited() -> Vec<BankSeat> {
     (0..LAYERS)
         .flat_map(|layer| pair(&format!("layer.{layer}.o")))
         .collect()
 }
 
-/// Write an adapter directory whose manifest states `site`, or does not.
 fn write_adapter(mount: &Path, name: &str, rank: u64, site: Option<&str>) {
     let dir = mount.join(name);
     std::fs::create_dir_all(&dir).expect("an adapter directory");
@@ -85,17 +76,18 @@ fn mounted(what: &str) -> (PathBuf, Adapters) {
     (mount, adapters)
 }
 
-// (a) and (b): the name grammar
+fn a_bank_says_which_site_it_corrects_every_case() {
+    both_spellings_of_a_bank_name_parse();
+    a_manifest_that_states_a_site_lands_into_that_sites_banks();
+    a_site_the_shell_cannot_serve_is_refused_by_name();
+}
 
-/// (a) Both spellings parse; the optional segment is the only difference.
 #[test]
 fn both_spellings_of_a_bank_name_parse() {
-    // The pre-B3 spelling: no site, and every other answer unmoved.
     assert_eq!(role_of("layer.7.lora_a"), "lora_a");
     assert_eq!(layer_of("layer.7.lora_a"), 7);
     assert_eq!(site_of("layer.7.lora_a"), None, "states no site");
 
-    // Every word of the vocabulary, not a sample.
     for site in Site::ALL {
         let name = format!("layer.7.{}.lora_b", site.spelled());
         assert_eq!(role_of(&name), "lora_b", "{name}");
@@ -103,20 +95,13 @@ fn both_spellings_of_a_bank_name_parse() {
         assert_eq!(site_of(&name), Some(site), "{name}");
     }
 
-    // A two-word site name is one segment, read whole.
     assert_eq!(site_of("layer.0.gate_up.lora_a"), Some(Site::GateUp));
 
-    // The vocabulary's bits match the guest surface's Site.
     assert_eq!(Site::Q.bit(), 1 << 0);
     assert_eq!(Site::O.bit(), 1 << 3);
     assert_eq!(Site::Down.bit(), 1 << 5);
 }
 
-// (c) and (d): the manifest key
-
-/// (c) A manifest that states `site` lands into the banks that declare it,
-/// per layer and by name.
-#[test]
 fn a_manifest_that_states_a_site_lands_into_that_sites_banks() {
     let (mount, adapters) = mounted("stated");
     write_adapter(&mount, "alice-v2", 2, Some("o"));
@@ -145,13 +130,9 @@ fn a_manifest_that_states_a_site_lands_into_that_sites_banks() {
     }
 }
 
-/// (d) Both site refusals, by name: a spelling nobody can name, and a site
-/// this load's banks do not declare.
-#[test]
 fn a_site_the_shell_cannot_serve_is_refused_by_name() {
     let (mount, adapters) = mounted("refused");
 
-    // Unknown spelling, refused at the manifest.
     write_adapter(&mount, "typo", 2, Some("mixer"));
     let why = adapters
         .planes("typo", &sited())
@@ -160,7 +141,6 @@ fn a_site_the_shell_cannot_serve_is_refused_by_name() {
     assert!(said.contains("mixer"), "names the word it was given: {said}");
     assert!(said.contains("`gate_up`"), "and the vocabulary: {said}");
 
-    // Known site, but not declared by this load's banks.
     write_adapter(&mount, "elsewhere", 2, Some("q"));
     let why = adapters
         .planes("elsewhere", &sited())
@@ -172,7 +152,6 @@ fn a_site_the_shell_cannot_serve_is_refused_by_name() {
         "and the banks this load declares: {said}"
     );
 
-    // Absent site is a value, not a wildcard — it does not quietly match `o`.
     write_adapter(&mount, "unstated", 2, None);
     let why = adapters
         .planes("unstated", &sited())
@@ -182,6 +161,3 @@ fn a_site_the_shell_cannot_serve_is_refused_by_name() {
         "says what was asked: {why}"
     );
 }
-
-// (e) byte-compatibility
-

@@ -1,9 +1,3 @@
-//! Reads a checkpoint (via `ztensor-compat`) into the loader's [`Metadata`].
-//! An object is one blob; under the canonical layout each of its planes
-//! becomes one [`RawTensor`], named by [`plane_name`], so a quantized weight
-//! reads as its codes, its `.scales` and its `.biases` exactly as a trace
-//! declares them.
-
 use std::path::{Path, PathBuf};
 
 use ztensor::format::cbor::Value;
@@ -16,25 +10,18 @@ use crate::term::{
 };
 use crate::types::{Axis, CheckpointFormat, DType, Encoding, FileId, QuantSpec, TensorId};
 
-// A `.zt` root that names shards brings them along; every other format is
-// one file that describes itself.
 pub fn parse(path: &Path) -> Result<Metadata, Error> {
     describe(&ztensor_compat::index(path).map_err(Error::from)?)
 }
 
-// A tensor name that appears in two files is refused, not resolved by precedence.
 pub fn parse_files(paths: &[PathBuf]) -> Result<Metadata, Error> {
     describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
 }
 
-/// The objects [`parse`] splits into planes, as `(object, plane names in
-/// canonical order)`. A leaf, a named layout and a gguf block array are one
-/// plane and are not listed.
 pub fn parse_groups(path: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {
     describe_groups(&ztensor_compat::index(path).map_err(Error::from)?)
 }
 
-/// [`parse_groups`], over a source the caller already opened.
 pub fn describe_groups(source: &Source) -> Result<Vec<(String, Vec<String>)>, Error> {
     let mut groups = Vec::new();
     for tensor in source.tensors() {
@@ -53,8 +40,6 @@ pub fn parse_attributes(path: &Path) -> Result<Attributes, Error> {
     ))
 }
 
-// Sorts before reading: merge keeps only the first source with file-level
-// key-values, so the answer depends on shard order.
 pub fn parse_attributes_files(paths: &[PathBuf]) -> Result<Attributes, Error> {
     let mut paths = paths.to_vec();
     paths.sort();
@@ -131,7 +116,6 @@ fn attributes_of(source: &Source) -> Attributes {
     }))
 }
 
-// Verifies every object's digest; an object without one fails rather than passes.
 pub fn verify(path: &Path) -> Result<usize, Error> {
     let source = Source::open(path).map_err(Error::from)?;
     let mut count = 0usize;
@@ -147,8 +131,6 @@ pub fn verify(path: &Path) -> Result<usize, Error> {
     Ok(count)
 }
 
-// Digest of every named object folded into one value; None if not a `.zt`
-// with a manifest. Derived from the manifest, not the path, so it survives a move.
 pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     if !path.is_file()
         || !path
@@ -179,7 +161,6 @@ pub fn artifact_identity(path: &Path) -> Result<Option<Vec<u8>>, Error> {
     Ok(Some(identity))
 }
 
-// Flat text map of file-level attributes; entries whose value isn't text are skipped.
 pub fn read_attributes(path: &Path) -> Result<std::collections::BTreeMap<String, String>, Error> {
     let source = Source::open(path).map_err(Error::from)?;
     let Some(Value::Map(entries)) = source.attributes() else {
@@ -194,13 +175,6 @@ pub fn read_attributes(path: &Path) -> Result<std::collections::BTreeMap<String,
         .collect())
 }
 
-/// A [`Source`] as the loader's [`Metadata`] — files, tensors, planes.
-///
-/// Public because a source is not always a path: a diffusers pipeline is
-/// several safetensors sets renamed into one name space
-/// ([`crate::file::diffusers::open`]), and describing THAT source is the
-/// only way its Metadata carries the same prefixed names the contract algebra
-/// will read it by.
 pub fn describe(source: &Source) -> Result<Metadata, Error> {
     let mut files = Vec::with_capacity(source.stores().len());
     for (index, store) in source.stores().iter().enumerate() {
@@ -241,7 +215,6 @@ pub fn describe(source: &Source) -> Result<Metadata, Error> {
     Ok(Metadata { files, tensors })
 }
 
-/// One plane of an object as the loader reads it.
 struct PlaneRead {
     name: String,
     offset: u64,
@@ -250,8 +223,6 @@ struct PlaneRead {
     encoding: Encoding,
 }
 
-/// The planes an object holds, in blob order. One for a leaf, a named
-/// layout, or a gguf block array; one per plane for a group term.
 fn planes_of(tensor: &Tensor<'_>) -> Result<Vec<PlaneRead>, Error> {
     let name = tensor.name();
     let signed = |shape: &[u64]| -> Result<Vec<i64>, Error> {
@@ -356,8 +327,6 @@ fn checkpoint_format(label: &str) -> CheckpointFormat {
     }
 }
 
-/// How the object's own bytes are encoded: the code plane's quantization
-/// for a group term or a gguf block array, the leaf otherwise.
 pub fn encoding_of(tensor: &Tensor<'_>) -> Result<Encoding, Error> {
     planes_of(tensor)?
         .into_iter()
@@ -365,4 +334,3 @@ pub fn encoding_of(tensor: &Tensor<'_>) -> Result<Encoding, Error> {
         .map(|plane| plane.encoding)
         .ok_or_else(|| Error::Checkpoint(format!("{}: an object with no planes", tensor.name())))
 }
-

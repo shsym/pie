@@ -1,9 +1,3 @@
-//! Trust-edge identity gate. The gateway sits behind an edge proxy that has
-//! already authenticated the caller; this only extracts tenant/user from the
-//! edge-supplied header for routing/quota/isolation — it is not
-//! authentication. The gateway must therefore only accept connections from
-//! the edge (private bind / mTLS), enforced at deploy, not here.
-
 use std::net::IpAddr;
 
 use anyhow::{Context, anyhow};
@@ -12,17 +6,10 @@ use ids::TenantId;
 
 use crate::session::Identity;
 
-/// Edge-supplied verified identity claim. Convention: `tenant/user` (a forwarded
-/// JWT-claims summary). The edge guarantees its presence + verification.
 pub const IDENTITY_HEADER: &str = "x-pie-identity";
-/// Standard client-IP forwarding header set by the edge proxy.
 pub const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
-/// Per-request trace id propagated from the edge.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Build an [`Identity`] from edge-supplied headers. Fails closed: a missing
-/// or malformed identity header is a misconfigured edge, so this rejects
-/// rather than serve an unattributed request.
 pub fn extract(headers: &HeaderMap) -> anyhow::Result<Identity> {
     let raw = headers
         .get(IDENTITY_HEADER)
@@ -51,8 +38,6 @@ pub fn extract(headers: &HeaderMap) -> anyhow::Result<Identity> {
     })
 }
 
-/// Parse the identity claim into `(tenant, user)`. Accepts `tenant/user` or a
-/// bare `user` (tenant defaults to `"default"`). Empty user is rejected.
 fn parse_identity(raw: &str) -> anyhow::Result<(String, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -68,19 +53,14 @@ fn parse_identity(raw: &str) -> anyhow::Result<(String, String)> {
     Ok((tenant.to_string(), user.to_string()))
 }
 
-/// Extract the origin client IP from an `X-Forwarded-For` value: a
-/// comma-separated, hop-appended list whose left-most entry is the original
-/// client. `None` if absent/unparseable (non-fatal; carried for tracing only).
 fn parse_forwarded_for(value: &str) -> Option<IpAddr> {
     let first = value.split(',').next()?.trim();
     if first.is_empty() {
         return None;
     }
-    // Try as-is, then strip a trailing `:port` (host:port form).
     first.parse::<IpAddr>().ok().or_else(|| {
         first
             .rsplit_once(':')
             .and_then(|(host, _)| host.parse().ok())
     })
 }
-

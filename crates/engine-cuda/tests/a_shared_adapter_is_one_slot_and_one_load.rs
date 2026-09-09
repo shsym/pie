@@ -1,26 +1,14 @@
-//! Pins the shared-adapter store's behavior with no GPU present: slot
-//! sharing, LRU reclaim under pressure, pinned-slot refusal, rewrite
-//! identity, single-flight reads, and per-layer plane resolution with
-//! orientation padding.
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine_cuda::blob::{Adapters, Blobs, Layout, Source};
 use engine_cuda::{AdapterPlane, BankSeat};
 
-// ── the fixture ──────────────────────────────────────────────────────────
-
-/// Layer count the fixture model text declares banks for.
 const LAYERS: u64 = 3;
-/// The rank the banks seat.
 const BANK_RANK: u64 = 8;
-/// The width they correct.
 const HIDDEN: u64 = 16;
-/// bf16, which is what a bank declares and what a blob ships.
 const ELEM: u64 = 2;
 
-/// Unique scratch directory for this test process.
 fn scratch(what: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -34,8 +22,6 @@ fn scratch(what: &str) -> PathBuf {
     at
 }
 
-/// The banks a `[layers, rank, hidden]` / `[layers, hidden, rank]` model text
-/// declares: `2 * LAYERS` of them, `A` rank-major and `B` out-major.
 fn seats() -> Vec<BankSeat> {
     let slot = BANK_RANK * HIDDEN * ELEM;
     (0..LAYERS)
@@ -62,9 +48,6 @@ fn seats() -> Vec<BankSeat> {
         .collect()
 }
 
-/// Write one adapter directory into `mount` at `name`. `rank` under the
-/// bank's rank exercises padding; the bytes are a per-element ramp so a
-/// mis-strided landing shows up as a wrong value, not just a wrong length.
 fn write_adapter(mount: &Path, name: &str, rank: u64, layouts: (Layout, Layout)) {
     let dir = mount.join(name);
     std::fs::create_dir_all(&dir).expect("an adapter directory");
@@ -91,7 +74,6 @@ fn write_adapter(mount: &Path, name: &str, rank: u64, layouts: (Layout, Layout))
     std::fs::write(dir.join("b.bin"), &ramp).expect("a B plane");
 }
 
-/// A store mounted on a fresh directory holding one rank-4 adapter.
 fn mounted(what: &str) -> (PathBuf, Adapters) {
     let mount = scratch(what);
     write_adapter(&mount, "alice-v2", 4, (Layout::RankMajor, Layout::OutMajor));
@@ -100,7 +82,6 @@ fn mounted(what: &str) -> (PathBuf, Adapters) {
     (mount, adapters)
 }
 
-/// A landing that writes nothing and counts everything — the device's stand-in.
 #[derive(Default)]
 struct Landings {
     calls: AtomicU64,
@@ -122,10 +103,18 @@ impl Landings {
     }
 }
 
-// ── (a) sharing ──────────────────────────────────────────────────────────
+fn a_shared_adapter_is_one_slot_and_one_load_every_case() {
+    two_instances_of_one_blob_share_one_slot_and_one_landing();
+    a_byte_seeded_instance_gets_a_slot_of_its_own();
+    a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest();
+    every_slot_pinned_is_refused_and_nothing_live_is_evicted();
+    a_rewritten_adapter_is_a_new_identity_and_the_old_one_stays();
+    eight_threads_asking_for_one_blob_read_it_once();
+    the_resolver_slices_per_layer_and_pads_per_orientation();
+    the_refusals_fire_by_name();
+    a_load_with_no_banks_seats_nothing_and_says_so();
+}
 
-/// Two instances naming one blob occupy one slot; only the first pays a
-/// landing.
 #[test]
 fn two_instances_of_one_blob_share_one_slot_and_one_landing() {
     let (_mount, mut adapters) = mounted("shared");
@@ -167,9 +156,6 @@ fn two_instances_of_one_blob_share_one_slot_and_one_landing() {
     );
 }
 
-/// A byte-seeded instance gets its own slot; content-hash dedup across
-/// byte-seeded channels is not done.
-#[test]
 fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
     let (_mount, mut adapters) = mounted("own");
     let seats = seats();
@@ -203,7 +189,6 @@ fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
     assert!(!own.shared);
     assert!(own.landed, "its bytes are its own and it pays for them");
     assert_eq!(landings.calls(), 2);
-    // The same instance twice is one slot: an instance is a bind identity.
     let again = adapters
         .bind(
             Source::Own {
@@ -218,11 +203,6 @@ fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
     assert!(!again.landed);
 }
 
-// ── (c) and (d) the residency statutes ───────────────────────────────────
-
-/// A release keeps a slot's contents without reclaiming it; under pressure,
-/// eviction takes the least recently used idle slot.
-#[test]
 fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {
     let mount = scratch("lru");
     for name in ["alice", "bob", "carol"] {
@@ -243,7 +223,6 @@ fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {
     adapters.release(alice);
     adapters.release(bob);
 
-    // Release alone evicts nothing: alice returns to her own slot, no re-landing.
     let alice_again = adapters
         .bind(Source::Shared { name: "alice" }, &seats, landings.land())
         .expect("alice returns");
@@ -252,7 +231,6 @@ fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {
     assert_eq!(landings.calls(), 2, "two landings so far, not three");
     adapters.release(alice_again);
 
-    // Bob is the least recently used idle slot, so carol takes his seat.
     let carol = adapters
         .bind(Source::Shared { name: "carol" }, &seats, landings.land())
         .expect("carol");
@@ -267,8 +245,6 @@ fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {
     assert!(!alice_third.landed);
 }
 
-/// A slot pinned by a live bind is refused at keying time, never evicted.
-#[test]
 fn every_slot_pinned_is_refused_and_nothing_live_is_evicted() {
     let mount = scratch("pinned");
     for name in ["alice", "bob", "carol"] {
@@ -312,9 +288,6 @@ fn every_slot_pinned_is_refused_and_nothing_live_is_evicted() {
     assert_eq!(carol.slot, bob.slot);
 }
 
-/// A rewritten file is a new identity and a new slot; the old slot stays
-/// live until its refs drain.
-#[test]
 fn a_rewritten_adapter_is_a_new_identity_and_the_old_one_stays() {
     let mount = scratch("rewrite");
     write_adapter(&mount, "alice", 4, (Layout::RankMajor, Layout::OutMajor));
@@ -327,7 +300,6 @@ fn a_rewritten_adapter_is_a_new_identity_and_the_old_one_stays() {
         .bind(Source::Shared { name: "alice" }, &seats, landings.land())
         .expect("the first version");
 
-    // Identity is keyed on (len, mtime) per file, so a rewrite is a new key.
     std::thread::sleep(std::time::Duration::from_millis(10));
     write_adapter(&mount, "alice", 8, (Layout::RankMajor, Layout::OutMajor));
 
@@ -343,10 +315,6 @@ fn a_rewritten_adapter_is_a_new_identity_and_the_old_one_stays() {
     assert_eq!(adapters.slots().refs(held.slot), 1, "the old one is pinned");
 }
 
-// ── (f) single-flight ────────────────────────────────────────────────────
-
-/// Eight concurrent first references to one file perform one read.
-#[test]
 fn eight_threads_asking_for_one_blob_read_it_once() {
     let at = scratch("flight").join("plane.bin");
     std::fs::write(&at, vec![7u8; 1 << 16]).expect("a plane");
@@ -364,7 +332,6 @@ fn eight_threads_asking_for_one_blob_read_it_once() {
             .into_iter()
             .map(|handle| handle.join().expect("a thread"))
             .collect();
-        // Held together: the handles keep the bytes alive, so eight refs are one allocation.
         assert_eq!(held.len(), 8);
         for blob in &held {
             assert_eq!(blob.bytes.len(), 1 << 16);
@@ -374,18 +341,11 @@ fn eight_threads_asking_for_one_blob_read_it_once() {
 
     assert_eq!(blobs.loads(), 1, "one read, seven waiters");
 
-    // Residency lives on the slot, not a host copy kept once every handle is gone.
     let again = blobs.open(&at, "plane").expect("a second generation");
     assert_eq!(blobs.loads(), 2);
     assert_eq!(again.bytes.len(), 1 << 16);
 }
 
-// ── (g) the resolver ─────────────────────────────────────────────────────
-
-/// A `[layers, ...]` file slices into one full-capacity plane per bank,
-/// padded per orientation: `A` pads trailing rows, `B` pads a stride inside
-/// each row.
-#[test]
 fn the_resolver_slices_per_layer_and_pads_per_orientation() {
     let (_mount, adapters) = mounted("slice");
     let seats = seats();
@@ -407,8 +367,6 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
         );
     }
 
-    // Source is a ramp of `(index | 0x0100)` u16s across `[LAYERS, 4, HIDDEN]`;
-    // layer 1's slice starts at element `1 * 4 * HIDDEN`.
     let source = |element: usize| ((element as u16) | 0x0100).to_le_bytes();
     let rank = 4usize;
     let hidden = HIDDEN as usize;
@@ -423,9 +381,7 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
         for col in 0..hidden {
             let at = (row * hidden + col) * 2;
             let want = match row < rank {
-                // Rank-major head: a straight copy of the slice.
                 true => source(hidden * rank + row * hidden + col),
-                // Trailing ranks are zero-padded.
                 false => [0, 0],
             };
             assert_eq!(
@@ -445,7 +401,6 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
         for col in 0..bank_rank {
             let at = (row * bank_rank + col) * 2;
             let want = match col < rank {
-                // Out-major: rank is a stride inside each row.
                 true => source(hidden * rank + row * rank + col),
                 false => [0, 0],
             };
@@ -458,11 +413,6 @@ fn the_resolver_slices_per_layer_and_pads_per_orientation() {
     }
 }
 
-// ── (h) the refusals ─────────────────────────────────────────────────────
-
-/// Every mount/manifest/model-text disagreement is refused with a named
-/// reason.
-#[test]
 fn the_refusals_fire_by_name() {
     let seats = seats();
     let landings = Landings::default();
@@ -513,7 +463,6 @@ fn the_refusals_fire_by_name() {
     assert!(said.contains("carries 8 bytes"), "{said}");
     assert!(said.contains("want 384"), "{said}");
 
-    // A rank-major B is refused rather than repacked.
     write_adapter(
         &mount,
         "flipped",
@@ -556,8 +505,6 @@ fn the_refusals_fire_by_name() {
     );
 }
 
-/// A load whose model text declares no bank seats nothing, and says so.
-#[test]
 fn a_load_with_no_banks_seats_nothing_and_says_so() {
     let (_mount, mut adapters) = mounted("bankless");
     let mut bankless = Adapters::new(0);

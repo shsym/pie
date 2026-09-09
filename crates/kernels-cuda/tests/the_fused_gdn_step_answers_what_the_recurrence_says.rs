@@ -1,8 +1,3 @@
-//! The one-launch gated-delta decode step lands the same output row and the
-//! same folded state as the recurrence written out on the host: q/k L2-normed
-//! per key head, the decayed state rounded to bf16 before the update, the
-//! value heads fanned over the key heads, and each lane's slot its own.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -19,8 +14,6 @@ struct Geometry {
     v_dim: u32,
 }
 
-/// A staged window: the grid stands `bucket` rows tall, `live` of them
-/// count, and the row planes start `base` rows in.
 struct Window {
     bucket: u32,
     live: u32,
@@ -148,6 +141,13 @@ fn check(geo: Geometry, window: Option<Window>) {
     }
 }
 
+fn the_fused_gdn_step_answers_what_the_recurrence_says_every_case() {
+    the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan();
+    the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says();
+    the_fused_step_answers_at_a_64_wide_head();
+    the_fused_step_answers_at_an_uneven_head();
+}
+
 #[test]
 fn the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan() {
     check(
@@ -161,7 +161,6 @@ fn the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan() {
     );
 }
 
-#[test]
 fn the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says() {
     check(
         Geometry {
@@ -178,7 +177,6 @@ fn the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_w
     );
 }
 
-#[test]
 fn the_fused_step_answers_at_a_64_wide_head() {
     check(
         Geometry {
@@ -191,7 +189,6 @@ fn the_fused_step_answers_at_a_64_wide_head() {
     );
 }
 
-#[test]
 fn the_fused_step_answers_at_an_uneven_head() {
     check(
         Geometry {

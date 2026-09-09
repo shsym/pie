@@ -1,17 +1,3 @@
-//! ONNX → zTensor object model projection.
-//!
-//! Extracts graph initializers (the model weights) from the protobuf
-//! stream with a minimal hand-written wire-format parser, so no protobuf
-//! dependency. A `raw_data` tensor is a plain range of the file, so it gets an
-//! address and a borrow; the typed repeated fields (`float_data`,
-//! `int32_data`, ...) have to be converted to little-endian bytes per the ONNX
-//! storage rules (small types are stored one element per int32), so they exist
-//! only once this reader has built them, so they are an opaque payload and
-//! report as much.
-//!
-//! Graphs, nodes, and attributes are out of scope: this reads weights,
-//! not computation. External data files are refused, not resolved.
-
 use std::borrow::Cow;
 
 use ztensor::provide::{Catalog, Decode};
@@ -24,7 +10,6 @@ fn bad(detail: impl Into<String>) -> Error {
     Error::InvalidInput(format!("onnx: {}", detail.into()))
 }
 
-/// ONNX TensorProto.DataType → leaf.
 fn map_dtype(id: u64) -> Result<Leaf> {
     Ok(match id {
         1 => Leaf::F32,
@@ -57,8 +42,6 @@ fn map_dtype(id: u64) -> Result<Leaf> {
     })
 }
 
-// ---- protobuf wire format ---------------------------------------------
-
 const VARINT: u32 = 0;
 const I64BIT: u32 = 1;
 const LEN: u32 = 2;
@@ -67,7 +50,6 @@ const I32BIT: u32 = 5;
 struct Pb<'a> {
     data: &'a [u8],
     pos: usize,
-    /// Absolute offset of `data[0]` in the file, for zero-copy ranges.
     base: usize,
 }
 
@@ -142,8 +124,6 @@ impl<'a> Pb<'a> {
     }
 }
 
-// ---- TensorProto ------------------------------------------------------
-
 enum TensorData {
     Raw { offset: u64, length: u64 },
     Owned(Vec<u8>),
@@ -162,8 +142,6 @@ fn parse_tensor(data: &[u8], base: usize) -> Result<TensorInfo> {
     let mut dims = Vec::new();
     let mut data_type = 0u64;
     let mut raw: Option<(u64, u64)> = None;
-    // The typed repeated fields, kept as their wire integers until the
-    // data type is known.
     let mut i32s: Vec<u32> = Vec::new();
     let mut i64s: Vec<u64> = Vec::new();
     let mut f32s: Vec<u8> = Vec::new();
@@ -186,7 +164,7 @@ fn parse_tensor(data: &[u8], base: usize) -> Result<TensorInfo> {
             }
             (1, VARINT) => dims.push(pb.varint()?),
             (2, VARINT) => data_type = pb.varint()?,
-            (4, LEN) => f32s.extend_from_slice(pb.bytes()?.1), // packed floats: LE bytes
+            (4, LEN) => f32s.extend_from_slice(pb.bytes()?.1),
             (5, LEN) => {
                 let (_, b) = pb.bytes()?;
                 let mut sub = Pb {
@@ -219,10 +197,8 @@ fn parse_tensor(data: &[u8], base: usize) -> Result<TensorInfo> {
                 let (abs, b) = pb.bytes()?;
                 raw = Some((abs as u64, b.len() as u64));
             }
-            (10, LEN) => f64s.extend_from_slice(pb.bytes()?.1), // packed doubles
+            (10, LEN) => f64s.extend_from_slice(pb.bytes()?.1),
             (13, LEN) => {
-                // external_data entries: presence alone means the payload
-                // lives in another file.
                 external = true;
                 pb.bytes()?;
             }
@@ -246,10 +222,6 @@ fn parse_tensor(data: &[u8], base: usize) -> Result<TensorInfo> {
         .width()
         .expect("onnx leaves are whole bytes") as usize;
 
-    // Assemble owned bytes from typed fields per ONNX storage rules:
-    // int32_data carries every type of width ≤ 4 (one element per entry),
-    // int64_data carries i64, uint64_data carries u32/u64, float/double
-    // are packed IEEE bytes.
     if raw.is_some() && !(f32s.is_empty() && f64s.is_empty() && i32s.is_empty() && i64s.is_empty())
     {
         return Err(bad(format!(
@@ -286,11 +258,6 @@ fn parse_tensor(data: &[u8], base: usize) -> Result<TensorInfo> {
     })
 }
 
-// ---- projection -------------------------------------------------------
-
-/// The typed repeated fields, converted once at open and handed out on
-/// request. They have no address: nothing in the file holds these bytes in the
-/// layout a consumer wants.
 struct Typed {
     buffers: Vec<Vec<u8>>,
 }
@@ -309,9 +276,6 @@ impl Decode for Typed {
 }
 
 pub(crate) fn project(store: &Store) -> Result<Projection> {
-    // ONNX keeps its weights inline in the protobuf stream and gives no index,
-    // so there is no header to read on its own: an unmapped store has to read
-    // the file to answer anything at all.
     let bytes: Cow<'_, [u8]> = match store.bytes() {
         Some(mapped) => Cow::Borrowed(mapped),
         None => Cow::Owned(store.read(0, store.len())?),
@@ -320,7 +284,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
     if buf.is_empty() {
         return Err(bad("empty file"));
     }
-    // ModelProto.graph is field 7.
     let mut pb = Pb {
         data: buf,
         pos: 0,
@@ -339,7 +302,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
     let (graph_base, graph_len) = graph.ok_or_else(|| bad("no graph field in ModelProto"))?;
     let graph_bytes = &buf[graph_base..graph_base + graph_len];
 
-    // GraphProto.initializer is field 5.
     let mut catalog = Catalog::new();
     let mut converted: Vec<Vec<u8>> = Vec::new();
     let mut pb = Pb {
@@ -409,9 +371,6 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         }
     }
 
-    // Weights are embedded in a protobuf stream with fields around and between
-    // them, so what else shares a page is not knowable from here: occupancy
-    // stays unstated and exclusivity is never claimed.
     let projection = Projection::new(catalog);
     Ok(if converted.is_empty() {
         projection

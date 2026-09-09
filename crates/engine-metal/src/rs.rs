@@ -1,37 +1,3 @@
-//! **THE RECURRENT-STATE DEVICE HALF** — what makes `RsVerb::Buffer` and
-//! `RsVerb::FoldBuffered` true on this plane (alto design §6; the CUDA
-//! sibling is `engine_cuda::store::rs`).
-//!
-//! A recurrence is a fold: once a token's activations are folded into the
-//! bank there is no cell to take back when a verifier rejects the token. So a
-//! speculative window is not folded. Its PRE-RECURRENCE activations — the
-//! conv's input rows, the gate projection's rows, the hasher's token ids —
-//! are scattered into a page slab this module owns, the recurrence runs over
-//! them from a WORK copy of the bank, and the bank itself is written only as
-//! of the row the verb names (`commit`). The rows past it are computed, so
-//! the window's logits are right, and leave nothing behind.
-//!
-//! **THE READ PATH.** A round's accepted prefix survives in the slab
-//! unfolded; the NEXT round's fire names it as `replay` and this module
-//! gathers those rows AHEAD of the fire's own, so the recurrence starts from
-//! `folded (+) replay(buffer)` and lands its state exactly after the prefix.
-//! That is one fire per speculative round — the shape `discard-buffered`'s
-//! doc promises and the CUDA plane refuses by name.
-//!
-//! **WHAT IS BUFFERED** is discovered from the trace, not declared per
-//! family: every op that reads a recurrent state cache has one input operand
-//! whose rows are the recurrence's input (`SsmCausalConv1d*::x`,
-//! `PleNgramIds*::ids`), and `SsmGdnPrep::ba` is paired to the delta state
-//! its gates feed. Both arms of a mixer — the one-row decode op and the
-//! chunked prefill op — resolve to ONE plane, keyed by the state cache they
-//! feed, because a lane's rows land on one arm this fire and may land on the
-//! other next fire and still have to find the same bytes.
-//!
-//! The extended rows live in a scratch the shell grows on demand
-//! ([`Seat::scratch_bytes`]); the page slab is reserved at load, one page
-//! slot per recurrent slot, since the runtime's RS store hands out page ids
-//! from the same pool the banks are counted in.
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,35 +10,24 @@ use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
 
-/// Which recurrence input a plane holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
-    /// A causal conv's input rows (the GDN qkv, or the PLE's normed rows).
     ConvX,
-    /// The `[b | a]` gate projection the delta scan's decay is prepared from.
     Ba,
-    /// The token ids the n-gram hasher walks.
     Ids,
-    /// KDA's per-channel forget-gate projection (`f`, one plane wide).
     KdaF,
-    /// KDA's per-head write-strength projection (`b`, one lane per head).
     KdaB,
 }
 
-/// One buffered plane: what it holds and how wide one token's row is.
 #[derive(Clone, Copy, Debug)]
 pub struct Plane {
-    /// The state cache (row of `Trace::caches`) this plane's rows feed.
     pub cache: u32,
     pub role: Role,
     pub width: u32,
     pub dtype: Dtype,
-    /// Bytes one token writes.
     pub row_bytes: u64,
 }
 
-/// One extended-output rectangle a committed launch lands: the conv's
-/// output, the prepared gates, the scan's output, the hasher's rows.
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     pub width: u32,
@@ -80,19 +35,13 @@ pub struct Region {
     pub row_bytes: u64,
 }
 
-/// Every plane and region the plan needs, keyed by the operands that read
-/// and write them.
 #[derive(Debug, Default)]
 pub struct Layout {
     pub planes: Vec<Plane>,
     pub regions: Vec<Region>,
-    /// Input operand value -> plane.
     pub in_of: HashMap<u32, usize>,
-    /// Output operand value -> region.
     pub out_of: HashMap<u32, usize>,
-    /// Bytes one token occupies across every plane.
     pub token_bytes: u64,
-    /// The widest delta bank one lane's work copy needs, in f32 elements.
     pub work_elems: u64,
 }
 
@@ -133,13 +82,6 @@ fn cache_of(trace: &Trace, state: ValueId) -> Result<u32> {
 }
 
 impl Layout {
-    /// The plan's buffered planes, or `None` for a plan with no recurrent
-    /// state to buffer.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a gate projection whose scan cannot be found,
-    /// or an operand the trace does not type.
     pub fn read(trace: &Trace) -> Result<Option<Layout>> {
         let mut layout = Layout::default();
         let mut plane_keys: HashMap<(u32, Role), usize> = HashMap::new();
@@ -252,8 +194,6 @@ impl Layout {
                     y,
                     ..
                 } => {
-                    // The scan reads the conv's extended output (`mixed`, a
-                    // region above) and its own two projections, buffered.
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::KdaF, *f)?;
                     plane(&mut layout, cache, Role::KdaB, *b)?;
@@ -302,24 +242,16 @@ impl Layout {
     }
 }
 
-/// The page slab: `[page slot][plane][token]`, one page slot per recurrent
-/// slot.
 #[derive(Debug)]
 pub struct Buffers {
     slab: Buffer,
     page_tokens: u32,
     slots: u32,
     page_bytes: u64,
-    /// Byte offset of each plane's first token inside a page slot.
     plane_at: Vec<u64>,
 }
 
 impl Buffers {
-    /// Reserve the slab one layout needs at one deployment's paging.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`] for the allocation, [`Fault::Deviceless`] off Apple.
     pub fn reserve(device: &Context, layout: &Layout, paging: Paging) -> Result<Buffers> {
         let page_tokens = paging.page_size.max(1);
         let mut plane_at = Vec::with_capacity(layout.planes.len());
@@ -355,7 +287,6 @@ impl Buffers {
     }
 }
 
-/// A run of buffer tokens `[from, from + count)` over a lane's page list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub pages: Vec<u32>,
@@ -363,33 +294,17 @@ pub struct Run {
     pub count: u32,
 }
 
-/// What one lane's verb asks of this fire, host-resolved.
 #[derive(Clone, Debug, Default)]
 pub struct LanePlan {
-    /// Buffered tokens replayed ahead of the lane's own rows.
     pub replay: u32,
-    /// Rows of the extended run whose state persists.
     pub commit: u32,
-    /// The lane's own rows this fire.
     pub rows: u32,
-    /// Buffer tokens gathered into the extended run — ahead of the rows, or
-    /// in their place when [`override_rows`](LanePlan::override_rows).
     pub gather: Option<Run>,
-    /// Where the lane's own rows are scattered to.
     pub scatter: Option<Run>,
-    /// `FoldBuffered`: the gathered tokens ARE the rows (the lane's own
-    /// tokens are placeholders the replay overwrites).
     pub override_rows: bool,
 }
 
 impl LanePlan {
-    /// Resolve one lane's verb against the rows it carries.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for a device-resident fold length (this plane has
-    /// no descriptor port to read it from), a `FoldBuffered` whose bound is
-    /// not the lane's row count, or a fold past the extended run.
     pub fn of(verb: &RsVerb, rows: u32, lane: u32, device_fold: Option<u32>) -> Result<LanePlan> {
         let host = |len: FoldLen| -> Result<u32> {
             match len {
@@ -508,47 +423,30 @@ impl LanePlan {
     }
 }
 
-/// One fire's recurrent-state seat: the per-lane plans, the tables the
-/// committed launches read, the slab and the extended scratch, all minted
-/// for this fire.
 #[derive(Debug)]
 pub struct Seat {
-    /// In fire lane order.
     pub lanes: Vec<LanePlan>,
-    /// `i32`, `[fire lanes]`.
     pub replay: Tensor,
-    /// `i32`, `[fire lanes]`.
     pub commit: Tensor,
-    /// `i32`, `[fire lanes]`: the bank each lane owns.
     pub slots: Tensor,
-    /// The whole page slab.
     pub pool: u32,
     pub layout: Arc<Layout>,
     pub plane_at: Vec<u64>,
     pub page_tokens: u32,
     pub page_bytes: u64,
     pub pool_slots: u32,
-    /// Per plane: the extended input rectangle, `rows_ext` tall.
     pub ext_in: Vec<Tensor>,
-    /// Per region: the extended output rectangle, `rows_ext` tall.
     pub ext_out: Vec<Tensor>,
-    /// `[fire lanes][work_elems]` f32.
     pub work: Tensor,
     pub rows_ext: u32,
-    /// Extended outputs by the value they stand in for, filled as the walk
-    /// lands them and read by the ops downstream.
     pub ext: RefCell<HashMap<u32, Tensor>>,
 }
 
 impl Seat {
-    /// Bytes of scratch a fire of `rows_ext` extended rows over `lanes`
-    /// lanes needs.
     #[must_use]
     pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
         let rows = u64::from(rows_ext.max(1));
         let mut at = 0u64;
-        // Each take below binds at least 4 bytes (a zero-row plane, or a
-        // layout with no delta work copy), so the sum must hold those too.
         for plane in &layout.planes {
             at += (rows * plane.row_bytes).max(4).next_multiple_of(256);
         }
@@ -561,12 +459,6 @@ impl Seat {
         at.max(256)
     }
 
-    /// Mint the seat for one fire.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a handle table already full or a scratch too
-    /// small for the extended rows.
     #[allow(clippy::too_many_arguments)]
     pub fn mint(
         handles: &Handles,
@@ -635,13 +527,6 @@ impl Seat {
         })
     }
 
-    /// Byte offset of buffer token `token` of plane `plane` inside the slab,
-    /// and how many tokens from it stay inside the same page.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a token past the lane's page list or a page
-    /// past the pool.
     pub fn locate(&self, run: &Run, plane: usize, token: u32) -> Result<(u64, u32)> {
         let page = token / self.page_tokens;
         let in_page = token % self.page_tokens;

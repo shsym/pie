@@ -1,23 +1,3 @@
-//! **A FLOAT PORT MERGED STRAIGHT INTO A STREAM (`Value::merge(vec![ctx_port,
-//! image])`, the Wan/mini-dit shape) LANDS ITS LANES' ROWS IN THE MERGED
-//! COLUMN, AND AN f32 LANE CHAIN WITH `add_bias` AND `split_rows` ARMS
-//! BODIES THAT ANSWER THEIR EAGER WALK.**
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test a_context_port_merged_into_the_stream_lands_its_rows
-//! ```
-//!
-//! Two things this plan states that the double-block miniature does not: a
-//! merge whose arm is a runtime input (no node writes that arm's rows, so
-//! the engine lands the port's rows in the merged column before the walk,
-//! zeros for a lane that fed nothing — the arming synthetics — so two walks
-//! of one composition read the same bytes and the golden holds), and the
-//! adaLN chain `sinusoid → silu → matmul → add_bias → split_rows →
-//! modulate / gated_residual_add` kept in f32 on the lane axis. Loads under
-//! the default knobs (bodies armed and golden-checked), fires two requests
-//! against a host f32 reference. Skips when no device is present.
-
 #![cfg(feature = "cuda")]
 
 mod common_dit;
@@ -43,13 +23,10 @@ impl ForwardHybrid for MergedBlock {
     }
     fn forward(&self, inputs: Input<StreamFacts>) -> Value {
         let (txt, img) = inputs.split(&StreamFacts::on(Stream::Text));
-        // The text lanes' rows come straight off a context port; the image
-        // lanes' off an embedded latent — one merged stream.
         let x_txt = txt.context(0, WIDTH);
         let embed = Weight::sym("embed", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let x_img = ops::linear::matmul(&img.latents(0, WIDTH, Dtype::Bf16), &embed);
         let x = Value::merge(vec![x_txt, x_img]);
-        // adaLN in f32 on the lane axis, biased and split.
         let t = inputs.lane_vector(0, 1);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0));
         let ada = Weight::sym("ada", [3 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
@@ -75,8 +52,6 @@ fn plan() -> Trace {
     trace_hybrid(NAME, &MergedBlock, Platform::Cuda)
 }
 
-/// One lane's velocity rows on the host: `x` is the lane's rows as the
-/// merged column holds them (the context cell, or `latent · embedᵀ`).
 fn reference(weights: &Weights, x: &[f32], rows: usize, timestep: f32) -> Vec<f32> {
     let w = WIDTH as usize;
     let half = (FREQ / 2) as usize;
@@ -138,7 +113,6 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
         let timestep = 0.3 + 0.2 * req as f32;
         let text: Vec<f32> = (0..text_rows * w).map(|_| bf(rng.unit())).collect();
         let latent: Vec<f32> = (0..image_rows * w).map(|_| bf(rng.unit())).collect();
-        // The image rows as the merged column holds them.
         let embed = weights.get("embed");
         let mut image = vec![0f32; image_rows * w];
         for r in 0..image_rows {
@@ -159,8 +133,6 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
         }
         let slot = 2 * req;
         let mut text_lane = lane(slot, &t, LaneStream::Text, req);
-        // The text lane feeds the context port (this plan's text input);
-        // `lane` wires port 0 of the latents kind, so retarget it.
         for feed in &mut text_lane.ports {
             if feed.kind == engine::fire::PortKind::Latents {
                 feed.kind = engine::fire::PortKind::Context;
@@ -172,7 +144,6 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
                 feed.port = 0;
             }
         }
-        // This plan reads no positions port: drop that feed.
         text_lane
             .ports
             .retain(|f| f.kind != engine::fire::PortKind::AxisPositions);

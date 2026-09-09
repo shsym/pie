@@ -1,8 +1,3 @@
-//! Pins that each catalog SKU's own-name load contract matches
-//! its plan: every checkpoint plane maps to a declared tensor, sharding and
-//! shapes agree, casts occur only where expected, and import/load agree on
-//! the same bytes.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -34,7 +29,6 @@ fn scratch() -> PathBuf {
 }
 
 fn write_checkpoint(path: &Path, params: &[Param]) {
-    // an mxfp4 bank's `.scales` is a plane of its codes' object, not an object.
     let banks: BTreeSet<&str> = params
         .iter()
         .filter(|p| p.dtype == Dtype::Mxfp4)
@@ -72,8 +66,6 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
             "`{}` is declared fp4, which names a kv-page scheme and no stored plane",
             param.name
         ),
-        // affine rows (`*-u4g64-*`, `*-u2g64-*`) are read through `Model::import`,
-        // not `load`; none of the SKUs above reach this arm.
         Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
@@ -86,8 +78,6 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
             param.name,
             param.dtype
         ),
-        // `ffn.gate.tid2eid` (dsv4-flash's token-id -> expert-id table) is the
-        // only I64 plane any catalog SKU declares.
         Dtype::I64 => raw(writer, param, ztensor::Leaf::I64, 8),
         Dtype::E5m2 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
             panic!(
@@ -95,8 +85,6 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
                 param.name, param.dtype
             )
         }
-        // K-quant planes: same argument as the affine rows above; no catalog
-        // SKU declares one yet.
         Dtype::Nvfp4
         | Dtype::E4m3row
         | Dtype::E4m3tile128
@@ -207,11 +195,17 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
     found
 }
 
-/// `*-u4g64-*`/`*-u2g64-*` rows are exempt: `state`'s affine arm can't
-/// invent a canonical triplet layout, so those rows are landed and tested
-/// through `Model::import` instead.
 fn by_load(row: &models::Sku) -> bool {
     row.recipe.weights.iter().all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
+}
+
+fn the_zt_contract_states_the_cut_every_case() {
+    one_entry_per_plan_param_under_the_plans_own_names();
+    a_cut_param_carries_a_shard_per_leg();
+    a_replicated_param_reads_its_own_name_and_nothing_else();
+    a_declared_shape_is_the_whole_tensors();
+    an_identity_load_states_no_cast();
+    a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in();
 }
 
 #[test]
@@ -220,7 +214,6 @@ fn one_entry_per_plan_param_under_the_plans_own_names() {
 
     for one in stated() {
         let supply = published(&one.contract);
-        // registered (adapter) params aren't demanded from the checkpoint.
         let demand: BTreeSet<&str> = one
             .params
             .iter()
@@ -250,7 +243,6 @@ fn one_entry_per_plan_param_under_the_plans_own_names() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-#[test]
 fn a_cut_param_carries_a_shard_per_leg() {
     let mut faults = Vec::new();
 
@@ -278,7 +270,6 @@ fn a_cut_param_carries_a_shard_per_leg() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-#[test]
 fn a_replicated_param_reads_its_own_name_and_nothing_else() {
     let mut faults = Vec::new();
 
@@ -306,7 +297,6 @@ fn a_replicated_param_reads_its_own_name_and_nothing_else() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-#[test]
 fn a_declared_shape_is_the_whole_tensors() {
     let mut faults = Vec::new();
 
@@ -346,7 +336,6 @@ fn a_declared_shape_is_the_whole_tensors() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-#[test]
 fn an_identity_load_states_no_cast() {
     let mut faults = Vec::new();
 
@@ -370,12 +359,6 @@ fn an_identity_load_states_no_cast() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-/// The other door: a checkpoint that ships an mxfp4 bank unquantized — BF16
-/// values, no `.scales` plane. The contract must declare exactly one
-/// producer per param: the payload's own entry, cast to a quantized
-/// encoding, which also produces `<w>.scales` — so the contract must not
-/// declare a separate entry for `.scales` itself.
-#[test]
 fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let dir = scratch();
     let mut faults = Vec::new();
@@ -402,7 +385,6 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
 
         let supply = published(&contract);
         for param in &trace.params {
-            // registered (adapter) params aren't demanded here either.
             if param.source != ParamSource::Checkpoint {
                 continue;
             }
@@ -416,8 +398,6 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
                 }
                 continue;
             };
-            // .scales plane: the payload's cast produces it; nothing else
-            // may declare it.
             if supply.contains_key(param.name.as_str()) {
                 faults.push(format!(
                     "`{}`: the contract declares `{}`, and the encode of `{stem}` \
@@ -456,9 +436,6 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-/// Fixture writer for a checkpoint that still needs quantizing: an mxfp4
-/// param is written as BF16 (the values it was quantized from), with no
-/// `.scales` companion, and its shape drops the codes axis.
 fn write_unquantized_checkpoint(path: &Path, params: &[Param]) {
     let mut planes: Vec<&Param> = params
         .iter()
@@ -483,5 +460,3 @@ fn write_unquantized_checkpoint(path: &Path, params: &[Param]) {
         .finish()
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
-
-

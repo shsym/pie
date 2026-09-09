@@ -1,10 +1,3 @@
-//! The sm90 prefill scheduler: per-CTA work lists balanced over a cost
-//! heap, one list per SM, longest prefixes first. A native reimplementation
-//! of FlashInfer's host planner (see [`sched`](crate::attn::sched)), kept
-//! so `Struct(AttnPrefillPlanSm90)` has an honest payload; the launcher
-//! this schedule feeds was never part of the lattice (the entry answers a
-//! typed refusal — see `attn::prefill_sm90`).
-
 use core::cmp::Reverse;
 
 use crate::error::Error;
@@ -18,18 +11,11 @@ use crate::jit::refuse;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// Host copy of the query indptr — `[batch_size + 1]`.
     pub qo_indptr: &'a [i32],
-    /// Host copy of the kv element offsets — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// Host per-request kv lengths, in tokens — `[batch_size]`.
     pub kv_len_arr: &'a [i32],
-    /// The row and lane counts this schedule is CARVED for: what the
-    /// per-head work bound and the allocations behind it are sized at.
     pub total_num_rows: u32,
     pub batch_size: u32,
-    /// What this fire actually brought: the lane walk that builds the work
-    /// lists reads ids and lengths off this fire's own three host vectors.
     pub live: Live,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
@@ -38,7 +24,6 @@ pub struct Request<'a> {
     pub enable_cuda_graph: bool,
 }
 
-/// One request as the balancer walks it.
 #[derive(Clone, Copy, Debug)]
 struct Lane {
     request: i32,
@@ -57,7 +42,6 @@ struct CtaWork {
     batch_indices: Vec<i32>,
 }
 
-/// The computed schedule: pure data, laid out and staged by [`plan`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub same_schedule_for_all_heads: bool,
@@ -86,15 +70,12 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
             ),
         ));
     }
-    // the three host vectors are this fire's, walked at the live lane count.
     let batch = req.live.requests as usize;
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
     spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let kv_lens = lengths(op, "kv length table", req.kv_len_arr, batch)?;
     narrow(op, "batch_prefill_sm90_head_indices", i64::from(req.num_qo_heads))?;
 
-    // Longest prefixes place first; the stable sort keeps request order
-    // between equal lengths.
     let mut lanes: Vec<Lane> = Vec::with_capacity(batch);
     for i in 0..batch {
         narrow(op, "batch_prefill_sm90_qo_len", i64::from(qo_lens[i]))?;
@@ -116,11 +97,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let mut heap = CostHeap::new(num_ctas);
     let mut ctas = vec![CtaWork::default(); num_ctas as usize];
 
-    // `max_num_works_per_head` bounds `max_total_num_works`, which `plan`
-    // sizes all eight int vectors at, and its threshold picks
-    // `same_schedule_for_all_heads`. Both inputs are the carved row and lane
-    // counts, so under the bucket ceiling this payload is a function of the
-    // key, not of whichever fire warmed the body.
     let max_num_works_per_head = (u64::from(req.total_num_rows).div_ceil(u64::from(cta_tile_q))
         + u64::from(req.batch_size)
         - 1) as usize;
@@ -154,7 +130,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                 );
                 let request = lane.request as usize;
                 let cta = &mut ctas[cta_idx as usize];
-                // Narrowed above: tile < tiles <= qo_len, head < heads.
                 cta.qo_tile_indices.push(qo_tile_idx as i32);
                 cta.qo_indptr.push(req.qo_indptr[request]);
                 cta.qo_len.push(lane.qo_len as i32);

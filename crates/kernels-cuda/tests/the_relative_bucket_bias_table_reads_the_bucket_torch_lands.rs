@@ -1,12 +1,3 @@
-//! `elementwise.relative_bucket_bias` lands, at every signed distance in
-//! `±(max_len − 1)` and every head, the embedding row of the bucket Hugging
-//! Face's `_relative_position_bucket` computes — the f32 transcription on
-//! the host below, which agrees with CPU torch at T5's `32 / 128`, at
-//! `16 / 64`, `64 / 256` and `32 / 1024`, exact boundaries (`n = 16, 32,
-//! 64`) included — from a bf16 and from an f32 embedding.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_relative_bucket_bias_table_reads_the_bucket_torch_lands`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -16,7 +7,6 @@ use dtype::Dtype;
 use kernels_cuda::elemwise::relative_bucket_bias;
 use kernels_cuda::tensor::Tensor;
 
-/// HF `T5Attention._relative_position_bucket`, in torch's own f32 steps.
 fn bucket(d: i64, bidirectional: bool, mut num_buckets: i64, max_distance: f32) -> i64 {
     let mut out = 0;
     let n = if bidirectional {
@@ -38,9 +28,6 @@ fn bucket(d: i64, bidirectional: bool, mut num_buckets: i64, max_distance: f32) 
     out + large.min(num_buckets - 1)
 }
 
-/// Bucket `b` of head `h` carries `STEP·h + b`, so a table cell names the
-/// bucket it read and the head it read it for. `STEP · heads` stays under
-/// 256, the last integer bf16 spells exactly.
 const STEP: usize = 64;
 
 fn embedding(num_buckets: usize, heads: usize) -> Vec<f32> {
@@ -99,17 +86,22 @@ fn check(
     }
 }
 
+fn the_relative_bucket_bias_table_reads_the_bucket_torch_lands_every_case() {
+    the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding();
+    the_t5_table_reads_the_bucket_at_every_distance_from_an_f32_embedding();
+    other_bucket_counts_and_a_one_directional_table_read_their_buckets();
+    a_max_distance_inside_the_exact_band_is_refused();
+}
+
 #[test]
 fn the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding() {
     check(4, 512, 32, 128.0, true, Dtype::Bf16);
 }
 
-#[test]
 fn the_t5_table_reads_the_bucket_at_every_distance_from_an_f32_embedding() {
     check(4, 512, 32, 128.0, true, Dtype::F32);
 }
 
-#[test]
 fn other_bucket_counts_and_a_one_directional_table_read_their_buckets() {
     check(3, 300, 16, 64.0, true, Dtype::F32);
     check(3, 300, 64, 256.0, true, Dtype::F32);
@@ -117,7 +109,6 @@ fn other_bucket_counts_and_a_one_directional_table_read_their_buckets() {
     check(2, 200, 32, 128.0, false, Dtype::F32);
 }
 
-#[test]
 fn a_max_distance_inside_the_exact_band_is_refused() {
     let mut gpu = Gpu::open();
     let emb_at = gpu.zeros(32 * 4 * 4);

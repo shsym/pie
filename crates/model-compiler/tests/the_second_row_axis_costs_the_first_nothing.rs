@@ -1,11 +1,3 @@
-//! Every SKU that existed before the second row axis still bakes to exactly
-//! one capture unit, and to an artifact the axis cannot be shown to have
-//! touched: each SKU is baked through both [`compile`] and [`compile_axes`]
-//! (with a full patch ladder admitted) and the two `CompiledModel`s must be
-//! `==`, field for field. The last test bakes a hand-built two-axis plan
-//! through the same door, so a green run above can't mean the patch path is
-//! unreachable.
-
 use model_compiler::{
     Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compile, compile_axes,
 };
@@ -15,11 +7,6 @@ use model_ir::{
     ValueDecl, ValueId,
 };
 
-/// The one thing the two sweeps above cannot say: that the patch path exists.
-///
-/// A hand-built tower — patch-shaped rows, then a token trunk that reads them
-/// — through the same door, so a green file is never "the second axis is
-/// unreachable".
 #[test]
 fn a_plan_that_states_patch_rows_bakes_two_units_and_stands_the_fold_down() {
     let trace = tower_and_trunk();
@@ -39,16 +26,11 @@ fn a_plan_that_states_patch_rows_bakes_two_units_and_stands_the_fold_down() {
     assert!(compiled.unit_script(1).is_some());
     assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 
-    // And the same plan against budgets that size no patch ceiling is a
-    // refusal with the axis in it, not a tower carved at zero rows.
     let refusal = compile(&trace, &Budget::new(4, 16), &DeviceProfile::default())
         .expect_err("no patch ceiling, no load");
     assert!(refusal.to_string().contains("patches"), "{refusal}");
 }
 
-/// Two patch-shaped ops, then two token-shaped ones — the tower/trunk shape in
-/// four nodes, stated in `Def` and `Ty` because the authoring surface has no
-/// tower vocabulary yet (that is M3).
 fn tower_and_trunk() -> Trace {
     let mut values: Vec<ValueDecl> = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();

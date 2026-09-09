@@ -1,5 +1,3 @@
-//! `icb::rebind`, host side: the derived [`DescriptorAbi`] lowered into device tables, and the two-pass fire that reads them without the host ever walking.
-
 #![cfg(target_vendor = "apple")]
 
 use std::collections::HashMap;
@@ -19,27 +17,15 @@ use crate::device::{Context, Pipelines};
 use crate::error::{Fault, Result};
 use crate::record::{Arg, Slot};
 
-/// What the lowering produced — the census of the device-side table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lowered {
-    /// ICB slots, one rebind thread each.
     pub slots: usize,
-    /// Arms across every slot; more than `slots` exactly where an entry picks
-    /// its shader off the window.
     pub arms: usize,
-    /// Law rows — one per moving component of every arm, plus one window-rows
-    /// law per slot.
     pub laws: usize,
-    /// Binding rows: every argument of every arm, for the re-encode a revived
-    /// or re-armed slot is.
     pub binds: usize,
-    /// Distinct pipelines the arms name.
     pub pipelines: usize,
-    /// Distinct reservations the bindings name.
     pub slabs: usize,
-    /// Bytes of staged-scalar arena.
     pub cells: u64,
-    /// Bytes of device table, all of it.
     pub bytes: u64,
 }
 
@@ -61,41 +47,25 @@ impl std::fmt::Display for Lowered {
     }
 }
 
-/// The device-side rebind: every table the shader reads, and the pipeline
-/// that reads them.
 pub struct Rebinder {
     pipeline: Pipeline,
-    /// Argument buffers: the ICB's own resource id, the pipeline states, and
-    /// the reservation addresses.
     handle: Buffer,
     pipes: Buffer,
     slabs: Buffer,
-    /// The header.
     plan: Buffer,
-    /// The packed `model_exec::fire::descriptor` bytes — the ONE thing a fire
-    /// writes.
     descriptor: Buffer,
-    /// The coordinate recipe.
     konst: Buffer,
     coeff: Buffer,
-    /// The tables.
     slot_rows: Buffer,
     arm_rows: Buffer,
     law_rows: Buffer,
     bind_rows: Buffer,
     pipe_rows: Buffer,
-    /// One word per slot: which arm is encoded in it, `0` for reset and
-    /// `u32::MAX` for "the host touched this, encode it again".
     live: Buffer,
-    /// The shader's one output.
     status: Buffer,
-    /// The staged scalars of every arm of every slot.
     cells: Buffer,
-    /// The compiled pipelines the arm table names, retained so their resource
-    /// ids stay valid for the life of the load.
     #[allow(dead_code, reason = "held for the resource ids written into `pipes`")]
     retained: Vec<Pipeline>,
-    /// How many bytes of descriptor the reservation holds.
     room: u64,
     census: Lowered,
 }
@@ -112,15 +82,11 @@ impl std::fmt::Debug for Rebinder {
 }
 
 impl Rebinder {
-    /// The census of what was lowered.
     #[must_use]
     pub fn census(&self) -> Lowered {
         self.census
     }
 
-    /// Mark every slot for re-encode: `Icb::rebind` diffs against a host-side
-    /// record while this shader diffs against `live`, so crossing from one
-    /// path to the other must be marked rather than assumed consistent.
     pub(crate) fn desync(&mut self) -> Result<()> {
         let mut word = Vec::with_capacity(self.census.slots * 4);
         for _ in 0..self.census.slots {
@@ -130,9 +96,6 @@ impl Rebinder {
     }
 }
 
-/// One argument's place in the staged-scalar arena, when it has one. Scalars
-/// have no `setBytes:` on an indirect compute command, so they go through
-/// staged cells instead.
 fn cell_of(arg: Arg) -> Option<usize> {
     match arg {
         Arg::I32(_) | Arg::U32(_) | Arg::F32(_) | Arg::Usize(_) => Some(8),
@@ -140,7 +103,6 @@ fn cell_of(arg: Arg) -> Option<usize> {
     }
 }
 
-/// A staged scalar's bytes.
 fn scalar_bytes(arg: Arg) -> Option<[u8; 8]> {
     let mut out = [0u8; 8];
     match arg {
@@ -153,7 +115,6 @@ fn scalar_bytes(arg: Arg) -> Option<[u8; 8]> {
     Some(out)
 }
 
-/// The `Fire` one recorded slot's pipeline is keyed on.
 fn fire_of(slot: &Slot) -> kernels_metal::Fire {
     kernels_metal::Fire {
         file: slot.point.file,
@@ -165,24 +126,10 @@ fn fire_of(slot: &Slot) -> kernels_metal::Fire {
 }
 
 fn resource_id(id: MTLResourceID) -> u64 {
-    // MTLResourceID is #[repr(C)] over one u64 with a crate-private field.
     // SAFETY: both types are eight bytes of plain data with no niche.
     unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }
 }
 
-/// Lower one derived table into the device tables the shader reads.
-///
-/// `icb` is the buffer the shader will rewrite and `slots` its command count;
-/// the two must be the artifact this table was derived from, which is checked
-/// slot for slot rather than assumed.
-///
-/// # Errors
-///
-/// [`Fault::Unstructured`] when the table is not this buffer's,
-/// [`Fault::Ceiling`] for a basis, a pipeline count or a reservation count
-/// past what the shader's fixed arrays hold, [`Fault::Shader`] for an arm
-/// whose entry will not compile, [`Fault::Device`] for a reservation the
-/// device declined.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn lower(
     device: &Context,
@@ -227,8 +174,6 @@ pub(crate) fn lower(
 
     let classes = abi.origin_classes.len();
 
-    // 1. The pipelines the arms name, deduplicated, with the two occupancy
-    //    numbers the shader needs to answer a `[0,0,0]` threadgroup.
     let mut pipe_index: HashMap<(&'static str, &'static str), u32> = HashMap::new();
     let mut retained: Vec<Pipeline> = Vec::new();
     let mut pipe_rows: Vec<layout::PipeRow> = Vec::new();
@@ -255,7 +200,6 @@ pub(crate) fn lower(
         });
     }
 
-    // 2. The reservations the bindings name, deduplicated.
     let mut slab_index: HashMap<u64, u32> = HashMap::new();
     let mut addresses: Vec<u64> = Vec::new();
     for slot in &abi.slots {
@@ -284,8 +228,6 @@ pub(crate) fn lower(
         });
     }
 
-    // 3. The tables. One pass, in slot order, so the arm and law runs are
-    //    contiguous and the shader indexes rather than searches.
     let mut slot_rows: Vec<layout::SlotRow> = Vec::with_capacity(abi.len());
     let mut arm_rows: Vec<layout::ArmRow> = Vec::new();
     let mut law_rows: Vec<layout::LawRow> = Vec::new();
@@ -298,8 +240,6 @@ pub(crate) fn lower(
         let arm_at = arm_rows.len() as u32;
         for arm in &slot.arms {
             let bind_at = bind_rows.len() as u32;
-            // Every argument of this arm, and a cell for every scalar among
-            // them: what a revived or re-armed slot is encoded again from.
             let mut cells_of_arg: Vec<Option<u64>> = Vec::with_capacity(arm.skeleton.args.len());
             for (index, arg) in arm.skeleton.args.iter().enumerate() {
                 match *arg {
@@ -346,7 +286,6 @@ pub(crate) fn lower(
                         let place = argument_place(arm, index as usize, &slab_index, &cells_of_arg);
                         law_row(law, layout::AT_ARG, u32::from(index), Some(place))
                     }
-                    // abi::read enumerates only the three places above.
                     At::Entry | At::Shared | At::Shape => {
                         return Err(Fault::Unstructured {
                             slot: slot_rows.len() as u32,
@@ -381,8 +320,6 @@ pub(crate) fn lower(
         ));
     }
 
-    // 4. The coordinate recipe, flat: one constant per direction and
-    //    `axes × 2 × classes` coefficients.
     let mut konst: Vec<i64> = Vec::with_capacity(abi.axes.len());
     let mut coeff: Vec<i64> = Vec::with_capacity(abi.axes.len() * 2 * classes);
     for row in &abi.recipe {
@@ -393,7 +330,6 @@ pub(crate) fn lower(
         }
     }
 
-    // 5. The reservations.
     let plan = layout::Plan::new(
         abi.len() as u32,
         abi.axes.len() as u32,
@@ -455,14 +391,10 @@ pub(crate) fn lower(
         room: room.max(64),
         census,
     };
-    // Nothing is assumed encoded: starting every word "host touched this"
-    // makes the first rebind a full re-encode, correct regardless of what
-    // the walk-built buffer left behind.
     rebinder.desync()?;
     Ok(rebinder)
 }
 
-/// One law, as the shader's row.
 fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)>) -> layout::LawRow {
     let mut row = match law {
         Law::Const(v) => {
@@ -491,7 +423,6 @@ fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)
             row.div = narrow(*div);
             row
         }
-        // No Metal fit ever produces Law::Slot; `lower` refuses such a table earlier.
         Law::Slot(id) => unreachable!("the Metal fit never states {id}"),
     };
     if let Some((arg_kind, slab, cell)) = place {
@@ -502,8 +433,6 @@ fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)
     row
 }
 
-/// Where an argument law writes: into a binding's offset, or into a staged
-/// cell of one of two widths.
 fn argument_place(
     arm: &Arm,
     index: usize,
@@ -538,14 +467,6 @@ fn stored(device: &Context, bytes: &[u8]) -> Result<Buffer> {
     Ok(buffer)
 }
 
-/// Rewrite the buffer from the descriptor and run it: one command buffer, two
-/// passes, no walk.
-///
-/// # Errors
-///
-/// [`Fault::Ceiling`] for a descriptor wider than the reservation,
-/// [`Fault::Device`] when the GPU refused, [`Fault::Unstructured`] when the
-/// shader itself refused the descriptor.
 pub(crate) fn fire(
     rebinder: &mut Rebinder,
     device: &Context,
@@ -561,7 +482,6 @@ pub(crate) fn fire(
             have: rebinder.room,
         });
     }
-    // The one host write of a fire: a memcpy into a Shared mapping.
     rebinder.descriptor.write(0, descriptor)?;
     rebinder.status.write(0, &0u64.to_ne_bytes())?;
 
@@ -604,8 +524,6 @@ pub(crate) fn fire(
         );
     }
     {
-        // The second pass observes everything the first wrote, which is the
-        // whole reason there are two.
         let encoder = frame.next_pass()?;
         for slab in residents {
             let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**slab);

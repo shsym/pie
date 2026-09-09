@@ -11,9 +11,6 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        // Arm chosen by attempting to build it, not by sniffing a name: the mlx
-        // arm must run before huggingface, since the flash artifact is otherwise
-        // huggingface-named.
         let mut refusals: Vec<String> = Vec::new();
         let arms: [(
             &str,
@@ -43,14 +40,6 @@ impl Model {
         })
     }
 
-    /// Reads a STAMPED ARTIFACT of this family's plain row with the draft
-    /// head overlaid beside it (`pie model import <artifact.zt> --aux <head>`):
-    /// every trunk plane by its own name, as the artifact already holds it,
-    /// and the head's planes through the `aux.` reading. What lets a head be
-    /// put onto a ninety-gigabyte artifact whose source snapshot is gone,
-    /// and lets the import write only the head. A row without a draft head
-    /// has nothing to overlay and refuses; a source that is not an artifact
-    /// refuses at the first trunk plane it lacks.
     pub fn import_from_own_with_aux(
         &self,
         src: &ztensor::Source,
@@ -92,8 +81,6 @@ impl Model {
         Ok(b.build())
     }
 
-    /// Reads the flash artifact's own names (mlx-community DeepSeek-V4-Flash). This read list also drives
-    /// [`Model::mlx_source_names`], so the two cannot drift apart.
     pub fn import_from_mlx(
         &self,
         src: &ztensor::Source,
@@ -103,15 +90,11 @@ impl Model {
         for read in self.mlx_reads() {
             match read {
                 Read::One(w, name) => b.read(w, name)?,
-                // Affine (quantized) banks: each half carries its own `.scales`/`.biases` and joins via `read_concat`.
                 Read::Concat(w, _, names) if affine(w.dtype) => {
                     b.read_concat(w, names)?;
                 }
                 Read::Concat(w, axis, names) => {
                     let hidden = i64::from(self.hidden);
-                    // Stacked MoE banks concat along the intermediate axis of a
-                    // rank-3 [experts, inter, hidden] tensor; shared/dense
-                    // fusions concat two rank-2 [inter, hidden] halves.
                     let parts = names
                         .into_iter()
                         .map(|name| {
@@ -129,8 +112,6 @@ impl Model {
         Ok(b.build())
     }
 
-    /// Every mlx source name this family's flash arm reads, in read order —
-    /// the census the plan-to-checkpoint bijection is held against.
     #[must_use]
     pub fn mlx_source_names(&self) -> Vec<String> {
         self.mlx_reads()
@@ -142,7 +123,6 @@ impl Model {
             .collect()
     }
 
-    /// The same census as [`mlx_source_names`](Model::mlx_source_names), with each name's [`Weight`] attached.
     #[must_use]
     pub fn mlx_planes(&self) -> Vec<(&Weight, String)> {
         self.mlx_reads()
@@ -170,15 +150,10 @@ impl Model {
         for (l, w) in self.layers.iter().enumerate() {
             layer_reads(w, &|s: &str| format!("model.layers.{l}.{s}"), &mut reads);
         }
-        // The draft head, under the `--aux` overlay's prefix: the companion's
-        // own names (`decoder.*`, `e_proj`, `h_proj`, `enorm`, `hnorm`,
-        // `hc_head.*`, `norm`), as `scripts/dsv4_mtp_companion.py` writes them.
         if let Some(mtp) = &self.mtp {
             reads.push(Read::One(&mtp.enorm, "aux.enorm.weight".into()));
             reads.push(Read::One(&mtp.hnorm, "aux.hnorm.weight".into()));
             reads.push(Read::One(&mtp.e_proj, "aux.e_proj.weight".into()));
-            // `h_proj` applies per stream: the one stored plane, `streams`
-            // times over, is the block-diagonal bank the text declares.
             reads.push(Read::Concat(
                 &mtp.h_proj,
                 0,
@@ -280,7 +255,6 @@ impl Model {
                     };
                     b.read_expr(down, Expr::concat(0, (0..*experts).map(slab).collect()))?;
                 }
-                // The v3-style huggingface layout never names a flash MoE.
                 Mlp::MoeFlash { .. } => {
                     return Err(Error::Illegible {
                         name: "dsv4".to_string(),
@@ -366,25 +340,11 @@ impl Model {
     }
 }
 
-/// One read of the flash arm: a plain plane, or a fused bank concatenated
-/// from several stored planes along `axis`.
-///
-/// There used to be a third form here — a NAME the census counted and no
-/// contract stated, and what sat in it was the hash layers' router
-/// (`ffn.gate.weight` for `layer < num_hash_layers`), on the reading that a
-/// lookup-routed layer computes no logits. The reference run against the
-/// miniature said otherwise: the official gate scores every layer and a hash
-/// layer's weights are its scores at the table's picks, so that plane is
-/// read like any other and the form went with the reading.
 enum Read<'w> {
     One(&'w Weight, String),
     Concat(&'w Weight, u8, Vec<String>),
 }
 
-/// Whether a bank stores MLX affine codes — the rows whose planes are a
-/// `.weight`/`.scales`/`.biases` triplet rather than one rectangle.
-/// One flash block's reads, at the names `n` spells: the trunk's layers and
-/// the draft head's block are the same list under different prefixes.
 fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Read<'w>>) {
     for (mix, tag) in [(&w.attn_mix, "attn_hc"), (&w.mlp_mix, "ffn_hc")] {
         reads.push(Read::One(&mix.scale, n(&format!("{tag}.scale"))));
@@ -452,8 +412,6 @@ fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Rea
     } = &w.mlp
     {
         match gate {
-            // Hash-routed layers score their gate too (the choice is the table's, the weights the
-            // scores' — the official `Gate.forward`), so the router plane is read, not merely named.
             Gate::Hash { tid2eid } => {
                 reads.push(Read::One(router, n("ffn.gate.weight")));
                 reads.push(Read::One(tid2eid, n("ffn.gate.tid2eid")));
@@ -472,7 +430,6 @@ fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Rea
                     n("ffn.switch_mlp.up_proj.weight"),
                 ],
             )),
-            // Split form: two plain reads, each at its own affine point.
             GateUp::Split { gate, up } => {
                 reads.push(Read::One(gate, n("ffn.switch_mlp.gate_proj.weight")));
                 reads.push(Read::One(up, n("ffn.switch_mlp.up_proj.weight")));

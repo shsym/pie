@@ -1,11 +1,3 @@
-//! `norm_modulate` lands what a norm entry followed by `scale_shift` lands,
-//! and `gated_residual_norm_modulate` lands what `gated_residual_add`
-//! followed by `norm_modulate` lands — bit-equal on the residual, within a
-//! bf16 ulp on the normed row (the fused pass keeps the normed value in f32
-//! where the chain rounds it) — for all three norms.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_fused_norm_modulate_lands_what_the_two_launches_land`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -20,8 +12,6 @@ const ROWS: usize = 24;
 const WIDTH: usize = 256;
 const EPS: f32 = 1e-6;
 
-/// Which norm the pass runs, named before the weight it may need has an
-/// address.
 #[derive(Clone, Copy)]
 enum Which {
     LayerNorm,
@@ -29,15 +19,6 @@ enum Which {
     RmsWeighted,
 }
 
-/// One bf16 ulp of the answer, plus one of the magnitude the difference under
-/// test rides on, plus a floor.
-///
-/// What separates the two spellings is ONE rounding of the normed row, which
-/// the modulation then SCALES — so the tolerance is set by that term and not
-/// by an answer two nearly cancelling terms may leave near zero. And however
-/// small that difference is, the two f32 results round to bf16 separately and
-/// may land on adjacent representable values: `|want| / 128` is that last
-/// step's own ulp.
 fn close(got: f32, want: f32, scale: f32, what: &str, at: usize) {
     assert!(
         (got - want).abs() <= (want.abs() + scale) / 128.0 + 1e-6,
@@ -58,8 +39,6 @@ fn check(which: Which, name: &str) {
     let g_at = gpu.up(&g_raw);
     let m_at = gpu.up(&m_raw);
     let w_at = gpu.up(&w_raw);
-    // Three copies of one starting residual: the plane the norm comparison
-    // reads and never moves, and the two the folds write in place.
     let r_still = gpu.up(&r_raw);
     let r_chain = gpu.up(&r_raw);
     let r_fused = gpu.up(&r_raw);
@@ -80,8 +59,6 @@ fn check(which: Which, name: &str) {
         Which::RmsWeighted => NormKind::RmsNorm { weight, eps: EPS },
     };
 
-    // The canonical equivalent of `norm_modulate`: the norm entry that
-    // already existed, then the unfused modulation.
     match which {
         Which::LayerNorm => {
             layernorm::layernorm_no_scale(&ctx, rect(r_still), EPS, &mut rect(normed))
@@ -94,8 +71,6 @@ fn check(which: Which, name: &str) {
     modulate::norm_modulate(&ctx, rect(r_still), m, None, kind, &mut rect(o_norm))
         .expect("the fused norm fires");
 
-    // And the deferred-residual pair, against the same two launches with the
-    // fold in front of them.
     modulate::gated_residual_add(&ctx, rect(r_chain), g, rect(y_at), None, &mut rect(r_chain))
         .expect("fires");
     modulate::norm_modulate(&ctx, rect(r_chain), m, None, kind, &mut rect(o_chain)).expect("fires");
@@ -131,7 +106,6 @@ fn check(which: Which, name: &str) {
         for col in 0..WIDTH {
             let at = row * WIDTH + col;
             let s = 1.0 + from_bf16(m_host[row * 2 * WIDTH + col]);
-            // The magnitude the one rounding under test rides on.
             let scale = (from_bf16(normed_row[at]) * s).abs().max(1.0);
             close(
                 from_bf16(fused_norm[at]),

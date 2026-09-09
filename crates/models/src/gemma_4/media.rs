@@ -1,24 +1,15 @@
-//! Gemma-4 vision preprocessing: resize to a whole `k x k` block grid,
-//! patchify in pool-block-major order, and emit one soft token per block.
-
 use crate::media::{
     Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8, VisionFrontEnd,
 };
 
-/// The `ROWS.arch` this front-end answers for.
 pub const ARCH: &str = "gemma4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmaVisionConfig {
-    /// Pixels per patch side.
     pub patch_size: u32,
-    /// The soft-token pool folds `k²` patch rows.
     pub pooling_kernel_size: u32,
-    /// A still image's soft-token ceiling.
     pub max_soft_tokens: u32,
-    /// A video frame's soft-token ceiling (lower than a still image's).
     pub video_soft_tokens: u32,
-    /// The separable position table's per-axis length — `[2, this, hidden]`.
     pub position_embedding_size: u32,
 }
 
@@ -35,20 +26,16 @@ impl Default for GemmaVisionConfig {
 }
 
 impl GemmaVisionConfig {
-    /// `pooling_kernel_size * patch_size`; both resize sides round down to
-    /// this multiple.
     #[must_use]
     pub const fn side_mult(&self) -> u32 {
         self.pooling_kernel_size * self.patch_size
     }
 
-    /// One patch row's width: `3 * patch_size^2` (RGB, no temporal axis).
     #[must_use]
     pub const fn patch_width(&self) -> usize {
         3 * self.patch_size as usize * self.patch_size as usize
     }
 
-    /// The soft-token ceiling this budget allows.
     #[must_use]
     pub const fn soft_tokens(&self, budget: Budget) -> u32 {
         match budget {
@@ -57,19 +44,11 @@ impl GemmaVisionConfig {
         }
     }
 
-    /// `max_patches = max_soft_tokens * pooling_kernel_size^2`.
     #[must_use]
     pub const fn max_patches(&self, budget: Budget) -> u32 {
         self.soft_tokens(budget) * self.pooling_kernel_size * self.pooling_kernel_size
     }
 
-    /// Rounds the target size down to `side_mult`, so every image's patch
-    /// grid is a whole number of `k x k` blocks.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Empty`] if both sides round to zero, or the rescued target
-    /// exceeds the patch budget.
     pub fn aspect_ratio_preserving_size(
         &self,
         h: u32,
@@ -96,8 +75,6 @@ impl GemmaVisionConfig {
             )));
         }
 
-        // One side survived: give the other one block, cap the survivor by
-        // aspect ratio.
         let max_side_length =
             (max_patches / (self.pooling_kernel_size * self.pooling_kernel_size)) * side_mult;
         if target_h == 0 {
@@ -118,20 +95,6 @@ impl GemmaVisionConfig {
         Ok((target_h, target_w))
     }
 
-    /// Emits patch rows in pool-block-major order (block-row, block-column,
-    /// then row/column within the block) so pooling needs no geometry. Each
-    /// row is HWC, values `2 · (v / 255 − 0.5)`: the processor rescales to
-    /// `[0, 1]` and normalizes nothing (`do_normalize: false`), and the
-    /// MODEL then centres — `Gemma4VisionPatchEmbedder.forward`'s "Gemma4
-    /// applies no normalization and instead scales in model code",
-    /// `2 * (pixel_values - 0.5)`, the same line in mlx_vlm's `_patchify`.
-    /// The tower text has no such op, so the front-end folds it in here.
-    /// Fed `[0, 1]`, the 31B tower called a red square "pink" and a blue one
-    /// "purple"; mlx_vlm on the same 4-bit weights says red and blue.
-    ///
-    /// # Panics
-    ///
-    /// If `rgb` is shorter than `h * w * 3`.
     #[must_use]
     pub fn patchify(&self, rgb: &[u8], h: u32, w: u32) -> (Vec<f32>, Vec<u32>) {
         let p = self.patch_size as usize;
@@ -160,9 +123,6 @@ impl GemmaVisionConfig {
                         let pc = ib_c * k + ic;
                         #[allow(clippy::cast_possible_truncation)]
                         {
-                            // `(x, y)`, the processor's `meshgrid(..,
-                            // indexing="xy")` order: table 0 and the first
-                            // rotary block are the COLUMN's.
                             pos[2 * out_idx] = pc as u32;
                             pos[2 * out_idx + 1] = pr as u32;
                         }
@@ -184,9 +144,6 @@ impl GemmaVisionConfig {
         (pix, pos)
     }
 
-    /// Two gathers into the `[2, position_embedding_size, hidden]` position
-    /// table, summed as two `embed_weighted` taps over the table flattened
-    /// to `[2 * size, hidden]`.
     #[must_use]
     pub fn pos_embed_taps(&self, positions: &[u32]) -> (Vec<i32>, Vec<f32>) {
         let plane = self.position_embedding_size;
@@ -206,12 +163,10 @@ impl GemmaVisionConfig {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gemma4Vision {
-    /// The processor's constants.
     pub config: GemmaVisionConfig,
 }
 
 impl Gemma4Vision {
-    /// The front-end at the checkpoint's own numbers.
     #[must_use]
     pub fn new() -> Gemma4Vision {
         Gemma4Vision::default()
@@ -223,7 +178,6 @@ impl VisionFrontEnd for Gemma4Vision {
         ARCH
     }
 
-    /// Gemma-4's own delimiters, not gemma-3's `<start_of_image>`.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
             prefix: super::tokenizer::IMAGE_PREFIX,
@@ -232,7 +186,6 @@ impl VisionFrontEnd for Gemma4Vision {
         }
     }
 
-    /// A video frame gets a smaller soft-token cap than a still image.
     fn encode(&self, src: &Rgb8, budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (target_h, target_w) = c.aspect_ratio_preserving_size(src.h, src.w, budget)?;
@@ -255,7 +208,6 @@ impl VisionFrontEnd for Gemma4Vision {
 
         Ok(EncodedSpan {
             token_count,
-            // No mrope: position advances by the rows occupied (1-D).
             position_span: token_count,
             grid: Grid::still(1, token_count),
             patch_grid: Grid::still(gh, gw),

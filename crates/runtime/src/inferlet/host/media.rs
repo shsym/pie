@@ -1,26 +1,3 @@
-//! pie:inferlet/media — Image / Video / Audio resources for multimodal input.
-//!
-//! Model-agnostic by construction: the inferlet hands the host raw encoded
-//! bytes (PNG/JPEG, animated GIF, WAV); this file decodes them ([`decode`]),
-//! reads the bound model's `ROWS.arch`, asks
-//! [`models::media::vision_front_end`] for that family's front-end or
-//! refuses by name, and hands the pixels over with the resample lent.
-//! Everything after (resize, patchify, normalize, log-mel) is the family's
-//! own arithmetic in its own module. An inferlet never branches on the
-//! model, and neither does the runtime: the arch match lives in the catalog.
-//!
-//! A span enters the sequence as the token run `tokens()` answers (prefix +
-//! pad × `token-count` + suffix, in the bound model's own ids), and as
-//! nothing else. The handle crosses a second time beside the tokens through
-//! `forward-pass.media`, carrying only the payload; the correspondence is
-//! scanned at submit ([`crate::pipeline::media`]), never asserted by the
-//! guest.
-//!
-//! A front-end names its architecture's delimiters as strings only, since
-//! the ids belong to the bound checkpoint's tokenizer. This file encodes
-//! them, once, at `from_bytes`, which keeps `tokens()` right across
-//! checkpoints of one architecture that renumbered their specials.
-
 pub mod decode;
 pub mod multimodal;
 
@@ -34,36 +11,21 @@ use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-/// Image resource — a preprocessed still image, also used for one video frame.
-///
-/// The handle is the span and nothing beside it: pixels, per-patch
-/// positions, the pre-merge grid, the delimiter ids, and the M-RoPE flag are
-/// all fields of [`EncodedSpan`], the type the front-end trait answers and
-/// the submission carries toward the contract.
 #[derive(Clone)]
 pub struct Image {
-    /// The preprocessed span, shared: a decoded image submitted to two passes
-    /// is decoded once and its payload copied never.
     pub span: Arc<EncodedSpan>,
 }
 
-/// Video resource — frames decoded + uniformly sampled host-side, each already
-/// preprocessed into an [`Image`]. The SDK splices them in order.
 pub struct Video {
     pub frames: Vec<Image>,
-    /// Per-frame timestamp in seconds, parallel to `frames`.
     pub timestamps: Vec<f32>,
 }
 
-/// Audio resource — a preprocessed log-mel span. The same [`EncodedSpan`] as
-/// [`Image`], because the two differ in how they are computed and in nothing
-/// the sequence can see.
 #[derive(Clone)]
 pub struct Audio {
     pub span: Arc<EncodedSpan>,
 }
 
-/// The bound model's audio processor, behind the front-end trait.
 struct AudioAdapter {
     arch_name: &'static str,
 }
@@ -96,7 +58,6 @@ impl AudioFrontEnd for AudioAdapter {
         }
         Ok(EncodedSpan {
             token_count,
-            // 1-D RoPE: the sequence cursor advances by the soft-token count.
             position_span: token_count,
             grid: Grid::still(1, token_count),
             patch_grid: Grid::still(1, n_frames),
@@ -113,15 +74,6 @@ impl AudioFrontEnd for AudioAdapter {
     }
 }
 
-/// The dispatch: the bound model's `ROWS.arch` to a vision front-end, or the
-/// one refusal this layer knows how to say. The arch match itself is
-/// [`models::media::vision_front_end`], a catalog fact; this layer only
-/// knows the bound model.
-///
-/// # Errors
-///
-/// [`Fault::NoVisionFrontEnd`], naming the model and the arch — a text model
-/// has no tower.
 fn vision_front_end() -> models::media::Result<Box<dyn VisionFrontEnd>> {
     let m = crate::model::model();
     let arch = m.arch_name();
@@ -131,7 +83,6 @@ fn vision_front_end() -> models::media::Result<Box<dyn VisionFrontEnd>> {
     })
 }
 
-/// The same, for audio.
 fn audio_front_end() -> models::media::Result<AudioAdapter> {
     let m = crate::model::model();
     let arch = m.arch_name();
@@ -145,11 +96,6 @@ fn audio_front_end() -> models::media::Result<AudioAdapter> {
     }
 }
 
-/// Spell the span in the bound checkpoint's own ids: resolves the
-/// front-end's string delimiters through the model's tokenizer. The
-/// placeholder must resolve to exactly one id (a reserved special); a
-/// checkpoint whose tokenizer does not carry it is refused here rather than
-/// diagnosed later as a run of the wrong length.
 fn spell(span: &mut EncodedSpan, delims: Delimiters) -> Result<(), String> {
     let encode = |s: &str| -> Vec<u32> {
         if s.is_empty() {
@@ -172,19 +118,9 @@ fn spell(span: &mut EncodedSpan, delims: Delimiters) -> Result<(), String> {
     Ok(())
 }
 
-/// A stable content hash of the preprocessed span — what the WIT's
-/// `digest()` answers for image and audio both.
-///
-/// Over the payload and its layout, deliberately not over the source bytes:
-/// two encodings of one photograph (a re-JPEG, a re-crop that resizes back
-/// to the same grid) are the same span to the model. Tokens are not folded
-/// in, since two different images produce identical token lists and the
-/// digest is what tells them apart.
 #[must_use]
 pub fn span_digest(span: &EncodedSpan) -> Vec<u8> {
     let mut h = blake3::Hasher::new();
-    // Domain separation, so a future audio/vision payload of identical bytes
-    // and identical extent cannot collide across modalities.
     h.update(b"pie:media-span:v1");
     for n in [
         span.token_count,
@@ -215,8 +151,6 @@ pub fn span_digest(span: &EncodedSpan) -> Vec<u8> {
     h.finalize().as_bytes().to_vec()
 }
 
-/// Uniformly sample up to `max_frames` indices from `0..n` (inclusive of the
-/// first and last frame). Returns all indices when `n <= max_frames`.
 fn sample_indices(n: usize, max_frames: usize) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
@@ -234,15 +168,11 @@ fn sample_indices(n: usize, max_frames: usize) -> Vec<usize> {
 impl pie::inferlet::media::Host for ProcessCtx {}
 
 impl pie::inferlet::media::HostImage for ProcessCtx {
-    /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
         let front_end = match vision_front_end() {
             Ok(fe) => fe,
             Err(fault) => return Ok(Err(fault.to_string())),
         };
-        // Decode is the host's; everything after goes through the trait and
-        // nothing else, so this must not reach anything an arbitrary
-        // front-end does not offer.
         let rgb = match decode::decode(&bytes) {
             Ok(rgb) => rgb,
             Err(fault) => return Ok(Err(fault.to_string())),
@@ -260,12 +190,10 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
         Ok(Ok(self.ctx().table.push(image)?))
     }
 
-    /// The span's full spelling, ready to splice.
     async fn tokens(&mut self, this: Resource<Image>) -> Result<Vec<u32>> {
         Ok(self.ctx().table.get(&this)?.span.tokens())
     }
 
-    /// The cache statute's key material.
     async fn digest(&mut self, this: Resource<Image>) -> Result<Vec<u8>> {
         Ok(span_digest(&self.ctx().table.get(&this)?.span))
     }
@@ -302,8 +230,6 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
 }
 
 impl pie::inferlet::media::HostVideo for ProcessCtx {
-    /// Decode an animated container, uniformly sample `<= max_frames` frames,
-    /// and preprocess each per the bound model's per-frame budget.
     async fn from_bytes(
         &mut self,
         bytes: Vec<u8>,
@@ -323,9 +249,6 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         let mut timestamps = Vec::with_capacity(sel.len());
         for &i in &sel {
             let (img, ts) = &decoded[i];
-            // A demuxed frame crosses as pixels, the one interchange form
-            // the trait states. `to_rgb8` drops the alpha channel; past
-            // this line a frame and a still are the same pixels.
             let rgb = img.to_rgb8();
             let (fw, fh) = (rgb.width(), rgb.height());
             let frame = match Rgb8::new(fh, fw, rgb.into_raw()) {
@@ -391,8 +314,6 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
 }
 
 impl pie::inferlet::media::HostAudio for ProcessCtx {
-    /// Decode (WAV) + resample + log-mel an encoded audio clip per the bound
-    /// model. Non-audio models are refused by name.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
         let adapter = match audio_front_end() {
             Ok(fe) => fe,
@@ -441,4 +362,3 @@ impl pie::inferlet::media::HostAudio for ProcessCtx {
         Ok(())
     }
 }
-

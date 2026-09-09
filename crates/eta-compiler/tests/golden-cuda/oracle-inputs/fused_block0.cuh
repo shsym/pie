@@ -462,20 +462,6 @@ __device__ __forceinline__ void ptir_parallel_gather(
   }
 }
 
-// cummass_le (top-p / nucleus): keep the DESCENDING prefix whose EXCLUSIVE
-// cumulative mass stays below `p` (interp.rs `Predicate::CummassLe`: sort the
-// row descending, then `k[i] = excl < p; excl += row[i]`). The input is NOT
-// sorted, so this is a block-cooperative selection loop -- one block-wide
-// "next largest still-unpicked element" pick per iteration, carrying the
-// previous pick as a total-order threshold instead of a visited set (the same
-// technique as tier0's `k_pivot_cummassle`). It stops as soon as the running
-// mass clears `p`, so a peaked LM row costs a handful of passes.
-//
-// This replaces the single-threaded M1 reference, which was O(len^3) on
-// thread 0 alone (a selection sort with a linear "already picked" rescan per
-// candidate) and therefore never returned at a 151936-token vocabulary --
-// every hand-written top-p sampler that failed to match
-// `LibraryOp::NucleusSample` wedged the GPU here.
 __device__ __forceinline__ void ptir_parallel_pivot_cummass(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -504,7 +490,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
         m1_pick(threshold_desc.len, row),
         threshold_desc.dtype);
     if (threadIdx.x == 0u) {
-      // Sentinel sorts before every real element, so the first pick is free.
+
       pivot_previous_value = m1_pos_inf();
       pivot_previous_index = 0u;
       pivot_exclusive = 0.0f;
@@ -561,8 +547,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
             index = pivot_share_index[warp];
           }
         }
-        // Descending order ⇒ once the mass condition fails it fails for every
-        // remaining element, so the zero-initialised tail is already correct.
+
         if (index == none || !(pivot_exclusive < cutoff)) {
           pivot_stop = 1u;
         } else {
@@ -578,21 +563,6 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
   }
 }
 
-// rank_le (top-k by rank): keep the elements whose count of strictly-greater
-// values is below `k` (interp.rs `Predicate::RankLe`).
-//
-// This replaces a literal per-element rank pass, which re-scanned the whole row
-// for every element and so cost O(len^2) unconditionally -- ~2.3e10 element
-// visits per row at a 151936-token vocabulary, which is what made
-// `mirostat-v2-sampling` take minutes per request. Instead: a block-cooperative
-// 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len) regardless of `k`.
-//
-// Equivalence: `greater(i)` equals the count of strictly smaller keys, which is
-// monotone in the key, so `greater(i) < k` holds exactly when `key(i) <= K_k`
-// for `K_k` the k-th smallest key counting multiplicity. Ties therefore all
-// survive or all fall together, which is what the reference does (it can keep
-// more than `k` elements when the boundary value repeats). NaN keys sort last
-// so they never displace a real element, and the marking pass excludes them.
 __device__ __forceinline__ void ptir_parallel_pivot_rank(
     const m1_u8* input,
     const m1_u8* threshold,
@@ -630,8 +600,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_rank(
     __syncthreads();
     for (int pass = 0; pass < 4; ++pass) {
       const int shift = 24 - 8 * pass;
-      // Bits fixed by earlier passes; `pass == 0` is special-cased because
-      // shifting a 32-bit value by 32 is undefined, not zero.
+
       const m1_u32 high_mask =
           (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
       for (m1_u32 bucket = threadIdx.x; bucket < 256u; bucket += blockDim.x)

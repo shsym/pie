@@ -6,6 +6,12 @@ use ::grammar::grammar::Grammar;
 use ::grammar::matcher::GrammarMatcher;
 use tokenizer::Tokenizer;
 
+fn matcher_every_case() {
+    more_than_eight_nullable_rules_complete_at_one_position();
+    shared_compiled_grammar_keeps_stop_tokens_matcher_local();
+    stop_token_rollback_is_one_history_step();
+}
+
 #[test]
 fn more_than_eight_nullable_rules_complete_at_one_position() {
     let grammar = Grammar::from_ebnf(
@@ -30,7 +36,6 @@ i ::= "" | "i" i
     assert!(matcher.can_terminate());
 }
 
-#[test]
 fn shared_compiled_grammar_keeps_stop_tokens_matcher_local() {
     let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= """#, "root").unwrap());
     let tokenizer = Arc::new(Tokenizer::from_vocab(&[
@@ -52,7 +57,6 @@ fn shared_compiled_grammar_keeps_stop_tokens_matcher_local() {
     assert!(get_bit(&second_mask, 2));
 }
 
-#[test]
 fn stop_token_rollback_is_one_history_step() {
     let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "a""#, "root").unwrap());
     let tokenizer = Arc::new(Tokenizer::from_vocab(&[

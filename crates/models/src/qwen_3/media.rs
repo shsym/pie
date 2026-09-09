@@ -1,33 +1,17 @@
-//! Qwen3.5 / Qwen3.6 vision preprocessing: resize, patchify, position taps.
-
 use crate::media::{
     Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8, VisionFrontEnd,
 };
 
-/// The `ROWS.arch` this front-end answers for.
-///
-/// Shared by both qwen3.5 and qwen3.6; their preprocessing is identical even
-/// though the towers differ in block count and width.
 pub const ARCH: &str = "qwen3_5";
 
-/// The processor's constants, as a field rather than a `const` so a future
-/// SKU can vary them without forking the type.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QwenVisionConfig {
-    /// Pixels per patch side.
     pub patch_size: u32,
-    /// `spatial_merge_size` — the merger folds `merge²` patch rows into one.
     pub merge_size: u32,
-    /// `temporal_patch_size`. A still image repeats itself across this axis.
     pub temporal_patch_size: u32,
-    /// Lower bound on `h̄ · w̄`; below it `smart_resize` scales UP.
     pub min_pixels: u32,
-    /// Upper bound on `h̄ · w̄`; above it `smart_resize` scales DOWN.
     pub max_pixels: u32,
-    /// `int(num_position_embeddings ** 0.5)` — the learned table's grid side.
     pub num_grid_per_side: u32,
-    /// `image_mean` / `image_std`, per channel: qwen's are 0.5 (pixels land
-    /// in `[-1, 1]`), GLM's tower keeps CLIP's.
     pub mean: [f32; 3],
     pub std: [f32; 3],
 }
@@ -48,30 +32,16 @@ impl Default for QwenVisionConfig {
 }
 
 impl QwenVisionConfig {
-    /// `patch_size · spatial_merge_size` — what both sides round to.
     #[must_use]
     pub const fn factor(&self) -> u32 {
         self.patch_size * self.merge_size
     }
 
-    /// How wide one patch row is: `C · T · P²`.
     #[must_use]
     pub const fn patch_width(&self) -> usize {
         3 * self.temporal_patch_size as usize * self.patch_size as usize * self.patch_size as usize
     }
 
-    /// Rounds both sides to the nearest multiple of `factor`; if the product
-    /// exceeds `max_pixels` scales down and floors to the factor, if under
-    /// `min_pixels` scales up and ceils to it.
-    ///
-    /// The round branch must not clamp a side to `max(factor, ·)`: a zero
-    /// side is the signal that lets the min-pixels branch rescue the image,
-    /// and clamping it early can leave the product above `min_pixels` so
-    /// neither branch fires.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Empty`] for an absolute aspect ratio past 200.
     pub fn smart_resize(&self, h: u32, w: u32) -> Result<(u32, u32)> {
         let (hf, wf) = (f64::from(h), f64::from(w));
         let (long, short) = (hf.max(wf), hf.min(wf));
@@ -103,42 +73,22 @@ impl QwenVisionConfig {
         Ok((h_bar as u32, w_bar as u32))
     }
 
-    /// The pre-merge patch grid a source image of `(h, w)` resizes into.
-    ///
-    /// # Errors
-    ///
-    /// [`smart_resize`](QwenVisionConfig::smart_resize)'s.
     pub fn patch_grid(&self, h: u32, w: u32) -> Result<(u32, u32)> {
         let (h_bar, w_bar) = self.smart_resize(h, w)?;
         Ok((h_bar / self.patch_size, w_bar / self.patch_size))
     }
 
-    /// The placeholder run's length: one token per merge block.
     #[must_use]
     pub const fn token_count(&self, gh: u32, gw: u32) -> u32 {
         gh * gw / (self.merge_size * self.merge_size)
     }
 
-    /// How far the 1-D position cursor advances past the span; not the token
-    /// count, but `max(merged_h, merged_w)`.
     #[must_use]
     pub const fn position_span(&self, gh: u32, gw: u32) -> u32 {
         let (hm, wm) = (gh / self.merge_size, gw / self.merge_size);
         if hm > wm { hm } else { wm }
     }
 
-    /// Patchifies into merge-block-major order: block-row, block-column, then
-    /// row and column inside the 2x2 block; lanes within a row are channel,
-    /// then temporal, then patch row, then patch column.
-    ///
-    /// Normalization is `(v / 255 - 0.5) / 0.5` (SigLIP's mean/std, not
-    /// CLIP's). `rgb` is `h * w * 3` bytes, row-major HWC.
-    ///
-    /// Also returns each row's `(y, x)` in the patch grid.
-    ///
-    /// # Panics
-    ///
-    /// If `rgb` is shorter than `h * w * 3`.
     #[must_use]
     pub fn patchify(&self, rgb: &[u8], h: u32, w: u32) -> (Vec<f32>, Vec<u32>) {
         let p = self.patch_size as usize;
@@ -193,11 +143,6 @@ impl QwenVisionConfig {
         (pix, pos)
     }
 
-    /// The learned position table's taps and weights, in [`patchify`]'s own
-    /// row order. Always four taps per row; on the native grid, [`axis_taps`]
-    /// puts weight 1 on the patch's own row and 0 on the rest.
-    ///
-    /// [`patchify`]: QwenVisionConfig::patchify
     #[must_use]
     pub fn pos_embed_taps(&self, gh: u32, gw: u32) -> (Vec<i32>, Vec<f32>) {
         let m = self.merge_size as usize;
@@ -222,10 +167,6 @@ impl QwenVisionConfig {
     }
 }
 
-/// Bilinear interpolation, two taps, `align_corners = True`.
-///
-/// `index` is the target position on an axis of length `size`; `side` is the
-/// stored table's. `max(1)` on the denominator guards `size == 1`.
 #[must_use]
 pub fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2]) {
     #[allow(clippy::cast_precision_loss)]
@@ -237,14 +178,11 @@ pub fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let tap = (floor as i64 + offset as i64).clamp(0, side as i64 - 1) as usize;
         taps[t] = tap;
-        // The linear hat kernel.
         weights[t] = (1.0 - (src - floor - offset).abs()).max(0.0);
     }
     (taps, weights)
 }
 
-/// The 2-D case: separable outer product of the two axes' taps and weights,
-/// four per patch. `indices = h_taps * side + w_taps`.
 #[must_use]
 pub fn interp(
     row: usize,
@@ -269,15 +207,12 @@ pub fn interp(
     (ids, weights)
 }
 
-/// Qwen3.5 / Qwen3.6's vision front-end.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Qwen35Vision {
-    /// The processor's constants.
     pub config: QwenVisionConfig,
 }
 
 impl Qwen35Vision {
-    /// The front-end at the checkpoint's own numbers.
     #[must_use]
     pub fn new() -> Qwen35Vision {
         Qwen35Vision::default()
@@ -289,9 +224,6 @@ impl VisionFrontEnd for Qwen35Vision {
         ARCH
     }
 
-    /// Names the three specials rather than their ids; the runtime resolves
-    /// them through the tokenizer, so a checkpoint that renumbers them still
-    /// works.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
             prefix: super::tokenizer::VISION_START,
@@ -300,8 +232,6 @@ impl VisionFrontEnd for Qwen35Vision {
         }
     }
 
-    /// `budget` is ignored: qwen caps a span by pixels, not soft-token count,
-    /// and a video frame uses the same ceiling as a still.
     fn encode(&self, src: &Rgb8, _budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (h_bar, w_bar) = c.smart_resize(src.h, src.w)?;

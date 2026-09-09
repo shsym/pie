@@ -2,40 +2,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Multi-head latent attention, the metal mirror of `kernels-cuda`'s
-// `attn/mla.cuh`. The projection split/norm/rope, the paged latent appender,
-// the q-absorb batched matmul, and the naive simd flash engine — the one CUDA
-// path that is a plain scalar/warp kernel rather than a Hopper/Blackwell mma.
-//
-// A CUDA warp is 32 lanes; a metal simdgroup is 32 lanes; the two dot-product
-// reductions map across unchanged (`simd_sum` for `__shfl_xor` fold). The one
-// deliberate divergence from `mla.cuh`: the flash kernel bounds its key sweep
-// by `position_ids[row]` (the fire's causal position), not by a re-derived
-// `kv_last_page_lens` — the metal pool carries no last-page table, and the
-// paged sdpa family already reads the sequence bound this way. `j_end = pos+1`
-// is the causal prefill bound and, for a decode row whose position is the last
-// cached slot, is exactly the full cached length the CUDA `causal=false` decode
-// sweeps. One kernel therefore serves both decode and prefill.
 
-// Largest per-lane strip the register arrays hold: CKV (latent rank) up to 512
-// (16 elements of 32-lane strip) and KPE (rope) up to 128 (4). The dispatch
-// refuses any wider geometry, so these ceilings are never exceeded.
 constant constexpr int kMaxCkvPer = 16;
 constant constexpr int kMaxKpePer = 4;
-// Simdgroups that share one (head, query row)'s key sweep. Each takes every
-// `kMlaSplit`-th step of the sweep and the threadgroup folds the partial
-// softmax states at the end: a decode row's sweep is a serial chain of
-// dependent loads and `simd_sum`s, ~2 us a key on one simdgroup, and a
-// 200-key context left the other cores idle. The fold reassociates the
-// online softmax (bf16 ulps move; greedy tokens on the bench prompts do not).
+
 constant constexpr int kMlaSplit = 8;
 
-// ── split kv_a into the rmsnormed latent and the rope tail ──────────────────
-//
-// One threadgroup per row. The rope tail (`k_pe`) is a straight copy of the
-// last `rope` lanes of the source row; the latent (`kv_c`) is the first
-// `kv_lora` lanes, rms-normalized with the learned weight. Mirrors
-// `pie::attn::mla_latents<T, 256>`.
 [[kernel]] void mla_latents_bfloat16(
     const device bfloat* kv_a          [[buffer(0)]],
     const device bfloat* norm_weight   [[buffer(1)]],
@@ -82,11 +54,6 @@ constant constexpr int kMlaSplit = 8;
   }
 }
 
-// ── split q_b into per-head nope and rope planes ────────────────────────────
-//
-// One thread per source element. Mirrors `pie::attn::mla_split_q_b<T>`: the
-// row-major `[tokens, heads, nope+rope]` block cut into `[tokens, heads, nope]`
-// and `[tokens, heads, rope]`.
 [[kernel]] void mla_split_q_b_bfloat16(
     const device bfloat* q_b   [[buffer(0)]],
     device bfloat* q_nope      [[buffer(1)]],
@@ -110,13 +77,6 @@ constant constexpr int kMlaSplit = 8;
   }
 }
 
-// ── append one latent row (ckv beside kpe) into the paged pool ──────────────
-//
-// One thread per (lane, row). The metal appender addresses by the op-named
-// `write_page`/`write_offset` tables — the write-geometry seam the paged
-// family closes — rather than re-deriving the destination slot from the
-// read-side CSR the way `mla.cuh`'s appender does. `ckv` lands in the keys
-// pages (rank-wide, one kv head), `kpe` in the values pages (rope-wide).
 [[kernel]] void mla_kv_append_bfloat16(
     const device bfloat* kv_c    [[buffer(0)]],
     const device bfloat* k_pe    [[buffer(1)]],
@@ -139,15 +99,6 @@ constant constexpr int kMlaSplit = 8;
   }
 }
 
-// ── absorb kv_b's up-projection into q ──────────────────────────────────────
-//
-// Per-head matmul: `q_latent[t,h,i] = sum_j q_nope[t,h,j] * kv_b[h][j][i]`,
-// where `kv_b` is the checkpoint's `[heads*(nope+v_dim), rank]` row-major
-// weight and head `h`'s nope block is rows `[h*(nope+v_dim) .. +nope)`. This is
-// the strided-batched `CUBLAS_OP_N` GEMM of `mla.cuh`'s `absorb_q`, written as
-// one thread per output element (the parity scale keeps the naive form well
-// inside budget). One thread computes `q_latent[t,h,i]` for a fixed rank lane
-// `i`, head `h`, token `t`.
 [[kernel]] void mla_absorb_q_bfloat16(
     const device bfloat* q_nope [[buffer(0)]],
     const device bfloat* kv_b   [[buffer(1)]],
@@ -157,9 +108,9 @@ constant constexpr int kMlaSplit = 8;
     const constant int& nope    [[buffer(5)]],
     const constant int& v_dim   [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
-  const int i = int(tid.x);   // rank lane
-  const int h = int(tid.y);   // head
-  const int t = int(tid.z);   // token
+  const int i = int(tid.x);
+  const int h = int(tid.y);
+  const int t = int(tid.z);
   if (i >= rank) return;
   const size_t qn_base = (size_t(t) * heads + h) * nope;
   const size_t kb_base = size_t(h) * size_t(nope + v_dim) * size_t(rank);
@@ -170,37 +121,6 @@ constant constexpr int kMlaSplit = 8;
   q_latent[(size_t(t) * heads + h) * rank + i] = bfloat(acc);
 }
 
-// ── map the latent reading back through kv_b's value planes ────────────────
-//
-// Per-head matmul: `o[t,h,j] = sum_i latent[t,h,i] * kv_b_v[h][j][i]`, the
-// other half of the absorb. `mla.cuh`'s `absorb_out` fires this as the
-// `CUBLAS_OP_T` strided-batched GEMM whose A operand starts at
-// `kv_b.ptr.wrapping_add(2 * nope * rank)`.
-//
-// # WHERE THE V BLOCK BEGINS, AND WHY THE `2` IS NOT A FACTOR OF TWO
-//
-// `Tensor::ptr` is a raw device ADDRESS and `wrapping_add` on it is BYTE
-// arithmetic — the same units `kernels-cuda`'s own `plane_bytes =
-// rows * width * 2` guard is written in. The `2` is `sizeof(bf16)`, not a
-// doubled stride. So the V block's base is `nope * rank` ELEMENTS past
-// `kv_b`, and with the batch stride `(nope + v_dim) * rank` the value planes
-// land exactly where the standard DeepSeek packing puts them:
-//
-//   kv_b is row-major `[heads * (nope + v_dim), rank]`; head `h` owns the
-//   `(nope + v_dim)` rows starting at `h*(nope+v_dim)`; the FIRST `nope` of
-//   those rows are the key-up block `W_UK` that `mla_absorb_q` reads, and the
-//   NEXT `v_dim` rows are the value-up block `W_UV` this kernel reads. Heads
-//   are OUTER, the two blocks are contiguous within a head, each row `rank`
-//   wide.
-//
-// So head `h`, value row `j`, rank lane `i` is
-// `kv_b[h*(nope+v_dim)*rank + (nope + j)*rank + i]` — read as `A^T` by the
-// GEMM (`lda = rank`, `op_a = T`), which is the same thing as reading this
-// row-major `[v_dim, rank]` block directly. `the_absorbed_pair_is_the_
-// unabsorbed_attention` in `engine-metal/tests/mla_on_device.rs` is the
-// measurement that settles it: any other base answers garbage, not epsilon.
-//
-// One thread per output element, as `mla_absorb_q`.
 [[kernel]] void mla_absorb_out_bfloat16(
     const device bfloat* latent [[buffer(0)]],
     const device bfloat* kv_b   [[buffer(1)]],
@@ -210,9 +130,9 @@ constant constexpr int kMlaSplit = 8;
     const constant int& v_dim   [[buffer(5)]],
     const constant int& nope    [[buffer(6)]],
     uint3 tid [[thread_position_in_grid]]) {
-  const int j = int(tid.x);   // value lane
-  const int h = int(tid.y);   // head
-  const int t = int(tid.z);   // token
+  const int j = int(tid.x);
+  const int h = int(tid.y);
+  const int t = int(tid.z);
   if (j >= v_dim) return;
   const size_t lat_base = (size_t(t) * heads + h) * size_t(rank);
   const size_t wv_base =
@@ -224,33 +144,6 @@ constant constexpr int kMlaSplit = 8;
   o[(size_t(t) * heads + h) * size_t(v_dim) + j] = bfloat(acc);
 }
 
-// ── naive paged flash over the latent kv ────────────────────────────────────
-//
-// One simdgroup per (head, query row). The 32 lanes split the latent rank
-// (`ckv`, up to 512 => 16 per lane) and the rope width (`kpe`, up to 128 => 4
-// per lane); each key contributes `q_nope . ckv + q_pe . kpe`, folded across
-// the simdgroup with `simd_sum`, then an online-softmax accumulation exactly as
-// `mla_naive_paged_kernel`. The output is the latent-space reading
-// `o[row,head,:ckv]` that `mla_absorb_out` maps back to value space.
-//
-// # Dense and selected are ONE body, as they are one kernel on CUDA
-//
-// `mla_naive_paged_kernel` takes a nullable `const i32* selection` beside an
-// `int top_k`: null sweeps `[0, j_end)` in key order, non-null sweeps the row
-// `selection + t*top_k` and attends the keys it names. Metal has no way to
-// leave a bound buffer unbound at an index the shader declares, so the two
-// modes are two entrypoints over the one inlined body below, and the body
-// keeps the CUDA predicate verbatim — `srow != nullptr`. After inlining each
-// entry the branch is a constant, so the dense point pays nothing for the
-// sparse one existing.
-//
-// The selection rows `index_topk_paged` publishes are ascending key ids with
-// a **-1 padded tail**, and the CUDA reader `continue`s on any entry outside
-// `[0, j_end)` rather than stopping — a padded slot contributes no key, and a
-// slot naming a position the causal bound does not reach is dropped, not
-// clamped. This body does the same. The skip is simdgroup-uniform (`j`
-// depends on the row, never the lane), so the `simd_sum` fold below stays
-// fully populated exactly as `__shfl_xor_sync(0xffffffffu, ...)` does.
 inline void mla_naive_paged_body(
     const device bfloat* q_nope,
     const device bfloat* q_pe,
@@ -276,8 +169,8 @@ inline void mla_naive_paged_body(
     threadgroup float* part_acc) {
   const int h   = int(gid.x);
   const int row = int(gid.y);
-  const int per  = ckv / 32;   // <= kMaxCkvPer
-  const int pper = kpe / 32;   // <= kMaxKpePer
+  const int per  = ckv / 32;
+  const int pper = kpe / 32;
 
   const int r      = req_of_token[row];
   const int q_pos  = position_ids[row];
@@ -303,11 +196,7 @@ inline void mla_naive_paged_body(
     int j = n;
     if (srow != nullptr) {
       j = srow[n];
-      // `index_topk_paged` publishes the row ascending with its `-1` padding
-      // as one tail (both of its arms), so the first `-1` ends the sweep: a
-      // 2048-slot budget over a 200-key context walked 1800 empty slots a
-      // simdgroup before this, ~1 ms a launch. Same keys, same order, same
-      // bits as the `continue` the CUDA plane keeps.
+
       if (j < 0) break;
       if (j >= j_end) continue;
     }
@@ -335,9 +224,6 @@ inline void mla_naive_paged_body(
     m = m_new;
   }
 
-  // Fold the `kMlaSplit` partial states: `(m, l, acc)` per simdgroup, the
-  // flash merge `exp(m_s - M)` weighting each. An empty share (no key fell
-  // to it) carries `m = -3e38, l = 0` and weighs nothing.
   if (lane == 0) {
     part_m[sg] = m;
     part_l[sg] = lsum;
@@ -361,7 +247,6 @@ inline void mla_naive_paged_body(
   for (int i = 0; i < per; ++i) orow[lane + i * 32] = bfloat(out[i] * inv);
 }
 
-// The dense reader: `attention.mla_decode` and `attention.mla_prefill`.
 [[kernel]] void mla_naive_paged_bfloat16(
     const device bfloat* q_nope     [[buffer(0)]],
     const device bfloat* q_pe       [[buffer(1)]],
@@ -390,9 +275,6 @@ inline void mla_naive_paged_body(
                        part_m, part_l, part_acc);
 }
 
-// The sparse reader: `attention.mla_decode_selected` and
-// `attention.mla_prefill_selected`. The first fourteen seats are the dense
-// point's, unmoved; the selection plane and its budget ride behind them.
 [[kernel]] void mla_naive_paged_selected_bfloat16(
     const device bfloat* q_nope     [[buffer(0)]],
     const device bfloat* q_pe       [[buffer(1)]],

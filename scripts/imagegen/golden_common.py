@@ -17,12 +17,10 @@ import torch
 
 GOLDEN_ROOT = os.environ.get("PIE_IMAGEGEN_GOLDEN", "/root/.cache/pie-imagegen/golden")
 
-
 def outdir(model: str) -> str:
     d = os.path.join(GOLDEN_ROOT, model)
     os.makedirs(d, exist_ok=True)
     return d
-
 
 class Tap:
     """Collects named tensors, saves one .npz.  Everything upcast to fp32."""
@@ -52,7 +50,6 @@ class Tap:
     def __len__(self) -> int:
         return len(self.d)
 
-
 def walk(obj: Any, suffix: str = "") -> Iterator[Tuple[str, Any]]:
     """Yield (dotted-suffix, leaf) for tensors nested in lists/tuples/dicts."""
     if isinstance(obj, (torch.Tensor, np.ndarray, int, float, bool)):
@@ -63,7 +60,6 @@ def walk(obj: Any, suffix: str = "") -> Iterator[Tuple[str, Any]]:
     elif isinstance(obj, dict):
         for k, v in obj.items():
             yield from walk(v, f"{suffix}.{k}")
-
 
 def hook_transformer(module: torch.nn.Module, tap: Tap, prefix: str, steps=(0,)):
     """Wrap `module.forward`; on the listed call indices record every tensor argument
@@ -90,7 +86,6 @@ def hook_transformer(module: torch.nn.Module, tap: Tap, prefix: str, steps=(0,))
     module.forward = wrapped
     return lambda: setattr(module, "forward", orig)
 
-
 def hook_scheduler(pipe, tap: Tap, prefix: str = "sched"):
     """Record every scheduler.step() output; the last one is the final latent."""
     sched = pipe.scheduler
@@ -108,7 +103,6 @@ def hook_scheduler(pipe, tap: Tap, prefix: str = "sched"):
     sched.step = wrapped
     return lambda: setattr(sched, "step", orig)
 
-
 def hook_prepare_latents(pipe, tap: Tap, key: str = "noise.init"):
     orig = pipe.prepare_latents
     done = {"v": False}
@@ -123,7 +117,6 @@ def hook_prepare_latents(pipe, tap: Tap, key: str = "noise.init"):
     pipe.prepare_latents = wrapped
     return lambda: setattr(pipe, "prepare_latents", orig)
 
-
 def md5(path: str) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -131,10 +124,7 @@ def md5(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-
 def manifest(d: str, extra: dict | None = None) -> str:
-    # A golden built from a VENDORED reference (scripts/imagegen/vendor/)
-    # needs neither library; record what is installed, not what is missing.
     def version(name: str) -> str | None:
         try:
             return __import__(name).__version__
@@ -157,7 +147,6 @@ def manifest(d: str, extra: dict | None = None) -> str:
     for r in rows:
         print(f"    {r['file']:<34} {r['bytes']:>12,}  {r['md5']}")
     return path
-
 
 def npz_keys(tap: Tap, limit: int = 400) -> None:
     for k in sorted(tap.d)[:limit]:

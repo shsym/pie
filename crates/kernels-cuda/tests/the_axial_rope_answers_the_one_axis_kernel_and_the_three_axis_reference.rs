@@ -1,10 +1,3 @@
-//! `rope_axes` over one axis at `rotary_dim == head_dim` lands exactly what
-//! the scalar `rope_full` lands — in both pairings — and over three axes with
-//! per-axis thetas and fractional positions it answers a host reference in
-//! all three forms.
-//!
-//! `cargo test -p kernels-cuda --features cuda --test the_axial_rope_answers_the_one_axis_kernel_and_the_three_axis_reference`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -19,9 +12,6 @@ const HEADS: usize = 3;
 const HEAD_DIM: usize = 64;
 const WIDTH: usize = HEADS * HEAD_DIM;
 
-/// The host's reading of the op: axis `a` owns `dims[a]` contiguous rotary
-/// channels in axis order, its `i`-th angle turns at
-/// `thetas[a]^(−2i/dims[a])`, and the form says which pair that angle turns.
 fn reference(
     x: &[f32],
     positions: &[f32],
@@ -54,16 +44,6 @@ fn reference(
                         RopeForm::Split => {
                             (first_channel + within, first_channel + block / 2 + within)
                         }
-                        // `SplitLadder` is a different shape of statement, not
-                        // a fourth pairing: its ladder runs across the WHOLE
-                        // row with the axes round-robin rather than down a
-                        // head, its frequencies climb a positive
-                        // endpoint-inclusive `linspace(0, 1, F_a)` instead of
-                        // the negative `-2i/dims[a]` this loop walks, and it
-                        // pads. The reference above cannot express it, so the
-                        // enumeration below never hands it over; LTX-2.5's
-                        // rows-bake and its parity gate (video and audio
-                        // velocity 0.99998) are where that form is checked.
                         RopeForm::SplitLadder => unreachable!(
                             "this reference walks per-head axis blocks at \
                              negative exponents; SplitLadder is neither"
@@ -81,6 +61,11 @@ fn reference(
     o
 }
 
+fn the_axial_rope_answers_the_one_axis_kernel_and_the_three_axis_reference_every_case() {
+    one_axis_is_the_scalar_kernels_own_rotation();
+    three_axes_answer_the_reference_in_every_form();
+}
+
 #[test]
 fn one_axis_is_the_scalar_kernels_own_rotation() {
     let mut lcg = Lcg::seeded(0xa1e5);
@@ -91,8 +76,6 @@ fn one_axis_is_the_scalar_kernels_own_rotation() {
 
     for (form, interleaved) in [(RopeForm::Neox, false), (RopeForm::Interleaved, true)] {
         let mut gpu = Gpu::open();
-        // `rope_full` rotates q and k in place; the axial op writes its own
-        // plane out of the same start.
         let scalar_at = gpu.up(&x_raw);
         let empty = gpu.zeros(2);
         let axial_in = gpu.up(&x_raw);
@@ -135,7 +118,6 @@ fn one_axis_is_the_scalar_kernels_own_rotation() {
     }
 }
 
-#[test]
 fn three_axes_answer_the_reference_in_every_form() {
     const ROTARY: usize = 48;
 
@@ -143,7 +125,6 @@ fn three_axes_answer_the_reference_in_every_form() {
     let thetas = [256.0f32, 10_000.0, 2000.0];
     let mut lcg = Lcg::seeded(0x3a1e5);
     let (x_raw, x) = lcg.row(ROWS * WIDTH);
-    // Fractional coordinates, LTX's kind: seconds and pixels, not indices.
     let positions: Vec<f32> = (0..ROWS * 3)
         .map(|i| (i as f32) * 0.5 + if i % 3 == 0 { 0.25 } else { 0.0 })
         .collect();
@@ -174,15 +155,11 @@ fn three_axes_answer_the_reference_in_every_form() {
         let want = reference(&x, &positions, &dims, &thetas, form, ROTARY);
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             let (g, w) = (from_bf16(g), w);
-            // `__sincosf` is the device's fast sine, as in every rotation this
-            // tree carries; the host's is correctly rounded. One bf16 rounding
-            // at the store on top of that.
             assert!(
                 (g - w).abs() <= 1e-3 + w.abs() / 128.0,
                 "{form:?} at {i}: {g} against {w}"
             );
         }
-        // The tail past the rotated prefix is copied, not touched.
         for row in 0..ROWS {
             for head in 0..HEADS {
                 for col in ROTARY..HEAD_DIM {

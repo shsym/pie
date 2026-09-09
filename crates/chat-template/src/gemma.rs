@@ -1,6 +1,3 @@
-//! Gemma's turn format: `<|turn>{role}\n{message}<turn|>\n`, with `<bos>`
-//! once at the head of the conversation and nowhere else.
-
 use std::sync::Arc;
 
 use tokenizer::Tokenizer;
@@ -50,9 +47,6 @@ impl Gemma {
         }
     }
 
-    /// One turn. The message is trimmed because the reference template is
-    /// written over trimmed content and a stray newline would land inside the
-    /// turn rather than around it.
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = prefix.to_vec();
         tokens.extend(self.tokenizer.encode(msg.trim()));
@@ -60,8 +54,6 @@ impl Gemma {
         tokens
     }
 
-    /// The turn that opens a conversation, and the ONLY place `<bos>` is
-    /// written — one entry point, so no caller can forget it.
     fn opening(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = vec![self.bos];
         tokens.extend(self.turn(prefix, msg));

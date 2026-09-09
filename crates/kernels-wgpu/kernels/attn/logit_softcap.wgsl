@@ -1,5 +1,4 @@
-//#include "common/bf16.inc.wgsl"
-//#include "common/math.inc.wgsl"
+
 
 @group(0) @binding(0) var<storage, read_write> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
@@ -36,4 +35,3 @@ fn main(
     }
 }
 
-// pie:instantiate logit_softcap_bfloat16 PIE_GROUP_X=256

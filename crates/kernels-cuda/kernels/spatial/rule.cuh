@@ -1,25 +1,10 @@
 #pragma once
 
-// **THE OUTPUT GRID OF ONE OP, ON THE DEVICE.** A `[lanes, 4]` table in,
-// the same out: each clip's box mapped by one rule (a convolution's
-// `(n + front + back - k) / s + 1`, a nearest upsample's factors, a
-// shuffle's or unshuffle's block), with the row offsets prefix-summed in
-// clip order so the output rectangle is packed the way the input was. One
-// block, one thread: a fire carries hundreds of clips at most, and the
-// prefix sum is the whole work. A box the rule cannot map (smaller than
-// the kernel, not divisible by the block) lands `{0, 0, 0, off}` — no
-// rows, so nothing downstream reads it.
 
 #include "prelude/device.cuh"
 
 namespace pie::spatial {
 
-/// `GridRule`, flattened: `kind` 0 conv (`a` k, `b` stride, `c` front pad,
-/// `d` back pad, `flag` causal_t), 1 upsample (`a` factor, `flag`
-/// keep_first_frame), 2 shuffle (`a` r, `flag` trim_t — the frames a
-/// causal temporal upsampler drops off the front of the result), 3
-/// unshuffle (`a` r), 4 avg-down (`a` factor: the unshuffle with the time
-/// axis zero-padded in front to a multiple of `a0`, so `t` rounds UP).
 struct RuleGeom {
     int kind;
     int a0, a1, a2;
@@ -58,7 +43,7 @@ __global__ void grid_rule(const int* __restrict__ grid, int* __restrict__ out, R
                 ow = w * g.a2;
                 break;
             case 2:
-                // The anchor drop; a box it empties maps to no rows at all.
+
                 ot = t * g.a0 - g.flag;
                 oh = h * g.a1;
                 ow = w * g.a2;
@@ -70,9 +55,7 @@ __global__ void grid_rule(const int* __restrict__ grid, int* __restrict__ out, R
                 if (ok) { ot = t / g.a0; oh = h / g.a1; ow = w / g.a2; }
                 break;
             default:
-                // `AvgDown3D`: the time axis is zero-padded IN FRONT to a
-                // multiple of the block, so `t` rounds up and a one-frame
-                // chunk still maps; `h`/`w` must divide.
+
                 ok = g.a0 > 0 && g.a1 > 0 && g.a2 > 0
                     && h % g.a1 == 0 && w % g.a2 == 0;
                 if (ok) { ot = (t + g.a0 - 1) / g.a0; oh = h / g.a1; ow = w / g.a2; }

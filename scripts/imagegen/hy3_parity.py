@@ -96,43 +96,21 @@ DEFAULT_GOLDEN = os.path.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# The golden runs fp32; pie runs the same weights cast to bf16 with bf16
-# activations, through a two-layer MoE trunk whose router is a hard top-k --
-# one flipped expert on one row is a big elementwise error and a tiny cosine
-# one, which is why the cosine gate carries the weight here.
 TOLERANCES = ["--tol", "0.2", "--rel-tol", "0.05", "--cos-tol", "0.999"]
 
-# `<cfg>` in the base repo's tokenizer -- the id the unconditional branch
-# writes over every prompt token.
 CFG_ID = 128010
 
-# The conditioning gate is stated AGAINST THE REFERENCE, never as a
-# constant: on a two-layer random-init miniature the prompt moves the image
-# rows by only rel 0.002 -- below the bf16 parity floor -- while it moves the
-# `<timestep>` row, which is causal over the prefix and nothing else, by rel
-# 0.021. A guessed absolute threshold would fail a correct model here and
-# pass an unconditioned one on a deeper row. So pie's own sensitivity is
-# compared to the reference's: within 25 % on the `<timestep>` row (the
-# clean signal) and within a factor of four on the image rows (whose signal
-# is at the noise floor on this fixture). The uncond canvas is ALSO diffed
-# against the reference's directly by `compare.py`, which is the airtight
-# form: pie matches both branches, and the two branches differ.
 COND_TIMESTEP_TOL = 0.25
 COND_IMAGE_FACTOR = 4.0
-# The KV-reuse gate: step 1 over the frozen prefix pages and step 1 from a
-# fresh prefill are the same arithmetic on the same bytes.
 REUSE_MAX_ABS = 1e-6
-
 
 def rope_x_scale(head_dim: int, theta: float = 10000.0) -> float:
     """`theta^(-2/d)` — `model.rs::rope_x_scale`."""
     return float(theta ** (-2.0 / head_dim))
 
-
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "hy3_mini_config.json")) as f:
         return json.load(f)
-
 
 def numbered(out: str, stem: str) -> list[str]:
     pattern = re.compile(rf"^{re.escape(stem)}_(\d+)\.json$")
@@ -142,11 +120,6 @@ def numbered(out: str, stem: str) -> list[str]:
         if match:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
-
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
 
 def cases(args) -> list[str]:
     cfg = config(args.golden)
@@ -159,25 +132,16 @@ def cases(args) -> list[str]:
     ids = layout["ids"]
     t_at, img_at, n = layout["timestep_row"], layout["image_row0"], layout["image_rows"]
     prefix = ids[:t_at]
-    pos = dump["rope.positions"].astype(np.float64)     # [seq, 2] integer (y, x)
+    pos = dump["rope.positions"].astype(np.float64)
 
     def scaled(rows: np.ndarray) -> list[float]:
         out = rows.copy()
         out[:, 1] *= scale
         return out.reshape(-1).astype(np.float32).tolist()
 
-    # The canvas lane's row order: the `<timestep>` row, then the image rows
-    # in raster order — which is the SEQUENCE's own run, because the CUDA
-    # fire path derives a lane's KV positions as `held .. held + rows` and
-    # refuses an explicit list.
     canvas_seq = [t_at] + list(range(img_at, img_at + n))
     canvas_pos = pos[canvas_seq]
 
-    # The reference's own unconditional branch: every PROMPT token replaced
-    # by `<cfg>`, the `<bos>` and the three image-meta tokens kept, so the
-    # length, the mask and the rotary positions are identical
-    # (`tokenization_hunyuan_image_3.py:738-739`). The control for "is the
-    # canvas conditioned at all".
     cfg_id = int(cfg["config"].get("cfg_token_id", CFG_ID))
     alt = list(prefix)
     for i in range(1, len(alt) - 3):
@@ -194,21 +158,15 @@ def cases(args) -> list[str]:
         "canvas_sequence": [int(p) for p in canvas_seq],
         "token_h": int(layout["token_h"]),
         "token_w": int(layout["token_w"]),
-        # The noisy latent as the clip's raster rows: the dump holds it
-        # `[1, C, h, w]`, the voxel port wants `[h*w, C]`.
         "latent": dump["latent"][0]
         .transpose(1, 2, 0)
         .reshape(-1)
         .astype(np.float32)
         .tolist(),
         "latent_channels": int(dump["latent"].shape[1]),
-        # `timestep_embedding(t, 256)`: the guest replicates it over the
-        # clip's voxels, which is how the two adaGN embedders read it.
         "tfreq": dump["tfreq"].reshape(-1).astype(np.float32).tolist(),
         "hidden": hidden,
         "timestep": float(layout["timestep"]),
-        # Step 1's timestep: the two KV-reuse fires run at it, one over the
-        # frozen pages and one from a fresh prefill.
         "timestep_next": float(layout["timestep"]) * 0.5,
     }
     os.makedirs(args.out, exist_ok=True)
@@ -221,11 +179,6 @@ def cases(args) -> list[str]:
         f"x-scale {scale:.6f} -> {path}"
     )
     return [path]
-
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
 
 def wasm(inferlet: str) -> str:
     name = os.path.basename(os.path.normpath(inferlet))
@@ -248,7 +201,6 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
-
 def split(text: str, n: int) -> list[str]:
     """`n` pieces, none of which starts with `-`.
 
@@ -267,7 +219,6 @@ def split(text: str, n: int) -> list[str]:
         cuts.append(at)
     cuts.append(len(text))
     return [text[a:b] for a, b in zip(cuts, cuts[1:])]
-
 
 def run(args) -> None:
     paths = numbered(args.out, "case")
@@ -307,11 +258,6 @@ def run(args) -> None:
             f.write(done.stdout)
         print(f"[run] -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
 def document(path: str) -> dict:
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
     if not lines:
@@ -322,7 +268,6 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
-
 
 def collect(args) -> str:
     cfg = config(args.golden)
@@ -336,10 +281,6 @@ def collect(args) -> str:
     rows = np.asarray(doc["canvas_hidden"], dtype=np.float32).reshape(n + 1, hidden)
 
     logits = dump["encode.logits"]
-    # The argmax is NOT compared as a tensor: it is a token id, and the
-    # distance between two ids says nothing (a flipped near-tie is a whole
-    # vocabulary apart and a rounding error in the logits). It is reported
-    # as an agreement COUNT beside the winning logit, which is comparable.
     uncond = np.asarray(doc["canvas_hidden_uncond"], dtype=np.float32).reshape(n + 1, hidden)
     channels = int(doc["latent_channels"])
     mine = {
@@ -374,7 +315,6 @@ def collect(args) -> str:
         f"({layout['token_h']}x{layout['token_w']} grid) -> {a}; golden -> {b}"
     )
 
-    # ---- the two claims the golden diff cannot make ---------------------
     def moved(x, y):
         return float(np.linalg.norm(np.asarray(y) - np.asarray(x)) / max(np.linalg.norm(x), 1e-30))
 
@@ -422,11 +362,6 @@ def collect(args) -> str:
         raise SystemExit("a claim about the denoise step failed")
     return a
 
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
-
 def compare(args) -> int:
     mine = os.path.join(args.out, "hy3_mini_pie.npz")
     theirs = os.path.join(args.out, "hy3_mini_target.npz")
@@ -439,7 +374,6 @@ def compare(args) -> int:
     ]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -470,7 +404,6 @@ def main() -> int:
         collect(args)
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

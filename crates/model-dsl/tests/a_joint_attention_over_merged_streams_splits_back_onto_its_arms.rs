@@ -1,27 +1,3 @@
-//! **MM-DiT JOINT ATTENTION IS A MERGE OF TWO STREAMS' PROJECTIONS, ONE
-//! RAGGED ATTENTION OVER THE GROUP CSR, AND A SPLIT BACK ONTO THE ARMS —
-//! AND THE SPLIT ARMS ARE SPELLED THE WAY THEIR SIBLINGS ARE.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_joint_attention_over_merged_streams_splits_back_onto_its_arms
-//! ```
-//!
-//! FLUX's double block: the text lanes and the image lanes each run their
-//! own qkv, `Value::merge` puts both in one `[Tokens, H·d]` rectangle, one
-//! `attention.ragged` over the packed group order lets every lane of a
-//! request see every other, and the answer is split per stream again for
-//! the per-stream output projections. The merge's guard is `Or(text, image)`
-//! and a value read under `text` afterwards must meet the text residual —
-//! spelled `text` — without a "mixes arms" refusal:
-//!
-//! ```text
-//! (a) the block traces; the ragged node's guard is the merge's Or
-//! (b) the per-stream output projections carry exactly their arm's guard
-//! (c) the residual folds meet the stream's own residual, one per arm
-//! (d) the group CSR is the whole-fire selection when read off the joint
-//!     value's arm — a merge of the two streams has no single mask
-//! ```
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request,
     Stream, Value, Weight, ops, seam, trace_hybrid,
@@ -72,8 +48,6 @@ impl ForwardHybrid for DoubleBlock {
         let q = Value::merge(vec![qt, qi]);
         let k = Value::merge(vec![kt, ki]);
         let v = Value::merge(vec![vt, vi]);
-        // Every lane of the fire joins the packing: the joint value belongs
-        // to no single arm, so the whole-fire input's tables serve it.
         let perm = inputs.row_permutation();
         let indptr = inputs.group_indptr();
         let o = ops::attn::ragged(
@@ -104,7 +78,6 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let text = Guard::Fact(Stream::Text.code());
     let image = Guard::not(text.clone());
 
-    // (a)
     let ragged = trace
         .nodes
         .iter()
@@ -127,7 +100,6 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     assert_eq!(*mask, RaggedMask::GroupBlockDiagonal);
     assert_eq!(q_indptr, kv_indptr, "self-attention: one CSR both sides");
 
-    // (d)
     assert_eq!(
         trace.values[q_indptr.0 as usize].def,
         Def::Input(RuntimeInput::Geometry {
@@ -138,8 +110,6 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
         })
     );
 
-    // (b), (c): the four nodes after the unpack — two projections, two folds
-    // — alternate text/image and carry exactly those guards.
     let folds: Vec<&Guard> = trace
         .nodes
         .iter()
@@ -166,7 +136,6 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
         .collect();
     assert_eq!(projections, vec![&image, &text]);
 
-    // The sweep resolves every merge: a text lane takes the text arm.
     let classes = model_dsl::resolve_classes(&trace).expect("every merge resolves");
     let word = StreamFacts(Stream::Text).word() & classes.mask;
     let class = classes.class_of(word).expect("a text lane has a class");

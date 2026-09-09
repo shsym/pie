@@ -1,5 +1,3 @@
-//! Boot: bind the device, bake the artifact, land the checkpoint, reserve, arm.
-
 use model_compiler::{Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
@@ -19,20 +17,12 @@ use crate::weights::Weights;
 
 use super::{Boot, FireCost, Golden, Graphs, Shell};
 
-/// The cold prefix both doors run: bind the device, settle the compiler's
-/// inputs, bake the artifact. `boot` is widened in place (its lattice).
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
-    // Before anything reads one: the diagnostics this boot states become the
-    // process's, so the trace filters deep in `record`/`dispatch` have a
-    // record to read (`serve::diag`). A `Boot` handed straight to
-    // `Shell::load` — every GPU test in this crate — arrives here too.
     super::diag::publish(&boot.knobs.diagnostics);
     let device = Context::bind(boot.ordinal, boot.comm)?;
 
-    // One-shot: whichever load arrives first states the kernel cache root.
     kernels_cuda::disk::install(boot.cache_dir);
 
-    // The shape lattice is a compiler input, filled by the load door's policy.
     boot.budget.buckets = crate::api::lattice(
         std::mem::take(&mut boot.budget.buckets),
         boot.budget.max_tokens,
@@ -42,7 +32,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         sms: device.device().num_sm,
         ..DeviceProfile::default()
     });
-    // P6's off arm bakes a different artifact rather than declining a graph.
     if let Some(streams) = boot.knobs.side_streams {
         profile.side_streams = streams;
     }
@@ -50,7 +39,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         .iter()
         .map(|op| (*op).to_string())
         .collect();
-    // The grouped arm names the same ops or none; the list is never the caller's.
     profile.grouped = if boot.knobs.grouped {
         crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
     } else {
@@ -61,17 +49,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         patches: boot.patches.clone(),
         voxels: boot.voxels.clone(),
     };
-    // The peepholes (`model_ir::fuse`) run on the trace this load keeps, so
-    // the compile and every node index taken off `boot.trace` below share
-    // one numbering; see the Metal shell's `load` for the argument.
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
-    // The chain fusions behind it; `diagnostics = "fuse-chains=off"` is the
-    // A/B arm that lands the traced launches instead.
     if boot.knobs.diagnostics.fuse_chains {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
         boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
-        // The adaLN peepholes (design D6): a scale-free norm into its
-        // modulation, and the gated fold into both.
         boot.trace = model_ir::fuse::modulation(boot.trace.clone());
         boot.trace = model_ir::fuse::q_norm_rope(boot.trace.clone());
         boot.trace = model_ir::fuse::embed_select(boot.trace.clone());
@@ -89,8 +70,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             boot.trace.nodes.len()
         );
     }
-    // `diagnostics = "gumbel-direct=off"`: keep a program's Gumbel-max head as
-    // the launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
     if !boot.knobs.diagnostics.gumbel_direct {
         eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -104,15 +83,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 }
 
 impl Shell {
-    /// Boot: bind, bake, land, reserve, arm.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Bake`] for a plan these budgets do not admit, [`Fault::Load`]
-    /// for a checkpoint the contract does not fit, [`Fault::Device`] for the
-    /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
-    /// not bind, [`Fault::Golden`] for an armed body that answers other than
-    /// its walk.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
         let mut boot = boot;
         let Baked {
@@ -124,9 +94,6 @@ impl Shell {
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
         )?;
-        // A conditional body needs its own stream, and its setter's module
-        // must be resident before any capture: warm each spelling the artifact
-        // baked, once, here.
         let mut wants_if = false;
         let mut wants_switch = false;
         for region in &compiled.regions {
@@ -180,7 +147,6 @@ impl Shell {
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
-        // The op-vocabulary scans, read once off the bake.
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(boot.classify, &compiled.classes);
@@ -195,16 +161,12 @@ impl Shell {
             boot.slots,
             u64::from(boot.pages),
         )?;
-        // A model that denoises fires every projection at a canvas of
-        // rows; its 8-bit dense projections are decoded to bf16 once here
-        // rather than on every fire (`weights::decoded_dense_bytes`).
         let decode_dense = landing.iter().flatten().any(model_ir::Request::denoise);
         let decoded_dense = if decode_dense {
             crate::weights::decoded_dense_bytes(&boot.trace)
         } else {
             0
         };
-        // The accounting sentence refuses ahead of every allocation.
         let accounting = crate::store::admit_the_card(
             boot.knobs.gpu_mem_utilization,
             boot.residency.device_demand(),
@@ -227,8 +189,6 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
-        // The convolution weights (D8) relabelled once into the tap-major
-        // order the spatial kernels read, before anything reads them.
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
@@ -251,7 +211,6 @@ impl Shell {
             })
             .max()
             .unwrap_or(0);
-        // The patch seat: the deployment's ceilings, the plan's own row width.
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
@@ -283,7 +242,6 @@ impl Shell {
                 })
             })
         });
-        // The self-conditioning gather's width, when the plan reads one.
         let self_cond_taps = u32::try_from(declared_width(
             &boot.trace,
             model_ir::RuntimeInput::SelfCondRows,
@@ -296,7 +254,6 @@ impl Shell {
             )
         });
         let patch_fold = patch_fold(&boot.trace);
-        // The voxel seat (D8): the deployment's ceilings, the plan's own port.
         let voxels = match boot.voxels.as_ref() {
             Some(ladder) if compiled.order_for(model_ir::RowAxis::Voxels).is_some() => Some(
                 crate::voxels::Store::reserve(crate::voxels::Seat::of(&boot.trace, ladder))?,
@@ -309,7 +266,6 @@ impl Shell {
                 model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
             )
         });
-        // The float ports and packing selections the plan reads (D2/D3).
         let feeds = Feeds::of(&boot.trace, &compiled);
         if let Some(value) = feeds.unlanded.first() {
             return Err(Fault::Unbound {
@@ -342,7 +298,6 @@ impl Shell {
 
         let exports = Exports::of(&boot.trace, &compiled)?;
 
-        // The score slab, carved off the `attn.scores` exports the text wrote.
         let score_heads = exports
             .scores
             .first()
@@ -364,7 +319,6 @@ impl Shell {
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
         pools.watch(airborne.clone());
-        // The readout's row-pointer tables, at the ceiling by construction.
         let readout_rows = crate::device::Buffer::zeroed(
             (boot.budget.max_lanes as usize)
                 .saturating_mul(boot.budget.max_tokens as usize)
@@ -416,20 +370,10 @@ impl Shell {
             exports,
             graphs: boot.graphs,
             copies: boot.knobs.copies,
-            // The three bodies words and the pad, derived from one `Recording`.
             pad: boot.knobs.pad(),
             golden: boot.knobs.golden(),
             golden_arm: Golden::Off,
-            // ARMING IS PER AXIS (D8). A plan that states voxel rows used to
-            // have its bodies switched off wholesale, which served a flagship's
-            // DiT eagerly for no reason but the VAE standing beside it in the
-            // same artifact. The eagerness belongs to the voxel REGIONS, and
-            // that is where it lives now: `Windows::admit_axes` marks every
-            // region on `RowAxis::Voxels` an island, so a body holds the token
-            // regions and re-issues the spatial launches at the fire's own
-            // clip geometry.
             bodies: boot.knobs.bodies(),
-            // Megabytes to bytes, once, at the seam the boot document crosses.
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
             arming: false,
             armed_body: None,
@@ -450,7 +394,6 @@ impl Shell {
             owed: None,
             guest_landed: crate::device::graph::Event::new()?,
         };
-        // A rotating load never records; say so once, at load.
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
                 "engine-cuda: [engine] graphs is on but this load armed a dense rotor, \
@@ -465,7 +408,6 @@ impl Shell {
                 }
             );
         }
-        // The diagnostic arms print one line at load.
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: [engine] graphs is {}, a diagnostic mode — every fire \
@@ -485,12 +427,7 @@ impl Shell {
                  captured; leave the key unstated to serve them"
             );
         }
-        // The arming pass is the last thing the load does; only the golden can fail it.
         shell.arm_bodies()?;
-        // A tensor-parallel follower runs the guest as a shadow of rank 0's:
-        // it fires the same boundaries (so its device-only `tok_in` handoff
-        // feeds its own pipelined decode step), but its host-ended rings are
-        // rank 0's, read and never written. See `program::Session`.
         if boot.world.rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -498,8 +435,6 @@ impl Shell {
     }
 }
 
-/// How wide a runtime input the plan declares is — the product of every dim
-/// past the leading row one, or `0` when no value of the trace names it.
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
     trace
         .values
@@ -527,7 +462,6 @@ fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64
         .unwrap_or(0)
 }
 
-/// How many patch rows this plan folds into one, or `1` for a plan that folds nothing.
 fn patch_fold(trace: &model_ir::Trace) -> u32 {
     trace
         .nodes
@@ -542,22 +476,12 @@ fn patch_fold(trace: &model_ir::Trace) -> u32 {
         .max(1)
 }
 
-/// Which bit of a fact word decides the correction window, or `None` when no
-/// single bit does (none qualifies, or two do).
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
     classes.adapter_fact(corrected)
 }
 
-/// What [`bake`] answers.
 pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
 }
-
-// `fuse_chains()` STOOD HERE, reading `PIE_FUSE_CHAINS` through a `OnceLock`.
-// The arm is `Knobs::diagnostics`'s `fuse_chains` now (`diagnostics =
-// "fuse-chains=off"`), read off the boot both callers already hold — `bake`
-// from its own `Boot`, `Cuda::load` from the `DeviceBoot` it was opened with.
-// A knob a caller can state needs no accessor to memoise it.

@@ -1,24 +1,7 @@
-//! MLX affine quantization: a scale and a bias per group. Unlike the MX
-//! schemes this one stores an offset, so a group's minimum is
-//! representable exactly and the zero point need not be a codepoint.
-
-/// One group's affine scale and zero point, by MLX's rule (bit-compatible
-/// with `mlx_lm convert`). Four details an independently written affine
-/// quantizer would get wrong:
-///
-///  * the scale is negated unless the group's minimum is larger in
-///    magnitude, putting code 0 on whichever end dominates.
-///  * the endpoint is snapped, not the scale: recomputed as
-///    `edge / round(edge / scale)`, keeping the largest magnitude exact.
-///  * `w_max` starts at zero, not negative infinity, so an all-negative
-///    group quantizes over the range up to zero.
-///  * rounding is half away from zero, not half to even; `eps` floors the
-///    scale so a constant group divides by `1e-7` instead of by zero.
 pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
     mlx_affine_group_params_bits(values, 4)
 }
 
-/// The same rule at any code width: `2^bits - 1` bins.
 pub fn mlx_affine_group_params_bits(values: &[f64], bits: u32) -> (f32, f32) {
     #[allow(clippy::cast_precision_loss)]
     let n_bins = ((1u32 << bits) - 1) as f32;
@@ -45,16 +28,6 @@ pub fn mlx_affine_group_params_bits(values: &[f64], bits: u32) -> (f32, f32) {
     (scale, bias)
 }
 
-/// Unpack MLX affine codes as the plain unsigned numbers they are, low code
-/// first within each byte and byte order within the `u32` words the
-/// checkpoint packs them into. The caller states the width — four bits, two
-/// codes a byte, or eight, one — because the bytes do not: both widths are
-/// one scheme (`QuantScheme::MlxAffineU4`) and the width is the plane's own
-/// `bits_per_element`.
-///
-/// The numbers are CODES, `0..=15` or `0..=255`, not values: what makes them
-/// values is the per-group scale and zero point beside them, which is the
-/// per-block `Scale` and `Bias` a contract composes around this decode.
 pub fn decode_mlx_affine_codes(bytes: &[u8], bits: u32) -> Vec<f64> {
     match bits {
         4 => {
@@ -65,7 +38,6 @@ pub fn decode_mlx_affine_codes(bytes: &[u8], bits: u32) -> Vec<f64> {
             }
             values
         }
-        // four codes a byte, least significant first.
         2 => {
             let mut values = Vec::with_capacity(bytes.len() * 4);
             for byte in bytes {

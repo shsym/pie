@@ -4,30 +4,13 @@
 
 namespace pie::elemwise {
 
-/// **THE CLIPPED LINEAR'S CLAMP** (`.wiki/alto/multimodal.md` §6.5).
-///
-/// `x = min(max(x, lo), hi)`, in place, one thread per element. gemma4's
-/// `vision_config.use_clipped_linears: true` publishes
-/// `{input,output}_{min,max}` as scalars beside every vision projection, so a
-/// text clamps what a matmul reads and what it writes; the bounds are the
-/// checkpoint's own numbers and arrive stated.
-///
-/// **THE BOUNDS ARE ROUNDED THROUGH `T` FIRST**, the way `mul_scalar` next
-/// door rounds its scalar: the clamp's output is a `T`, so comparing against
-/// an f32 bound the element cannot represent would let a value land one
-/// rounding past the bound the text stated.
 template <class T>
 __global__ void clamp(T* __restrict__ x, float lo, float hi, usize n,
                       int width, const u32* __restrict__ win)
 {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, `x` arrives
-    // at its plane base and this lane owns element `at`; null, it arrived
-    // pre-shifted and `i` is the element already. The bounds are not a row
-    // plane either way, and are read where they are.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr
@@ -41,18 +24,6 @@ __global__ void clamp(T* __restrict__ x, float lo, float hi, usize n,
 }
 
 
-/// **THE SAME CLAMP, WITH THE BOUNDS ON THE DEVICE**
-/// (`.wiki/alto/multimodal.md` §12.2).
-///
-/// `lo` and `hi` are one-element planes rather than launch arguments, because
-/// gemma4's are 448 learned scalars the CHECKPOINT ships — saturating bounds
-/// from quantization-aware training, one pair per side of every linear — and
-/// a text that stated them would be a checkpoint transcribed into a `const`.
-/// `elemwise::scale` reads its scalar the same way and for the same reason.
-///
-/// The bounds are already in `T`, so there is no rounding to do: the plain
-/// form rounds its `float` arguments through the element before comparing,
-/// and this one reads elements that were rounded at import.
 template <class T>
 __global__ void clamp_learned(
     T* __restrict__ x,
@@ -64,12 +35,7 @@ __global__ void clamp_learned(
 {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
-    // lane is not a row here, so the live-rows word bounds `win[0] * width`
-    // elements, and `win[1] * width` is where they begin. Armed, `x` arrives
-    // at its plane base and this lane owns element `at`; null, it arrived
-    // pre-shifted and `i` is the element already. The bounds are not a row
-    // plane either way, and are read where they are.
+
     if (win != nullptr &&
         i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
     const usize at = win != nullptr

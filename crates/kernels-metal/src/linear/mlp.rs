@@ -1,6 +1,3 @@
-//! `Mlp`: gated activations over a packed `[gate | up]` row (and one
-//! two-tensor form). One entry per IR variant.
-
 use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, refuse};
@@ -8,7 +5,6 @@ use crate::tensor::Tensor;
 
 const GROUP: u32 = 256;
 
-/// The packed row cut in two, plus the geometry every packed entry shares.
 struct Halves {
     packed: Tensor,
     y: Tensor,
@@ -93,8 +89,6 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
-/// [`swiglu_clamp`] over an unfused pair: the same clamps and the same silu,
-/// with the halves handed over as two tensors rather than as one packed row.
 pub fn swiglu_clamp_split(
     ctx: &Ctx<'_>,
     gate: Tensor,
@@ -135,8 +129,6 @@ pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<
     )
 }
 
-/// The ungated map: gelu_tanh over one projection, no
-/// `up` multiply — a tower MLP's spelling, not a gated trunk's with ones.
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mlp_gelu_tanh_bfloat16" });
@@ -164,7 +156,6 @@ pub fn geglu_tanh_packed(
     )
 }
 
-/// `up_cap: None` means uncapped; the shader reads 0 as "no cap".
 pub fn situ(
     ctx: &Ctx<'_>,
     packed: Tensor,

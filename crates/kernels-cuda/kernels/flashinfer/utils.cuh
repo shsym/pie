@@ -1,55 +1,35 @@
-/*
- * Copyright (c) 2023 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_UTILS_CUH_
 #define FLASHINFER_UTILS_CUH_
 #include <cuda_bf16.h>
-// PIE: REMOVED -- host-only `<cuda_device_runtime_api.h>`. 1 line of host C++, guarded out of
-// every NVRTC compile before it was removed, so removing it changes no compile. This marker is
-// one a strip does NOT undo; see MODIFICATIONS.
+
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-// PIE: REMOVED -- host-only `<atomic>`. 1 line of host C++, guarded out of every NVRTC compile
-// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
 #include <cstdint>
-// PIE: REMOVED -- host-only `<iostream>`. 1 line of host C++, guarded out of every NVRTC
-// compile before it was removed, so removing it changes no compile. This marker is one a strip
-// does NOT undo; see MODIFICATIONS.
-#include <type_traits>
-// PIE: REMOVED -- host-only `<vector>`. 1 line of host C++, guarded out of every NVRTC compile
-// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
 
-// PIE: `exception.h` is deleted, and this include with it. That file was pure
-// host C++ -- `flashinfer::Error` derives from `std::exception` and every macro
-// in it builds its message in a `std::ostringstream` -- so its entire body was
-// already inside `#ifndef __CUDACC_RTC__` and NVRTC has always seen an empty
-// file through this line. The twelve `FLASHINFER_CHECK`/`FLASHINFER_ERROR`
-// expansions below are all inside `#define` bodies that NVRTC never expands,
-// which is why they compiled against an undefined macro before this deletion
-// and still do. `src/plan/error.rs` owns the refusals now. This is the one
-// marker in the tree that a strip does NOT undo: restoring upstream means
-// restoring the deleted file too. See MODIFICATIONS.
+#include <type_traits>
+
+
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
-// macro to turn off fp16 qk reduction to reduce binary
 #ifndef FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION
 #define FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION 0
 #endif
@@ -210,7 +190,6 @@
     }                                                             \
   }
 
-// convert head_dim to compile-time constant
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
   switch (head_dim) {                                  \
     case 64: {                                         \
@@ -240,7 +219,6 @@
     }                                                  \
   }
 
-// convert interleave to compile-time constant
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
     constexpr bool INTERLEAVE = true;                    \
@@ -370,10 +348,6 @@ __forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2
   return (x / y) * y;
 }
 
-// PIE: REMOVED -- five host functions, `GetCudaComputeCapability` through `UpPowerOfTwo`,
-// including `DebugPrintCUDAArray` -- the last `cudaMemcpy` under `csrc/`. 74 lines of host C++,
-// guarded out of every NVRTC compile before it was removed, so removing it changes no compile.
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
 #define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
   {                                                    \
@@ -387,77 +361,65 @@ __forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2
     }                                                  \
   }
 
-/*!
- * \brief Return x - y if x > y, otherwise return 0.
- */
+
+
 __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
   return (x > y) ? x - y : 0U;
 }
 
-// ======================= PTX Memory Utility Functions =======================
-// Non-atomic global memory access with cache streaming hint (cs)
-// These are useful for streaming memory access patterns where data is used once
 
-/*!
- * \brief Get the lane ID within a warp (0-31)
- */
+
+
 __forceinline__ __device__ int get_lane_id() {
   int lane_id;
   asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   return lane_id;
 }
 
-/*!
- * \brief Non-atomic global load for short (2 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ short ld_na_global_s16(const short* addr) {
   short val;
   asm volatile("ld.global.cs.b16 %0, [%1];" : "=h"(val) : "l"(addr));
   return val;
 }
 
-/*!
- * \brief Non-atomic global store for short (2 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ void st_na_global_s16(short* addr, short val) {
   asm volatile("st.global.cs.b16 [%0], %1;" ::"l"(addr), "h"(val));
 }
 
-/*!
- * \brief Non-atomic global load for int (4 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ int ld_na_global_v1(const int* addr) {
   int val;
   asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(addr));
   return val;
 }
 
-/*!
- * \brief Non-atomic global load for int2 (8 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ int2 ld_na_global_v2(const int2* addr) {
   int2 val;
   asm volatile("ld.global.cs.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
   return val;
 }
 
-/*!
- * \brief Non-atomic global store for int (4 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ void st_na_global_v1(int* addr, int val) {
   asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
 }
 
-/*!
- * \brief Non-atomic global store for int2 (8 bytes) with cache streaming hint
- */
+
+
 __forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
   asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" ::"l"(addr), "r"(val.x), "r"(val.y));
 }
 
-/*!
- * \brief Prefetch data to L2 cache
- */
+
+
 template <typename T>
 __forceinline__ __device__ void prefetch_L2(const T* addr) {
   asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
@@ -495,6 +457,6 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
   template <typename T>                                                                        \
   inline constexpr bool has_##member##_v = has_##member<T>::value;
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_UTILS_CUH_
+#endif

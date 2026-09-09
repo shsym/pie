@@ -1,32 +1,3 @@
-//! `Group`: one tensor-parallel deployment behind [`Engine`], made of one
-//! [`Cuda`] shell per rank.
-//!
-//! Traces are SPMD — every rank runs the same plan over its own band of the
-//! weights and meets the others in the plan's collectives — so a group is
-//! the same verbs, issued to every rank at once. Each verb runs on one
-//! thread per rank (a rank's device is bound per thread), which is what lets
-//! a fire's collectives complete: rank 0's launch would otherwise wait on a
-//! peer that has not been asked yet. Rank 0 answers; the followers' answers
-//! are checked for errors and for agreeing on the identities they mint.
-//!
-//! The runtime sees one engine: one load, one frame numbering, one
-//! completion sink (rank 0's; a follower's completions are its own
-//! business), one set of channels read from rank 0.
-//!
-//! # A rank that fails does not strand its peers
-//!
-//! A collective blocks until every rank arrives. A rank that refuses a verb
-//! before its collective (a bad address, a refused dispatch) never arrives,
-//! and its peers would sit in NCCL forever — the open item of
-//! `.wiki/tp-verification.md`. So every verb is a bounded wait: the ranks
-//! answer on a channel, the first refusal ABORTS every communicator
-//! (`ncclCommAbort` makes the peers' pending collectives return), and a rank
-//! that answers nothing within the verb's wait is given up on the same way.
-//! Either way the group is POISONED: the refusal is the answer, every later
-//! verb refuses by name, and teardown leaves the stuck ranks to the process
-//! (a destroy would wait on them). The communicators are opened with the
-//! same bound.
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,47 +16,19 @@ use eta_ir::container::HostRole;
 use crate::api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
 use crate::comm::{Comm, Id};
 
-/// How long the communicators may take to find each other. Rank threads
-/// past it are given up on (they hold nothing but their own device).
 const INIT_WAIT: Duration = Duration::from_secs(120);
-/// How long a load may take on every rank — the arming pass fires every
-/// rung of the lattice, a matter of minutes for a wide model.
 const LOAD_WAIT: Duration = Duration::from_secs(3600);
-/// How long any other verb may take on every rank.
 const VERB_WAIT: Duration = Duration::from_secs(600);
-/// After an abort, how long the aborted ranks get to come back before they
-/// are left to the process.
 const GRACE: Duration = Duration::from_secs(30);
 
-/// The ranks of one tensor-parallel group, as one engine.
 pub struct Group {
-    /// One shell per rank, each behind its own lock so a verb's rank thread
-    /// owns it for the verb — and a rank that never came back keeps it
-    /// locked, which is how a poisoned group refuses fast.
     ranks: Vec<Arc<Mutex<Cuda>>>,
     ordinals: Vec<i32>,
-    /// Every rank's communicator, for the abort that unblocks the peers of
-    /// a rank that refused.
     comms: Vec<Arc<Comm>>,
-    /// Set by the first refusal or timeout; every later verb refuses by name.
     poisoned: Arc<Mutex<Option<String>>>,
-    /// Rank 0's device facts, read once at open. Kept beside the shells
-    /// rather than through them: [`Engine::device_facts`] borrows for the
-    /// group's life, and a shell held by a verb's rank thread cannot lend
-    /// one out. The facts are "what the machine is. Stable for the life of
-    /// the process", so one read is the whole answer.
     facts: Option<DeviceFacts>,
 }
 
-/// Opens one CUDA shell per boot as a tensor-parallel group: rank `i` is
-/// `boots[i]`, its width is `boots.len()`, and every rank's communicator is
-/// opened here, together, before any shell exists.
-///
-/// # Errors
-///
-/// Fewer than two boots (one rank is [`open`](crate::open)), a knob out of
-/// range, a communicator NCCL refused to open, or a rank that did not join
-/// the group within [`INIT_WAIT`].
 pub fn open_group(
     boots: Vec<DeviceBoot>,
     contract_for: ContractFor,
@@ -99,14 +42,7 @@ pub fn open_group(
         ));
     }
     let size32 = u32::try_from(size).map_err(|_| "more ranks than a u32 counts".to_string())?;
-    // Rank 0's word: every rank of a group is booted from one `[engine]`
-    // table, and NCCL's environment is the process's, not a rank's.
     let id = Id::new(boots[0].knobs.nccl_transport).map_err(|fault| fault.to_string())?;
-    // Every rank opens its communicator on a thread bound to its own device;
-    // `ncclCommInitRank` returns only once the whole group has arrived, so
-    // the opens run concurrently — and a rank that never arrives would hold
-    // the rest in NCCL, so the opens are waited on with a bound and a thread
-    // past it is left to the process.
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Comm, String>)>();
     for (rank, boot) in boots.iter().enumerate() {
         let tx = tx.clone();
@@ -154,8 +90,6 @@ pub fn open_group(
         }
     }
     if let Some(why) = refusal {
-        // The ranks that did open are aborted so a peer still inside
-        // `ncclCommInitRank` returns rather than waits for one that never comes.
         for comm in comms.iter().flatten() {
             comm.abort();
         }
@@ -193,13 +127,11 @@ pub fn open_group(
 }
 
 impl Group {
-    /// How many ranks this group is.
     #[must_use]
     pub fn size(&self) -> usize {
         self.ranks.len()
     }
 
-    /// The refusal that poisoned this group, if one did.
     fn poison(&self) -> Option<String> {
         self.poisoned
             .lock()
@@ -207,8 +139,6 @@ impl Group {
             .unwrap_or(None)
     }
 
-    /// Poison the group with `why` and abort every communicator, so a rank
-    /// parked in a collective returns.
     fn poison_with(&self, why: &str) {
         if let Ok(mut held) = self.poisoned.lock()
             && held.is_none()
@@ -220,13 +150,6 @@ impl Group {
         }
     }
 
-    /// Runs `verb` on every rank at once, each on a thread bound to that
-    /// rank's device, and returns every rank's answer in rank order. The
-    /// first rank that refused speaks for the group — and poisons it: its
-    /// peers, parked in the collective it never reached, are aborted out
-    /// of NCCL and their answers discarded. A rank that answers nothing
-    /// within `wait` is treated the same way, its thread left holding its
-    /// shell.
     fn each_within<R, F>(&mut self, wait: Duration, verb: F) -> EngineResult<Vec<R>>
     where
         R: Send + 'static,
@@ -281,15 +204,10 @@ impl Group {
                 }
                 Ok((rank, Err(error))) => {
                     heard += 1;
-                    // Said here as well as returned: the group's teardown
-                    // waits on every rank, so a refusal is otherwise the
-                    // last thing read.
                     eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
                     if refused.is_none() {
                         self.poison_with(&format!("rank {rank} refused: {error}"));
                         refused = Some(error);
-                        // The peers come back through the abort; give them
-                        // the grace, not the whole wait.
                         let grace = std::time::Instant::now() + GRACE;
                         while heard < size {
                             let left = grace.saturating_duration_since(std::time::Instant::now());
@@ -329,7 +247,6 @@ impl Group {
             .collect())
     }
 
-    /// [`each_within`](Self::each_within) at the ordinary verb's wait.
     fn each<R, F>(&mut self, verb: F) -> EngineResult<Vec<R>>
     where
         R: Send + 'static,
@@ -338,7 +255,6 @@ impl Group {
         self.each_within(VERB_WAIT, verb)
     }
 
-    /// Runs `verb` on rank `rank` alone, on this thread bound to its device.
     fn on<R, F>(&mut self, rank: usize, verb: F) -> EngineResult<R>
     where
         F: FnOnce(&mut Cuda) -> EngineResult<R>,
@@ -361,7 +277,6 @@ impl Group {
         })
     }
 
-    /// [`each`](Self::each), answering with rank 0's value.
     fn lead<R, F>(&mut self, verb: F) -> EngineResult<R>
     where
         R: Send + 'static,
@@ -373,11 +288,6 @@ impl Group {
 }
 
 impl Drop for Group {
-    /// Every rank is torn down at once, each on a thread bound to its
-    /// device: `ncclCommDestroy` waits for the rest of the clique, so
-    /// dropping the ranks one after another would hang on the first. A
-    /// poisoned group is left to the process: some rank may still be parked
-    /// in a verb, and a teardown that waited on it would never end.
     fn drop(&mut self) {
         let ranks = std::mem::take(&mut self.ranks);
         let ordinals = std::mem::take(&mut self.ordinals);
@@ -404,36 +314,23 @@ impl Engine for Group {
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
-        // Rank 0's, read once at open: a shell a verb's rank thread is
-        // holding could not lend one out, and the machine does not change.
         self.facts.as_ref()
     }
 
     fn export_kv_handle(&self) -> Option<KvHandle> {
-        // A rank's pages hold its band of the heads; a transfer plane that
-        // reads one rank's handle would move half a cache.
         None
     }
 
     fn bind_thread(&mut self) -> EngineResult<()> {
-        // Each rank binds its own device inside `each`.
         Ok(())
     }
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
-        // Every rank loads at once: the warm-up fires inside a load carry
-        // the plan's collectives, which need the whole group present.
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
         Ok(answers.swap_remove(0))
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        // Every rank runs the guest: a PIPELINED decode step's input token is
-        // sampled by the prior step's epilogue and injected by this step's
-        // prologue, so a follower without the guest would decode a placeholder
-        // token. Sampling (`argmax`) is deterministic over the full,
-        // replicated logits, so every rank samples the same token; only the
-        // host-facing streaming (take_channel) is read from rank 0.
         let registration = registration.clone();
         self.lead(move |rank| rank.register_program(&registration))
     }
@@ -442,12 +339,6 @@ impl Engine for Group {
         &mut self,
         registration: &ChannelRegistration,
     ) -> EngineResult<RegisteredChannel> {
-        // Rank 0 owns the host end and the runtime pumps its mirror. A
-        // follower shares rank 0's endpoint for a host-facing ring — its
-        // shadow session pulls the guest's cells out of the same pinned
-        // mirror and never writes a word or cell of it — but registers its
-        // OWN device-only ring (e.g. the decode `tok_in` handoff), which
-        // lives on the follower's device and carries no host end to share.
         let registered = self.on(0, |rank| rank.register_channel(registration))?;
         if registration.host_role == HostRole::None {
             for rank in 1..self.ranks.len() {
@@ -471,9 +362,6 @@ impl Engine for Group {
     }
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        // Every rank binds its own session over the same instance id (each
-        // shell's counter is deterministic); a follower binds as a shadow of
-        // rank 0's (`Plane::set_shadow`, armed at load).
         let binding = binding.clone();
         self.lead(move |rank| rank.bind_instance(&binding))
     }
@@ -504,20 +392,11 @@ impl Engine for Group {
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        // The adapter is a weight bank sharded like the rest of the stack, so
-        // every rank lands its band.
         let registration = registration.clone();
         self.lead(move |rank| rank.register_adapter(&registration))
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        // Every rank runs the whole fire — the SPMD model forward, its
-        // collectives, AND the guest boundaries attached to it. A follower's
-        // guest is a shadow: it samples the same token off its own replicated
-        // logits and feeds its own device-only `tok_in` for the next
-        // pipelined step, but its host-facing rings are rank 0's, pulled and
-        // never written. Rank 0's ticket is the group's; a follower's
-        // host-facing readouts are never taken.
         let frame = frame.clone();
         self.each(move |rank| rank.submit(&frame))
             .map(|mut tickets| tickets.swap_remove(0))
@@ -531,8 +410,6 @@ impl Engine for Group {
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
-        // One completion per step reaches the runtime: rank 0's. A follower
-        // still settles its own fires; it just tells no one.
         let silent: engine::CompletionSink = Arc::new(|_, _| {});
         for (rank, shell) in self.ranks.iter().enumerate() {
             if let Ok(mut shell) = shell.try_lock() {
@@ -546,8 +423,6 @@ impl Engine for Group {
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        // Rank 0's ticket carries the readouts back; the followers settle a
-        // copy so their pending frame retires with it.
         let template = ticket.clone();
         let mut settled = self.each(move |rank| {
             let mut own = template.clone();
@@ -577,10 +452,6 @@ impl Engine for Group {
     }
 
     fn encode(&mut self, plan: &mut MediaEncode) -> EngineResult<()> {
-        // A media tower is a plan of its own, run by rank 0 alone: its
-        // rows land in a channel the group reads from rank 0 anyway. This
-        // shell carries no encoder today, so rank 0's answer is its own
-        // refusal by name rather than the group's.
         self.on(0, |rank| rank.encode(plan))
     }
 

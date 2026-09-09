@@ -1,14 +1,3 @@
-//! The in-proc standalone: an embedded controller actor, a gateway, and a
-//! worker co-resident over loopback, behind `StandaloneHandle` /
-//! `run_standalone`.
-//!
-//! Topology is the same dial-in as a real cluster, just collapsed into one
-//! process: the controller actor is embedded and a single cloneable `Handle`
-//! drives BOTH control planes through [`EmbeddedControl`] (no control sockets).
-//! The gateway binds an ephemeral loopback worker-facing port; the embedded
-//! worker dials INTO it via [`worker::run_with`], exactly as a remote worker
-//! would. The gateway's client edge is then served on `listen_addr`.
-
 use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
@@ -18,11 +7,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use worker::ControlLink;
 
-/// In-proc adapter over the embedded controller `Handle`, implementing BOTH the
-/// worker [`ControlLink`] and the gateway [`gateway::GatewayControl`] seams
-/// against the same actor. Registration is infallible (no transport) and the
-/// watches forward the controller's own receivers, so the co-resident roles
-/// observe topology/routing updates with zero network hops.
 #[derive(Clone)]
 struct EmbeddedControl(controller::Handle);
 
@@ -59,68 +43,33 @@ impl gateway::GatewayControl for EmbeddedControl {
     }
 }
 
-/// A running in-proc standalone (embedded controller + gateway + worker over
-/// loopback). Owns the three role handles; [`shutdown`](Self::shutdown) drains
-/// all three.
 pub struct StandaloneHandle {
-    /// The resolved client-facing listen address (after an ephemeral bind).
     pub listen_addr: SocketAddr,
-    /// The resolved worker dial-in address the embedded worker connected to.
     pub worker_addr: SocketAddr,
-    /// Keeps the embedded controller actor alive; dropping the last `Handle`
-    /// closes its command channel and the actor task winds down.
     _controller: controller::Handle,
     worker: worker::WorkerHandle,
     gateway: JoinHandle<()>,
 }
 
 impl StandaloneHandle {
-    /// Drain + stop all three embedded planes cleanly: stop accepting client
-    /// traffic first, then drain in-flight turns in the worker, then release the
-    /// controller actor.
     pub async fn shutdown(self) {
         self.gateway.abort();
         self.worker.shutdown().await;
-        // `_controller` drops here, retiring the actor.
     }
 }
 
-/// Boot the embedded controller + gateway + worker over loopback from the
-/// pre-derived typed Configs (see `derive::derive_standalone`) and return a handle.
 pub async fn run_standalone(
     controller: controller::Config,
     mut gateway: gateway::Config,
     worker: worker::Config,
 ) -> Result<StandaloneHandle> {
-    // Choose the process-wide TLS backend before any embedded role can build a
-    // client. Every HTTPS client here is reqwest's `rustls-no-provider`, so
-    // rustls declines to guess and the first `Client::builder().build()`
-    // PANICS until someone names one. A `pie serve` names it in `bootstrap`'s
-    // observability init -- but this function is the composition root for
-    // embedders that reach no `bootstrap` entry point at all (`tests/gpu`
-    // boots exactly this, and its boot smokes died in `reqwest::Client::new`
-    // before asserting anything about the engine they gate). Idempotent, so
-    // saying it twice in one process is a fact rather than a failure.
     bootstrap::install_crypto_provider();
 
-    // Embed the controller actor; one cloneable Handle drives both planes.
     let handle = controller::embed(controller);
     let control = EmbeddedControl(handle.clone());
 
-    // The in-proc gateway binds its worker-facing socket on an ephemeral
-    // loopback port so the embedded worker can dial in.
     gateway.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
 
-    // The client edge binds `[worker.server] host:port` -- the only address in
-    // the standalone file that looks like it decides this.
-    //
-    // On its own it does not: `[gateway] listen` decides it, that section is
-    // empty in every generated config, and its default is 0.0.0.0:8080 -- so a
-    // file saying `host = "127.0.0.1"` would serve on every interface.
-    //
-    // Overwritten rather than defaulted-from, because two spellings for one
-    // bind address is what produced this: whichever loses is a line in a config
-    // file that means nothing.
     let host: std::net::IpAddr = worker.server.host.parse().with_context(|| {
         format!(
             "[server] host {:?} is not an IP address",
@@ -134,20 +83,15 @@ pub async fn run_standalone(
     let listen_addr = gw.listen_addr;
     let worker_addr = gw.worker_addr;
 
-    // Boot the embedded worker against the injected control link, dialing INTO
-    // the in-proc gateway — the same path a remote worker takes.
     let worker = worker::run_with(
         worker,
         control,
         vec![format!("tcp://{worker_addr}")],
-        // The client edge, taken from the bound socket rather than the config:
-        // `port = 0` means the OS chose, and the config still says 0.
         Some(format!("ws://{listen_addr}")),
     )
     .await
     .context("boot embedded worker")?;
 
-    // Serve the gateway client edge (its worker-facing accept loop is already up).
     let gateway = tokio::spawn(async move {
         if let Err(e) = gw.serve().await {
             tracing::error!(error = %e, "in-proc gateway exited");

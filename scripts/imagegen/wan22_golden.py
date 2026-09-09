@@ -48,27 +48,24 @@ STEPS = 8
 HEIGHT, WIDTH, FRAMES = 480, 832, 17
 
 MINI_CFGS = {
-    # study wan22.md D.3 "wan22-nano": deliberately a different rope split than 128
     "nano": dict(patch_size=(1, 2, 2), num_attention_heads=2, attention_head_dim=24,
                  in_channels=16, out_channels=16, text_dim=64, freq_dim=32, ffn_dim=128,
                  num_layers=2, cross_attn_norm=True, qk_norm="rms_norm_across_heads",
                  eps=1e-6, image_dim=None, added_kv_proj_dim=None, rope_max_seq_len=1024),
-    # the real head_dim, so the [44,42,42] split is exercised too
     "d128": dict(patch_size=(1, 2, 2), num_attention_heads=2, attention_head_dim=128,
                  in_channels=16, out_channels=16, text_dim=64, freq_dim=256, ffn_dim=512,
                  num_layers=2, cross_attn_norm=True, qk_norm="rms_norm_across_heads",
                  eps=1e-6, image_dim=None, added_kv_proj_dim=None, rope_max_seq_len=1024),
 }
-MINI_LATENT = (16, 5, 16, 16)     # C, T, H, W -> S = 5*8*8 = 320 tokens
+MINI_LATENT = (16, 5, 16, 16)
 MINI_CTX_LEN = 32
-
 
 def run_full(d: str, dtype=torch.bfloat16):
     from diffusers import WanPipeline
 
     tap = Tap()
     pipe = WanPipeline.from_pretrained(REPO, torch_dtype=dtype)
-    pipe.vae.to(torch.float32)                     # fp32 decode is required for parity
+    pipe.vae.to(torch.float32)
     pipe.to("cuda")
     with open(os.path.join(d, "wan22_config.json"), "w") as f:
         json.dump({"transformer": dict(pipe.transformer.config),
@@ -88,7 +85,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     tap.put("prompt_embeds.nonzero_rows", nz)
     print(f"  prompt embeds {tuple(pe.shape)}  nonzero rows {nz}")
 
-    # VAE decode tap
     vtap = {}
     vorig = pipe.vae.decode
 
@@ -115,20 +111,19 @@ def run_full(d: str, dtype=torch.bfloat16):
     for k, v in vtap.items():
         tap.put("vae.decode." + k, v)
 
-    frames = out.frames[0]                       # (F, H, W, 3) float in [0,1]
+    frames = out.frames[0]
     u8 = (np.clip(frames, 0, 1) * 255).astype(np.uint8)
     np.save(os.path.join(d, "wan22_frames.npy"), u8)
     try:
         import imageio.v3 as iio
         iio.imwrite(os.path.join(d, "wan22_golden.mp4"), u8, fps=24, codec="libx264")
-    except Exception as e:                        # pragma: no cover
+    except Exception as e:
         print(f"  [warn] mp4 encode failed: {e}")
     from PIL import Image
     Image.fromarray(u8[0]).save(os.path.join(d, "wan22_frame0.png"))
     tap.put("frames.u8_shape", list(u8.shape))
     tap.save(os.path.join(d, "wan22_golden.npz"))
     npz_keys(tap)
-
 
 def run_mini(d: str, device="cpu", dtype=torch.float32):
     from diffusers import WanTransformer3DModel
@@ -160,10 +155,9 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
             o = m(hidden_states=hs, timestep=ts, encoder_hidden_states=ctx, return_dict=False)
         tap.put_tree(f"mini.{tag}.out", o)
 
-        # TI2V's per-token timestep path: timestep is [B, S] instead of [B]
         s = t * (h // 2) * (w // 2)
         pt = torch.full((1, s), 500.0, device=device, dtype=dtype)
-        pt[:, : (h // 2) * (w // 2)] = 0.0        # first latent frame is the conditioning image
+        pt[:, : (h // 2) * (w // 2)] = 0.0
         tap.put(f"mini.{tag}.in.timestep_pertoken", pt)
         try:
             with torch.no_grad():
@@ -178,7 +172,6 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
                   f, indent=2)
     tap.save(os.path.join(d, "wan22_mini.npz"))
     npz_keys(tap)
-
 
 def run_vae(d: str, device="cuda"):
     """`AutoencoderKLWan` alone, fp32, over the full run's final latent.
@@ -204,7 +197,7 @@ def run_vae(d: str, device="cuda"):
     full = os.path.join(d, "wan22_golden.npz")
     if not os.path.exists(full):
         raise SystemExit(f"{full} is missing; run `--full` first (the latent is a real one)")
-    z = np.load(full)["latent.final"]            # [1, 48, T, H, W], DiT space
+    z = np.load(full)["latent.final"]
     z = torch.from_numpy(np.ascontiguousarray(z.reshape(z.shape[-4:]))).to(
         device=device, dtype=torch.float32)[None]
 
@@ -213,7 +206,7 @@ def run_vae(d: str, device="cuda"):
     denorm = z * std + mean
 
     with torch.no_grad():
-        x = vae.decode(denorm, return_dict=False)[0]          # [1, 3, 4T-3, 16H, 16W]
+        x = vae.decode(denorm, return_dict=False)[0]
 
     t_lat = int(z.shape[2])
     frames = int(x.shape[2])
@@ -223,13 +216,11 @@ def run_vae(d: str, device="cuda"):
     os.makedirs(raw, exist_ok=True)
     shapes = {}
     for key, t in (("latent", z[0]), ("denorm", denorm[0]), ("pixels", x[0])):
-        cthw = t.detach().float().cpu().numpy()               # [C, T, H, W]
+        cthw = t.detach().float().cpu().numpy()
         rows = np.ascontiguousarray(cthw.transpose(1, 2, 3, 0)).astype("<f4")
         rows.tofile(os.path.join(raw, f"{key}.f32"))
         shapes[key] = {"t": int(cthw.shape[1]), "h": int(cthw.shape[2]),
                        "w": int(cthw.shape[3]), "channels": int(cthw.shape[0])}
-    # Chunk `k` of the decode loop is latent frame `k`; it lands output
-    # frames `[chunks[k], chunks[k+1])`.
     shapes["chunks"] = [0] + [1 + 4 * k for k in range(t_lat)]
     shapes["latents_mean"] = [float(v) for v in cfg.latents_mean]
     shapes["latents_std"] = [float(v) for v in cfg.latents_std]
@@ -246,7 +237,6 @@ def run_vae(d: str, device="cuda"):
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}]; chunks {shapes['chunks']}")
 
     run_vae_encode(d, vae, x, mean, std)
-
 
 def run_vae_encode(d, vae, x, mean, std):
     """The same clip back IN: `AutoencoderKLWan._encode` over the decoded pixels.
@@ -266,7 +256,7 @@ def run_vae_encode(d, vae, x, mean, std):
     arm answers.
     """
     with torch.no_grad():
-        enc = vae._encode(x)                          # [1, 2*z, T, h, w]
+        enc = vae._encode(x)
     post = enc[:, : vae.config.z_dim]
     normalised = (post - mean) / std
 
@@ -278,13 +268,11 @@ def run_vae_encode(d, vae, x, mean, std):
     os.makedirs(raw, exist_ok=True)
     shapes = {}
     for key, t in (("pixels", x[0]), ("mean", post[0]), ("latent", normalised[0])):
-        cthw = t.detach().float().cpu().numpy()               # [C, T, H, W]
+        cthw = t.detach().float().cpu().numpy()
         rows = np.ascontiguousarray(cthw.transpose(1, 2, 3, 0)).astype("<f4")
         rows.tofile(os.path.join(raw, f"{key}.f32"))
         shapes[key] = {"t": int(cthw.shape[1]), "h": int(cthw.shape[2]),
                        "w": int(cthw.shape[3]), "channels": int(cthw.shape[0])}
-    # Chunk `k` of the encode loop takes pixel frames `[chunks[k],
-    # chunks[k+1])` and lands latent frame `k`: one frame, then four.
     shapes["chunks"] = [0] + [1 + 4 * k for k in range(t_lat)]
     shapes["patch_size"] = int(vae.config.patch_size or 1)
     shapes["source"] = "the fp32 decode of latent.final, back through the encoder"
@@ -293,7 +281,6 @@ def run_vae_encode(d, vae, x, mean, std):
     print(f"  vae encode: pixels {tuple(x.shape)} -> mean {tuple(post.shape)} "
           f"[{float(post.min()):.3f}, {float(post.max()):.3f}]; "
           f"normalised [{float(normalised.min()):.3f}, {float(normalised.max()):.3f}]")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -314,7 +301,6 @@ def main():
         print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED, "steps": STEPS,
                  "height": HEIGHT, "width": WIDTH, "frames": FRAMES})
-
 
 if __name__ == "__main__":
     main()

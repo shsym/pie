@@ -1,5 +1,4 @@
-//#include "common/bf16.inc.wgsl"
-//#include "common/reduce.inc.wgsl"
+
 
 const PIE_MAX_RANK = 128u;
 
@@ -66,4 +65,3 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
-// pie:instantiate lora_correct_bf16 PIE_GROUP_X=256

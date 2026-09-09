@@ -1,39 +1,3 @@
-//! Reading `tencent/HunyuanImage-3.0` — one flat namespace of 5 161
-//! tensors across 32 shards (`model.safetensors.index.json`) — into this
-//! family's own scheme.
-//!
-//! Four places the checkpoint's spelling and the plan's part company:
-//!
-//! 1. **`qkv_proj` is head-interleaved.** The reference reshapes it
-//!    `[kv_heads, groups + 2, head_dim, hidden]` and splits `[groups, 1,
-//!    1]` on axis 1, so per KV group the four query heads come first, then
-//!    K, then V. This text wants `[q | k | v]`. One `Expr::gather` over
-//!    axis 0 states the whole rearrangement — no slicing of a strided view,
-//!    no concatenation.
-//! 2. **The same gather carries the 2-D rope's channel permutation** (see
-//!    [`super::model::rope_x_scale`]): each head's `y` pairs move to the
-//!    low half and its `x` pairs to the high half, in `RopeForm::Split`'s
-//!    own pairing. The two QK-norm gains are permuted with them — the norm
-//!    runs AFTER the rotation, so its gain is indexed by rotated channel.
-//! 3. **`gate_and_up_proj`'s halves are swapped.** The reference computes
-//!    `down(x1 · silu(x2))` with `x1` the FIRST half; `linear.mlp_swiglu`
-//!    computes `silu(first) · second`. Swapping at import keeps the fused
-//!    kernel and costs nothing at serving time.
-//! 4. **`timestep_emb`'s second linear is stacked twice.** The plan lands
-//!    the `<timestep>` row with one `ScaleShift` over a zero row, which
-//!    reads `[t_emb | t_emb]`; the checkpoint stores `t_emb`'s projection
-//!    once. (wan_2's `head_proj` is the same device.)
-//!
-//! Everything else is a rename. The 64 routed experts of a layer are 128
-//! separate tensors, stacked into the two `[64, ·, ·]` banks the routed
-//! matmul reads; on the flagship rows those banks are declared `U8g64`, so
-//! the ladder encodes them on the way in (design D10) while every dense
-//! plane stays bf16.
-//!
-//! Not read here: `vae.*` (1.26 B fp32) and `vision_model.*` /
-//! `vision_aligner.*` (0.45 B) — this text traces neither, and a plane no
-//! trace names is a plane no artifact needs.
-
 use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
 use checkpoint::types::Encoding;
 use checkpoint_dsl::{Builder, Error, encoding, extents, stored_encoding};
@@ -42,7 +6,6 @@ use model_dsl::{Platform, Weight};
 use super::model::{Conv, Embedder, GroupNorm, Linear, Model, ResBlock};
 
 impl Model {
-    /// The whole trunk and image head, from the HF spelling.
     pub fn import(
         &self,
         src: &ztensor::Source,
@@ -54,8 +17,6 @@ impl Model {
         b.read(&self.embed, "model.wte.weight")?;
         b.read(&self.head, "lm_head.weight")?;
         b.read(&self.final_norm, "model.ln_f.weight")?;
-        // The one plane no checkpoint carries: `[+1 | -1]`, the two signs
-        // of the canvas lane's `special` flag broadcast to a row.
         signs(&mut b, src, &self.ones, "model.ln_f.weight")?;
 
         let head_dim = d.head_dim;
@@ -134,9 +95,6 @@ impl Model {
             )?;
         }
 
-        // ---- the three timestep embedders ---------------------------------
-        // `timestep_emb`'s second linear is doubled; the other two are read
-        // as they are stored.
         b.read(&self.timestep_emb.mlp_in.w, "timestep_emb.mlp.0.weight")?;
         b.read(&self.timestep_emb.mlp_in.bias, "timestep_emb.mlp.0.bias")?;
         b.read_expr(
@@ -150,7 +108,6 @@ impl Model {
         embedder(&mut b, &self.time_embed, "time_embed")?;
         embedder(&mut b, &self.time_embed_2, "time_embed_2")?;
 
-        // ---- the conv image head ------------------------------------------
         conv(
             &mut b,
             src,
@@ -171,7 +128,6 @@ impl Model {
     }
 }
 
-/// `Linear(256 → hidden)` then `Linear(hidden → out)`, both as stored.
 fn embedder(b: &mut Builder, e: &Embedder, prefix: &str) -> Result<(), Error> {
     b.read(&e.mlp_in.w, format!("{prefix}.mlp.0.weight"))?;
     b.read(&e.mlp_in.bias, format!("{prefix}.mlp.0.bias"))?;
@@ -179,8 +135,6 @@ fn embedder(b: &mut Builder, e: &Embedder, prefix: &str) -> Result<(), Error> {
     b.read(&e.mlp_out.bias, format!("{prefix}.mlp.2.bias"))
 }
 
-/// A `nn.Conv2d`'s `[C_out, C_in, kh, kw]` flattened to the `[C_out,
-/// C_in·taps]` tap-major plane `spatial.conv3d` reads, and its f32 bias.
 fn conv(b: &mut Builder, src: &ztensor::Source, c: &Conv, name: &str) -> Result<(), Error> {
     let shape = extents(&c.w);
     let stored = stored_encoding(src, &format!("{name}.weight"))?;
@@ -196,8 +150,6 @@ fn group_norm(b: &mut Builder, g: &GroupNorm, name: &str) -> Result<(), Error> {
     b.read(&g.bias, format!("{name}.bias"))
 }
 
-/// One `ResBlock`: `in_layers.{0,2}`, `emb_layers.1`, `out_layers.{0,3}`
-/// and the 1×1 `skip_connection`.
 fn resblock(
     b: &mut Builder,
     src: &ztensor::Source,
@@ -220,8 +172,6 @@ fn linear(b: &mut Builder, w: &Linear, name: &str) -> Result<(), Error> {
     b.read(&w.bias, format!("{name}.bias"))
 }
 
-/// `[up | gate]` as stored becomes `[gate | up]` as `linear.mlp_swiglu`
-/// reads it.
 fn swap_halves(src: Expr, inter: i64) -> Expr {
     Expr::concat(
         0,
@@ -229,7 +179,6 @@ fn swap_halves(src: Expr, inter: i64) -> Expr {
     )
 }
 
-/// One plane stacked on top of itself: `[x | x]`.
 fn doubled(src: Expr) -> Expr {
     Expr::concat(0, vec![src.clone(), src])
 }
@@ -238,15 +187,6 @@ fn slab(expr: Expr, shape: Vec<i64>, stored: Encoding) -> Expr {
     expr.transmute(TensorType::new(shape, stored))
 }
 
-/// **THE ROTARY CHANNEL PERMUTATION OF ONE HEAD**, `perm[new] = old`.
-///
-/// The reference's angle vector is `[y·θ0, x·θ1, y·θ2, x·θ3, …]` of length
-/// `d/2`, repeated twice and applied with `rotate_half` — so pair `k` is
-/// channels `(k, k + d/2)` and its axis alternates. `RopeForm::Split` over
-/// two `d/2`-wide blocks pairs `(b + i, b + d/4 + i)` and gives each block
-/// one axis. Sending the `d/4` even (`y`) pairs to block 0 and the `d/4`
-/// odd (`x`) pairs to block 1, in order, makes the two forms the same
-/// rotation.
 fn rope_channels(head_dim: u32) -> Vec<i64> {
     let d = i64::from(head_dim);
     let quarter = d / 4;
@@ -266,8 +206,6 @@ fn rope_channels(head_dim: u32) -> Vec<i64> {
     perm
 }
 
-/// [`rope_channels`] laid out over `heads` heads: `perm[new] = old` on a
-/// `[heads·head_dim]` axis.
 fn head_permutation(heads: u32, head_dim: u32) -> Vec<i64> {
     let channels = rope_channels(head_dim);
     let d = i64::from(head_dim);
@@ -276,29 +214,21 @@ fn head_permutation(heads: u32, head_dim: u32) -> Vec<i64> {
         .collect()
 }
 
-/// The rows of `[q | k | v]` in the checkpoint's own `[kv_heads, groups +
-/// 2, head_dim, hidden]` row space. Query head `groups·g + j` is block
-/// `(g, j)`; K is block `(g, groups)` and V block `(g, groups + 1)`. Q and
-/// K carry the rotary permutation; V does not turn and keeps its order.
 fn qkv_rows(kv_heads: u32, groups: u32, head_dim: u32, q_perm: &[i64], k_perm: &[i64]) -> Vec<i64> {
     let d = i64::from(head_dim);
     let stride = i64::from(groups + 2) * d;
     let mut rows = Vec::new();
-    // q, in head order `groups·g + j` — which is what the reference's
-    // `reshape(bsz, q_len, num_heads, head_dim)` numbers them.
     for q in q_perm {
         let head = q / d;
         let c = q % d;
         let (g, j) = (head / i64::from(groups), head % i64::from(groups));
         rows.push(g * stride + j * d + c);
     }
-    // k: block `groups` of each kv head, rotary-permuted.
     for k in k_perm {
         let head = k / d;
         let c = k % d;
         rows.push(head * stride + i64::from(groups) * d + c);
     }
-    // v: block `groups + 1`, in order — V does not turn.
     for g in 0..i64::from(kv_heads) {
         for c in 0..d {
             rows.push(g * stride + (i64::from(groups) + 1) * d + c);
@@ -307,8 +237,6 @@ fn qkv_rows(kv_heads: u32, groups: u32, head_dim: u32, q_perm: &[i64], k_perm: &
     rows
 }
 
-/// `[+1 | -1]` down a `[2·h, 1]` column: two constant fills joined, stated
-/// in the dtype `seed` is stored in and cast where the row wants another.
 fn signs(b: &mut Builder, src: &ztensor::Source, w: &Weight, seed: &str) -> Result<(), Error> {
     let stored = stored_encoding(src, seed)?;
     let Encoding::Raw(dtype) = stored.clone() else {

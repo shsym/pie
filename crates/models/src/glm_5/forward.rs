@@ -12,8 +12,6 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// True for rows routed to a registered adapter. A fire with no adapter
-    /// rows has zero rows in this class, so the correction dispatches nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -55,8 +53,6 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        // Two schedules, [decode, prefill], split by Facts::qo_one(); latent_attention
-        // splits q the same way so each reader finds its matching plan.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan = [
             ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
@@ -74,8 +70,6 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // Applied after all_reduce: on a tp-split partial product the
-            // correction would be summed tp times.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -138,8 +132,6 @@ impl ForwardHybrid for Model {
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let logits = ops::linear::lm_head(&x, &m.head);
-        // This rank landed its COLUMNS of the logits; the plan wants all of
-        // them. (`dim(0) < vocab` is the band, read off the weight itself.)
         if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
         } else {
@@ -148,8 +140,6 @@ impl ForwardHybrid for Model {
     }
 }
 
-/// `m.heads` and `m.kv_lora_rank` come from the trunk; `a` carries only what
-/// varies per layer (head widths, rope theta, scale, weights, spaces).
 fn latent_attention(
     x: &Value,
     inputs: &Input<Facts>,
@@ -264,6 +254,5 @@ fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> 
         ix.theta,
     );
     let weights = ops::linear::matmul(q_a, &ix.weights_proj);
-    // One key per token: stride 1, published ids are token positions.
     ops::attn::index_topk(&q, &weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
 }

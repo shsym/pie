@@ -1,11 +1,3 @@
-//! Engine-backend bootstrap helpers for pie-worker.
-//!
-//! Builds a runtime-owned [`runtime::engine::EngineBox`] and its
-//! [`EngineCapabilities`] from the operator's config before
-//! `runtime::bootstrap`, mapping options onto the per-backend boot struct
-//! (e.g. cuda's [`DeviceBoot`]) that crosses the seam.
-
-/// Which engine flavor this binary can host, and the refusals for the rest.
 pub mod flavor;
 
 use std::path::Path;
@@ -29,8 +21,6 @@ use crate::config::VulkanEngineOptions;
 #[cfg(feature = "wgpu")]
 use crate::config::WgpuEngineOptions;
 
-/// Per-flavor engine options, passed to native-engine creation helpers. `Clone`
-/// exists so `serve.rs` can rebuild a per-group variant.
 #[derive(Clone)]
 pub enum EngineOptions {
     #[cfg(feature = "cuda")]
@@ -44,7 +34,6 @@ pub enum EngineOptions {
 }
 
 impl EngineOptions {
-    /// Which compiled flavor this options bundle targets.
     pub fn flavor(&self) -> Flavor {
         match self {
             #[cfg(feature = "cuda")]
@@ -66,20 +55,8 @@ impl EngineOptions {
     }
 }
 
-/// What a load answered about itself: device, pools, limits, and a
-/// `ModelProfile`. `snapshot_dir`/`model_id`/`arch_name` live on
-/// [`GroupEngine`] instead — they name the caller's checkpoint, not the engine's.
 pub use engine::Capabilities as EngineCapabilities;
 
-/// The pool ceilings a load is baked against, out of what the operator stated.
-///
-/// Every `[engine]` number the Metal geometry is built from must be positive.
-///
-/// These were all clamped with `.max(1)` at the point of use, which turns a
-/// deployment typo into a server that boots, reports ready, and then refuses
-/// every request -- the worst of the three possible outcomes. The two numbers
-/// that were already refused (`max_forward_tokens = 1` against the lane count,
-/// and a page pool past the device) name the value and the knob; so does this.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     for (key, value) in [
@@ -103,8 +80,6 @@ fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     Ok(())
 }
 
-/// `slots` seats recurrent state only (`max_state_slots`); the KV page pool
-/// is shared by every live sequence and seats nothing.
 #[cfg(any(feature = "cuda", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
@@ -113,10 +88,6 @@ fn cuda_budgets(
     voxel_ceilings: (Option<u32>, Option<u32>),
 ) -> engine::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
-    // `max_model_len` when stated (a zero means unstated); else the
-    // contract's default. Beyond capping one sequence, this sizes every
-    // lane's KV reservation and the arming pass's synthetic lanes, so it
-    // decides which decode widths get an armed body on a small pool.
     let max_context = opts
         .max_model_len
         .filter(|&len| len > 0)
@@ -126,10 +97,7 @@ fn cuda_budgets(
     engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
         max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
-        // Empty defers to `engine_cuda::api::lattice`'s `default_lattice` rungs.
         buckets: Vec::new(),
-        // How many banks the deployment intends to register; a load whose
-        // intent exceeds what the text seats is refused.
         max_adapters: adapter_seats,
         page_size,
         max_context,
@@ -138,24 +106,13 @@ fn cuda_budgets(
             .max_total_pages
             .unwrap_or_else(|| pages_per_slot.saturating_mul(256))
             .max(1),
-        // Both absent: the shell derives a ladder from the loaded text.
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
-        // And the third axis's pair, which used to be unsettable: the knob
-        // was on `Budgets` and nothing could turn it, so every deployment
-        // took the derived 65 536 and a `vae.encode` of a 1024^2 picture
-        // (1 048 576 pixel voxels) was refused with no way to say otherwise.
         max_voxels: voxel_ceilings.0,
         max_clips: voxel_ceilings.1,
     }
 }
 
-/// The cuda boot, as the shell's own type: device, cache directories and
-/// `[engine]` knobs. An absent knob takes `Knobs::default()`.
-///
-/// # Errors
-///
-/// A `[engine] graphs` or `recording` spelling the shell does not speak.
 #[cfg(feature = "cuda")]
 fn device_boot(
     opts: &CudaNativeEngineOptions,
@@ -177,8 +134,6 @@ fn device_boot(
             .parse::<Recording>()
             .map_err(|error| anyhow!("[engine] recording: {error}"))?;
     }
-    // Deprecated keys map onto `recording`; `pad` applies last since the
-    // bodies route requires it.
     match opts.bodies {
         Some(true) if !knobs.bodies() => knobs.recording = Recording::default(),
         Some(false) if knobs.bodies() => knobs.recording = Recording::Shaped,
@@ -210,9 +165,6 @@ fn device_boot(
     if let Some(streams) = opts.side_streams {
         knobs.side_streams = Some(streams);
     }
-    // The one word list a person debugging types, parsed into the shell's own
-    // record here so a misspelling is a refusal that names the vocabulary
-    // rather than a trace that never prints.
     if let Some(words) = opts.diagnostics.as_deref() {
         knobs.diagnostics = words
             .parse::<Diagnostics>()
@@ -225,7 +177,6 @@ fn device_boot(
     }
     Ok(DeviceBoot {
         ordinal: ordinal_of(&opts.device),
-        // Rank and communicator are the group opener's to assign.
         world: World::default(),
         comm: None,
         graphs,
@@ -235,9 +186,6 @@ fn device_boot(
     })
 }
 
-/// A one-way, human-readable record of what a boot asked for, under
-/// `$PIE_HOME/logs/`. Nothing reads this back; write failures are logged
-/// and swallowed rather than failing the boot.
 #[cfg(feature = "cuda")]
 fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
     let dir = bootstrap::paths::pie_home().join("logs");
@@ -252,13 +200,6 @@ fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
     }
 }
 
-/// Hand an engine its model: trace the plan runtime-side, state the
-/// ceilings, and land the checkpoint. Reaching the tracer through
-/// `runtime::engine::load` keeps `model` out of this crate's dependency
-/// graph.
-// The eight are the load's own inputs — the engine, where the checkpoint is,
-// the ceilings, and the four facts a landing states. Grouping them into a
-// struct would move the same list one level out.
 #[allow(clippy::too_many_arguments)]
 fn land(
     backend: &mut runtime::engine::EngineBox,
@@ -268,11 +209,9 @@ fn land(
     platform: model_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
-    // `[model] sku`, or `None` to identify one (first fit wins).
     sku: Option<&str>,
 ) -> Result<engine::Loaded> {
     if component != crate::executor::ModelComponent::Full {
-        // The catalog ships no encoder trace, so it is refused by name.
         return Err(anyhow!(
             "this build loads only the full model; {component:?} needs a traced plan the catalog \
              does not ship"
@@ -283,7 +222,6 @@ fn land(
         snapshot_dir,
         platform,
         budgets,
-        // `None` is uncapped; a budget the shell cannot meet refuses the load.
         residency,
         -1,
         frames_in_flight,
@@ -291,12 +229,6 @@ fn land(
     backend.load(request).map_err(anyhow::Error::from)
 }
 
-/// Write the operator's adapters into the banks the load just reserved. A
-/// plane file is one bank's slot, verbatim.
-///
-/// # Errors
-///
-/// A plane file that will not read, or whatever the engine refused.
 fn register_operator_adapters(
     backend: &mut runtime::engine::EngineBox,
     adapters: &crate::config::AdapterConfig,
@@ -331,11 +263,6 @@ fn register_operator_adapters(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Native engine creation helpers.
-// -----------------------------------------------------------------------------
-
-/// What an engine may be pointed at: a `.zt` artifact, or a snapshot directory.
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
     if snapshot_dir.is_dir()
         || (snapshot_dir.is_file() && crate::weights::is_artifact_path(snapshot_dir))
@@ -353,18 +280,14 @@ pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
     snapshot_dir: &Path,
     cache_dir: &Path,
-    // The shared-adapter mount, or `None` for the feature off.
     adapter_dir: Option<&Path>,
     group_id: usize,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
-    // `[model] max_patches` / `[model] max_images`, or both `None` to derive them.
     patch_ceilings: (Option<u32>, Option<u32>),
-    // `[model] max_voxels` / `[model] max_clips`, the same way.
     voxel_ceilings: (Option<u32>, Option<u32>),
-    // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
 ) -> Result<GroupEngine> {
     validate_snapshot_dir(snapshot_dir)?;
@@ -374,7 +297,6 @@ pub(crate) fn create_engine_backend_group(
 
     let mut boots = Vec::with_capacity(rank_options.len());
     for (rank, rank_options) in rank_options.iter().enumerate() {
-        // Irrefutable in a CUDA-only build; load-bearing once another feature widens the enum.
         #[allow(
             irrefutable_let_patterns,
             reason = "`EngineOptions` has one variant in a CUDA-only build"
@@ -398,8 +320,6 @@ pub(crate) fn create_engine_backend_group(
             "cuda group opened {opened} ranks for {ranks} rank configs"
         ));
     }
-    // A group serves the identified checkpoint at its own width: the SKU row
-    // is the one-rank name plus `-tp<ranks>`, which the catalog must ship.
     let widened;
     let sku = match sku {
         Some(named) => Some(named),
@@ -420,7 +340,6 @@ pub(crate) fn create_engine_backend_group(
         }
         None => None,
     };
-    // One load, not one per rank: a rank is not a load.
     #[allow(
         irrefutable_let_patterns,
         reason = "`EngineOptions` has one variant in a CUDA-only build"
@@ -438,7 +357,6 @@ pub(crate) fn create_engine_backend_group(
         frames_in_flight,
         sku,
     )?;
-    // The banks are reserved by the load; this is the write.
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
@@ -458,32 +376,24 @@ pub(crate) fn create_engine_backend_group(
                   every path that takes one diverges"
     )
 )]
-// One per engine knob a boot states, and they are not a set that composes:
-// each is read by a different arm below.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_engine_backend(
     options: &EngineOptions,
     snapshot_dir: &Path,
     cache_dir: &Path,
-    // The shared-adapter mount, or `None` for the feature off.
     adapter_dir: Option<&Path>,
     group_id: usize,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
-    // `[model] max_patches` / `[model] max_images`, or both `None` to derive them.
     patch_ceilings: (Option<u32>, Option<u32>),
-    // `[model] max_voxels` / `[model] max_clips`, the same way.
     voxel_ceilings: (Option<u32>, Option<u32>),
-    // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
 ) -> Result<GroupEngine> {
-    // Each is used only inside a `#[cfg(feature = "engine-…")]` arm below.
     let _ = (group_id, cache_dir, adapter_dir);
     validate_snapshot_dir(snapshot_dir)?;
 
-    // Typed: with no `engine-*` feature `EngineOptions` has no variants.
     let (mut backend, budgets, platform): (
         runtime::engine::EngineBox,
         engine::Budgets,
@@ -509,18 +419,12 @@ pub(crate) fn create_engine_backend(
                 model_ir::Platform::Cuda,
             )
         }
-        // The shell reads exactly one key from this in-memory document.
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         EngineOptions::Metal(opts) => {
-            // `{:?}` keeps the decimal point; `{}` on `1.0` reads as an integer in TOML.
             let mut boot_doc = format!(
                 "[metal]\ngpu_mem_utilization = {:?}\n",
                 opts.gpu_mem_utilization
             );
-            // The one word list a person debugging types, quoted through
-            // `toml::Value` so a filter or a path cannot break the document.
-            // It goes before the `[metal.tuning]` table below, since a bare
-            // key after a table header would land inside it.
             if let Some(words) = opts.diagnostics.as_deref() {
                 boot_doc.push_str(&format!(
                     "diagnostics = {}\n",
@@ -531,19 +435,12 @@ pub(crate) fn create_engine_backend(
                 boot_doc.push_str("\n[metal.tuning]\n");
                 boot_doc.push_str(&opts.tuning.to_string());
             }
-            // Quoted through `toml::Value` so an unusual path cannot break the document.
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",
                     toml::Value::String(mount.display().to_string())
                 ));
             }
-            // A stated zero is a typo, not a request. Clamping it with
-            // `.max(1)` booted a server whose pool seats one page and whose
-            // every request then dies at admission -- and it did so silently,
-            // because `runtime::bootstrap::verify_config`'s own `total_pages
-            // must be > 0` check never sees the zero the clamp already ate.
-            // Refuse by name, the way a geometry that cannot bake is refused.
             metal_geometry_is_stated(opts)?;
             let backend = runtime::engine::backend::open::metal(boot_doc.as_bytes())?;
             let page_size = opts.kv_page_size.max(1);
@@ -561,13 +458,6 @@ pub(crate) fn create_engine_backend(
                     max_context,
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     pages: opts.total_pages.max(1),
-                    // `[model] max_patches` / `max_images` when stated; absent,
-                    // the shell derives a ladder from the loaded text
-                    // (`engine_metal::api::patch_ladder`: the token ceiling,
-                    // capped at two native-grid images) — which for a qwen
-                    // tower (256 patches at its smallest image) is under one
-                    // picture at a 128-token fire, so a vision deployment
-                    // states it.
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,
@@ -576,17 +466,12 @@ pub(crate) fn create_engine_backend(
                 model_ir::Platform::Metal,
             )
         }
-        // Same shape as the Metal arm: an in-memory `[vulkan]` document is the
-        // whole boot. The device is a number rather than a selector string,
-        // because Vulkan enumerates its physical devices.
         #[cfg(feature = "vulkan")]
         EngineOptions::Vulkan(opts) => {
-            // `{:?}` keeps the decimal point; `{}` on `1.0` reads as an integer in TOML.
             let mut boot_doc = format!(
                 "[vulkan]\ndevice_index = {}\ngpu_mem_utilization = {:?}\nvalidation = {}\n",
                 opts.device_index, opts.gpu_mem_utilization, opts.validation
             );
-            // Quoted through `toml::Value` so an unusual path cannot break the document.
             if let Some(cache) = &opts.pipeline_cache {
                 boot_doc.push_str(&format!(
                     "pipeline_cache = {}\n",
@@ -594,9 +479,6 @@ pub(crate) fn create_engine_backend(
                 ));
             }
             let backend = runtime::engine::backend::open::vulkan(boot_doc.as_bytes())?;
-            // No page-geometry knob on this table: the shell has no planner to
-            // derive one and the contract's default is the geometry every
-            // deployment has run.
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -607,8 +489,6 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: defaults.max_context,
-                    // Seats are state slots, not pool pages: a stateless model
-                    // admits by pages alone and this number never seats it.
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
@@ -619,14 +499,8 @@ pub(crate) fn create_engine_backend(
                 model_ir::Platform::Vulkan,
             )
         }
-        // Same shape again, over the `[wgpu]` table. Two keys the Vulkan arm
-        // has no analogue for ride along: `backends` narrows which backends
-        // the instance may enumerate, and `power_preference` ranks the
-        // adapters inside that set.
         #[cfg(feature = "wgpu")]
         EngineOptions::Wgpu(opts) => {
-            // `{:?}` keeps the decimal point; `{}` on `1.0` reads as an integer in TOML.
-            // Strings go through `toml::Value` so an odd one cannot break the document.
             let mut boot_doc = format!(
                 "[wgpu]\nadapter_index = {}\ngpu_mem_utilization = {:?}\npower_preference = {}\n",
                 opts.adapter_index,
@@ -645,13 +519,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cache.display().to_string())
                 ));
             }
-            // Absent means "ask the adapter"; the shell's own default stands
-            // in when the backend publishes nothing.
             if let Some(memory) = opts.device_memory {
                 boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
             }
             let backend = runtime::engine::backend::open::wgpu(boot_doc.as_bytes())?;
-            // No page-geometry knob on this table either; see the arm above.
             let defaults = engine::Budgets::default();
             (
                 backend,
@@ -662,8 +533,6 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: defaults.max_context,
-                    // Seats are state slots, not pool pages: a stateless model
-                    // admits by pages alone and this number never seats it.
                     slots: opts.max_state_slots.unwrap_or(256).max(1),
                     pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
                     max_patches: patch_ceilings.0,
@@ -675,7 +544,6 @@ pub(crate) fn create_engine_backend(
             )
         }
     };
-    // Unreachable in a build with no `engine-*` feature.
     #[cfg_attr(
         not(feature = "cuda"),
         allow(
@@ -694,7 +562,6 @@ pub(crate) fn create_engine_backend(
         sku,
     )?;
 
-    // The banks are reserved by the load; this is the write.
     register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
@@ -709,11 +576,12 @@ pub(crate) fn create_engine_backend(
 mod tests {
     use super::*;
 
-    /// **THE THIRD AXIS'S CEILINGS REACH THE ENGINE.** Both were hard-coded
-    /// `None` here, so `Budgets::max_voxels` and `max_clips` were knobs
-    /// nothing could turn: every deployment took the shell's derived
-    /// ceiling and a `vae.encode` of a picture larger than it was refused
-    /// with no way to say otherwise.
+    fn backend_every_case() {
+        the_voxel_ceilings_a_deployment_states_reach_the_budget();
+        the_pool_budget_seats_by_state_slots_not_pages();
+        an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
+    }
+
     #[test]
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
         let opts = CudaNativeEngineOptions::default();
@@ -730,8 +598,6 @@ mod tests {
         assert_eq!(stated.max_clips, Some(4));
     }
 
-    /// The seat count is `max_state_slots`, not the page pool.
-    #[test]
     fn the_pool_budget_seats_by_state_slots_not_pages() {
         let mut opts = CudaNativeEngineOptions {
             kv_page_size: Some(16),
@@ -741,7 +607,6 @@ mod tests {
         let budgets = cuda_budgets(&opts, 0, (None, None), (None, None));
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
-        // No seat count stated: the contract's own default, whatever the pool.
         assert_eq!(budgets.slots, 256);
         assert_eq!(budgets.pages, 1024);
         opts.max_total_pages = None;
@@ -750,13 +615,10 @@ mod tests {
         opts.max_state_slots = Some(4);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);
 
-        // Zero still seats one.
         opts.max_state_slots = Some(0);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 1);
     }
 
-    /// What an engine may be handed: an artifact, or a snapshot directory.
-    #[test]
     fn an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -779,29 +641,19 @@ mod tests {
         assert!(error.contains("neither a .zt artifact"), "{error}");
     }
 
-    // The tests below need `DeviceBoot` (`cargo test -p worker --features cuda`).
 }
 
-/// Per-engine bundle created before bootstrap.
 pub struct GroupEngine {
-    /// What the load can do — device, pools, ceilings, guest-visible profile.
     pub caps: EngineCapabilities,
-    /// What the load came out as: its plan's name and the bytes it landed.
     pub facts: engine::LoadFacts,
-    /// Where this worker resolved the checkpoint.
     pub snapshot_dir: PathBuf,
-    /// The device behind it.
     pub backend: runtime::engine::EngineBox,
 }
 
-/// Per-model bundle of concrete engine backends: one entry per DP replica.
 pub struct ModelEngines {
     pub groups: Vec<GroupEngine>,
 }
 
-/// Partition `world_size` ranks into one tensor-parallel group, e.g.
-/// `world_size=2, tp_degree=2 → [[0, 1]]`. Refuses >1 group: a worker
-/// serves exactly one replica.
 pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec<usize>>> {
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
@@ -828,9 +680,6 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
         .collect())
 }
 
-/// Project a [`config::ModelConfig`] into the typed [`EngineOptions`] the
-/// engine expects. The cuda variant's `device` is a placeholder the
-/// per-group spawn loop overwrites.
 #[cfg_attr(
     not(feature = "cuda"),
     allow(
@@ -859,7 +708,6 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
             c.device = device.clone();
             Ok(EngineOptions::CudaNative(c))
         }
-        // No device selector: `Shell::open` always takes the default Metal device.
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Flavor::Metal => {
             let p: MetalEngineOptions = m
@@ -870,8 +718,6 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
                 .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             Ok(EngineOptions::Metal(p))
         }
-        // No device selector either: which physical device to bind is
-        // `[engine] device_index`, an option key, not the `device` list.
         #[cfg(feature = "vulkan")]
         Flavor::Vulkan => {
             let v: VulkanEngineOptions = m
@@ -882,8 +728,6 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
                 .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             Ok(EngineOptions::Vulkan(v))
         }
-        // No device selector either: which adapter to bind is
-        // `[engine] adapter_index`, an option key, not the `device` list.
         #[cfg(feature = "wgpu")]
         Flavor::Wgpu => {
             let w: WgpuEngineOptions = m
@@ -901,19 +745,23 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
 mod topology_tests {
     use super::*;
 
+    fn backend_1_every_case() {
+        topology_rejects_dp_two();
+        topology_rejects_indivisible();
+        topology_rejects_zero_tp();
+    }
+
     #[test]
     fn topology_rejects_dp_two() {
         let err = calculate_topology(2, 1).unwrap_err().to_string();
         assert!(err.contains("run 2 workers"), "got: {err}");
     }
 
-    #[test]
     fn topology_rejects_indivisible() {
         let err = calculate_topology(3, 2).unwrap_err().to_string();
         assert!(err.contains("must be divisible"), "got: {err}");
     }
 
-    #[test]
     fn topology_rejects_zero_tp() {
         let err = calculate_topology(4, 0).unwrap_err().to_string();
         assert!(err.contains("must be > 0"), "got: {err}");

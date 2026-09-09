@@ -1,34 +1,21 @@
-//! Tiktoken-style BPE merge, keyed by token-ID pairs rather than byte hashing.
-
 use anyhow::{Context, Result, bail, ensure};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Token ID (the value returned to the caller).
 pub(crate) type TokenId = u32;
 
-/// Merge rank (lower = higher priority). Internal to the BPE algorithm.
 type Rank = u32;
 
-// ---------------------------------------------------------------------------
-// BpeTable — the only data structure
-// ---------------------------------------------------------------------------
-
 pub(crate) struct BpeTable {
-    /// Symbol lookup: bytes → token ID.
     token_to_id: FxHashMap<Arc<[u8]>, TokenId>,
-    /// Merge lookup: (left_id, right_id) → (rank, merged_id).
     merges: FxHashMap<(TokenId, TokenId), (Rank, TokenId)>,
-    /// Decode table: token_id → bytes (indexed by ID).
     id_to_bytes: Vec<Option<Arc<[u8]>>>,
-    /// Pre-computed byte fallback: byte → token_id for `<0xNN>` tokens.
     byte_fallback_ids: [Option<TokenId>; 256],
 }
 
 impl BpeTable {
-    /// Build from a rank→bytes map (tiktoken-native: rank == token ID).
     pub(crate) fn from_decoder_map(map: HashMap<TokenId, Vec<u8>>) -> Result<Self> {
         if map.is_empty() {
             return Ok(Self {
@@ -52,7 +39,6 @@ impl BpeTable {
         let mut merges =
             FxHashMap::with_capacity_and_hasher(map.len().saturating_mul(2), Default::default());
 
-        // First pass: register all symbols.
         for (id, bytes) in map {
             let bytes: Arc<[u8]> = bytes.into();
             token_to_id
@@ -62,22 +48,18 @@ impl BpeTable {
             id_to_bytes[id as usize] = Some(bytes);
         }
 
-        // Second pass: for every token of length ≥ 2, try all possible splits
-        // to find which pair merges into it.  For tiktoken, rank == id.
-        // The merge with the lowest resulting id wins.
         for (id, bytes) in id_to_bytes.iter().enumerate() {
             let bytes = bytes.as_deref().expect("contiguous IDs were validated");
             if bytes.len() < 2 {
                 continue;
             }
-            // Try all split points.
             for split in 1..bytes.len() {
                 let left = &bytes[..split];
                 let right = &bytes[split..];
                 if let (Some(&left_id), Some(&right_id)) =
                     (token_to_id.get(left), token_to_id.get(right))
                 {
-                    let rank = id as TokenId; // tiktoken: rank == id
+                    let rank = id as TokenId;
                     merges
                         .entry((left_id, right_id))
                         .and_modify(|e: &mut (Rank, TokenId)| {
@@ -98,15 +80,6 @@ impl BpeTable {
         })
     }
 
-    /// Build from HF `tokenizer.json` vocab + merges.
-    ///
-    /// Merge priority comes from position in the merges array.
-    /// Single-character vocab entries are atoms (not merge results).
-    ///
-    /// If `raw_byte_keys` is true, GPT-2 unicode keys in `vocab` are
-    /// converted to raw bytes via the inverse byte mapping.  This lets
-    /// the encode path work directly on `&[u8]` without running
-    /// `bytes_to_unicode()`.
     pub(crate) fn from_vocab_and_merges(
         vocab: &HashMap<String, u32>,
         merge_pairs: &[(String, String)],
@@ -126,7 +99,6 @@ impl BpeTable {
             FxHashMap::with_capacity_and_hasher(vocab.len(), Default::default());
         let mut merges = FxHashMap::with_capacity_and_hasher(merge_pairs.len(), Default::default());
 
-        // First pass: register all symbols.
         for (token, &id) in vocab {
             let key = if raw_byte_keys {
                 byte_level_token_to_bytes(token)
@@ -144,7 +116,6 @@ impl BpeTable {
             id_to_bytes[id as usize] = Some(key);
         }
 
-        // Second pass: build merge table from explicit merge pairs.
         for (idx, (a, b)) in merge_pairs.iter().enumerate() {
             let a_key = if raw_byte_keys {
                 byte_level_token_to_bytes(a)
@@ -158,7 +129,6 @@ impl BpeTable {
                 b.as_bytes().to_vec()
             };
 
-            // Merged bytes = a_key + b_key.
             let mut merged_key = a_key.clone();
             merged_key.extend_from_slice(&b_key);
 
@@ -183,7 +153,6 @@ impl BpeTable {
             }
         }
 
-        // Pre-compute byte fallback table: byte → token_id of `<0xNN>`.
         let mut byte_fallback_ids = [None; 256];
         for byte in 0u16..=255 {
             let hex = format!("<0x{byte:02X}>");
@@ -200,13 +169,11 @@ impl BpeTable {
         })
     }
 
-    /// Look up token ID for a byte sequence.
     #[inline]
     pub(crate) fn bytes_to_id(&self, bytes: &[u8]) -> Option<TokenId> {
         self.token_to_id.get(bytes).copied()
     }
 
-    /// Look up bytes for a token ID.
     #[inline]
     pub(crate) fn id_to_bytes(&self, id: TokenId) -> Option<&[u8]> {
         self.id_to_bytes.get(id as usize)?.as_deref()
@@ -220,12 +187,6 @@ impl BpeTable {
         self.id_to_bytes.len()
     }
 
-    /// Insert a token (for added/special tokens).
-    ///
-    /// Does NOT add merge entries — added tokens are matched by AhoCorasick
-    /// before BPE encoding, so they never participate in the merge algorithm.
-    /// Skips `token_to_id` insertion if the ID already exists in the base vocab
-    /// (some models list tokens in both `vocab` and `added_tokens`).
     pub(crate) fn insert_added(&mut self, bytes: Vec<u8>, id: TokenId) -> Result<()> {
         ensure!(
             id as usize <= self.id_to_bytes.len(),
@@ -265,7 +226,6 @@ impl BpeTable {
             .all(|bytes| seen.insert(bytes.as_ref()))
     }
 
-    /// Pair-merge rank lookup: can (left, right) merge?
     #[inline]
     fn pair_rank(&self, left: TokenId, right: TokenId) -> Rank {
         self.merges
@@ -273,31 +233,20 @@ impl BpeTable {
             .map_or(Rank::MAX, |&(r, _)| r)
     }
 
-    /// Pair-merge lookup: returns (rank, merged_id).
     #[inline]
     fn pair_merge(&self, left: TokenId, right: TokenId) -> Option<(Rank, TokenId)> {
         self.merges.get(&(left, right)).copied()
     }
 
-    /// Byte-fallback lookup (internal).
     #[inline]
     fn byte_fallback(&self, byte: u8) -> Option<TokenId> {
         self.byte_fallback_ids[byte as usize]
     }
 
-    // -----------------------------------------------------------------------
-    // Canonical serialization (see `crate::canonical`)
-    // -----------------------------------------------------------------------
-
-    /// The decode table, whole — `None` where an id carries no token.
     pub(crate) fn decode_table(&self) -> &[Option<Arc<[u8]>>] {
         &self.id_to_bytes
     }
 
-    /// The merge table as `(left, right, rank, merged)`, in a fixed order.
-    ///
-    /// Sorted, because the table is a hash map and its iteration order is not
-    /// stable across runs — an artifact has to be byte-reproducible.
     pub(crate) fn merge_quads(&self) -> Vec<(TokenId, TokenId, Rank, TokenId)> {
         let mut quads: Vec<_> = self
             .merges
@@ -312,8 +261,6 @@ impl BpeTable {
         &self.byte_fallback_ids
     }
 
-    /// Whether `token_to_id` is recoverable from the decode table alone
-    /// (not always true after `insert_added` overwrites an entry).
     pub(crate) fn encode_map_is_derivable(&self) -> bool {
         let mut derived: FxHashMap<&[u8], TokenId> =
             FxHashMap::with_capacity_and_hasher(self.token_to_id.len(), Default::default());
@@ -330,7 +277,6 @@ impl BpeTable {
                 .all(|(bytes, &id)| derived.get(bytes.as_ref()) == Some(&id))
     }
 
-    /// Rebuilds a table from its canonical parts.
     pub(crate) fn from_canonical(
         vocab: Vec<Vec<u8>>,
         merges: &[(TokenId, TokenId, Rank, TokenId)],
@@ -374,20 +320,11 @@ impl BpeTable {
         })
     }
 }
-// ---------------------------------------------------------------------------
-// GPT-2 byte ↔ unicode mapping (compile-time const tables)
-// ---------------------------------------------------------------------------
 
-/// Determine whether byte `b` maps directly (identity) in the GPT-2 scheme.
-/// These are printable ASCII (0x21..=0x7E) plus Latin-1 Supplement (0xA1..=0xAC, 0xAE..=0xFF).
 const fn is_direct_byte(b: u8) -> bool {
     matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF)
 }
 
-/// Build the GPT-2 byte→unicode table at compile time.
-///
-/// Direct bytes map to their codepoint (identity).
-/// Non-direct bytes (control chars, 0x7F, 0xAD, etc.) map to U+0100 + offset.
 const fn build_byte_to_unicode() -> [char; 256] {
     let mut table = ['\0'; 256];
     let mut n = 0u32;
@@ -411,8 +348,6 @@ const fn build_byte_to_unicode() -> [char; 256] {
     table
 }
 
-/// Build the GPT-2 char→byte (inverse) table at compile time.
-/// Table size 324 covers the max code point used, with headroom.
 const fn build_char_to_byte() -> [Option<u8>; 324] {
     let b2u = build_byte_to_unicode();
     let mut table: [Option<u8>; 324] = [None; 324];
@@ -427,14 +362,8 @@ const fn build_char_to_byte() -> [Option<u8>; 324] {
     table
 }
 
-/// GPT-2 char→byte (inverse) mapping table.
 static CHAR_TO_BYTE: [Option<u8>; 324] = build_char_to_byte();
 
-/// Decode a byte-level vocabulary token.
-///
-/// Mergeable tokens consist entirely of the byte alphabet. Added tokens may
-/// contain arbitrary Unicode; Hugging Face's ByteLevel decoder preserves such
-/// tokens as their literal UTF-8 bytes.
 fn byte_level_token_to_bytes(token: &str) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(token.len());
     for character in token.chars() {
@@ -447,30 +376,16 @@ fn byte_level_token_to_bytes(token: &str) -> Vec<u8> {
     decoded
 }
 
-// ---------------------------------------------------------------------------
-// Core: doubly-linked-list BPE merge (token-ID pair keys)
-// ---------------------------------------------------------------------------
-
-/// A node in the flat-array doubly-linked list used for BPE merging.
-///
-/// Each node represents a token in the current merge state.
-/// `rank` caches the merge rank of fusing this node with its successor.
 struct Node {
     token_id: TokenId,
     rank: Rank,
-    prev: u32, // NONE = no predecessor (head)
-    next: u32, // NONE = no successor (sentinel)
+    prev: u32,
+    next: u32,
 }
 
 const NONE: u32 = u32::MAX;
 
-/// BPE merge on a sequence of initial token IDs.
-///
-/// Dispatches to a linear-scan or heap-based implementation depending on the
-/// number of tokens.  Short pieces benefit from cache-friendly linear scan;
-/// long pieces benefit from O(log n) heap-based min-finding.
 fn bpe_merge(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenId; 16]> {
-    // Threshold tuned experimentally: BinaryHeap overhead pays off at ~32+ tokens.
     if initial_ids.len() <= 32 {
         bpe_merge_linear(initial_ids, ranks)
     } else {
@@ -478,7 +393,6 @@ fn bpe_merge(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenId; 16
     }
 }
 
-/// Build the initial linked list from token IDs.
 fn build_nodes(ids: &[TokenId]) -> SmallVec<[Node; 32]> {
     let n = ids.len();
     let mut nodes: SmallVec<[Node; 32]> = SmallVec::with_capacity(n);
@@ -493,7 +407,6 @@ fn build_nodes(ids: &[TokenId]) -> SmallVec<[Node; 32]> {
     nodes
 }
 
-/// Compute the merge rank for node `i`: rank of merging i with i.next.
 #[inline]
 fn node_rank(nodes: &[Node], i: usize, ranks: &BpeTable) -> Rank {
     let j = nodes[i].next;
@@ -503,7 +416,6 @@ fn node_rank(nodes: &[Node], i: usize, ranks: &BpeTable) -> Rank {
     ranks.pair_rank(nodes[i].token_id, nodes[j as usize].token_id)
 }
 
-/// Collect surviving token IDs from the linked list.
 fn collect_ids(nodes: &[Node]) -> SmallVec<[TokenId; 16]> {
     let mut ids = SmallVec::new();
     let mut cur = 0u32;
@@ -514,14 +426,12 @@ fn collect_ids(nodes: &[Node]) -> SmallVec<[TokenId; 16]> {
     ids
 }
 
-/// Linear-scan BPE merge: O(n) per merge step. Best for short pieces.
 fn bpe_merge_linear(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenId; 16]> {
     let n = initial_ids.len();
     debug_assert!(n >= 2);
 
     let mut nodes = build_nodes(initial_ids);
 
-    // Compute initial pair ranks and find the global minimum.
     let mut min_rank: (Rank, u32) = (Rank::MAX, NONE);
     for i in 0..n.saturating_sub(1) {
         let rank = node_rank(&nodes, i, ranks);
@@ -531,32 +441,27 @@ fn bpe_merge_linear(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[Toke
         }
     }
 
-    // Merge loop.
     while min_rank.0 != Rank::MAX {
         let i = min_rank.1 as usize;
         let j = nodes[i].next as usize;
 
-        // Look up the merged token ID.
         let (_, merged_id) = ranks
             .pair_merge(nodes[i].token_id, nodes[j].token_id)
             .expect("cached merge rank must have a merge entry");
         nodes[i].token_id = merged_id;
 
-        // Unlink j.
         let j_next = nodes[j].next;
         nodes[i].next = j_next;
         if j_next != NONE {
             nodes[j_next as usize].prev = i as u32;
         }
 
-        // Update affected ranks.
         nodes[i].rank = node_rank(&nodes, i, ranks);
         let pred = nodes[i].prev;
         if pred != NONE {
             nodes[pred as usize].rank = node_rank(&nodes, pred as usize, ranks);
         }
 
-        // Linear scan for new minimum.
         min_rank = (Rank::MAX, NONE);
         let mut cur = 0u32;
         loop {
@@ -574,7 +479,6 @@ fn bpe_merge_linear(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[Toke
     collect_ids(&nodes)
 }
 
-/// Heap-based BPE merge: O(log n) per merge step. Best for long pieces.
 fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenId; 16]> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
@@ -584,10 +488,8 @@ fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenI
 
     let mut nodes = build_nodes(initial_ids);
 
-    // Priority queue: (rank, node_index). Reverse for min-heap.
     let mut heap: BinaryHeap<Reverse<(Rank, u32)>> = BinaryHeap::with_capacity(n);
 
-    // Compute initial pair ranks.
     for i in 0..n.saturating_sub(1) {
         let rank = node_rank(&nodes, i, ranks);
         nodes[i].rank = rank;
@@ -596,32 +498,27 @@ fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenI
         }
     }
 
-    // Merge loop.
     while let Some(Reverse((rank, idx))) = heap.pop() {
         let i = idx as usize;
 
-        // Stale entry: skip if rank no longer matches.
         if nodes[i].rank != rank {
             continue;
         }
 
         let j = nodes[i].next as usize;
 
-        // Look up the merged token ID.
         let (_, merged_id) = ranks
             .pair_merge(nodes[i].token_id, nodes[j].token_id)
             .expect("heap merge rank must have a merge entry");
         nodes[i].token_id = merged_id;
 
-        // Unlink j.
         let j_next = nodes[j].next;
         nodes[i].next = j_next;
         if j_next != NONE {
             nodes[j_next as usize].prev = i as u32;
         }
-        nodes[j].rank = Rank::MAX; // invalidate removed node
+        nodes[j].rank = Rank::MAX;
 
-        // Update affected ranks and push to heap.
         let new_rank = node_rank(&nodes, i, ranks);
         nodes[i].rank = new_rank;
         if new_rank != Rank::MAX {
@@ -641,12 +538,6 @@ fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenI
     collect_ids(&nodes)
 }
 
-// ---------------------------------------------------------------------------
-// Public API: BPE encode
-// ---------------------------------------------------------------------------
-
-/// Encode a raw byte slice using byte-level BPE (each byte is an atom).
-/// Used by modern byte-level models (Qwen, DeepSeek, GLM, Nemotron).
 pub(crate) fn bpe_encode_bytes(
     piece: &[u8],
     bpe: &BpeTable,
@@ -661,7 +552,6 @@ pub(crate) fn bpe_encode_bytes(
 
     let n = piece.len();
 
-    // A single byte is an atom regardless of whole-piece merge policy.
     if n == 1 {
         match bpe.bytes_to_id(piece) {
             Some(id) => out.push(id),
@@ -670,13 +560,11 @@ pub(crate) fn bpe_encode_bytes(
         return;
     }
 
-    // Tiktoken and HF ignore_merges=true prefer an exact whole-piece token.
     if prefer_whole_token && let Some(id) = bpe.bytes_to_id(piece) {
         out.push(id);
         return;
     }
 
-    // Build initial token IDs — each byte is an atom.
     let mut initial_ids: SmallVec<[TokenId; 32]> = SmallVec::with_capacity(n);
     let mut all_resolved = true;
     for i in 0..n {
@@ -695,7 +583,6 @@ pub(crate) fn bpe_encode_bytes(
         return;
     }
 
-    // Segment into runs of resolved vs unresolved atoms.
     let mut i = 0;
     while i < n {
         if initial_ids[i] == TokenId::MAX {
@@ -716,8 +603,6 @@ pub(crate) fn bpe_encode_bytes(
     }
 }
 
-/// Encode a text fragment using char-level BPE (each Unicode char is an atom).
-/// Used by Gemma byte-fallback models.
 pub(crate) fn bpe_encode_chars(
     piece: &str,
     bpe: &BpeTable,
@@ -731,15 +616,13 @@ pub(crate) fn bpe_encode_chars(
         return;
     }
 
-    // Collect char boundary offsets: [0, first_char_end, ..., len].
     let offsets: SmallVec<[usize; 32]> = piece
         .char_indices()
         .map(|(i, _)| i)
         .chain(std::iter::once(bytes.len()))
         .collect();
-    let n = offsets.len() - 1; // number of atoms (chars)
+    let n = offsets.len() - 1;
 
-    // A single char is an atom regardless of whole-piece merge policy.
     if n == 1 {
         match bpe.bytes_to_id(bytes) {
             Some(id) => out.push(id),
@@ -753,7 +636,6 @@ pub(crate) fn bpe_encode_chars(
         return;
     }
 
-    // Build initial token IDs from char spans.
     let mut initial_ids: SmallVec<[TokenId; 32]> = SmallVec::with_capacity(n);
     let mut all_resolved = true;
     for w in offsets.windows(2) {
@@ -773,7 +655,6 @@ pub(crate) fn bpe_encode_chars(
         return;
     }
 
-    // Segment into runs of resolved vs unresolved atoms.
     let mut i = 0;
     while i < n {
         if initial_ids[i] == TokenId::MAX {
@@ -795,8 +676,6 @@ pub(crate) fn bpe_encode_chars(
     }
 }
 
-/// Byte-fallback: encode unknown bytes as `<0xNN>` tokens.
-/// Appends directly to `out` — no intermediate allocations.
 fn fallback_into(
     bytes: &[u8],
     bpe: &BpeTable,
@@ -814,8 +693,3 @@ fn fallback_into(
         out.push(id);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-

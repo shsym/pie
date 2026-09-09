@@ -44,21 +44,19 @@ SEED = 0
 STEPS = 4
 SIZE = 1024
 
-# head_dim MUST stay 128 (sum(axes_dims_rope)); in_channels stays 128 (VAE patchification).
 MINI_CFG = dict(
     patch_size=1, in_channels=128, out_channels=None,
     num_layers=2, num_single_layers=2,
-    attention_head_dim=128, num_attention_heads=2,     # inner_dim 256
-    joint_attention_dim=192,                           # fake 3 x 64 text stack
+    attention_head_dim=128, num_attention_heads=2,
+    joint_attention_dim=192,
     timestep_guidance_channels=256, mlp_ratio=3.0,
     axes_dims_rope=(32, 32, 32, 32), rope_theta=2000, eps=1e-6,
     guidance_embeds=True,
 )
-MINI_IMG_HW = (8, 8)     # 64 image tokens
+MINI_IMG_HW = (8, 8)
 MINI_TXT_LEN = 32
-MINI_REFS = 2            # exercise the T = 10*(i+1) reference offsets
+MINI_REFS = 2
 MINI_REF_HW = (8, 8)
-
 
 def run_full(d: str, dtype=torch.bfloat16):
     from diffusers import Flux2KleinPipeline
@@ -76,11 +74,6 @@ def run_full(d: str, dtype=torch.bfloat16):
                                       text_encoder_out_layers=(9, 18, 27))
     tap.put("prompt_embeds", pe); tap.put("text_ids", tids)
     print(f"  prompt embeds {tuple(pe.shape)}  text_ids {tuple(tids.shape)}")
-    # The exact ids the pipeline fed Qwen3 (`_get_qwen3_prompt_embeds`): the
-    # chat template with one user turn, the generation cue, thinking off,
-    # right-padded to 512 with `<|endoftext|>` under a key mask. pie's
-    # `text` reading runs the unpadded prefix, so a parity check compares
-    # the rows the mask keeps.
     rendered = pipe.tokenizer.apply_chat_template(
         [{"role": "user", "content": PROMPT}], tokenize=False,
         add_generation_prompt=True, enable_thinking=False)
@@ -92,8 +85,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     print(f"  {n_real} real tokens: {enc['input_ids'][0][:n_real].tolist()}")
 
     r1 = hook_prepare_latents(pipe, tap)
-    # Every step's transformer call, so a trajectory diverging past step 0
-    # can be placed: `dit.step{i}.in.*` / `dit.step{i}.out`.
     r2 = hook_transformer(pipe.transformer, tap, "dit", steps=tuple(range(STEPS)))
     r3 = hook_scheduler(pipe, tap)
     g = torch.Generator("cpu").manual_seed(SEED)
@@ -111,7 +102,6 @@ def run_full(d: str, dtype=torch.bfloat16):
     tap.put("image.rgb", np.asarray(img).astype(np.float32))
     tap.save(os.path.join(d, "flux2_golden.npz"))
     npz_keys(tap)
-
 
 def run_mini(d: str, device="cpu", dtype=torch.float32):
     from diffusers import Flux2Transformer2DModel
@@ -142,7 +132,7 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
         return torch.cartesian_prod(torch.arange(t, t + 1), torch.arange(hh),
                                     torch.arange(ww), torch.arange(ll)).float()
 
-    img_ids = ids(0, h, w)                                     # target latent, T = 0
+    img_ids = ids(0, h, w)
     ref_ids = torch.cat([ids(10 * (i + 1), rh, rw) for i in range(MINI_REFS)], 0)
     txt_ids = torch.cartesian_prod(torch.arange(1), torch.arange(1),
                                    torch.arange(1), torch.arange(st)).float()
@@ -170,9 +160,7 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     print(f"  mini params: {sum(v.numel() for v in sd.values())}")
     npz_keys(tap)
 
-
-VAE_TOKENS = 32   # a 32x32 token grid at /16: the 512x512 image the Rust gate decodes
-
+VAE_TOKENS = 32
 
 def run_vae(d: str, device="cuda"):
     """The autoencoder alone, fp32 (`force_upcast`), on one 32x32 token grid.
@@ -198,18 +186,18 @@ def run_vae(d: str, device="cuda"):
     vae = (AutoencoderKLFlux2.from_pretrained(REPO, subfolder="vae", torch_dtype=torch.float32)
            .to(device).eval())
     cfg = vae.config
-    ch = cfg.latent_channels * cfg.patch_size[0] * cfg.patch_size[1]   # 32 * 2 * 2 = 128
+    ch = cfg.latent_channels * cfg.patch_size[0] * cfg.patch_size[1]
     n = VAE_TOKENS
     full = os.path.join(d, "flux2_golden.npz")
     if os.path.exists(full):
-        z = np.load(full)["latent.final"]              # [1, tokens, 128], row-major (h, w)
+        z = np.load(full)["latent.final"]
         z = z.reshape(z.shape[-2], z.shape[-1])
         side = int(round(z.shape[0] ** 0.5))
         assert side * side == z.shape[0], f"{z.shape[0]} packed tokens are not a square"
         z = z.reshape(side, side, ch)
         h0 = (side - n) // 2
-        z = z[h0:h0 + n, h0:h0 + n]                    # [n, n, 128]
-        z = np.ascontiguousarray(z.transpose(2, 0, 1))  # [128, n, n]
+        z = z[h0:h0 + n, h0:h0 + n]
+        z = np.ascontiguousarray(z.transpose(2, 0, 1))
         source = f"centre {n}x{n} crop of flux2_golden.npz latent.final ({side}x{side})"
     else:
         g = torch.Generator().manual_seed(7)
@@ -224,9 +212,9 @@ def run_vae(d: str, device="cuda"):
     patchify = Flux2KleinPipeline._patchify_latents
 
     with torch.no_grad():
-        x = vae.decode(unpatchify(z * bn_std + bn_mean), return_dict=False)[0]   # [1, 3, 16n, 16n]
-        mean = vae.encode(x, return_dict=False)[0].mean                          # [1, 32, 2n, 2n]
-        packed = (patchify(mean) - bn_mean) / bn_std                             # [1, 128, n, n]
+        x = vae.decode(unpatchify(z * bn_std + bn_mean), return_dict=False)[0]
+        mean = vae.encode(x, return_dict=False)[0].mean
+        packed = (patchify(mean) - bn_mean) / bn_std
 
     tap = Tap()
     tap.put("vae.latent", z[0])
@@ -242,7 +230,7 @@ def run_vae(d: str, device="cuda"):
     shapes = {}
     for key, t in (("latent", z[0]), ("pixels", x[0]), ("mean", packed[0])):
         chw = t.detach().float().cpu().numpy()
-        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")   # [h, w, C] -> rows of C
+        hwc = np.ascontiguousarray(chw.transpose(1, 2, 0)).astype("<f4")
         hwc.tofile(os.path.join(raw, f"{key}.f32"))
         shapes[key] = {"t": 1, "h": int(chw.shape[1]), "w": int(chw.shape[2]),
                        "channels": int(chw.shape[0])}
@@ -257,7 +245,6 @@ def run_vae(d: str, device="cuda"):
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}] -> mean {tuple(packed.shape)}; "
           f"round trip max |mean - latent| {float(back):.4f}")
     npz_keys(tap)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -277,7 +264,6 @@ def main():
     if a.vae:
         print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED, "steps": STEPS, "size": SIZE})
-
 
 if __name__ == "__main__":
     main()

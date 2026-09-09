@@ -1,13 +1,9 @@
-//! Thin WIT/resource handle for `rs-working-set`. All substantive operations delegate to the owning `RsStore`, resolved through `store::registry` by `(model, engine)`.
-//! [`RsWorkingSet`] is `Clone`, not `Copy`; every clone shares one [`Arc<RsLifecycle>`], whose idempotent release only runs when the last outstanding clone drops. The explicit WIT `drop` path calls [`RsWorkingSet::release`] synchronously and marks it done, so a teardown that bypasses that glue still releases via `Drop`.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{RsGeometry, RsWorkingSetId};
 use crate::engine::EngineId;
 
-/// Idempotent release fallback shared by every clone of one [`RsWorkingSet`] value; runs `release_working_set`/`retire_idle` exactly once, via this type's `Drop`.
 #[derive(Debug)]
 struct RsLifecycle {
     released: AtomicBool,
@@ -31,25 +27,21 @@ impl RsLifecycle {
 }
 
 impl Drop for RsLifecycle {
-    /// The process-teardown fallback: runs only when the last `Arc` clone drops. No-ops if [`RsWorkingSet::release`] already ran.
     fn drop(&mut self) {
         self.release();
     }
 }
 
-/// Host resource state behind the `pie:inferlet/working-set.rs-working-set` WIT resource. `Clone`, not `Copy`; every clone shares one lifecycle.
 #[derive(Debug, Clone)]
 pub struct RsWorkingSet {
     pub model: usize,
     pub engine: EngineId,
     pub id: RsWorkingSetId,
-    /// Model RS geometry (cached from model caps at construction).
     pub geom: RsGeometry,
     lifecycle: Arc<RsLifecycle>,
 }
 
 impl RsWorkingSet {
-    /// A fresh handle for a newly minted working-set `id` (a `create`/`fork` result — never an already-live id).
     pub fn new(model: usize, engine: EngineId, id: RsWorkingSetId, geom: RsGeometry) -> Self {
         RsWorkingSet {
             model,
@@ -66,7 +58,6 @@ impl RsWorkingSet {
         }
     }
 
-    /// Explicit release (the WIT `drop` path): runs now and marks it done, so every clone's eventual `Arc` drop is a no-op.
     pub fn release(&self) {
         self.lifecycle.release();
     }
@@ -91,8 +82,6 @@ impl RsWorkingSet {
         }
     }
 
-    /// Whether [`Self::release`] (or the `Drop` fallback) has already run.
-    /// Test/diagnostic use.
     #[cfg(test)]
     pub fn is_released(&self) -> bool {
         self.lifecycle.released.load(Ordering::Acquire)
@@ -112,15 +101,10 @@ mod tests {
         }
     }
 
-    /// A fresh single-engine model registration with a `capacity`-slot RS
-    /// pool, isolated from every other test (`register_model` mints a new
-    /// model index each call).
     fn fresh_model(capacity: usize) -> usize {
         registry::register_model(16, &[0], &[capacity])
     }
 
-    /// Prepare + publish a fresh folded-state write (mirrors
-    /// `store::rs::tests::write_state`): consumes exactly one RS pool slot.
     fn commit_state_write(model: usize, id: RsWorkingSetId, _epoch: u64) {
         let stores = registry::get(model, 0);
         let mut rs = stores.rs.lock().unwrap();

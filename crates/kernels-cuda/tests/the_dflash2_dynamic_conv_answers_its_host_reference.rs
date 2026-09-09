@@ -1,22 +1,3 @@
-//! **DFlash2's two-tap grouped dynamic convolution**, held against a host
-//! transcription of the reference's rule
-//! (`mlx_dspark.dflash_model.DFlashGroupedConv._convolve`):
-//!
-//! ```text
-//! coeff[i, t, c] = base[side, t, c] + delta[i, t, g(c)]
-//! y[i, c]        = Σ_t coeff[i, t, c] · x[i − t, c],   x[i − t] = 0 for i < t
-//! ```
-//!
-//! within each request's own span of rows — a request's first row has no
-//! in-block predecessor, so its taps past zero read nothing. Both sides of
-//! the projection are checked (`side` 0 convolves a sublayer's input, 1 its
-//! output), over three requests of different lengths including a one-row
-//! span, which is the case where every tap but the zeroth is dead.
-//!
-//! ```text
-//! cargo test -p kernels-cuda --features cuda --test the_dflash2_dynamic_conv_answers_its_host_reference
-//! ```
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -28,8 +9,6 @@ use kernels_cuda::tensor::{RaggedTensor, Tensor};
 
 #[test]
 fn the_dynamic_conv_mixes_each_row_with_the_one_before_it() {
-    // Three requests: spans of 5, 1 and 3 rows. The one-row span is the
-    // anchor-only case; the others exercise the in-span walk.
     let indptr: [i32; 4] = [0, 5, 6, 9];
     let rows = 9usize;
     let channels = 128usize;

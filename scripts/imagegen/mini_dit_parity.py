@@ -64,15 +64,7 @@ DEFAULT_SKU = "mini-dit-bf16-kv-bf16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# The bf16 drift the reference measured on these inputs (README §3): worst
-# max-abs 0.088, worst relative 9.7e-3, worst cosine 0.99995.  A pie-side bf16
-# run is a different bf16 run, so the gate is the same order and no tighter.
 TOLERANCES = ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"]
-
-
-# ----------------------------------------------------------------------------
-# patchify / unpatchify -- the reference's exact index algebra, in numpy
-# ----------------------------------------------------------------------------
 
 def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     """[B,C,H,W] -> [B, (H/p)*(W/p), C*p*p], feature order (c, ph, pw)."""
@@ -81,17 +73,11 @@ def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     x = x.transpose(0, 2, 4, 1, 3, 5)
     return np.ascontiguousarray(x.reshape(b, (hs // p) * (ws // p), c * p * p))
 
-
 def unpatchify(tokens: np.ndarray, c: int, hs: int, ws: int, p: int) -> np.ndarray:
     b = tokens.shape[0]
     x = tokens.reshape(b, hs // p, ws // p, c, p, p)
     x = x.transpose(0, 3, 1, 4, 2, 5)
     return np.ascontiguousarray(x.reshape(b, c, hs, ws))
-
-
-# ----------------------------------------------------------------------------
-# the case
-# ----------------------------------------------------------------------------
 
 def numbered(out: str, stem: str, euler: bool) -> list[str]:
     """`<out>/<stem>[_euler]_<b>.json` for every batch element `b`, in order.
@@ -108,11 +94,9 @@ def numbered(out: str, stem: str, euler: bool) -> list[str]:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
 
-
 def config(golden: str) -> dict:
     with open(os.path.join(golden, "config.json")) as f:
         return json.load(f)
-
 
 def cases(args) -> list[str]:
     """Write one `case_{b}.json` per batch element; answer their paths."""
@@ -126,8 +110,6 @@ def cases(args) -> list[str]:
     timestep = dump["in.timestep"]
     txt_pos = dump["in.txt_pos"]
     img_pos = dump["in.img_pos"]
-    # The reference dumps `patches` already; recomputing it from `in.latent`
-    # is what proves this file's index algebra is the reference's.
     patches = patchify(dump["in.latent"], p)
     assert np.array_equal(patches, dump["patches"]), "patchify disagrees with the reference"
 
@@ -166,11 +148,6 @@ def cases(args) -> list[str]:
     print(f"[case] {len(written)} batch element(s), {latents.shape[1]} image rows -> {args.out}")
     return written
 
-
-# ----------------------------------------------------------------------------
-# run
-# ----------------------------------------------------------------------------
-
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first.
 
@@ -200,7 +177,6 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
-
 def run(args) -> None:
     paths = numbered(args.out, "case", args.euler)
     if not paths:
@@ -213,11 +189,6 @@ def run(args) -> None:
         )
     binary = wasm(args.inferlet)
     manifest = os.path.join(args.inferlet, "Pie.toml")
-    # `pie run` takes no `--model`: the row it serves comes from the config,
-    # which has to point `[model] model` at the artifact this row imported
-    # (`pie model import ... --sku mini-dit-bf16-kv-bf16`). The sandbox needs
-    # `allow_fs` and a scratch dir holding the case files, since a case is
-    # far past one command-line argument.
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{'_euler' if args.euler else ''}_{b}.json")
         cmd = [pie]
@@ -225,12 +196,8 @@ def run(args) -> None:
             cmd += ["--config", args.config]
         cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
         if args.case_file:
-            # the case as a file under the sandbox's per-process scratch dir
-            # (needs `[sandbox] allow_fs` and the file placed there by hand)
             cmd += ["--case_file", os.path.basename(case)]
         else:
-            # the case as eight argv pieces (`case_0..7`), each well under the
-            # kernel's 128 KiB single-argument ceiling; no sandbox fs needed
             text = open(case).read()
             n = 8
             step = -(-len(text) // n)
@@ -255,11 +222,6 @@ def run(args) -> None:
             f.write(done.stderr)
         print(f"[run] batch {b} -> {out}")
 
-
-# ----------------------------------------------------------------------------
-# collect
-# ----------------------------------------------------------------------------
-
 def document(path: str) -> dict:
     """`pie run` prints a human header before the document; take the JSON."""
     lines = [line for line in open(path).read().splitlines() if line.startswith("{")]
@@ -271,7 +233,6 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
-
 
 def guidance(args) -> int:
     """CLASSIFIER-FREE GUIDANCE, ON THE DEVICE — does it run, and is it right?
@@ -328,7 +289,6 @@ def guidance(args) -> int:
             bad += 1
             continue
 
-        # 1. The peer bind points at the OTHER group's rows.
         if np.array_equal(g0, unc):
             print(f"[guidance] batch {at}: PASS s=0 the combine is the unconditional "
                   f"branch, exactly — the peer is the other group")
@@ -338,7 +298,6 @@ def guidance(args) -> int:
                   f"unconditional branch of its OWN fire by rel {off:.3g}")
             bad += 1
 
-        # 2. Guidance actually moves the answer.
         spread = float(np.linalg.norm(g1 - g0)) / max(float(np.linalg.norm(g0)), 1e-30)
         if spread > 1e-3:
             print(f"[guidance] batch {at}: PASS guidance moves the velocity by rel "
@@ -349,7 +308,6 @@ def guidance(args) -> int:
                   f"here holds trivially")
             bad += 1
 
-        # 3. The combine is affine in s.
         want = 2.0 * g1 - g0
         off = float(np.linalg.norm(g2 - want)) / max(float(np.linalg.norm(want)), 1e-30)
         if off < 1e-5:
@@ -359,7 +317,6 @@ def guidance(args) -> int:
             print(f"[guidance] batch {at}: FAIL s=2 is not 2*s1 - s0: rel {off:.3g}")
             bad += 1
     return 1 if bad else 0
-
 
 def collect(args) -> str:
     cfg = config(args.golden)
@@ -389,16 +346,11 @@ def collect(args) -> str:
             out[f"euler.x{i + 1}"] = stack("euler_x", i)
         out["euler.latent"] = out[f"euler.x{steps}"]
     elif args.tap:
-        # The tapped intermediate rides in the velocity's place at its own
-        # `[rows, width]`; no unpatchify — the golden's key is `[B, rows, width]`
-        # (a trunk tensor) or `[B, width]` (a lane vector, rows == 1).
         planes = [np.asarray(doc["velocity"], dtype=np.float32) for doc in docs]
         tw = docs[0].get("velocity_width", width)
         out[args.tap] = np.stack([plane.reshape(-1, tw) for plane in planes]).squeeze()
     else:
         out["velocity"] = stack("velocity")
-        # The head's own rectangle too, so a mismatch says whether it is the
-        # arithmetic or the unpatchify.
         out["final.tokens"] = np.stack(
             [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
         )
@@ -407,11 +359,6 @@ def collect(args) -> str:
     np.savez(path, **out)
     print(f"[collect] {len(out)} tensors from {len(docs)} batch element(s) -> {path}")
     return path
-
-
-# ----------------------------------------------------------------------------
-# compare
-# ----------------------------------------------------------------------------
 
 def compare(args) -> int:
     mine = os.path.join(args.out, f"mini_dit_pie{'_euler' if args.euler else ''}.npz")
@@ -432,7 +379,6 @@ def compare(args) -> int:
         cmd += ["--keys", args.tap]
     print(f"[compare] {' '.join(cmd)}")
     return subprocess.call(cmd)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -476,7 +422,6 @@ def main() -> int:
         collect(args)
         return compare(args)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1,57 +1,3 @@
-//! **THE WAN 2.2 VAE DECODER, LOADED OUT OF THE SERVING ARTIFACT, TURNS A
-//! `T x 30 x 52` DiT-SPACE LATENT INTO THE
-//! REFERENCE'S `(4T - 3) x 480 x 832` PIXELS — ONE FIRE PER LATENT FRAME,
-//! DOWN ONE SLOT, THE HEAD ARM FIRST.** (design D8/D11, milestone M3)
-//!
-//! ```text
-//! CUDA_VISIBLE_DEVICES=<n> cargo test -p engine-cuda --features cuda \
-//!   --test the_wan_2_vae_answers_the_reference -- --nocapture
-//! ```
-//!
-//! The golden is `scripts/imagegen/wan22_golden.py --vae`: the fp32
-//! `AutoencoderKLWan` over `latent.final` of the full 480x832x17 run —
-//! `latent.f32` (`[T*30*52, 48]`, the DENOISER's space), `denorm.f32` (the
-//! same times `latents_std` plus `latents_mean`, which is what the
-//! reference hands its decoder) and `pixels.f32` (`[(4T-3)*480*832, 3]` in
-//! `[-1, 1]`), rows of voxels in `(t, h, w)` order under
-//! `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_vae/`. The weights come out of
-//! `$PIE_IMAGEGEN_ARTIFACTS/wan22-ti2v-5b.zt` — the artifact serving
-//! reads — through `own_contract` over the VAE plan's params alone, so the
-//! load is the decoder's ~1.4 GB and not the row's 22.5. It is the artifact
-//! and not the snapshot on purpose: the denormalisation rows this arm
-//! carries are STATED (a `Concat` of filled cells) and materialize on the
-//! host at `pie model import`; a CUDA serving plan cannot lower one.
-//!
-//! **WHAT IS CLAIMED, AND WHAT IS NOT.**
-//!
-//! 1. *The chunked decode is the reference's decode.* Latent frame 0 goes
-//!    through `vae.decode.head` and lands ONE output frame; every later
-//!    frame goes through `vae.decode` and lands FOUR; the two arms share
-//!    one slot so each causal conv's `CacheRow::State` slab carries its
-//!    last frames forward, which is what `feat_cache` does on the other
-//!    side. Gate: `cos >= 0.999`, `mean |err| <= 0.02` over the whole clip,
-//!    and the SAME gate per chunk, so a fire that read a stale cache says
-//!    which one it was. MEASURED, 5 latent frames of 30x52 into 17 frames
-//!    of 480x832: cos 0.999986, mean |err| 0.00244, max |err| 0.256, with
-//!    every chunk between 0.999984 and 0.999988 — full pixel parity, mid
-//!    block included (`spatial::attention_over(.., VoxelSegment::Frames(1),
-//!    ..)`), not a decoder-minus-attention.
-//! 2. *The frame caches MATTER.* The later-frames arm is fired a second
-//!    time on a FRESH slot — the same latent frame, the same everything,
-//!    but with every slab zeroed instead of carrying frame `k-1` — and the
-//!    pixels must move by more than the gate's tolerance. If they do not,
-//!    the state rows are not reaching the convolutions and a green cosine
-//!    would be measuring a cacheless decoder that happens to be close.
-//!    MEASURED: cos 0.9807, mean |err| 0.1250 — fifty times the gate.
-//! 3. *The head arm is not the later arm.* Firing the LATER arm on frame 0
-//!    lands four frames, not one; that is not a parity claim, it is the
-//!    claim that the two arms are actually two arms.
-//!
-//! Nothing here claims the ENCODER — that is
-//! `the_wan_2_vae_encodes_the_reference`, its own gate over its own arms —
-//! or a T > 5 clip (the golden's own length). Skipped by name without a
-//! device, the artifact or the golden.
-
 #![cfg(feature = "cuda")]
 
 use std::path::PathBuf;
@@ -67,9 +13,6 @@ use model_dsl::{
 use models::wan_2::forward::Facts;
 use models::wan_2::model::Model;
 
-/// The two VAE arms as a plan of their own: the reading bits still select
-/// between them, so the trace keeps the family's own split and the state
-/// slabs are the family's own `caches()`.
 struct VaeOnly {
     model: Model,
 }
@@ -99,8 +42,6 @@ impl ForwardHybrid for VaeOnly {
         let head = codes.vae_decode_head.expect("the head arm's code");
         let rest = codes.vae_decode.expect("the later-frames arm's code");
         let _ = models::wan_2::forward::vae_decode(&arms[usize::from(head)], vae, true);
-        // A hybrid plan answers one value; the arms plant their own seams
-        // and this is only what the trace hands back.
         models::wan_2::forward::vae_decode(&arms[usize::from(rest)], vae, false)
     }
 }
@@ -165,7 +106,6 @@ fn score(got: &[f32], want: &[f32]) -> Score {
     }
 }
 
-/// The box `shapes.json` states for one plane.
 fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     let at = &shapes[key];
     let get = |name: &str| at[name].as_u64().expect("a box extent") as u32;
@@ -175,7 +115,6 @@ fn boxed(shapes: &serde_json::Value, key: &str) -> ([u32; 3], usize) {
     )
 }
 
-/// The word one lane of `reading` on the video stream carries.
 fn word(reading: u8) -> u64 {
     Facts::of(
         &Request::new(1, false)
@@ -185,7 +124,6 @@ fn word(reading: u8) -> u64 {
     .word()
 }
 
-/// The loaded decoder, held across the fires that share its caches.
 struct Decoder {
     shell: Shell,
     head: u8,
@@ -193,7 +131,6 @@ struct Decoder {
 }
 
 impl Decoder {
-    /// One latent frame in, its pixels and their box out.
     fn frame(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
         let reading = if first { self.head } else { self.rest };
         let tokens = [0u32];
@@ -218,8 +155,6 @@ impl Decoder {
         (values, boxes[0])
     }
 
-    /// Zero every frame cache: `Shell::open` is what clears a slot's state
-    /// rows, and it is what starts a clip.
     fn rewind(&mut self) {
         self.shell.open(0).expect("slot 0 opens");
     }
@@ -234,16 +169,6 @@ fn load(artifact: &PathBuf, max_voxels: u32) -> (Decoder, f64) {
     );
     let arm = VaeOnly { model };
     let trace = trace_hybrid("wan22-vae-decode", &arm, Platform::Cuda);
-    // **THE ARTIFACT, NOT THE SNAPSHOT.** This row's `vae.denorm_scale` /
-    // `vae.denorm_bias` are STATED rows — a config vector reaches a plan as
-    // 48 filled cells concatenated — and a `Concat` over computed buffers
-    // lowers to a `Reblock` tile map, which a CUDA serving plan does not
-    // carry (`checkpoint::plan::passes::tile::CUDA_TILE_MAP_MASK`). Those
-    // rows are materialized once, on the host, by `pie model import`; what
-    // serving reads is the `.zt`'s own plane of that name, which is exactly
-    // what `own_contract` asks for. So this gate loads what serving loads,
-    // and takes the VAE's planes out of it by naming only the VAE plan's
-    // params.
     let src = ztensor::Source::open(artifact)
         .unwrap_or_else(|why| panic!("{}: {why}", artifact.display()));
     let contract = checkpoint_dsl::own_contract(&src, &trace.params, 1, Platform::Cuda)
@@ -320,13 +245,9 @@ fn the_decoder_answers_the_reference_frame_by_frame() {
     assert_eq!(latent.len(), plane * t_lat as usize * latent_c);
     assert_eq!(pixels.len(), out_plane * frames as usize * pixel_c);
 
-    // The ladder is the INPUT clip's ceiling, not the output's: the
-    // compiler walks each `Spatial` op's grid rule to size the values a
-    // decode grows into. One latent frame is `hl * wl` voxels.
     let (mut vae, load_s) = load(&root, plane as u32 + 8);
     eprintln!("wan vae: load {load_s:.1} s, {t_lat} latent frames of {hl}x{wl}");
 
-    // ---- the clip, fire by fire ------------------------------------------
     let mut got: Vec<f32> = Vec::with_capacity(pixels.len());
     let mut per_chunk: Vec<(u32, Score)> = Vec::new();
     let mut at = 0usize;
@@ -383,10 +304,6 @@ fn the_decoder_answers_the_reference_frame_by_frame() {
         whole.mean_abs
     );
 
-    // ---- claim 2: the frame caches matter --------------------------------
-    // The same later-frames arm on the same latent frame, but from a slot
-    // whose slabs were just zeroed. If that lands the same pixels, the
-    // state rows are not reaching the convolutions.
     assert!(t_lat >= 2, "the caches can only be claimed past frame 0");
     let k = (t_lat - 1) as usize;
     let rows = &latent[k * plane * latent_c..(k + 1) * plane * latent_c];
@@ -407,7 +324,6 @@ fn the_decoder_answers_the_reference_frame_by_frame() {
         cacheless.mean_abs
     );
 
-    // ---- claim 3: the two arms are two arms ------------------------------
     vae.rewind();
     let (_, later_on_zero) = vae.frame(false, [1, hl, wl], &latent[..plane * latent_c]);
     assert_eq!(

@@ -1,8 +1,3 @@
-//! `layout::embed_scale_add_select` (the per-layer embed fold whose residual
-//! is a layer's slice of a stacked table, the `select` folded away) lands
-//! every plane `layout::select` followed by `layout::embed_scale_add` lands,
-//! bit for bit, with and without a staged window.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -38,7 +33,6 @@ fn check(window: Option<(u32, u32, u32)>) {
     let stacked = Tensor::new(stacked_at, rows, (layers * hidden) as u32, Dtype::Bf16);
     let ids_t = Tensor::new(ids_at, rows, 1, Dtype::I32);
 
-    // The pair: select, then the fold in place on the copy.
     let sel_at = gpu.up(&fill);
     let (e1, es1, ys1) = (gpu.up(&fill), gpu.up(&fill), gpu.up(&fill));
     layout::select(&ctx, stacked, layer, hidden as u32, &mut plane(sel_at)).expect("select fires");
@@ -56,7 +50,6 @@ fn check(window: Option<(u32, u32, u32)>) {
     )
     .expect("the fold fires");
 
-    // The one launch.
     let (e2, es2, y2, ys2) = (gpu.up(&fill), gpu.up(&fill), gpu.up(&fill), gpu.up(&fill));
     layout::embed_scale_add_select(
         &ctx,
@@ -91,12 +84,16 @@ fn check(window: Option<(u32, u32, u32)>) {
     }
 }
 
+fn the_select_folded_embed_lands_the_pair_every_case() {
+    the_folded_launch_lands_the_pair();
+    the_folded_launch_lands_the_pair_under_a_window();
+}
+
 #[test]
 fn the_folded_launch_lands_the_pair() {
     check(None);
 }
 
-#[test]
 fn the_folded_launch_lands_the_pair_under_a_window() {
     check(Some((8, 5, 2)));
 }

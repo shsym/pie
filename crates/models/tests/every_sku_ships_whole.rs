@@ -1,10 +1,18 @@
-//! Checks every catalog SKU names exactly one import/template/tokenizer
-//! contract, its tp matches its name, and its trace is platform-consistent.
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint_dsl::Error;
+
+fn every_sku_ships_whole_every_case() {
+    a_sku_name_states_the_world_its_row_ships();
+    every_import_row_reads_the_checkpoint_it_is_handed();
+    the_block_drafters_plan_is_whole();
+    the_dflash2_plan_is_whole_and_convolves();
+    the_v1_text_states_a_bidirectional_block_of_sixteen();
+    the_dspark_plan_is_whole_and_walks_a_bigram();
+    gemma_carries_the_block_drafter_too();
+    gpt_oss_carries_the_block_drafter_too();
+}
 
 #[test]
 fn a_sku_name_states_the_world_its_row_ships() {
@@ -30,7 +38,6 @@ fn a_sku_name_states_the_world_its_row_ships() {
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
 }
 
-#[test]
 fn every_import_row_reads_the_checkpoint_it_is_handed() {
     let dir = scratch();
     let path = dir.join("holds-nothing.zt");
@@ -67,8 +74,6 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
                 continue;
             }
         };
-        // A sharded row (tp > 1) refuses at the rank width before it reads
-        // the checkpoint at all, which is a different refusal than this test checks.
         if tp > 1 {
             assert!(
                 refusal.contains("WHOLE checkpoint"),
@@ -117,16 +122,6 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
 
-/// **THE BLOCK DRAFTER'S TEXT TRACES** — the plan `qwen36-27b-dflash` builds
-/// runs the validator in `trace_hybrid`'s `finish`, which is what says the
-/// two-armed shape (a trunk guarded away from the draft rows, a drafter
-/// reading the target's own head) is a plan the compiler will take at all.
-///
-/// It is also the regression for `Guard::common`: the trunk here runs inside
-/// a split arm, and every attention layer inside it MERGES. Without a merge
-/// coming back on the arm its siblings are on, the first `lora_correct` past
-/// it panics as mixed arms, which is exactly how this plan failed before.
-#[test]
 fn the_block_drafters_plan_is_whole() {
     use model_dsl::Platform;
     let row = models::skus()
@@ -146,11 +141,6 @@ fn the_block_drafters_plan_is_whole() {
     }
 }
 
-/// **THE DFLASH2 TEXT TRACES, AND CONVOLVES.** The v2 row builds the same
-/// two-armed plan with the dynamic convolution around every sublayer of the
-/// drafter — four `attention.block_dyn_conv` nodes a block, twenty in all —
-/// and no masked read: every v2 layer is sliding and causal inside the block.
-#[test]
 fn the_dflash2_plan_is_whole_and_convolves() {
     use model_dsl::Platform;
     let row = models::skus()
@@ -177,15 +167,11 @@ fn the_dflash2_plan_is_whole_and_convolves() {
         assert_eq!((topks, walks), (1, 1), "{platform:?}: the selector reads the block out once");
         let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
         assert!(seams.iter().any(|s| s.contains("mtp")), "{platform:?}: no draft seam; {seams:?}");
-        // The facts a guest seeds the block from ride on the trace.
         let facts = trace.drafter.expect("the v2 text states its block drafter");
         assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (8, 248_070, false));
     }
 }
 
-/// **THE V1 TEXT STATES ITS BLOCK TOO**, and says it is bidirectional — its
-/// last layer is full attention over the block, so a guest must bind a mask.
-#[test]
 fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     use model_dsl::Platform;
     let row = models::skus()
@@ -194,23 +180,17 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     let trace = (row.trace)(Platform::Metal);
     let facts = trace.drafter.expect("the v1 text states its block drafter");
     assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (16, 248_070, true));
-    // The A3B mixture carries the same shape with eight taps and its own mask id.
     let a3b = models::skus()
         .find(|row| row.recipe.text == "qwen36-35b-a3b-dflash")
         .expect("this build ships the A3B block-drafter row");
     let facts = (a3b.trace)(Platform::Metal).drafter.expect("the A3B text states its block drafter");
     assert_eq!((facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from), (16, 248_077, true, 1));
-    // And an undrafted text states none.
     let plain = models::skus()
         .find(|row| row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&model_dsl::Dtype::U4g64))
         .expect("the plain row");
     assert!((plain.trace)(Platform::Metal).drafter.is_none());
 }
 
-/// **THE DSPARK TEXT**: v1's backbone with no convolution, a top-k and a
-/// bigram walk for its readout, and a block of fifteen whose every row
-/// proposes — the anchor row included.
-#[test]
 fn the_dspark_plan_is_whole_and_walks_a_bigram() {
     use model_dsl::Platform;
     let row = models::skus()
@@ -237,13 +217,6 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
     );
 }
 
-
-/// **THE SAME FOUR HOOKS IN A SECOND FAMILY.** gemma's text carries z-lab's
-/// head for its mixture: six taps (six `fc` slices into the fusion), the v1
-/// shape's one bidirectional layer (one non-causal masked read), a block of
-/// sixteen whose mask id is 4, and no trunk plan guarded on anything but the
-/// trunk's own rows.
-#[test]
 fn gemma_carries_the_block_drafter_too() {
     use model_dsl::Platform;
     let row = models::skus()
@@ -272,10 +245,6 @@ fn gemma_carries_the_block_drafter_too() {
     assert!((plain.trace)(Platform::Metal).drafter.is_none());
 }
 
-/// **A THIRD FAMILY, AND THE FIRST HEAD OF ANOTHER GEOMETRY.** gpt-oss carries
-/// z-lab's head: eight layers all full attention (eight non-causal reads over
-/// a block of eight), 64 query heads at head dim 64 with biased projections.
-#[test]
 fn gpt_oss_carries_the_block_drafter_too() {
     use model_dsl::Platform;
     let row = models::skus()

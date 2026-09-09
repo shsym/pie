@@ -1,9 +1,3 @@
-//! Per-(model, engine) store registry.
-//!
-//! Maps a model/engine pair to its owning `KvStore` and `RsStore` so `pipeline::fire` and the WIT host resources resolve handles without each component holding a direct store reference. An append-only static keyed by `model_idx` (lock-step with bootstrap model registration), each entry a `Vec` indexed by engine ordinal.
-//!
-//! Locking discipline (required): lock a store synchronously for prepare/publication/settlement and release it before awaiting the engine — never across an `await`.
-
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -11,8 +5,6 @@ use super::kv::KvStore;
 use super::rs::RsStore;
 use super::seat::SeatBook;
 
-/// parking_lot mutexes do not poison, so this taint flag restores fail-loud on a panic mid-mutation: set on unwind inside [`with_kv_lock`], asserted on every entry.
-/// Process-global, not per-store: one panic taints every `(model, engine)` store in the process. Acceptable while deployment is one store.
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct KvTaintOnPanic;
@@ -43,25 +35,16 @@ pub fn with_kv_lock<T>(
     result
 }
 
-/// The typed stores for one (model, engine).
 #[derive(Clone)]
 pub struct Stores {
-    // parking_lot: adaptive spinning beats the futex round trip under the contended herd (every guest's finalize/prepare takes this lock).
     pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
-    /// Which pool slot each working set's sequences sit in — the seat `Lane::slot` states to the shell. Sized by the same `num_slots` as `RsStore`: both are "how many sequences the pools seat at once".
     pub seats: Arc<Mutex<SeatBook>>,
-    /// Woken when a working set gives its seats back, so a fire parked on a
-    /// full seat book re-asks instead of failing (`fire::seat_lane_slots`).
     pub seats_freed: Arc<tokio::sync::Notify>,
-    /// Tokens per KV page for this model/engine.
     pub kv_page_size: u32,
-    /// The most KV pages one sequence may hold — `max_context` rounded up
-    /// to whole pages. Zero states no ceiling.
     pub context_pages: u64,
 }
 
-/// `max_context` tokens as whole KV pages; zero (no ceiling) stays zero.
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
     (max_context as u64).div_ceil(u64::from(kv_page_size.max(1)))
 }
@@ -69,8 +52,6 @@ fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
 static REGISTRY: LazyLock<boxcar::Vec<RwLock<Vec<Option<Stores>>>>> =
     LazyLock::new(boxcar::Vec::new);
 
-/// Test convenience: register a model with no host swap pages. Production
-/// bootstrap always sizes swap explicitly via [`register_model_with_swap`].
 #[cfg(test)]
 pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[usize]) -> usize {
     register_model_with_swap(
@@ -82,12 +63,6 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
     )
 }
 
-/// Register a model's per-engine stores at bootstrap. Capacities come from the engine-preallocated static pools. Returns the assigned model index.
-///
-/// `num_slots` (the engine's `PoolFacts::state_slots`) sizes both the recurrent-state pool and the [`SeatBook`], since a sequence's recurrent bank row and its seat are the same seat.
-///
-/// `max_context` (the engine's `FireLimits::max_context`, in tokens) is the
-/// ceiling one sequence may grow to; zero states none.
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
@@ -177,8 +152,6 @@ pub fn unregister_engine(model_idx: usize, engine_idx: usize) -> anyhow::Result<
     Ok(())
 }
 
-/// The stores for `(model_idx, engine_idx)`; cheap `Arc` clones. Panics if
-/// never registered — a bootstrap wiring bug, not a runtime condition.
 pub fn get(model_idx: usize, engine_idx: usize) -> Stores {
     try_get(model_idx, engine_idx).unwrap_or_else(|| {
         panic!("store registry: no stores for model {model_idx} engine {engine_idx}")
@@ -206,6 +179,11 @@ pub fn all_for_model(model_idx: usize) -> Vec<Stores> {
 mod tests {
     use super::*;
 
+    fn registry_every_case() {
+        dynamic_store_slots_unregister_without_reusing_engine_ids();
+        dynamic_store_slots_allow_global_engine_id_gaps();
+    }
+
     #[test]
     fn dynamic_store_slots_unregister_without_reusing_engine_ids() {
         let model = register_model(16, &[8], &[0]);
@@ -217,7 +195,6 @@ mod tests {
         assert!(try_get(model, 2).is_some());
     }
 
-    #[test]
     fn dynamic_store_slots_allow_global_engine_id_gaps() {
         let model = register_model(16, &[8], &[0]);
         register_engine_with_swap(model, 4, 16, 40, 4, 0, 0, 0).unwrap();

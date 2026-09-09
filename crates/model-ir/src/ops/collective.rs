@@ -3,19 +3,16 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// Crosses devices — the SPMD tensor-parallel collectives.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Collective {
     AllReduce {
         buf: ValueId,
         buf_out: ValueId,
     },
-    /// Concatenates each rank's shard into the full tensor on every rank.
     AllGather {
         x: ValueId,
         y: ValueId,
     },
-    /// Sums across ranks, leaving each rank its shard of the result.
     ReduceScatter {
         x: ValueId,
         y: ValueId,

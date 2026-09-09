@@ -1,5 +1,3 @@
-//! Per-SKU tokenizer contract table: concatenates each family's table and answers a SKU lookup.
-
 pub use ::tokenizer::contract::{Contract, Fault};
 
 pub type ContractRow = (&'static str, &'static Contract);

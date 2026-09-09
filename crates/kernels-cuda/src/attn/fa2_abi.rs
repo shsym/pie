@@ -1,14 +1,7 @@
-//! The by-value parameter blocks the fa2 kernels take, `#[repr(C)]` against
-//! the layouts `attn/attention.cuh` declares, and the packers that fill them from
-//! a plan + a buffer set. Device pointers travel as the `u64` the handles
-//! carry ([`DevicePtr`]); the whole struct crosses the launch as one
-//! `ArgValue::Bytes` argument.
-
 use crate::attn::plan::{DecodePlan, PrefillPlan};
 
 pub type DevicePtr = u64;
 
-/// `::flashinfer::uint_fastdiv`: 24 bytes / align 8. The C++ fields sit at bytes 0 (divisor, u32), 8 (magic, u64), 16 (divisor again, u32); encoding as three u64 words `[d, magic, d]` lands each in place and zeros the padding holes a field-struct spelling would leave undefined.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct UintFastdiv {
@@ -79,7 +72,6 @@ pub struct DecodeParams {
     pub kv_chunk_size_ptr: DevicePtr,
     pub block_valid_mask: DevicePtr,
     pub partition_kv: bool,
-    /// The decode side's row indirection — `[lanes + 1]` query boundaries. `decode.cuh` reads `q + q_indptr[batch_idx] * q_stride_n` rather than `q + batch_idx * q_stride_n`, which differs whenever `batch_idx` is a fire lane and the rows it names are the plane's.
     pub q_indptr: DevicePtr,
 }
 
@@ -127,10 +119,6 @@ pub struct PrefillPagedParams {
     pub maybe_max_item_len_ptr: DevicePtr,
 }
 
-/// `::flashinfer::BatchPrefillRaggedParams<bf16, bf16, bf16, i32>`, the
-/// unpaged prefill's block: k and v are row-major rectangles walked through
-/// `kv_indptr` instead of a `paged_kv_t`. 312 bytes, align 8, pinned by the
-/// `static_assert` beside `RaggedParams` in `attn/attention.cuh`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillRaggedParams {
@@ -192,9 +180,6 @@ const _: () = assert!(
     "PrefillRaggedParams: alignof disagrees with ::flashinfer::BatchPrefillRaggedParams",
 );
 
-/// `::pie::attn::fa2::RaggedRefParams`: the ragged block with the
-/// per-group `ref_start` table (`i32`, `[groups]`) appended — 320 bytes,
-/// pinned beside the block's own assertion in `attn/attention.cuh`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillRaggedRefParams {
@@ -207,10 +192,6 @@ const _: () = assert!(
     "PrefillRaggedRefParams: sizeof disagrees with ::pie::attn::fa2::RaggedRefParams",
 );
 
-/// `::pie::attn::fa2::RaggedTagParams`: the ragged block with the two
-/// reference tag tables (`i32`, indexed by fire-absolute packed row on the
-/// query and the key side) appended — 328 bytes, pinned beside the block's
-/// own assertion in `attn/attention.cuh`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillRaggedTagParams {
@@ -224,11 +205,6 @@ const _: () = assert!(
     "PrefillRaggedTagParams: sizeof disagrees with ::pie::attn::fa2::RaggedTagParams",
 );
 
-/// `::pie::attn::fa2::RaggedBiasParams`: the ragged block with the
-/// relative-position bias table (`f32`, `[num_qo_heads, 2·max_len − 1]`)
-/// and its `max_len` appended — 328 bytes (the `u32` pads to the block's
-/// 8-byte alignment), pinned beside the block's own assertion in
-/// `attn/attention.cuh`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillRaggedBiasParams {
@@ -242,10 +218,6 @@ const _: () = assert!(
     "PrefillRaggedBiasParams: sizeof disagrees with ::pie::attn::fa2::RaggedBiasParams",
 );
 
-/// `RelBiasParams<DecodeParams>` (`attn/attention.cuh`): the base block, then
-/// the learned relative-bias table and its extents. Both bases end on a
-/// pointer, so the derived fields start at `size_of::<Base>()` here as they
-/// do there (no tail padding for the Itanium ABI to reuse).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct DecodeRelParams {
@@ -257,7 +229,6 @@ pub struct DecodeRelParams {
     pub log_alpha: f32,
 }
 
-/// `RelBiasParams<PrefillParams>`, see [`DecodeRelParams`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct PrefillRelParams {
@@ -275,8 +246,6 @@ const _: () = assert!(
     "a params base must end on its alignment for the derived block to start where C++ puts it",
 );
 
-/// Every device address a decode or prefill fire touches, gathered by the
-/// entry from `q`/`o`/the pool row/the plan's workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Buffers {
     pub q: DevicePtr,
@@ -292,8 +261,6 @@ pub struct Buffers {
     pub float_buffer: DevicePtr,
 }
 
-/// What the cascade merge needs when the schedule split kv: the partial
-/// planes the attention wrote and the final planes they fold into.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Partials {
     pub tmp_v: DevicePtr,
@@ -307,7 +274,6 @@ pub struct Partials {
     pub head_dim: u32,
 }
 
-/// A workspace seat as the params spell it: base plus the laid offset. A `None` seat resolves to the base and is guarded off by the schedule's flags before the device ever dereferences it.
 pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
     match off {
         Some(off) => base.saturating_add(off as u64),
@@ -324,9 +290,6 @@ pub fn sm_scale_or_default(sm_scale: f32, head_dim: u32) -> f32 {
     }
 }
 
-/// The paged-kv view the fa2 kernels take by value.
-///
-/// `batch_size` is the index the protective page bound (`indptr[batch_size]`) is read at: it must be one past the last lane of the vector this launch was handed (`lane_offset + num_requests`). Too small is a silent failure — a legitimate page clamps to offset 0 and the fire reads page zero's bytes.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn make_paged_kv(
@@ -415,7 +378,6 @@ pub fn make_decode_params(
     p.kv_tile_indices = resolve(int_buf, info.kv_tile_indices_offset);
     p.o_indptr = resolve(int_buf, info.o_indptr_offset);
     p.kv_chunk_size_ptr = resolve(int_buf, info.kv_chunk_size_ptr_offset);
-    // never optional: decode.cuh dereferences it for every work item.
     p.q_indptr = bufs.qo_indptr;
     p.padded_batch_size = info.padded_batch_size as u32;
     p.partition_kv = info.split_kv;
@@ -497,8 +459,6 @@ pub fn make_prefill_params(
     p.partition_kv = info.split_kv;
 
     p.max_total_num_rows = info.total_num_rows as u32;
-    // the fold reads *seq_len_ptr in place of the baked max_seq_len when non-null.
-    // not `resolve`: an absent seat must stay null here, not resolve to the workspace base (which would be read as a count).
     p.total_num_rows = match info.total_num_rows_offset {
         Some(off) => int_buf.saturating_add(u64::from(off)),
         None => 0,

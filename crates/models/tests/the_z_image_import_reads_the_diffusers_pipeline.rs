@@ -1,33 +1,3 @@
-//! **THE Z-IMAGE IMPORT READS EVERY `dit.` TENSOR OF THE DIFFUSERS INDEX,
-//! EVERY `te.` TENSOR IT RUNS OVER, EVERY `vae.` TENSOR — AND EVERY PLANE
-//! IT DECLARES TYPES TO THE EXTENTS THE PLAN STATES.**
-//!
-//! ```text
-//! cargo test -p models --test the_z_image_import_reads_the_diffusers_pipeline
-//! ```
-//!
-//! A diffusers pipeline opens as one prefixed name space
-//! (`checkpoint::file::diffusers`): `dit.<transformer>`, `te.<text_encoder>`,
-//! `vae.<vae>`. This test builds the flagship's contract over that name
-//! space and checks it from both ends — what it reads against the index,
-//! and what it declares against the type checker:
-//!
-//! ```text
-//! (a) over a SYNTHETIC source shaped like the snapshot's headers (the 521
-//!     fp32 transformer tensors, the 398 bf16 encoder tensors and the 244
-//!     bf16 VAE tensors, in a sparse file of no bytes): every `dit.` tensor
-//!     is read; every `te.` tensor but the last layer's and the final
-//!     norm's is read; every `vae.` tensor is read; nothing is read twice;
-//!     every declared plane type-checks to its declared extents
-//! (b) the miniature reads its own bare `state_dict` AND the same names
-//!     under `dit.`, to the same checks
-//! (c) over the REAL `Tongyi-MAI/Z-Image-Turbo` snapshot, when the
-//!     HuggingFace cache holds one: the same checks, and the index's own
-//!     name list is exactly what (a) synthesized
-//! ```
-//!
-//! (c) is skipped by name where the 30 GiB snapshot is absent.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -43,11 +13,8 @@ use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
 
-/// One tensor of a checkpoint: its name, its shape, its element.
 type Named = (String, Vec<u64>, Leaf);
 
-/// The transformer's `state_dict`, as `zimage_golden.py --mini` and the
-/// snapshot's index both spell it, at one [`Dims`], one element type.
 fn transformer(d: &Dims, leaf: Leaf) -> Vec<Named> {
     let dim = u64::from(d.dim);
     let hd = u64::from(d.head_dim);
@@ -110,7 +77,6 @@ fn transformer(d: &Dims, leaf: Leaf) -> Vec<Named> {
     out
 }
 
-/// `Qwen3Model`'s `state_dict` (`text_encoder/model.safetensors.index.json`).
 fn text_encoder() -> Vec<Named> {
     let hidden = u64::from(model::TE_HIDDEN);
     let q = u64::from(model::TE_Q_HEADS * model::TE_HEAD_DIM);
@@ -141,8 +107,6 @@ fn text_encoder() -> Vec<Named> {
     out
 }
 
-/// `AutoencoderKL`'s `state_dict` (`vae/diffusion_pytorch_model.safetensors`,
-/// 244 bf16 tensors), spelled from `vae/config.json`'s numbers.
 fn vae() -> Vec<Named> {
     let channels: [u64; 4] = [128, 256, 512, 512];
     let mut out: Vec<Named> = Vec::new();
@@ -173,8 +137,6 @@ fn vae() -> Vec<Named> {
         }
         resnet(push, &format!("{stem}.resnets.1"), c, c);
     }
-    // The decoder: 16 -> 512, mid, four up blocks of three resnets down
-    // the reversed channel list (an upsampler on all but the last), out.
     conv(&mut push, "decoder.conv_in", 512, 16, 3);
     mid(&mut push, "decoder.mid_block", 512);
     let mut c_prev = 512;
@@ -200,8 +162,6 @@ fn vae() -> Vec<Named> {
     }
     norm(&mut push, "decoder.conv_norm_out", 128);
     conv(&mut push, "decoder.conv_out", 3, 128, 3);
-    // The encoder: 3 -> 128, four down blocks of two resnets up the channel
-    // list (a downsampler on all but the last), mid, out to [mean | logvar].
     conv(&mut push, "encoder.conv_in", 128, 3, 3);
     let mut c_prev = 128;
     for (i, &c) in channels.iter().enumerate() {
@@ -245,9 +205,6 @@ fn bytes_of(leaf: Leaf) -> u64 {
     }
 }
 
-/// A source of these names and shapes over a sparse file holding no bytes:
-/// enough for a contract to build and type-check, which never reads a
-/// value.
 fn synthetic(dir: &Path, tensors: &[Named]) -> ztensor::Source {
     let path = dir.join("synthetic.bin");
     let mut catalog = Catalog::new();
@@ -289,7 +246,6 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// The checkpoint's types, for the contract type checker.
 struct Types<'a>(&'a ztensor::Source);
 
 impl CheckpointTypes for Types<'_> {
@@ -303,7 +259,6 @@ impl CheckpointTypes for Types<'_> {
     }
 }
 
-/// How many times each checkpoint tensor is named by the contract.
 fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for tensor in &contract.tensors {
@@ -314,8 +269,6 @@ fn reads(contract: &ModelContract) -> BTreeMap<String, usize> {
     counts
 }
 
-/// Every declared plane, in contract order, types to the extents it
-/// declares — `Out` references resolving against what came before.
 fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     let types = Types(src);
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
@@ -337,9 +290,6 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
         );
         resolver.publish(&tensor.name, ty);
     }
-    // And the storage compiler lowers it: the derived planes are kernels
-    // (`Bias`) over fills, which the byte-run compiler cannot take and the
-    // plan builder must.
     let metadata = checkpoint::file::zt::describe(src)
         .unwrap_or_else(|why| panic!("the source does not describe: {why}"));
     let plan = checkpoint::plan::compile(&metadata, contract, StorageTarget::default())
@@ -347,7 +297,6 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     assert!(!plan.instrs.is_empty());
 }
 
-/// The flagship's contract over `src`, checked from both ends.
 fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
     let row = models::sku(TURBO).expect("the catalog ships the flagship");
     let contract = row
@@ -355,8 +304,6 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
         .unwrap_or_else(|why| panic!("the flagship does not read this checkpoint: {why}"));
     let counts = reads(&contract);
 
-    // Every `dit.` tensor of the index is read; nothing under `dit.` is
-    // read that the index does not hold.
     let dit_index: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("dit.")).collect();
     let dit_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("dit.")).collect();
     let unread: Vec<&&String> = dit_index.difference(&dit_read).collect();
@@ -370,8 +317,6 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
         "`dit.` names read that the index lacks: {phantom:?}"
     );
 
-    // The encoder: every layer this plan runs, and the embedding; not the
-    // last layer, not the final norm, no head.
     let te_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("te.")).collect();
     let skipped_layer = format!("te.model.layers.{}.", model::TE_DEPTH - 1);
     let te_want: BTreeSet<&String> = index
@@ -385,7 +330,6 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
     );
     assert_eq!(te_want.len(), 1 + 11 * model::TE_LAYERS as usize);
 
-    // Every `vae.` tensor of the index is read, and nothing the index lacks.
     let vae_index: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("vae.")).collect();
     let vae_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("vae.")).collect();
     let unread: Vec<&&String> = vae_index.difference(&vae_read).collect();
@@ -400,7 +344,6 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
     );
     assert_eq!(vae_index.len(), 244, "the FLUX VAE is 244 tensors");
 
-    // Exactly once, except the seeds.
     let twice: BTreeSet<String> = counts
         .iter()
         .filter(|(_, count)| **count != 1)
@@ -414,7 +357,6 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
     type_checks(&contract, src);
 }
 
-/// The miniature's contract over `src` (bare names or `dit.`-prefixed).
 fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
     let row = models::sku(MINI).expect("the catalog ships the miniature");
     let contract = row
@@ -439,7 +381,14 @@ fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
     type_checks(&contract, src);
 }
 
-/// (a)
+fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
+    the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot();
+    the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed();
+    neither_row_serves_the_other_rows_checkpoint();
+    the_flagship_reads_the_real_snapshot();
+    the_derived_planes_are_stated_through_internal_steps();
+}
+
 #[test]
 fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
     let dir = scratch();
@@ -456,8 +405,6 @@ fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// (b)
-#[test]
 fn the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed() {
     for prefix in ["", "dit."] {
         let dir = scratch();
@@ -470,12 +417,6 @@ fn the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed() {
     }
 }
 
-/// A raw checkpoint is read by name and typed by shape: the miniature's
-/// contract BUILDS over the flagship's transformer (every name it wants is
-/// there) and fails the type check at the first bank of another width, which
-/// is why the flagship sits above it in the catalog; the flagship over the
-/// bare miniature refuses at build, having no encoder to read.
-#[test]
 fn neither_row_serves_the_other_rows_checkpoint() {
     let dir = scratch();
     let turbo = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
@@ -514,8 +455,6 @@ fn neither_row_serves_the_other_rows_checkpoint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The repo directory in the HuggingFace cache, honoring the same
-/// precedence `huggingface_hub` uses.
 fn hub() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -535,8 +474,6 @@ fn snapshot() -> Option<PathBuf> {
         .find(|path| path.join("model_index.json").is_file())
 }
 
-/// (c)
-#[test]
 fn the_flagship_reads_the_real_snapshot() {
     let Some(root) = snapshot() else {
         eprintln!("skipping: no Tongyi-MAI/Z-Image-Turbo snapshot in the HuggingFace cache");
@@ -546,8 +483,6 @@ fn the_flagship_reads_the_real_snapshot() {
         .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
     let index: BTreeSet<String> = src.names().map(str::to_string).collect();
 
-    // The synthetic index of (a) is the real one, name for name and shape
-    // for shape, so (a) tests what (c) tests.
     let mut synthesized = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
     synthesized.extend(prefixed("te.", text_encoder()));
     synthesized.extend(prefixed("vae.", vae()));
@@ -566,16 +501,11 @@ fn the_flagship_reads_the_real_snapshot() {
 
     check_turbo(&src, &index);
 
-    // The identification sweep lands on the flagship and no earlier row.
     let identified = models::identify(&src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the snapshot identifies as nothing: {why}"));
     assert_eq!(identified, TURBO);
 }
 
-/// The derived planes are stated through internal steps that reach the
-/// checkpoint: a pad bank reads its token by `Src` and its `−1` block by
-/// `Out`; the constant is a fill plus a bias and nothing else.
-#[test]
 fn the_derived_planes_are_stated_through_internal_steps() {
     let dir = scratch();
     let tensors = prefixed("dit.", transformer(&Dims::mini(), Leaf::F32));

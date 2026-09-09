@@ -1,6 +1,3 @@
-//! safetensors projection: strict open, honest caps, and the conversion
-//! path to canonical `.zt`.
-
 use std::fs;
 use std::path::PathBuf;
 use ztensor::{Error, Leaf, Term, Writer};
@@ -9,8 +6,6 @@ fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
-/// Builds a safetensors file. Offsets are assigned in the given tensor
-/// order; `meta` becomes `__metadata__`.
 fn st_bytes(tensors: &[(&str, &str, &[u64], &[u8])], meta: &[(&str, &str)]) -> Vec<u8> {
     let mut entries = Vec::new();
     if !meta.is_empty() {
@@ -50,10 +45,18 @@ fn f32s(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+fn safetensors_every_case() {
+    open_and_read();
+    dtype_projections();
+    unknown_dtype_refused();
+    rejects_bad_geometry();
+    convert_to_canonical_zt();
+}
+
 #[test]
 fn open_and_read() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
-    let b = vec![7u8; 8]; // 4 bf16 elements
+    let b = vec![7u8; 8];
     let path = st_file(
         "basic.safetensors",
         &[
@@ -92,7 +95,6 @@ fn open_and_read() {
     assert!(caps.map);
 }
 
-#[test]
 fn dtype_projections() {
     let path = st_file(
         "dtypes.safetensors",
@@ -111,7 +113,6 @@ fn dtype_projections() {
     assert_eq!(st.tensor("fp4").unwrap().nbytes(), 2);
 }
 
-#[test]
 fn unknown_dtype_refused() {
     let path = st_file("f4.safetensors", &[("t", "F4", &[2], &[0x21])], &[]);
     assert!(matches!(
@@ -120,9 +121,7 @@ fn unknown_dtype_refused() {
     ));
 }
 
-#[test]
 fn rejects_bad_geometry() {
-    // size mismatch: F32 [2,2] needs 16 bytes
     let path = st_file(
         "short.safetensors",
         &[("t", "F32", &[2, 2], &[0u8; 12])],
@@ -130,10 +129,7 @@ fn rejects_bad_geometry() {
     );
     assert!(ztensor_compat::open(&path).is_err());
 
-    // overlap / hole: hand-build offsets that don't tile
     let mut bytes = st_bytes(&[("a", "U8", &[8], &[1u8; 8])], &[]);
-    // corrupt data_offsets [0,8] -> [0,4]: shape mismatch aside, the data
-    // section now has a trailing hole
     let needle = b"[0,8]";
     let pos = bytes.windows(5).position(|w| w == needle).unwrap();
     bytes[pos..pos + 5].copy_from_slice(b"[0,4]");
@@ -141,16 +137,12 @@ fn rejects_bad_geometry() {
     fs::write(&path, &bytes).unwrap();
     assert!(ztensor_compat::open(&path).is_err());
 
-    // truncated header
     let path = st_file("trunc.safetensors", &[("t", "U8", &[4], &[9u8; 4])], &[]);
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..9]).unwrap();
     assert!(ztensor_compat::open(&path).is_err());
 }
 
-/// The conversion path: HF checkpoint in, canonical tier-3 `.zt` out, with
-/// bit-reproducibly.
-#[test]
 fn convert_to_canonical_zt() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
     let b = vec![3u8; 8];
@@ -174,7 +166,6 @@ fn convert_to_canonical_zt() {
     convert(&zt1);
     convert(&zt2);
 
-    // Bit-reproducible: same source, identical canonical output.
     assert_eq!(fs::read(&zt1).unwrap(), fs::read(&zt2).unwrap());
 
     let r = ztensor::Source::open(&zt1).unwrap();
@@ -195,10 +186,8 @@ fn convert_to_canonical_zt() {
         b
     );
     assert!(r.tensor("a.weight").unwrap().verify().unwrap().is_checked()); // digests added
-    assert!(r.attributes().is_some()); // metadata carried over
+    assert!(r.attributes().is_some());
 
-    // Everything the projection could not offer, the conversion added: a
-    // digest to verify against, and (on <=64K page hosts) pages of its own.
     let caps = r.tensor("a.weight").unwrap().caps();
     assert!(caps.verify && caps.map && caps.locate);
     if ztensor::provide::page_size() <= ztensor::format::ALIGN_CANONICAL {

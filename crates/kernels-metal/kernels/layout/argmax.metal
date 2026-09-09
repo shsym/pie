@@ -1,15 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// **ONE ROW'S ARGMAX, WRITTEN INTO ONE COLUMN OF AN I32 PLANE.**
-///
-/// `y[row * depth + column] = argmax_c x[row, c]`, one threadgroup per row.
-/// Every thread scans a strided share of the row keeping its best `(value,
-/// index)`, the simdgroups fold with `simd_max` and a `simd_min` over the
-/// indices that hit it, and thread 0 folds the simdgroups. Ties go to the
-/// LOWEST column and a NaN never wins — the epilogue's `reduce_argmax` rule,
-/// stated here so a draft the head chained on is the token the verifier
-/// reads back from the same logits.
 constant constexpr uint kArgmaxSimdgroups = 32;
 constant constexpr float NEG_INF_F = -INFINITY;
 

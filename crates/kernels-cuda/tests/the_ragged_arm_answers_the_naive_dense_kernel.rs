@@ -1,14 +1,3 @@
-//! `attention.ragged` (the FA2 ragged tensor-core arm) lands what
-//! `attention.dense` (the naive one-block-per-row kernel) lands over the same
-//! block-diagonal groups, for three groups of unequal size at head widths
-//! 64, 128 and 256 with grouped heads — and what an f32 host reference
-//! computes for a small case, within bf16's own rounding. An armed staged
-//! seat changes nothing: the arm reads every group its table names (the
-//! engine hands the tables over whole, padded with empty segments) and
-//! touches no row past them.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_answers_the_naive_dense_kernel`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -19,9 +8,6 @@ use kernels_cuda::attn_dense;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
 use kernels_cuda::tensor::Tensor;
 
-/// An absolute bound at `|o| < 1`: two bf16 roundings (the probabilities
-/// the tensor core reads, the output) are each `2^-9`, and the fp32
-/// accumulations underneath them are far below that.
 const TOLERANCE: f32 = 1.0e-2;
 
 fn indptr(sizes: &[u32]) -> Vec<i32> {
@@ -32,8 +18,6 @@ fn indptr(sizes: &[u32]) -> Vec<i32> {
     out
 }
 
-/// f32 attention over one block-diagonal group table, grouped heads read
-/// as the kernels read them.
 #[allow(clippy::too_many_arguments)]
 fn reference(
     q: &[f32],
@@ -100,7 +84,6 @@ fn assert_close(got: &[u16], want: &[f32], what: &str, live_rows: usize, width: 
     eprintln!("{what}: worst |diff| {worst:.2e} over {live_rows} rows");
 }
 
-/// Fires both kernels over `sizes` groups and compares them row for row.
 fn against_dense(sizes: &[u32], hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
     let table = indptr(sizes);
     let rows = *table.last().unwrap() as usize;
@@ -155,22 +138,27 @@ fn against_dense(sizes: &[u32], hd: u32, q_heads: u32, kv_heads: u32, seed: u64)
     );
 }
 
+fn the_ragged_arm_answers_the_naive_dense_kernel_every_case() {
+    the_ragged_arm_answers_the_dense_kernel_at_head_width_64();
+    the_ragged_arm_answers_the_dense_kernel_at_head_width_128();
+    the_ragged_arm_answers_the_dense_kernel_at_head_width_256();
+    the_ragged_arm_answers_an_f32_host_reference();
+    the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat();
+}
+
 #[test]
 fn the_ragged_arm_answers_the_dense_kernel_at_head_width_64() {
     against_dense(&[37, 512, 4096], 64, 4, 2, 0x64);
 }
 
-#[test]
 fn the_ragged_arm_answers_the_dense_kernel_at_head_width_128() {
     against_dense(&[37, 512, 4096], 128, 4, 2, 0x128);
 }
 
-#[test]
 fn the_ragged_arm_answers_the_dense_kernel_at_head_width_256() {
     against_dense(&[37, 512, 4096], 256, 2, 1, 0x256);
 }
 
-#[test]
 fn the_ragged_arm_answers_an_f32_host_reference() {
     for hd in [64u32, 128, 256] {
         let sizes = [5u32, 33, 70, 1];
@@ -182,8 +170,6 @@ fn the_ragged_arm_answers_an_f32_host_reference() {
         let (q_raw, q_f) = lcg.row(rows * qw);
         let (k_raw, k_f) = lcg.row(rows * kw);
         let (v_raw, v_f) = lcg.row(rows * kw);
-        // Sharper than `1/sqrt(hd)`, so the softmax is not a near-uniform
-        // average and the comparison has something to disagree about.
         let sm_scale = 2.5 / (hd as f32).sqrt();
         let want = reference(
             &q_f,
@@ -234,17 +220,13 @@ fn the_ragged_arm_answers_an_f32_host_reference() {
     }
 }
 
-/// The seat: a plane taller than its groups cover and a staged seat armed
-/// with lane words that name a subset. The arm reads no seat — every group
-/// of the table is served — and rows past every group keep their bytes.
-#[test]
 fn the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat() {
     let hd = 64u32;
     let (q_heads, kv_heads) = (2u32, 2u32);
     let sizes = [40u32, 100, 300, 64];
     let table = indptr(&sizes);
     let rows = *table.last().unwrap() as usize;
-    let plane_rows = rows + 96; // a bucket taller than the groups cover
+    let plane_rows = rows + 96;
     let (qw, kw) = ((q_heads * hd) as usize, (kv_heads * hd) as usize);
     let mut lcg = Lcg::seeded(0x5ea7);
     let (q_raw, q_f) = lcg.row(plane_rows * qw);
@@ -252,7 +234,6 @@ fn the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat() {
     let (v_raw, v_f) = lcg.row(plane_rows * kw);
     let (fill_raw, _) = lcg.row(plane_rows * qw);
     let sm_scale = 1.0 / (hd as f32).sqrt();
-    // The seat names groups 1 and 2; the arm ignores it and serves all four.
     let (first, live) = (1usize, 2usize);
     let want = reference(
         &q_f,

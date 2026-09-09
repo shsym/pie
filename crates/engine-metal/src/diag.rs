@@ -1,64 +1,25 @@
-//! The diagnostics a person debugging turns on, typed — and stated by the
-//! boot document rather than read out of the environment (article 9).
-//!
-//! Twenty-six `PIE_*` environment variables were compiled into this shell:
-//! traces, dumps, measurement arms and the numbers a sweep moves. They are one
-//! typed record now, filled from the boot document the same way
-//! `[metal.tuning]` already fills `kernels_metal::tuning` — the precedent this
-//! module follows, and whose own doc comment says why ("swept via the boot
-//! document rather than environment variables, which would need a rebuild per
-//! arm"; an environment variable does not need a rebuild either, but it does
-//! need a shell to read one, and that is what article 9 forbids).
-//!
-//! ```toml
-//! [engine]
-//! diagnostics = "tier-trace,kernel-profile=2"
-//! ```
-//!
-//! or, per run and touching no file, `pie run … --diag tier-trace`. The words
-//! reach this shell as `[metal] diagnostics` in the in-memory boot document
-//! the runtime writes, are parsed here, and a word this shell does not speak
-//! refuses the open by name.
-//!
-//! # Why a published record
-//!
-//! These are read from a window cut, a kernel compile, an allocator, a
-//! keep-alive thread — places a boot never reaches. The record is published
-//! once by [`crate::boot::open`] ([`publish`]) and read through [`on`]; the
-//! provenance is the boot document, which is what article 9 asks for. The CUDA
-//! shell's `engine_cuda::serve::diag` is the same module, one shell over.
-
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// How the per-entrypoint kernel profile keys its rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
-    /// Off: no per-kernel command buffers, no timings.
     #[default]
     Off,
-    /// One row per entrypoint.
     On,
-    /// One row per entrypoint AND scalar argument set (a matvec's K and N, a
-    /// router's expert count…), so one entrypoint's time splits by shape.
-    /// Prints sixty rows a fire instead of ten.
     Shaped,
 }
 
 impl Profile {
-    /// Whether anything is timed at all.
     #[must_use]
     pub fn on(self) -> bool {
         !matches!(self, Profile::Off)
     }
 
-    /// Whether the key carries the launch's scalars.
     #[must_use]
     pub fn shaped(self) -> bool {
         matches!(self, Profile::Shaped)
     }
 
-    /// How many rows a fire's profile prints.
     #[must_use]
     pub fn rows(self) -> usize {
         match self {
@@ -68,9 +29,6 @@ impl Profile {
     }
 }
 
-/// Which kind of streamed dispatch `streamed_repeat` repeats. Mirrors
-/// `program::launch::StepKind`, which is private to that module; this is the
-/// word a person types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamedKind {
     Wide,
@@ -80,100 +38,40 @@ pub enum StreamedKind {
     Argmax,
 }
 
-/// What a person debugging turned on, for this process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostics {
-    /// `cut-trace`: every cut a fire makes — the rows of the value the cut
-    /// carries, the pass it is, and the host time the blocking commit cost.
     pub cut_trace: bool,
-    /// `tier-trace`: what a fire cost the streamed tier — seat copies, cuts,
-    /// hits/misses, host time inside the cuts — as deltas, one line a fire;
-    /// and, at load, what prefaulting and bank decoding took.
     pub tier_trace: bool,
-    /// `rs-trace`: every non-fold recurrent lane plan, and every `rs_land`'s
-    /// two rectangles.
     pub rs_trace: bool,
-    /// `fire-trace`: `[fire t_us=…]` lines around a fire's phases, which
-    /// `benches/pie_bench.py` reads off the server's stdout.
     pub fire_trace: bool,
-    /// `region-trace`: one line per compiled region naming the form it took,
-    /// and why the grouped form was declined when it was — the decline reason
-    /// reaches nobody otherwise.
     pub region_trace: bool,
-    /// `streamed-trace`: the streamed form's step words and grid sizes.
     pub streamed_trace: bool,
-    /// `kernel-profile[=1|2]`: the device time of each fire by entrypoint. A
-    /// measurement mode, not a serving one — it takes a command buffer per
-    /// kernel.
     pub kernel_profile: Profile,
-    /// `kernel-dump=<dir>`: every generated Metal source as `<entry>.metal`,
-    /// and every streamed dispatch table as `<entry>.tables`, for a standalone
-    /// harness to replay.
     pub kernel_dump: Option<PathBuf>,
-    /// `route-dump=<file>`: the router's own vectors, as they were written.
     pub route_dump: Option<PathBuf>,
-    /// `pass-half=off`: seat the WHOLE slab in one expert-major pass instead
-    /// of half of it (which exists so the other half can be filled while this
-    /// one runs). **On** by default; this is the A/B arm.
     pub pass_half: bool,
-    /// `route-prefetch=off`: do not predict the next fire's routes. **On** by
-    /// default; this is the A/B arm.
     pub route_prefetch: bool,
-    /// `expert-passes=off`: no expert-major passes at all — one pass over
-    /// every region. **On** by default; this is the A/B arm.
     pub expert_passes: bool,
-    /// `keepalive=off`: stop the keep-alive spinner that holds the GPU's
-    /// clocks up between fires. **On** by default; this is the A/B arm
-    /// (measured: dsv4 237 → 163 ms/token with it, GLM 320 → 337 ms against).
     pub keepalive: bool,
-    /// `scratch-no-zero`: skip the host memset of a fire's scratch, to measure
-    /// what the host's touch of those pages costs the device. Off: the memset
-    /// is what serving does.
     pub scratch_no_zero: bool,
-    /// `host-rows`: stage a fire's rows through the host.
     pub host_rows: bool,
-    /// `prefault`: walk every resident plane at load so the pager does the
-    /// work up front instead of during the first fires.
+    pub nan_check: bool,
+
+    pub nan_limit: f32,
     pub prefault: bool,
-    /// `copy-resident`: copy each window into a Metal-allocated buffer instead
-    /// of binding the mapping, to price the no-copy binding's first-use
-    /// wiring.
     pub copy_resident: bool,
-    /// `prefetch-k=<n>`: how many fires ahead the route predictor looks.
-    /// `None` keeps the shell's own `PREFETCH_K`.
     pub prefetch_k: Option<usize>,
-    /// `seat-threads=<n>`: threads the seat filler uses. `None` keeps the
-    /// shell's own `SEAT_THREADS`.
     pub seat_threads: Option<usize>,
-    /// `keepalive-iters=<n>`: the spinner's inner loop count, tuned so one
-    /// dispatch is a few hundred microseconds. `None` keeps the shell's own.
     pub keepalive_iters: Option<u32>,
-    /// `window-ceiling=<bytes>`: clamp `maxBufferLength` down, to cut a
-    /// mapping into more windows than the device would ask for. `None` takes
-    /// the device's own answer.
     pub window_ceiling: Option<u64>,
-    /// `streamed-groups=<n>`: cap the blocks a wide dispatch spreads over.
-    /// `None` keeps the shell's own `STREAMED_MAX_GROUPS`.
     pub streamed_groups: Option<u32>,
-    /// `streamed-repeat=<n>`: issue each wide dispatch `n` times — all are
-    /// idempotent, so this prices a dispatch. `1` is serving.
     pub streamed_repeat: usize,
-    /// `streamed-repeat-kind=<wide|partial|single|reduce|argmax>`: narrow
-    /// `streamed_repeat` to one kind of step. `None` repeats the wide ones.
     pub streamed_repeat_kind: Option<StreamedKind>,
-    /// `streamed-limit=<k>`: run only the first `k` steps. This BREAKS the
-    /// program and times what ran. `None` runs all of them.
     pub streamed_limit: Option<usize>,
-    /// `streamed-nop=<n>`: `n` dispatches of one group that hit the kernel's
-    /// `default: return` — the production floor of a dispatch with these
-    /// bindings and no op behind it.
     pub streamed_nop: usize,
 }
 
 impl Default for Diagnostics {
-    /// Nothing traced, nothing dumped, every arm at what serving does — byte
-    /// for byte what this shell did before the record existed and nobody had
-    /// set a `PIE_*` variable.
     fn default() -> Diagnostics {
         Diagnostics {
             cut_trace: false,
@@ -191,6 +89,8 @@ impl Default for Diagnostics {
             keepalive: true,
             scratch_no_zero: false,
             host_rows: false,
+            nan_check: false,
+            nan_limit: 3.0e38,
             prefault: false,
             copy_resident: false,
             prefetch_k: None,
@@ -207,14 +107,12 @@ impl Default for Diagnostics {
 }
 
 impl Diagnostics {
-    /// Whether anything at all is stated.
     #[must_use]
     pub fn any(&self) -> bool {
         *self != Diagnostics::default()
     }
 }
 
-/// Whether a `word=value` that reads as a switch means on.
 fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
     match value {
         "" | "on" | "1" | "true" | "yes" => Ok(true),
@@ -225,17 +123,15 @@ fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
     }
 }
 
-/// A number, or a refusal naming the word that wanted one.
 fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<T, String> {
     value
         .parse::<T>()
         .map_err(|_| format!("`{word}` takes a number; `{value}` is not one"))
 }
 
-/// The vocabulary, for the refusal that lists it.
 const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
-     `kernel-dump=<dir>`, `route-dump=<file>`, `pass-half=off`, \
+     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, `pass-half=off`, \
      `route-prefetch=off`, `expert-passes=off`, `keepalive=off`, \
      `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
      `prefetch-k=<n>`, `seat-threads=<n>`, `keepalive-iters=<n>`, \
@@ -246,11 +142,6 @@ const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
 impl std::str::FromStr for Diagnostics {
     type Err = String;
 
-    /// A comma-separated word list: `tier-trace,kernel-profile=2,pass-half=off`.
-    ///
-    /// A bare word turns its knob on; `word=off` turns it off; a word that
-    /// takes a value takes it after `=`. Empty words are skipped. **An unknown
-    /// word refuses by name and lists the vocabulary.**
     fn from_str(list: &str) -> std::result::Result<Diagnostics, String> {
         let mut diag = Diagnostics::default();
         for term in list.split(',') {
@@ -275,6 +166,12 @@ impl std::str::FromStr for Diagnostics {
                 "keepalive" => diag.keepalive = switch(word, value)?,
                 "scratch-no-zero" => diag.scratch_no_zero = switch(word, value)?,
                 "host-rows" => diag.host_rows = switch(word, value)?,
+                "nan-check" => diag.nan_check = switch(word, value)?,
+                "nan-limit" => {
+                    diag.nan_limit = value.parse::<f32>().map_err(|_| {
+                        format!("`nan-limit` takes a float magnitude; `{value}` is not one")
+                    })?;
+                }
                 "prefault" => diag.prefault = switch(word, value)?,
                 "copy-resident" => diag.copy_resident = switch(word, value)?,
                 "kernel-profile" => {
@@ -319,8 +216,6 @@ impl std::str::FromStr for Diagnostics {
                 }
                 "prefetch-k" => diag.prefetch_k = Some(number(word, value)?),
                 "seat-threads" => {
-                    // Zero threads is a typo, not a request; the shell's own
-                    // figure is what an absent word means.
                     let threads: usize = number(word, value)?;
                     if threads == 0 {
                         return Err("`seat-threads` must be > 0".to_string());
@@ -360,14 +255,8 @@ impl std::str::FromStr for Diagnostics {
     }
 }
 
-/// The record this process serves under, published by the first boot.
 static PUBLISHED: OnceLock<Diagnostics> = OnceLock::new();
 
-/// State this process's diagnostics, from the boot document that carried them.
-///
-/// One process hosts one deployment, so the first boot to state a record
-/// states it for the process. A later boot asking for a different one is told
-/// so and ignored.
 pub(crate) fn publish(stated: &Diagnostics) {
     let published = PUBLISHED.get_or_init(|| stated.clone());
     if published != stated {
@@ -378,8 +267,6 @@ pub(crate) fn publish(stated: &Diagnostics) {
     }
 }
 
-/// What this process's boot stated. All-off before any boot has, which is what
-/// a unit test that never opens a device reads.
 #[must_use]
 pub fn on() -> &'static Diagnostics {
     static OFF: OnceLock<Diagnostics> = OnceLock::new();
@@ -392,6 +279,14 @@ pub fn on() -> &'static Diagnostics {
 mod tests {
     use super::*;
 
+    fn diag_every_case() {
+        an_empty_list_turns_nothing_on();
+        a_word_list_names_each_knob();
+        an_unknown_word_refuses_by_name();
+        a_number_that_is_not_one_refuses();
+        the_streamed_kind_takes_one_of_five_words();
+    }
+
     #[test]
     fn an_empty_list_turns_nothing_on() {
         let diag: Diagnostics = "".parse().expect("silence parses");
@@ -399,7 +294,6 @@ mod tests {
         assert!(!diag.any());
     }
 
-    #[test]
     fn a_word_list_names_each_knob() {
         let diag: Diagnostics = "tier-trace, kernel-profile=2 ,pass-half=off,streamed-nop=3"
             .parse()
@@ -413,7 +307,6 @@ mod tests {
         assert!(diag.keepalive, "an unnamed arm keeps its default");
     }
 
-    #[test]
     fn an_unknown_word_refuses_by_name() {
         let why = "tier-traces".parse::<Diagnostics>().expect_err("refused");
         assert!(why.contains("tier-traces"), "{why}");
@@ -423,14 +316,12 @@ mod tests {
         );
     }
 
-    #[test]
     fn a_number_that_is_not_one_refuses() {
         assert!("prefetch-k=many".parse::<Diagnostics>().is_err());
         assert!("seat-threads=0".parse::<Diagnostics>().is_err());
         assert!("window-ceiling=0".parse::<Diagnostics>().is_err());
     }
 
-    #[test]
     fn the_streamed_kind_takes_one_of_five_words() {
         let diag: Diagnostics = "streamed-repeat=4,streamed-repeat-kind=reduce"
             .parse()

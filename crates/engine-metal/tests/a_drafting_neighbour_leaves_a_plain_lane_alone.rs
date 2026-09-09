@@ -1,19 +1,3 @@
-//! **A PLAIN LANE'S LOGITS DO NOT CHANGE WHEN A DRAFTING LANE SHARES ITS
-//! FIRE.** The draft arm runs over the drafting rows only (the `drafts` fact
-//! splits every node it touches), so a lane that asked for nothing must read
-//! the same trunk logits whether the neighbours beside it drafted or not —
-//! bit for bit, at the SAME fire width.
-//!
-//! The width is held because it is its own variable: on the two-bit routed
-//! path a five-row fire and a two-row fire take different kernel tilings and
-//! part by up to ~1.4 logits at the readout (measured here, four plain lanes
-//! beside one against one plain lane beside one — no head anywhere). That is
-//! the numerics floor a crowd gate has to read against; what this file
-//! asserts is that a head in the crowd adds nothing to it.
-//!
-//! `PIE_DSV4_MTP_ARTIFACT` names the artifact; unset, `/tmp/warmstream/
-//! dsv4-mini-mtp.zt`, skipping by name when absent.
-
 #![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
@@ -56,6 +40,7 @@ fn load(artifact: &PathBuf) -> Shell {
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
     drop(source);
     Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: artifact,
@@ -72,8 +57,6 @@ fn load(artifact: &PathBuf) -> Shell {
     .expect("the drafting shell loads")
 }
 
-/// Decode `STEPS` greedy tokens in lane A (plain) with, beside it in every
-/// fire, lane B either plain or drafting. Returns lane A's logits rows.
 fn plain_beside(shell: &mut Shell, slot_a: u32, slot_b: u32, b_drafts: bool) -> Vec<Vec<f32>> {
     shell.open(slot_a).expect("slot a opens");
     shell.open(slot_b).expect("slot b opens");
@@ -113,12 +96,9 @@ fn a_plain_lane_reads_the_same_logits_beside_a_drafting_one() {
     let mut shell = load(&artifact);
     assert!(shell.drafts());
 
-    // Two rows a fire: one neighbour, plain or drafting.
     let beside_plain = plain_beside(&mut shell, 0, 1, false);
     let beside_drafting = plain_beside(&mut shell, 2, 3, true);
     compare("one drafting lane (against one plain lane)", &beside_plain, &beside_drafting);
-    // Five rows a fire: the runtime's window of four drafting one-token
-    // lanes, against four plain ones — the same shape with no head in it.
     let beside_crowd = plain_beside_window(&mut shell, 4, &[5, 6, 7, 8], false);
     let beside_window = plain_beside_window(&mut shell, 9, &[10, 11, 12, 13], true);
     let floor = widest_gap(&beside_plain, &beside_crowd);
@@ -133,8 +113,6 @@ fn widest_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
         .fold(0f32, f32::max)
 }
 
-/// Lane A plain, decoding as in [`plain_beside`], beside `slots.len()`
-/// drafting lanes that each carry one token per fire (the runtime's window).
 fn plain_beside_window(shell: &mut Shell, slot_a: u32, slots: &[u32], drafting: bool) -> Vec<Vec<f32>> {
     shell.open(slot_a).expect("slot a opens");
     for &slot in slots {

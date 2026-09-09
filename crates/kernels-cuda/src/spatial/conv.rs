@@ -1,33 +1,3 @@
-//! `Conv3d`: implicit-GEMM convolution over `[rows, C_in]` voxel rows into
-//! `[rows_out, C_out]`, `conv2d` being the `kt = 1` case of the same entry.
-//! Two device kernels compute it — fp32 FMA tiles (every shape) and bf16
-//! `mma.sync` tiles (`C_in % 8 == 0`, 16-byte planes, sm_80+) — and
-//! [`conv3d`] picks; [`conv3d_on`] lets a golden pin one.
-//!
-//! **THE WEIGHT LAYOUT.** `w` is `[C_out, kt*kh*kw*C_in]` bf16, K flattened
-//! tap-major and channel-fastest: `K = ((it*kh + ih)*kw + iw)*C_in + c_in`,
-//! i.e. PyTorch's `weight.permute(0, 2, 3, 4, 1).reshape(C_out, -1)` (cuDNN's
-//! KRSC). A checkpoint that stores the natural `[C_out, C_in*kt*kh*kw]`
-//! rectangle is relabelled once at load by [`conv_weight_taps_major`]. The
-//! reason is the gather: one K step reads `BK` consecutive channels of one
-//! tap from both operands as 16-byte words, which the natural order
-//! (channels `kt*kh*kw` apart) would turn into two-byte strided loads on
-//! every weight tile.
-//!
-//! **TIME.** `causal_t = false`: `pad[0]` frames on both sides — zeros
-//! ([`TimePad::Zero`]), or the clip's own first frame in front and its
-//! last frame behind ([`TimePad::Replicate`]: LTX-2.5's non-causal
-//! decoder, `torch.cat([x[:, :, :1], x, x[:, :, -1:]], dim=2)`).
-//! `causal_t = true`: `pad[0]` frames in front and none behind, the frames
-//! before the clip read from `cache` when one is given — the previous
-//! tile's last `pad[0]` frames, `[sum over lanes of pad[0]*h*w, C_in]` in
-//! lane order — else frame 0 ([`TimePad::Replicate`]) or zero
-//! ([`TimePad::Zero`]). `h`/`w` padding is symmetric zero either way.
-//!
-//! Numerics: bf16 in, fp32 accumulation over the whole K, bias in fp32,
-//! one rounding at the store. The two kernels sum K in different orders and
-//! agree to fp32 rounding.
-
 use crate::error::Error;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated,
@@ -40,15 +10,10 @@ const FILE: &str = "spatial/conv.cuh";
 
 const OP: &str = "spatial.conv3d";
 
-/// The direct kernel's tile: output voxels by output channels.
 const DIRECT_TILE: [u32; 2] = [64, 64];
 
 const DIRECT_BLOCK: u32 = 256;
 
-/// The tensor-core kernel's tile, its pipeline depth, and the dynamic
-/// shared memory that buys (`conv3d_mma_smem<3>()` in the device text:
-/// three stages of `(128 + 128) x 40` bf16, which also holds the epilogue
-/// tile).
 const MMA_TILE: [u32; 2] = [128, 128];
 
 const MMA_STAGES: u32 = 3;
@@ -57,42 +22,23 @@ const MMA_BLOCK: u32 = 256;
 
 const MMA_SMEM: u32 = MMA_STAGES * (MMA_TILE[0] + MMA_TILE[1]) * (32 + 8) * 2;
 
-/// What a padded frame reads: the frames before the clip under `causal_t`
-/// when no cache is given, and the frames on both sides of it otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimePad {
-    /// Zeros — the first tile of a zero-padded causal convolution, or a
-    /// plain zero-padded symmetric one.
     Zero,
-    /// The clip's own end frames, repeated: frame 0 in front and, for a
-    /// symmetric convolution, the last frame behind.
     Replicate,
 }
 
-/// The static shape of one convolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Conv3d {
-    /// `[kt, kh, kw]`.
     pub k: [u32; 3],
-    /// `[st, sh, sw]`.
     pub stride: [u32; 3],
-    /// `[pt, ph, pw]`: the zero padding IN FRONT of each axis (under
-    /// `causal_t` `pt` is the front-only time padding).
     pub pad: [u32; 3],
-    /// The zero padding BEHIND each axis; equal to `pad` for a symmetric
-    /// convolution, ignored on the time axis under `causal_t`. The kernel
-    /// never reads it: only the front pad shifts the tap window, and the
-    /// back pad reaches it through the output box (`o_grid`) alone.
     pub pad_back: [u32; 3],
-    /// Time is padded in front only, from the cache when one is given.
     pub causal_t: bool,
-    /// What a padded frame reads: the front frames under `causal_t` without
-    /// a cache, both ends of a symmetric convolution.
     pub time_pad: TimePad,
 }
 
 impl Conv3d {
-    /// A 2-D convolution: `kt = 1`, no time stride or padding.
     #[must_use]
     pub const fn conv2d(k: [u32; 2], stride: [u32; 2], pad: [u32; 2]) -> Self {
         Self {
@@ -105,16 +51,11 @@ impl Conv3d {
         }
     }
 
-    /// Taps per output channel: `kt * kh * kw`.
     #[must_use]
     pub const fn taps(&self) -> u32 {
         self.k[0] * self.k[1] * self.k[2]
     }
 
-    /// The output box of an input box — what a caller writes into `o_grid`:
-    /// `(n + 2*pad - k) / stride + 1` per axis, with the time axis padded
-    /// only in front under `causal_t`. `None` when the box is smaller than
-    /// the kernel.
     #[must_use]
     pub fn out_extent(&self, [t, h, w]: [u32; 3]) -> Option<[u32; 3]> {
         let axis = |n: u32, k: u32, s: u32, front: u32, back: u32| {
@@ -131,21 +72,13 @@ impl Conv3d {
     }
 }
 
-/// Which device kernel lands the convolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConvPath {
-    /// Tensor cores when the shape and device admit them, else the direct
-    /// kernel.
     Auto,
-    /// The fp32 FMA kernel: every channel count and alignment.
     Direct,
-    /// The bf16 `mma.sync` kernel; refused when the shape does not admit
-    /// it rather than silently falling back.
     TensorCore,
 }
 
-/// `ConvGeom` in `spatial/conv.cuh`, field for field. `#[repr(C)]` because
-/// the bytes cross the launch ABI as one by-value parameter.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Geom {
@@ -166,19 +99,6 @@ struct Geom {
     rows_out: i32,
 }
 
-/// Implicit-GEMM 3-D convolution: `o[m][n] = bias[n] + sum x[tap(m)][c] *
-/// w[n][tap*C_in + c]`. See the module doc for the weight layout and the
-/// time rules.
-///
-/// `x`: `[rows, C_in]` bf16; `grid`/`o_grid`: `[lanes, 4]` i32 lane tables
-/// for the input and output boxes (the output box per lane is
-/// [`Conv3d::out_extent`] of the input's); `w`: `[C_out, taps*C_in]` bf16;
-/// `bias`: `C_out` f32 or none; `cache`: the causal front frames or none;
-/// `o`: `[rows_out, C_out]` bf16. Output rows no lane claims land zeros.
-///
-/// Errs [`Error::DtypeUnsupported`] for anything but bf16 activations, or a
-/// refusal for a weight that is not `[C_out, taps*C_in]`, a cache without
-/// `causal_t`, a zero kernel or stride, or a lane table of the wrong shape.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d(
     ctx: &Ctx,
@@ -205,7 +125,6 @@ pub fn conv3d(
     )
 }
 
-/// [`conv3d`] on a named kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_on(
     ctx: &Ctx,
@@ -361,11 +280,6 @@ pub fn conv3d_on(
     )
 }
 
-/// The load-time relabelling: `src` is the checkpoint's natural
-/// `[C_out, C_in*kt*kh*kw]` rectangle (`(c_in, kt, kh, kw)`, `kw` fastest —
-/// `weight.reshape(C_out, -1)`), `dst` the same values as
-/// `[C_out, kt*kh*kw*C_in]` in the tap-major channel-fastest order
-/// [`conv3d`] reads. `taps = kt*kh*kw`.
 pub fn conv_weight_taps_major(
     ctx: &Ctx,
     src: Tensor,

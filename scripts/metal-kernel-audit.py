@@ -59,15 +59,11 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHADERS = ROOT / "crates/kernels-metal/kernels"
 
-# `host_name(fn "_" #name "_d_" #d)` -- adjacent literals, joined by the compiler.
 HOST_NAME = re.compile(r'host_name\(\s*((?:"[^"]*"\s*)+)\)')
 LITERAL = re.compile(r'"([^"]*)"')
-# A kernel declared directly, with no template above it. The `template` guard is
-# the whole subtlety: without it every template BODY counts as an entrypoint.
 PLAIN_KERNEL = re.compile(
     r'(?m)^\s*(?:\[\[kernel\]\]|kernel)\s+void\s+([A-Za-z_0-9]+)\s*\(')
 
-# The axis suffixes a name carries, longest-match first within each family.
 AXIS_TOKENS = [
     (re.compile(r'_gs_(\d+)$'), "gs"),
     (re.compile(r'_b_(\d+)$'), "b"),
@@ -81,17 +77,6 @@ AXIS_TOKENS = [
     (re.compile(r'(_p32)$'), "p32"),
     (re.compile(r'(_bfloat16)$'), "bf16"),
 ]
-
-# Deliberately NOT axes, and each one was a wrong guess first:
-#
-#   _wm_/_wn_   five `host_name` lines typed out by hand at quantized_qmm_t.metal
-#               :2918-2966, not stamped by `instantiate_qmm_t`. Under
-#               `.wiki/kernel-refactor.md` §5 rule 4 they are five distinct
-#               kernels, so they are five rows and their names are base text.
-#   _f32        the splitk ACCUMULATE type, and it sits before `_bfloat16`
-#               (`affine_qmm_t_splitk_f32_bfloat16_gs_...`), so it is part of
-#               the base rather than a point of the dtype axis.
-
 
 def preprocessed(path):
     """The shader with its macros expanded.
@@ -107,29 +92,17 @@ def preprocessed(path):
         target = path.parent / match.group(1)
         return target.read_text() if target.exists() else ''
 
-    for _ in range(8):  # the driver's splicer allows 8 levels
+    for _ in range(8):
         text = re.sub(r'(?m)^\s*#include\s*"([^"]+)"\s*$', splice, text)
-    # Angle includes are the system headers, and they are stripped AFTER
-    # splicing, not before: a shared `.metal` carries its own `<metal_stdlib>`,
-    # and stripping only the top-level file left one buried in the spliced text.
-    # That failed the preprocessor and silently dropped 356 entrypoints — the
-    # audit reported drift rather than a crash, which is the good failure, but
-    # only because the set is compared rather than trusted.
     text = re.sub(r'(?m)^\s*#include\s*<[^>]+>\s*$', '', text)
     done = subprocess.run(["gcc", "-E", "-P", "-x", "c", "-"], input=text,
                           capture_output=True, text=True)
     return done.stdout
 
-
 def entrypoints_of(path):
     text = preprocessed(path)
     names = {"".join(LITERAL.findall(group)) for group in HOST_NAME.findall(text)}
     for match in PLAIN_KERNEL.finditer(text):
-        # A template BODY is not an entrypoint. Look back to the end of the
-        # previous declaration rather than at the previous LINE: a template
-        # parameter list wraps, and reading one line found `int WM = 2, int
-        # WN = 2>` and called `affine_qmm_t_aligned` a dispatchable name.
-        # That put three phantom rows in the table before anything noticed.
         head = text[:match.start()]
         cut = max(head.rfind(";"), head.rfind("}"))
         if "template" in head[cut + 1:]:
@@ -137,14 +110,12 @@ def entrypoints_of(path):
         names.add(match.group(1))
     return names
 
-
 def census():
     found = {}
     for path in sorted(SHADERS.rglob("*.metal")):
         for name in entrypoints_of(path):
             found[name] = path.name
     return found
-
 
 def split_axes(name):
     """`affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32` -> base, [(axis, value), ...]"""
@@ -158,8 +129,6 @@ def split_axes(name):
                 break
         else:
             return base, list(reversed(axes))
-
-
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -181,28 +150,6 @@ def main():
         return 0
 
     if mode in ("--table", "--check", "--write"):
-        # RETIRED, all three, and the branch exists rather than being deleted
-        # so that a caller asking for a comparison gets an error instead of a
-        # census. Without it `--table` falls through to the default below,
-        # which prints the shader set and exits 0 -- a check that passes
-        # without checking, which is the failure the `--no-concat` comment
-        # describes further down.
-        #
-        # `--check` and `--write` maintained a committed
-        # `crates/kernels-metal/entrypoints.generated.txt`: the shader half of
-        # invariant (1), written to a file so `tests/entrypoints.rs` could diff
-        # the table against it without running a C preprocessor. That file went
-        # first, and `--table` replaced the pair by doing both hops in one
-        # process -- census here, table from `cargo run -p kernels-metal
-        # --example entrypoints`.
-        #
-        # That example is deleted with the rest of `examples/`, so `--table` is
-        # retired rather than repointed, and no route back is cheap: the shader
-        # half needs `gcc -E` because the axis product is written nowhere but
-        # the `instantiate_*` macros, the table half needs a Rust process, and
-        # a `cargo test` in this crate can be neither. `tests/entrypoints.rs`
-        # says what it still covers -- the table against itself and against the
-        # shader FILE names -- and the set comparison is not part of it.
         print(f"{mode} is retired: it compared the shader census to the Rust "
               f"table's axis product, and the `cargo run -p kernels-metal "
               f"--example entrypoints` it read the table with is deleted. "
@@ -210,22 +157,6 @@ def main():
         return 2
 
     if mode == "--one-way":
-        # Invariant (3): `kernels-metal` depends on nothing above it.
-        #
-        # ONE tree now. This walked two -- the shader tree and a host C++
-        # library under `include/pie/kernels/` -- and the second is deleted:
-        # its launch shapes are Rust in `engine-metal/src/lowering/grid.rs`
-        # and the C++ driver that compiled against them is gone. What is left
-        # is the `*_params.h` a shader and its host caller must agree on,
-        # which cannot be Rust because a `.metal` `#include`s it.
-        #
-        # A `#include` of a driver header, or a mention of a driver TYPE, is
-        # the arrow turning around: it is how `runahead.hpp` ended up in
-        # `kernels-cuda`, per .wiki/kernel-refactor.md §1.1. That
-        # `kernels-cuda` is the ARCHIVE crate, deleted at `85c6c674b`, and
-        # `runahead.hpp` is in no tree today -- the incident is history, not a
-        # place to go look. Cite it as the shape of the mistake and nothing
-        # more.
         shaders = ROOT / "crates/kernels-metal/kernels"
         own = {path.name for path in shaders.rglob("*") if path.is_file()}
         driver_types = ("RawMetalContext", "DeviceTuning", "SlotHandle", "Pso",
@@ -242,14 +173,6 @@ def main():
                     if name in stripped:
                         problems.append((path, number, f"names {name}"))
 
-        # And the other direction: a header in the SHADER tree that no shader
-        # reaches is host C++ in the runtime search path, which is the defect
-        # this tree was split to fix and then grew back anyway.
-        # `quant/affine_format.hpp` was a host-only struct sitting among the
-        # `.metal` files, included by the deleted C++ library and by nothing
-        # the compiler ever saw. An orphan header is how that starts, so the
-        # orphan is what this refuses -- by reachability rather than by
-        # extension, because the extension was never the tell.
         included = set()
         for path in list(shaders.rglob("*.metal")) + headers:
             for line in path.read_text(errors="ignore").splitlines():
@@ -274,44 +197,6 @@ def main():
         return 0
 
     if mode in ("--no-concat", "--paths", "--dead-paths-unused", "--cpp"):
-        # RETIRED, and failing rather than passing is the point.
-        #
-        # All four served the C++ Metal driver, and that driver was deleted
-        # whole. The first three walked `crates/engine-metal/csrc`: `rglob`
-        # over a missing directory yields nothing, so each printed its success
-        # line over an empty set and had been guaranteeing nothing for as long
-        # as the port has been finished. `--cpp` is the opposite failure and
-        # the more misleading one -- it kept PASSING honestly, compiling a
-        # real test against real headers, which is why it outlived the other
-        # three: nothing about a green check says the thing it checks has no
-        # callers left.
-        #
-        # None of the invariants went away with the C++. Each moved somewhere
-        # stronger, which is why these are retired rather than repointed:
-        #
-        # * `--no-concat` forbade ASSEMBLING an entrypoint name, on the
-        #   syntax. `model-compiler`'s `kernels::check_plan` runs from
-        #   `trace::finish` on every plan and refuses any launched symbol
-        #   no row declares, which checks the RESULT and so catches a name
-        #   built by any means. `engine-metal`'s coverage ledger asserts
-        #   the same thing over all eight texts at once.
-        # * `--paths` and `--dead-paths-unused` required every `.metal`
-        #   literal to resolve. The literals are now the table's own
-        #   `KernelSig::file` fields, and `engine-metal`'s
-        #   `every_file_a_kernel_row_states_is_a_file_that_exists` holds
-        #   every one of them against the tree.
-        # * `--cpp` compiled `csrc/tests/entrypoint_test.cpp` against
-        #   `include/pie/kernels/entrypoint.h` to check that the name grammar
-        #   accepts every real entrypoint and refuses the rest. Both files are
-        #   deleted. `kernels-metal/tests/entrypoints.rs` holds that same
-        #   invariant in the language the driver is actually written in, and
-        #   the grammar it checks is the table's own -- not a second copy that
-        #   had to be kept in step with it.
-        #
-        # A repointed regex would have been worse than any of them:
-        # `AffineFormat::kernel_suffix` has a legitimate Rust caller that
-        # MATCHES a suffix against the table rather than launching it, so the
-        # C++ pattern read against Rust reports a defect that is not there.
         print(f"{mode} is retired: it served the C++ Metal driver, which the "
               f"Rust port removed. See the comment at this branch for where "
               f"its invariant is held now.")
@@ -322,7 +207,6 @@ def main():
     print(f"\n{len(found)} entrypoints in {len(set(found.values()))} files",
           file=sys.stderr)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

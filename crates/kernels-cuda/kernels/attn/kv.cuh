@@ -60,10 +60,6 @@ __global__ void kv_append(
 
     const int t = blockIdx.x + first_token;
 
-    // `devwin` is the pre-staged device window pair, `(start, count)`:
-    // word 0 is a START. The staged-geometry seat's `win` is `(count,
-    // start)` — same pointer shape, opposite word order, and the rename
-    // is what keeps one from ever arming the other.
     if (devwin != nullptr) {
         const int w0 = static_cast<int>(devwin[0]);
         const int w1 = static_cast<int>(devwin[1]);
@@ -170,16 +166,9 @@ __global__ void kv_append_explicit(
 {
     const int b = blockIdx.x;
     if (b >= B) return;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && b >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The SOURCE
-    // rows move by it, and with them `row_valid` and the staged `w_page` /
-    // `w_off` write tables, which are row planes handed at their base too. The
-    // cell they name does not move: it is a page ordinal and an offset inside
-    // that page, the lanes' own, and no window's zero rebases it.
+
     const int b_row = win != nullptr ? b + static_cast<int>(win[1]) : b;
     if (row_valid != nullptr && row_valid[b_row] == 0) return;
     const int actual_page = static_cast<int>(w_page[b_row]);
@@ -286,17 +275,11 @@ __global__ void kv_append_fp8_per_tensor(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The SOURCE
-    // rows move by it; the cell they land in does not, because the qo
-    // boundaries this resolves against are the window's own, rebased to its
-    // zero, and the page tables are the lanes'.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     int actual_page = 0;
     int offset_in_page = 0;
@@ -335,17 +318,11 @@ __global__ void kv_append_per_token_head(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The SOURCE
-    // rows move by it; the cell they land in does not, because the qo
-    // boundaries this resolves against are the window's own, rebased to its
-    // zero, and the page tables are the lanes'.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
@@ -486,17 +463,11 @@ __global__ void kv_append_fp4_block(
     const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The SOURCE
-    // rows move by it; the cell they land in does not, because the qo
-    // boundaries this resolves against are the window's own, rebased to its
-    // zero, and the page tables are the lanes'.
+
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
-    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h = blockIdx.y;
     const int b = blockIdx.z;
@@ -708,10 +679,7 @@ __global__ void kv_append_explicit_devwin(
 {
     const int b = blockIdx.x;
     if (b >= n_max) return;
-    // `devwin` is the pre-staged device window pair, `(start, count)`:
-    // word 0 is a START. The staged-geometry seat's `win` is `(count,
-    // start)` — same pointer shape, opposite word order, and the rename
-    // is what keeps one from ever arming the other.
+
     const int w0 = static_cast<int>(devwin[0]);
     const int w1 = static_cast<int>(devwin[1]);
     if (b < w0 || b >= w0 + w1) return;

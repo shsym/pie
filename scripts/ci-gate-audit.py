@@ -74,15 +74,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
-# The engine-flavor and probe chain: an inner library, and the package that
-# must re-declare its features for them to be reachable from a build command.
-# `pie` is where the chain has to end, because it is the only member with a
-# `[[bin]]`.
 FORWARDS = [("runtime", "worker"), ("worker", "pie")]
 
-# Features deliberately not forwarded, and why. Same contract as EXCLUSIONS:
-# the reason lives in the data, because the next reader's question is "was
-# this decided or forgotten?".
 FORWARD_EXCLUSIONS = {
     ("worker", "pie"): {
         "nixl": (
@@ -95,11 +88,6 @@ FORWARD_EXCLUSIONS = {
     },
 }
 
-# Crates deliberately outside a gate, and what would have to change.
-#
-# The value is the reason. It is printed when the audit fails on a crate
-# that IS listed here, which cannot happen -- but it is also the thing a
-# reader comes here for, so it lives in the data rather than a comment.
 EXCLUSIONS = {
     "fmt": {
         "engine-cuda": (
@@ -108,11 +96,6 @@ EXCLUSIONS = {
             "benefit to files that are being replaced. Add it when the "
             "rewrite lands."
         ),
-        # The ahead-of-time archive crate had an entry of its own here --
-        # "144 drifted hunks against 57 commits in three days" -- and it was
-        # dropped when the crate was deleted at `85c6c674b`, because an
-        # exclusion naming a non-member is what the check below refuses. The
-        # JIT crate that has its name now is the entry that remains.
         "kernels-cuda": (
             "1,320 drifted hunks against 47 commits in three days, three "
             "of them in the last day: the crate the CUDA rewrite moved "
@@ -123,78 +106,22 @@ EXCLUSIONS = {
         ),
     },
     "clippy": {
-        # Everything not yet at zero warnings. A gate is worth nothing
-        # until the crate is clean, so the entry to remove here is the
-        # last warning rather than the line. Counts are unique warning
-        # SITES from a cold `cargo clean -p <crate>` -- a warm clippy run
-        # replays nothing and reports zero, which is how several of these
-        # looked clean for months.
         "engine-cuda": "needs nvcc, and is being rewritten",
-        # `engine-vulkan` STOOD HERE reading "needs slangc on the runner;
-        # zero warnings otherwise", and the entry outlived its subject the
-        # way an exclusion always can: R3 put the crate in the root
-        # manifest's `exclude`, and an exclusion naming a NON-MEMBER is what
-        # the check below refuses -- correctly, because it reads as a crate
-        # somebody decided not to lint rather than as a crate cargo can no
-        # longer see. `engine-metal` and `engine-wgpu` went the same way and
-        # were never entries here at all: they were named in the gate lists,
-        # which is why they surfaced as `-p ... is not a workspace member`
-        # instead. Both halves of this file caught the same deletion from
-        # opposite sides, which is the point of having both.
-        #
-        # None of the three comes back as an exclusion. They come back as
-        # members, at P5, and then the question is whether they are gated.
-        # `kernels-cuda` STOOD HERE reading "52 warnings, and the rewrite is
-        # landing in it". Both halves expired. The crate is named by the
-        # clippy step in `ci.yml` AND was excluded here, which is the one
-        # combination this audit calls out by itself -- an exclusion that
-        # excludes nothing still reads as a crate nobody lints. And the 52
-        # warnings are gone: the crate passes this gate's exact flags at
-        # zero, verified by running the step. The rewrite landed, and the
-        # exclusion outlived it.
-        # `kernels-metal` and `kernels-vulkan` STOOD HERE, reading "needs a
-        # Mac" and "needs slangc on the runner". Neither claim survives:
-        # this gate names both crates, and neither toolchain is needed to
-        # CHECK one -- `kernels-vulkan` only shells out to `slangc` under
-        # `native`, which is off by default. `kernels-vulkan` is clean under
-        # this gate's exact flags.
-        #
-        # `kernels-metal` is not, and that is a real failure rather than a
-        # missing exclusion: its LIB is clean, but `--all-targets` does not
-        # compile on a non-Mac toolchain (6 errors, E0061/E0308, in the lib
-        # test and `tests/entrypoints.rs`). Re-excluding it here would turn
-        # a red gate into a silent one, which is the trade this whole file
-        # exists to refuse.
         "pie-server-py": "a pyo3 extension; built by maturin, not by this job",
     },
 }
 
-# The step names carrying each gate's `-p` list, in ci.yml.
 STEPS = {
     "fmt": ["cargo fmt (compiler crates)"],
     "clippy": [
         "cargo clippy (deny warnings)",
         "cargo clippy (model, deny warnings)",
-        # `cargo clippy (engine-metal, portable half)` and `(engine-metal,
-        # metal-4)` STOOD HERE, on the macOS job, because a lint can depend
-        # on `cfg(target_os)` and only a Mac can ask that question in both
-        # feature halves. Naming them here is what turned "gated on the macOS
-        # job instead" from a sentence into a check, and the check then did
-        # its job in the direction nobody expected: R3 deleted the macOS job
-        # with the crate, and this list said so by name rather than going
-        # quietly narrower.
-        #
-        # They return at P5 with the job. A step named here that ci.yml does
-        # not have is an error, so this list cannot be restored ahead of the
-        # steps it claims.
     ],
 }
-
 
 def members():
     """Every crate Cargo considers part of this workspace."""
     return {name for name in packages()}
-
 
 def packages():
     """`name -> declared features` for every workspace member."""
@@ -206,7 +133,6 @@ def packages():
         check=True,
     )
     return {p["name"]: p["features"] for p in json.loads(out.stdout)["packages"]}
-
 
 def forward_problems(pkgs):
     """Features that stop at a library instead of reaching the binary.
@@ -262,7 +188,6 @@ def forward_problems(pkgs):
                 )
     return problems
 
-
 def steps_by_name():
     """`ci.yml`'s `run:` bodies, keyed by step name.
 
@@ -296,14 +221,9 @@ def steps_by_name():
             body.append(line)
             index += 1
         block = "\n".join(body)
-        # Everything after the `run:` key, whether the command is inline
-        # on that line or a `|` block beneath it -- slicing past the whole
-        # LINE would drop a one-line command, which is how the `model`
-        # clippy step first read as ungated.
         run = re.search(r"^[ \t]*run:[ \t]*\|?[ \t]*", block, re.M)
         steps[head.group(2)] = block[run.end() :] if run else ""
     return steps
-
 
 def listed(body):
     """The crates a `-p`-style command names, and how often."""
@@ -311,7 +231,6 @@ def listed(body):
     for crate in re.findall(r"-p\s+([A-Za-z0-9_-]+)", body):
         counts[crate] = counts.get(crate, 0) + 1
     return counts
-
 
 def main():
     pkgs = packages()
@@ -330,10 +249,6 @@ def main():
                 )
                 continue
             for crate, count in listed(bodies[step]).items():
-                # Counted WITHIN a step, not across them. A crate named
-                # twice in one command is the bug that happened here; a
-                # crate named in two steps is a crate gated in two feature
-                # configurations, which is the point of having two.
                 if count > 1:
                     problems.append(
                         f"{gate}: `-p {crate}` appears {count} times in "
@@ -386,7 +301,6 @@ def main():
             f"crates, {len(EXCLUSIONS.get(gate, {}))} excluded on purpose."
         )
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

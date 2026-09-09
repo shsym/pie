@@ -1,20 +1,3 @@
-//! **THE DYNAMIC BLOCK CONVOLUTION, AGAINST A HOST REFERENCE** — the gate
-//! for `attn/block_dyn_conv.metal` (`Attention::BlockDynConv`, DFlash2's
-//! `attention_conv` / `mlp_conv`).
-//!
-//! The reference is `mlx_dspark.dflash_model.DFlashGroupedConv._convolve`
-//! written out on the host in f32: for each request's span,
-//! `y[i, c] = Σ_t (base[side, t, c] + δ[i, side, t, g(c)]) · x[i − t, c]`,
-//! with `x` zero before the span's first row. Two requests of different
-//! lengths in one fire, so the boundary is exercised in the middle of the row
-//! run and not only at row zero; both sides; pseudo-random bf16 operands.
-//! The kernel accumulates in f32 and rounds once, so the bar is a bf16 ulp
-//! of the answer.
-//!
-//! ```text
-//! cargo test -p engine-metal --release --test the_block_dyn_conv_matches_its_reference -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
@@ -28,7 +11,6 @@ const CHANNELS: u32 = 96;
 const GROUP: u32 = 16;
 const GROUPS: u32 = CHANNELS / GROUP;
 const TAPS: u32 = 2;
-/// Two requests: a full draft block and a shorter one.
 const SPANS: [u32; 2] = [8, 5];
 
 fn noise(at: u64) -> u32 {
@@ -42,7 +24,6 @@ fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
-/// Round to bf16 and back, so the host holds exactly what the device reads.
 fn bf16_round(v: f32) -> f32 {
     let bits = v.to_bits();
     let rounding = 0x7fff + ((bits >> 16) & 1);
@@ -82,13 +63,10 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         v
     };
     let coeff_width = 2 * TAPS * GROUPS;
-    // Operands, held on the host at bf16 precision.
     let x: Vec<f32> = (0..(rows * CHANNELS) as u64).map(|at| bf16_round(unit(at))).collect();
     let coeff: Vec<f32> = (0..(rows * coeff_width) as u64)
         .map(|at| bf16_round(0.25 * unit(at ^ 0x5151)))
         .collect();
-    // The base is identity at tap 0 and a small learned tap 1, as the
-    // published heads carry it — plus noise so the two sides differ.
     let base: Vec<f32> = (0..(2 * TAPS * CHANNELS) as u64)
         .map(|at| {
             let tap = (at / u64::from(CHANNELS)) % u64::from(TAPS);
@@ -126,7 +104,6 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         }
         let got = bf16_floats(&handles.read(hy, u64::from(rows * CHANNELS) * 2).expect("read y"));
 
-        // The reference.
         let mut worst = 0.0f32;
         let mut worst_at = (0usize, 0usize);
         for (r, &span) in SPANS.iter().enumerate() {
@@ -147,7 +124,6 @@ fn the_convolution_matches_the_reference_on_both_sides() {
                     }
                     let want = bf16_round(acc);
                     let have = got[row * CHANNELS as usize + c];
-                    // One bf16 ulp of the answer, with a floor for answers near zero.
                     let ulp = (want.abs() * (1.0 / 128.0)).max(1.0 / 128.0 * 0.05);
                     let d = (want - have).abs() / ulp;
                     if d > worst {
@@ -161,9 +137,6 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         assert!(worst <= 1.0, "side {side}: the kernel parts from the reference by {worst:.2} bf16 ulp at {worst_at:?}");
     }
 
-    // The boundary is real: the second request's first row must not read the
-    // first request's last row. Flip that row of `x` and re-fire side 1: the
-    // second request's rows must not move.
     let before = bf16_floats(&handles.read(hy, u64::from(rows * CHANNELS) * 2).expect("read y"));
     let mut flipped = x.clone();
     let last_of_first = (indptr[1] as usize - 1) * CHANNELS as usize;

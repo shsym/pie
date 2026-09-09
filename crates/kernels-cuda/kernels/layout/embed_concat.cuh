@@ -4,10 +4,6 @@
 
 namespace pie::layout {
 
-// The gather that concatenates: y[r] = table[ids[r,0]] || ... ||
-// table[ids[r,heads-1]] — one row assembled from `heads` table rows, each
-// landing in its own `width`-wide slice of the output (the PLE n-gram
-// embedding's read, qwen4). One thread per OUTPUT element.
 template <class T>
 __global__ void embed_concat(
     const int* __restrict__ ids,
@@ -28,14 +24,9 @@ __global__ void embed_concat(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<long long>(win[0])) return;
-    // And `win[1]` is where those live rows start: `ids` and `y` are row
-    // planes handed at their base, so the OUTPUT element this thread writes
-    // must be re-addressed from the shifted row rather than from the flat
-    // launch index. `table` is read by the id and never moves.
+
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
@@ -45,11 +36,6 @@ __global__ void embed_concat(
         : table[(long long)id * width + w];
 }
 
-// The affine-landed table's gather: 4-bit codes under bf16 scales and zero
-// points, `group` codes a factor. One thread per output element, exactly as
-// the raw gather above; the streamed seat mirrors the moe select's
-// (`MoeGroupBases` — three live bases behind one cell), null for a table a
-// tier holds where the launch said.
 struct alignas(16) EmbedTableBases {
     const u8* codes;
     const u8* scales;
@@ -94,14 +80,9 @@ __global__ void embed_concat_mlxu4(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<long long>(win[0])) return;
-    // And `win[1]` is where those live rows start: `ids` and `y` are row
-    // planes handed at their base, so the OUTPUT element this thread writes
-    // must be re-addressed from the shifted row rather than from the flat
-    // launch index. The code/scale banks are read by the id and never move.
+
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
@@ -120,9 +101,6 @@ __global__ void embed_concat_mlxu4(
     y[at] = Elem<T>::from_f32(v);
 }
 
-// The eight-bit twin of the gather above — one byte one code, the same
-// affine fold and the same seat. Separate rather than templated so the
-// four-bit symbol the PLE table fires stays byte-for-byte what it was.
 template <class T>
 __global__ void embed_concat_mlxu8(
     const int* __restrict__ ids,
@@ -160,14 +138,9 @@ __global__ void embed_concat_mlxu8(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && r >= static_cast<long long>(win[0])) return;
-    // And `win[1]` is where those live rows start: `ids` and `y` are row
-    // planes handed at their base, so the OUTPUT element this thread writes
-    // must be re-addressed from the shifted row rather than from the flat
-    // launch index. The code/scale banks are read by the id and never move.
+
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const long long at = (row * heads + h) * (long long)width + w;
 
@@ -185,4 +158,4 @@ __global__ void embed_concat_mlxu8(
     y[at] = Elem<T>::from_f32(v);
 }
 
-} // namespace pie::layout
+}

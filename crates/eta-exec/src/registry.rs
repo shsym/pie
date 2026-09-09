@@ -10,8 +10,6 @@ use super::plan::{ExecPlan, adopt_launch_package};
 use super::value::{Value, concrete_dtype, decode_wire, wire_cell_bytes};
 use crate::{Error, Result};
 
-/// How much of a fire's geometry an instance's descriptor resolves on
-/// device. The port registry's own type, re-exported here.
 pub use eta_ir::registry::GeometryClass as Geometry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,7 +22,6 @@ pub enum Direction {
 }
 
 impl Direction {
-    /// Which way `channel` crosses, if it crosses.
     #[must_use]
     pub const fn of(channel: &LaunchChannel) -> Self {
         match channel.extern_dir {
@@ -35,7 +32,6 @@ impl Direction {
     }
 }
 
-/// Which end of a channel the host holds. ETA's own, re-exported.
 pub use eta_ir::container::HostRole;
 
 pub use eta_compiler::codegen::program::EmittedKernel;

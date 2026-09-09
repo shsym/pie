@@ -1,10 +1,3 @@
-//! `attention.ragged` under `RaggedMask::ReferenceSelfOnly` lands what an
-//! f32 host reference lands: in each group, rows at or past `ref_start` see
-//! only keys at or past it, rows before it see every key; a `ref_start` at
-//! the group's length or below zero leaves the group unmasked.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --test the_ragged_arm_keeps_reference_rows_to_themselves`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -24,7 +17,6 @@ fn indptr(sizes: &[u32]) -> Vec<i32> {
     out
 }
 
-/// Whether a group-local query row may see a group-local key row.
 fn allowed(ref_start: i32, qo: usize, kv: usize) -> bool {
     let start = usize::try_from(ref_start).unwrap_or(0);
     qo < start || kv >= start
@@ -139,27 +131,29 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, sizes: &[u32], ref_start: &[i32],
     );
 }
 
-/// Reference tails that begin mid-tile, at a tile boundary, at the group's
-/// end (unmasked), below zero (unmasked) and at zero (unmasked).
 const SIZES: [u32; 6] = [64, 300, 200, 50, 40, 5];
 const REF_START: [i32; 6] = [20, 100, 200, -1, 0, 3];
+
+fn the_ragged_arm_keeps_reference_rows_to_themselves_every_case() {
+    reference_rows_see_only_reference_keys_at_head_width_64();
+    reference_rows_see_only_reference_keys_at_head_width_128();
+    reference_rows_see_only_reference_keys_at_head_width_256();
+    a_short_reference_table_is_refused();
+}
 
 #[test]
 fn reference_rows_see_only_reference_keys_at_head_width_64() {
     check(64, 4, 2, &SIZES, &REF_START, 0x64);
 }
 
-#[test]
 fn reference_rows_see_only_reference_keys_at_head_width_128() {
     check(128, 4, 2, &SIZES, &REF_START, 0x128);
 }
 
-#[test]
 fn reference_rows_see_only_reference_keys_at_head_width_256() {
     check(256, 2, 1, &SIZES, &REF_START, 0x256);
 }
 
-#[test]
 fn a_short_reference_table_is_refused() {
     let mut gpu = Gpu::open();
     let q_at = gpu.zeros(8 * 128 * 2);

@@ -159,7 +159,6 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Readouts) => false,
 
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
-                    // The voxel axis: its own row space too.
                     Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
                 },
             },
@@ -320,7 +319,6 @@ impl Windows {
             match axis {
                 model_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
                 model_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
-                // M0: no voxel table on this shell; a voxel region is the zero window.
                 model_ir::RowAxis::Voxels => spans.clear(),
             }
 

@@ -1,9 +1,3 @@
-//! Bound instances and their wait slots: runtime bookkeeping, not a
-//! statement about what an engine is. [`InstanceBindingPlan`] holds the
-//! runtime's own fields (`engine_id`, `pacing_wait_id`) plus the contract's
-//! [`InstanceBinding`](engine::InstanceBinding); the engine mints the
-//! instance id itself.
-
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,24 +5,17 @@ use engine::channel::ChannelSeed;
 use engine::program::{BindExtents, InstanceBinding};
 use eta_ir::registry::GeometryClass;
 
-/// A registered program's id, as the engine minted it.
 pub type ProgramId = engine::ProgramId;
-/// A bound instance's id, as the engine minted it.
 pub type InstanceId = engine::InstanceId;
 
-/// One instance binding, runtime bookkeeping and contract argument together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceBindingPlan {
-    /// Which engine in the registry.
     pub engine_id: usize,
-    /// The wait slot this instance's pacing parks on.
     pub pacing_wait_id: u64,
-    /// What the engine is asked to bind.
     pub binding: InstanceBinding,
 }
 
 impl InstanceBindingPlan {
-    /// The plan that binds `program` to `channels`.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -58,25 +45,16 @@ impl InstanceBindingPlan {
         }
     }
 
-    /// Which program this instantiates.
     #[must_use]
     pub fn program_id(&self) -> ProgramId {
         self.binding.program
     }
 
-    /// The class this binding asked for.
     #[must_use]
     pub fn geometry_class(&self) -> GeometryClass {
         self.binding.geometry
     }
 
-    /// Did the engine acknowledge the class that was asked for?
-    ///
-    /// # Errors
-    ///
-    /// When it bound a different one — which means the engine resolves a
-    /// different amount of the fire geometry on the device than the runtime
-    /// staged for, and every fire after would read a descriptor nobody wrote.
     pub fn validate_binding(&self, bound: &engine::BoundInstance) -> anyhow::Result<()> {
         anyhow::ensure!(
             bound.geometry == self.binding.geometry,
@@ -216,7 +194,6 @@ pub struct BoundInstance {
 }
 
 impl BoundInstance {
-    /// Wrap the engine's answer in the runtime's bookkeeping.
     #[must_use]
     pub fn new(
         engine_id: usize,

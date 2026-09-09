@@ -1,18 +1,3 @@
-//! The trace-time validator. Everything a plan's ports, shapes and dtypes
-//! must satisfy is checked here, once, right after every trace.
-//! Faults, never panics — each message reads like a sentence and names the
-//! node, the op, and the value it is about. All faults are collected in one
-//! pass over the plan; nothing stops at the first.
-//!
-//! Port expectations — the struct kind a plan port takes, the cache storage a
-//! cache port names, the dtypes each op pins — live in one table
-//! (`expect`), matched per op right next to the rules that read it.
-//!
-//! [`classes`] is the second thing checked about a trace and the one thing
-//! computed from it: the 2^F class sweep and the backward demand walk that
-//! resolves every `Def::Merge`. It is a sibling rather than a rule of `check`
-//! because coverage is a property of a whole class, not of a value.
-
 pub mod classes;
 
 pub use classes::{fact_width, resolve_classes};
@@ -23,7 +8,6 @@ use std::fmt::{self, Display, Formatter};
 use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask, Spatial};
 use crate::{Def, Dim, Dtype, Operands, Operation, Trace, StructKind, Ty, ValueId};
 
-/// Where an out-of-range `ValueId` was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Site {
     Input { node: usize, op: &'static str },
@@ -33,8 +17,6 @@ pub enum Site {
     Seam { seam: String },
 }
 
-/// A one-word summary of a `Def`, carried into faults instead of the def
-/// itself so messages stay small and sentence-shaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefKind {
     Input,
@@ -44,93 +26,51 @@ pub enum DefKind {
     Merge,
 }
 
-/// One port of a node, named the way `Operands` orders them: `In(i)` is the
-/// i-th id `inputs()` pushes, `Out(i)` the i-th from `outputs()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Port {
     In(usize),
     Out(usize),
 }
 
-/// What the value at a port must be, checked against its `ValueDecl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
-    /// `Ty::Struct` of one of these kinds — a plan port names its plan.
     Struct(&'static [StructKind]),
-    /// `Def::Cache` — the port names storage, not data.
     Cache,
-    /// A tensor of exactly this dtype.
     Tensor(Dtype),
 }
 
-/// One broken validator rule, with enough context to act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
-    /// A referenced id does not index `trace.values`.
     OutOfRange { site: Site, id: ValueId, len: usize },
-    /// A node produces an id whose decl does not say `Def::Op(that node)`.
     ForeignOutput { node: usize, op: &'static str, id: ValueId, declared: DefKind },
-    /// One id, two producers (or twice from the same node).
     DoubleOutput { id: ValueId, first: usize, first_op: &'static str, second: usize, second_op: &'static str },
-    /// `Def::Op(i)` names a node that does not output this id.
     PhantomDef { id: ValueId, node: usize, op: &'static str },
-    /// `Def::Op(i)` names a node index past the end of `trace.nodes`.
     DefNodeOutOfRange { id: ValueId, node: usize, len: usize },
-    /// An input (directly, or through a merge arm) is defined at or after its
-    /// consumer in program order.
     UseBeforeDef { node: usize, op: &'static str, input: ValueId, arm: Option<ValueId>, def_node: usize },
-    /// `Def::Weight(k)` with `k` past the end of `trace.params`.
     WeightOutOfRange { id: ValueId, index: u32, len: usize },
-    /// `Def::Cache(k)` with `k` past the end of `trace.caches`.
     CacheOutOfRange { id: ValueId, index: u32, len: usize },
-    /// A weight's shape must be all-`Const`; this axis is symbolic.
     SymbolicWeight { id: ValueId, axis: usize, dim: Dim },
-    /// A symbolic dim anywhere but axis 0.
     SymbolicAxis { id: ValueId, axis: usize, dim: Dim },
-    /// An alias pair whose `out` is not among the node's outputs.
     AliasOutUnknown { node: usize, op: &'static str, out: ValueId },
-    /// An alias pair whose `in` is not among the node's inputs.
     AliasInUnknown { node: usize, op: &'static str, input: ValueId },
-    /// An in-place overwrite between two differently-typed values.
     AliasTyMismatch { node: usize, op: &'static str, out: ValueId, input: ValueId, out_ty: Ty, in_ty: Ty },
-    /// A value overwritten in place is read again after the overwrite. The
-    /// arena folds an alias onto its operand's rectangle unconditionally, so
-    /// the later reader gets the result, not the value it named.
     FoldThenRead { fold: usize, fold_op: &'static str, input: ValueId, node: usize, op: &'static str, arm: Option<ValueId> },
-    /// A struct value defined by anything but an op.
     StructDef { id: ValueId, kind: StructKind, def: DefKind },
-    /// A struct value used as a merge arm.
     StructArm { merge: ValueId, arm: ValueId },
-    /// A merge with fewer than two arms.
     MergeTooFew { id: ValueId, arms: usize },
-    /// A merge arm whose type differs from the merge's own.
     MergeArmTy { merge: ValueId, arm: ValueId, merge_ty: Ty, arm_ty: Ty },
-    /// The expectation table names a port the op's `Operands` impl never
-    /// produced. The impls are hand-written: dropping an input from `inputs()`
-    /// shifts or vacates every index after it, and this is the drift detector.
     PortMissing { node: usize, op: &'static str, port: Port },
-    /// A port bound to the wrong kind of value: a plan port whose value is not
-    /// its struct kind, or a cache port whose value is not `Def::Cache`.
     PortKind { node: usize, op: &'static str, port: Port, id: ValueId, want: Expect, ty: Ty, def: DefKind },
-    /// A dtype-pinned port bound to a tensor of another dtype (or to a struct).
     PortDtype { node: usize, op: &'static str, port: Port, id: ValueId, want: Dtype, ty: Ty },
 }
 
-/// Validate a traced plan, collecting every fault.
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     let mut faults = Vec::new();
     let len = trace.values.len();
     let in_range = |id: ValueId| (id.0 as usize) < len;
 
-    // Program order: each node's ports, gathered once through `Operands`.
-    // `owner` remembers who produced each id; `matched` marks ids whose decl
-    // agrees with their producer, so the value sweep below can tell a
-    // phantom `Def::Op` from a mere disagreement.
     let mut owner: Vec<Option<usize>> = vec![None; len];
     let mut matched = vec![false; len];
-    // The node that overwrites each value in place, for the read-after-fold
-    // sweep below. First writer wins: a second fold over the same operand is
-    // itself a read of the first one's result and faults as one.
     let mut folded: Vec<Option<(usize, &'static str)>> = vec![None; len];
     let (mut ins, mut outs, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
     let mut seen = HashSet::new();
@@ -166,8 +106,6 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 faults.push(Fault::OutOfRange { site: Site::Input { node: j, op }, id, len });
                 continue;
             }
-            // Use-after-def, chasing merge arms (a merge is data, so each arm
-            // must itself be settled before the consumer fires).
             seen.clear();
             available(trace, id, id, j, op, &mut seen, &mut faults);
         }
@@ -195,10 +133,6 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
-        // Port expectations: plan ports carry their struct kind, cache ports
-        // name storage, pinned ports their dtype. The table indexes the same
-        // declaration order `Operands` reads; a position the node never
-        // produced is drift, and faults as `PortMissing`.
         for &(port, want) in expect(&node.op) {
             let id = match port {
                 Port::In(i) => ins.get(i),
@@ -209,7 +143,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 continue;
             };
             if !in_range(id) {
-                continue; // already an OutOfRange fault above
+                continue;
             }
             let decl = &trace.values[id.0 as usize];
             let wrong_kind = match want {
@@ -233,30 +167,13 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         }
     }
 
-    // An in-place fold is the LAST read of what it folds over. The arena
-    // gives an alias its operand's rectangle unconditionally (`fold_in_place`
-    // — no copy is minted for a still-live operand), so a node reading that
-    // operand later sees the fold's result under the old name. That is how a
-    // per-block table added onto one stack-wide adaLN vector silently
-    // accumulates every table before it.
-    //
-    // A guarded fold clobbers only the lanes it is admitted on, so the rule
-    // asks whether every lane the READER serves lies inside them: two arms of
-    // one split fold one rectangle on disjoint rows, and are no fault.
-    //
-    // NODE READERS ONLY. A seam runs at plan end and so reads through every
-    // fold after it — but an observation seam is deliberately planted on a
-    // value the next op folds (`attn.out` names the merge that
-    // `gate_sigmoid_mul` then gates), and that is an exactness question about
-    // what a probe hands out, not a wrong answer in the plan. Faulting it here
-    // would refuse half the text catalog for a debug knob.
     if folded.iter().any(Option::is_some) {
         for (k, node) in trace.nodes.iter().enumerate() {
             ins.clear();
             node.op.inputs(&mut ins);
             for &id in &ins {
                 if !in_range(id) {
-                    continue; // already an OutOfRange fault above
+                    continue;
                 }
                 seen.clear();
                 intact(trace, &folded, id, id, k, &mut seen, &mut faults);
@@ -270,7 +187,6 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             Ty::Struct(kind) => Some(*kind),
             Ty::Tensor { .. } => None,
         };
-        // Struct values are defined only by plan-building ops.
         if let (Some(kind), false) = (struct_kind, matches!(decl.def, Def::Op(_))) {
             faults.push(Fault::StructDef { id, kind, def: DefKind::of(&decl.def) });
         }
@@ -321,8 +237,6 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 }
             }
         }
-        // Symbolic dims live only at axis 0 (weights answer to the stricter
-        // all-`Const` rule above; don't fault them twice).
         if !matches!(decl.def, Def::Weight(_)) {
             if let Ty::Tensor { shape, .. } = &decl.ty {
                 for (axis, &dim) in shape.iter().enumerate().skip(1) {
@@ -345,15 +259,11 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     if faults.is_empty() { Ok(()) } else { Err(faults) }
 }
 
-/// `check`, keeping the plan on success — for the tail of a trace pipeline.
 pub fn checked(trace: Trace) -> Result<Trace, Vec<Fault>> {
     check(&trace)?;
     Ok(trace)
 }
 
-/// Is `id` settled before `trace.nodes[node]` fires? Direct op outputs must
-/// come from an earlier node; merges are chased arm by arm (`root` keeps the
-/// operand actually consumed for the message; `seen` breaks merge cycles).
 fn available(
     trace: &Trace, root: ValueId, id: ValueId, node: usize, op: &'static str,
     seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
@@ -371,13 +281,10 @@ fn available(
                 }
             }
         }
-        _ => {} // Input / Weight / Cache: always bound before the first node.
+        _ => {}
     }
 }
 
-/// Is what `id` names still what it named when it was defined, by the time
-/// node `at` reads it? Merges are chased arm by arm, like [`available`]: an
-/// arm the merge may select is a rectangle the reader may be handed.
 fn intact(
     trace: &Trace, folded: &[Option<(usize, &'static str)>], root: ValueId, id: ValueId,
     at: usize, seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
@@ -402,12 +309,6 @@ fn intact(
     }
 }
 
-/// The per-op port-expectation table. Struct and cache coverage is complete:
-/// every plan-consuming variant names its exact `StructKind`s, and every
-/// `cache`/`pages`/`state`/`keys`/`pool`/`entries` field demands
-/// `Def::Cache`. Dtype rows pin the conventional element types (positions-
-/// and indptr-like inputs i32; gate/lse/routing-weight outputs f32; the
-/// `row_valid` padding mask u8) — advisory, not an exhaustive typing.
 fn expect(op: &Operation) -> &'static [(Port, Expect)] {
     use Port::{In, Out};
 
@@ -428,18 +329,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Decode { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE)],
             Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
             Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
-            // The tower's attention pins its indptr and nothing else: q, k, v
-            // and o ride the activation dtype, and `segments` is the patch
-            // axis's own bounds vector, i32 like every other indptr here.
             Attention::Dense { .. } => &[(In(3), I32)],
-            // The ragged attention pins its two CSRs, and — under the
-            // reference mask — the two per-row tag tables behind them; q, k,
-            // v and o ride the activation dtype.
             Attention::Ragged { mask: RaggedMask::ReferenceSelfOnly { .. }, .. } => {
                 &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)]
             }
-            // Under the relative bias the table behind the CSRs is the f32
-            // `[heads, 2·max_len − 1]` plane the kernel adds from.
             Attention::Ragged { mask: RaggedMask::RelativeBias { .. }, .. } => {
                 &[(In(3), I32), (In(4), I32), (In(5), F32)]
             }
@@ -473,7 +366,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), CACHE)]
             }
             Attention::BlockDynConv { .. } => &[],
-            // `hp` is optional, so the input positions past it are not fixed.
             Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (Out(0), I32)],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
             Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
@@ -483,24 +375,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
             Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
-            // `row_valid` is one byte per padded row, not an index vector:
-            // `kernels/attn/pool.cuh` takes it as `const u8* __restrict__`.
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => {
                 &[
                     (In(0), I32),
                     (In(1), U8),
                     (Out(0), I32),
                     (Out(1), I32),
-                    // The compressed row's rope position, an index like the
-                    // two beside it.
                     (Out(2), I32),
                 ]
             }
-            // The state write scatters by the source cache's own write
-            // descriptors, exactly as the appenders beside it do.
             Attention::PoolStateWrite { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
-            // `ape` rides at In(3) when the compressor states one, so the
-            // three ports above it keep the indices they have always had.
             Attention::PoolGather { ape: None, .. } => {
                 &[(In(0), I32), (In(1), I32), (In(2), CACHE)]
             }
@@ -513,13 +397,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PoolLse { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), CACHE), (Out(1), F32)]
             }
-            // The selected twin seats the compressed-row ids between the fire
-            // tables and the cache, so the pool space stays the last input.
             Attention::PoolLseSelected { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), I32), (In(4), CACHE), (Out(1), F32)]
             }
-            // The hasher reads ids and writes ids; its window cache is the
-            // state slab between them.
             Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
                 &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
             }
@@ -531,32 +411,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MoeTopkSigmoidSink { .. }
             | Linear::MoeTopkSqrtSoftplus { .. }
             | Linear::MoePredictRoute { .. } => &[(Out(0), I32), (Out(1), F32)],
-            // The relative-position profile lands f32 for the score to add.
             Linear::RelBias { .. } => &[(Out(0), F32)],
-            // The lookup router lands the same pair off a token-id column and
-            // an I64 table: the ids are the fire's own `RuntimeInput::Tokens`
-            // stream, i32 like every other id column in this table.
             Linear::MoeHashRoute { .. } => &[(In(0), I32), (Out(0), I32), (Out(1), F32)],
-            // The grouped projection's static routes: i32, like every route
-            // plane the routed selects read.
             Linear::GroupRoutes { .. } => &[(Out(0), I32)],
             Linear::MatmulGrouped { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
-            // The bias-free quantized twin carries no bias port, so `routes`
-            // sits back at In(2), where `MoeMatmulSelect` keeps it.
             Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
             Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
-            // The bias mixture reads both routing outputs at once, so it pins
-            // the pair the two rows above pin one each of. Its `bias` rides the
-            // activation dtype, as `MoeMatmulSelectBias`'s does.
             Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
-            // The correction's routes sit at In(3), behind `x` and the two
-            // bank planes: one adapter id per token ROW, `-1` for the base
-            // model, and the same i32 pinning every routed op here states.
             Linear::LoraCorrect { .. } => &[(In(3), I32)],
-            // Channel mixing with nothing pinned: the gemms, their epilogues,
-            // and the routed sum's gate ride the activation dtype they are given.
             Linear::Matmul { .. }
             | Linear::LmHead { .. }
             | Linear::MlpSwiglu { .. }
@@ -579,38 +443,23 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
                 &[(In(1), I32)]
             }
-            // The axis rope reads the guest's f32 positions, fractional
-            // where a text wants them.
             Elementwise::RopeAxes { .. } => &[(In(1), F32)],
-            // The modulation ops read their lane map, when they have one, as
-            // the i32 token→lane table it is; it sits behind the activations.
             Elementwise::Modulate { lane_of_row: Some(_), .. }
             | Elementwise::NormModulate { lane_of_row: Some(_), .. } => &[(In(2), I32)],
             Elementwise::GatedResidualAdd { lane_of_row: Some(_), .. } => &[(In(3), I32)],
             Elementwise::GatedResidualNormModulate { lane_of_row: Some(_), .. } => {
                 &[(In(4), I32)]
             }
-            // The timestep embedding is fp32 end to end: the scalar in and
-            // the sinusoid row out.
             Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
-            // The bucket embedding rides the checkpoint's dtype; the table
-            // it lands is f32, what the ragged arm's bias reads.
             Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
             Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
-            // The mix projection is f32 end to end — the operand the norm
-            // widened, the dynamic plane, and the row the sinkhorn splits.
             Elementwise::HcProject { .. } => &[(In(0), F32), (In(1), F32), (Out(0), F32)],
             Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
-            // The trunk collapse reads the f32 mix row and the f32 gate planes.
             Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
-            // The fused per-layer input gathers by i32 token ids, as `Embed` does.
             Elementwise::EmbedScaleAdd { .. } | Elementwise::EmbedScaleAddSelect { .. } => {
                 &[(In(0), I32)]
             }
-            // Per-token math with nothing pinned: the norms, the residual and
-            // scaling arithmetic, and the gate take and return the activation
-            // dtype they are given.
             Elementwise::Rmsnorm { .. }
             | Elementwise::RmsnormPerHead { .. }
             | Elementwise::RmsnormPlusOne { .. }
@@ -651,35 +500,17 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
         },
         Operation::Layout(op) => match op {
             Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
-            // The readout gather's row indices are the usual i32 index vector.
             Layout::GatherRows { .. } => &[(In(1), I32)],
-            // The interpolating gather pins BOTH its geometry ports: the taps
-            // are i32 like every index vector here, and the weights are f32
-            // because they are the preprocessor's arithmetic and not the
-            // activation's — a weight quantised to the model element would
-            // move the resample by more than the gather it feeds.
             Layout::EmbedWeighted { .. } => &[(In(0), I32), (In(1), F32)],
-            // The scatter's route vector, at In(1) behind the tower rows it
-            // places: one destination TOKEN row per source row, i32 like
-            // every other index vector this IR names.
-            // The dropping twin pins the same port for the same reason;
-            // what differs is which values it admits, a host-side check.
             Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
-            // The pool pins nothing: it folds rows of the activation dtype
-            // into fewer rows of the same one, and its `side` is a stated
-            // number rather than an operand.
             Layout::SplitQkv { .. }
             | Layout::SplitQGate { .. }
             | Layout::SplitRows { .. }
             | Layout::Select { .. }
             | Layout::PoolRows { .. }
             | Layout::MergeRows { .. }
-            // The argmax pins nothing: its operands are the readout's own
-            // dtype and its i32 answer is stated by the value it writes.
             | Layout::Argmax { .. } => &[],
             Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
-            // The two permutations pin their row order: one i32 fire row per
-            // packed row, `-1` past the selection.
             Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
         },
         Operation::CustomCuda(op) => match op {
@@ -688,12 +519,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             }
         },
         Operation::Collective(_) => &[],
-        // Every grid is an i32 lane table; the norm's affine planes and the
-        // conv's bias are f32 like every other per-channel plane here.
         Operation::Spatial(op) => match op {
             Spatial::Grid { .. } => &[(In(0), I32), (Out(0), I32)],
-            // `bias` and `cache` are optional, so the ports past `w` are
-            // not fixed; the output grid is the last input.
             Spatial::Conv3d { .. } => &[(In(1), I32)],
             Spatial::GroupNorm { .. } => &[(In(1), I32), (In(2), F32), (In(3), F32)],
             Spatial::Attention { .. } => &[(In(3), I32)],
@@ -703,8 +530,6 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Spatial::AvgDown { .. }
             | Spatial::Patchify { .. }
             | Spatial::Unpatchify { .. } => &[(In(1), I32), (In(2), I32)],
-            // The store's third input is the slab it writes, whose kind
-            // the `Def::Cache` states; only the grid is pinned here.
             Spatial::CacheStore { .. } => &[(In(1), I32)],
         },
     }
@@ -722,8 +547,6 @@ impl DefKind {
     }
 }
 
-/// "v42" — the spelling every message uses for a value. `pub(crate)` so the
-/// class sweep next door spells a merge the same way this file does.
 pub(crate) struct V(pub(crate) ValueId);
 
 impl Display for V {
@@ -732,7 +555,6 @@ impl Display for V {
     }
 }
 
-/// "bf16" — a dtype's lowercase name.
 struct N(Dtype);
 
 impl Display for N {
@@ -741,7 +563,6 @@ impl Display for N {
     }
 }
 
-/// "bf16[tokens, 4096]" / "struct AttnDecodePlan" — a type, said briefly.
 struct T<'a>(&'a Ty);
 
 impl Display for T<'_> {

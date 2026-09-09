@@ -3,7 +3,7 @@
 using namespace metal;
 
 struct M1Status {
-  uint state;  // 0 unset, 1 ready/running, 2 retry, 3 fault, 4 committed
+  uint state;
   uint fault;
   uint reserved0;
   uint reserved1;
@@ -179,14 +179,6 @@ inline void m1_fault(device M1Status* status, uint code) {
   status->state = 3;
 }
 
-// A fault that says which op and which guard. `fault` alone is the op tag, and
-// several ops share one tag -- every intrinsic is 0xA0 -- so the tag names a
-// family rather than a cause. `reserved0` carries the intrinsic id and
-// `reserved1` packs the guard site with the immediate, which is what turns
-// "instance N launch failed: op tag 0xA0" into something actionable.
-//   site 1 = channel sink is narrower than the value
-//   site 2 = MtpDrafts with a zero row width
-//   site 3 = no arm claimed this tag
 inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
   status->reserved0 = p.intr;
   status->reserved1 = (site << 24) | (p.imm & 0x00ffffffu);
@@ -194,11 +186,6 @@ inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
   status->state = 3;
 }
 
-// A strided, word-wide typed copy. `begin`/`step` partition it across a
-// threadgroup; 0/1 is the serial walk. The byte-at-a-time version this replaces
-// issued one device access per byte, so copying a vocabulary-wide f32 row -- a
-// plain reshape in the sampler's PTIR graph -- was ~1M dependent accesses on a
-// single thread, about 85ms of an ~89ms decode step.
 inline void m1_copy_typed_range(
     const device uchar* input,
     device uchar* output,
@@ -335,13 +322,6 @@ inline void m1_reduce_integer(
   }
 }
 
-// Sequential fold, not a staged tree. `m1_argmax_combine` is a strict total
-// order on (have, value desc, index asc), so its maximum is unique and every
-// evaluation order yields the same (value, index) -- unlike m1_reduce_float's
-// sum, whose tree shape is part of the numeric ABI. The tree here cost a
-// materialization of one 16-byte candidate per element into device `temporary`
-// plus a full read-modify-write per pass, all on the single thread that owns the
-// lane; on a 248k vocab that was ~257ms, roughly 60x the entire model forward.
 inline void m1_reduce_argmax(
     const device uchar* input,
     device uchar* output,
@@ -368,9 +348,7 @@ inline void m1_reduce_argmax(
       reinterpret_cast<const device float*>(input);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
-    // Four independent accumulators, folded at the end. Associativity makes the
-    // split free (see the note above), and it breaks the dependent chain that
-    // otherwise serialises one device load per iteration on this single thread.
+
     M1ArgmaxCandidate best[4] = {
         {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u},
         {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u}};
@@ -399,11 +377,6 @@ inline void m1_reduce_argmax(
   }
 }
 
-// Threadgroup-cooperative argmax, for the grouped region launch that gives a
-// lane a whole threadgroup instead of one thread. Same strict total order as
-// m1_argmax_combine, so the answer is identical to the serial fold above; only
-// the partition changes. The tree guards `tid + stride` so a non-power-of-two
-// threadgroup is still correct.
 inline void m1_reduce_argmax_mt(
     const device uchar* input,
     device uchar* output,
@@ -413,8 +386,7 @@ inline void m1_reduce_argmax_mt(
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
   if (in_desc.dtype != 0) {
-    // Integer argmax rows are small in every shipped program; keep the serial
-    // path rather than duplicating it.
+
     if (tid == 0) m1_reduce_argmax(input, output, temporary, in_desc);
     return;
   }
@@ -460,7 +432,7 @@ inline void ptir_m1_execute(
   const M1ValueDesc d2 = descriptors[p.a2];
   const M1ValueDesc out0 = descriptors[p.o0];
 
-  if (p.tag == 0x81) {  // const
+  if (p.tag == 0x81) {
     for (uint i = 0; i < out0.len; ++i) {
       if (p.lit_dtype == 0) m1_store_f(o0, i, as_type<float>(p.lit_bits));
       else if (p.lit_dtype == 1) m1_store_i(o0, i, int(p.lit_bits));
@@ -469,7 +441,7 @@ inline void ptir_m1_execute(
     }
     return;
   }
-  if (p.tag == 0x90 || p.tag == 0x91) {  // channel root
+  if (p.tag == 0x90 || p.tag == 0x91) {
     if (out0.dtype == 3) {
       for (uint i = 0; i < out0.len; ++i)
         o0[i] = (a0[i >> 3] >> (i & 7)) & 1u;
@@ -478,7 +450,7 @@ inline void ptir_m1_execute(
     }
     return;
   }
-  if (p.tag == 0x92) {  // direct channel sink
+  if (p.tag == 0x92) {
     const uint logical_bytes =
         d0.dtype == 3 ? (d0.len + 7u) / 8u : d0.len * 4u;
     if (logical_bytes > p.sink_bytes) {
@@ -495,11 +467,11 @@ inline void ptir_m1_execute(
     for (uint i = logical_bytes; i < p.sink_bytes; ++i) o0[i] = 0;
     return;
   }
-  if (p.tag == 0xA0) {  // intrinsic logits staging is bf16
+  if (p.tag == 0xA0) {
     const device bfloat* logits =
         reinterpret_cast<const device bfloat*>(a0) +
         ulong(p.imm2) * p.imm;
-    if (p.intr == 6u) {  // MtpDrafts: bounded argmax of the bound MTP rows
+    if (p.intr == 6u) {
       if (p.imm == 0u) {
         m1_fault_op(status, 2u, p);
         return;
@@ -522,9 +494,7 @@ inline void ptir_m1_execute(
       }
       return;
     }
-    // Unrolled: the lane that owns this region is a single thread, so a scalar
-    // loop over a vocab-wide row is a chain of dependent device round trips.
-    // Eight independent loads per iteration let the memory pipeline overlap them.
+
     device float* out_f = reinterpret_cast<device float*>(o0);
     uint i = 0;
     for (; i + 8u <= out0.len; i += 8u) {
@@ -538,11 +508,11 @@ inline void ptir_m1_execute(
     for (; i < out0.len; ++i) out_f[i] = float(logits[i]);
     return;
   }
-  if (p.tag == 0xA1) {  // explicit Metal semantic boundary: identity
+  if (p.tag == 0xA1) {
     m1_copy_typed(a0, o0, out0.len, out0.dtype);
     return;
   }
-  if (p.tag == 0xA2) {  // explicit Metal semantic boundary: discard sink
+  if (p.tag == 0xA2) {
     return;
   }
 
@@ -586,7 +556,7 @@ inline void ptir_m1_execute(
     }
     return;
   }
-  if (p.tag == 0x07) {  // cast
+  if (p.tag == 0x07) {
     for (uint i = 0; i < out0.len; ++i) {
       const uint source = m1_pick(d0.len, i);
       if (out0.dtype == 0) m1_store_f(o0, i, m1_load_f(a0, source, d0.dtype));
@@ -709,7 +679,7 @@ inline void ptir_m1_execute(
     m1_reduce_argmax(a0, o0, temporary, d0);
     return;
   }
-  if (p.tag == 0x38) {  // left-aligned broadcast
+  if (p.tag == 0x38) {
     for (uint linear = 0; linear < out0.len; ++linear) {
       uint rem = linear, source_index = 0;
       uint source_stride[4] = {1, 1, 1, 1};
@@ -752,9 +722,7 @@ inline void ptir_m1_execute(
     return;
   }
   if (p.tag == 0x40 || p.tag == 0x41) {
-    // Scanned in the operand's own dtype. A u32 offset scan is exactly what
-    // ragged row offsets are built from, and accumulating one through float
-    // is exact only below 2^24 -- past that it rounds, silently.
+
     const bool is_sum = p.tag == 0x40;
     for (uint row = 0; row < d0.rows; ++row) {
       float accumulated_f = is_sum ? 0.0f : 1.0f;
@@ -1020,10 +988,6 @@ inline void ptir_m1_execute(
   m1_fault_op(status, 3u, p);
 }
 
-// The grouped region hands a lane a whole threadgroup. Ops whose partition is
-// provably free run across it; everything else stays on thread 0 and keeps the
-// exact serial semantics (m1_reduce_float's sum tree, for one, is a numeric
-// ABI and must not be repartitioned). The caller barriers between ops.
 inline void ptir_m1_execute_mt(
     uint generated_tag,
     device M1Status* status,
@@ -1043,11 +1007,11 @@ inline void ptir_m1_execute_mt(
   p.tag = generated_tag;
   const M1ValueDesc d0 = descriptors[p.a0];
 
-  if (p.tag == 0x33) {  // argmax: order-independent, so partition it
+  if (p.tag == 0x33) {
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
     return;
   }
-  if (p.tag == 0x39 || p.tag == 0xA1) {  // reshape / semantic-boundary identity
+  if (p.tag == 0x39 || p.tag == 0xA1) {
     const M1ValueDesc out0 = descriptors[p.o0];
     m1_copy_typed_range(a0, o0, out0.len, out0.dtype, tid, nthreads);
     return;

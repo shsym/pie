@@ -1,23 +1,3 @@
-//! `emit_fused_region_cuda` — one kernel for a whole generated region.
-//!
-//! The region's ops are emitted inline, in plan order, into a single
-//! `__global__` body: each op resolves its operands to scratch offsets and
-//! calls the runtime's block-parallel helper for its family, falling back
-//! to the single-thread `ptir_m1_execute` switch for ops with no parallel
-//! form. Between ops the block syncs and bails out if the status word moved
-//! off `1`, keeping a fused region pass-atomic like the one-op-per-launch
-//! path.
-//!
-//! Two analyses run before emission: reshape aliasing (a `reshape` whose
-//! result never leaves the region is aliased to its input's id rather than
-//! emitted), and direct argmax (`analyze_direct_argmax`: an `argmax` fed by
-//! a logits intrinsic through nothing but reshapes reads the intrinsic's
-//! device buffer straight). Both only ever elide a node whose value some
-//! other emission still produces. The NUCLEUS region has no CUDA kernel of
-//! its own and is emitted here as ordinary ops — eliding its operands on
-//! the grounds that a library kernel reads the intrinsic (true on Metal)
-//! would leave its scratch slot zeroed and the draw always returning token 0.
-
 use crate::codegen::error::{EmitError, EmitterKind, ValueLayoutSite};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -36,33 +16,12 @@ use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
 use super::validate::validate_generated_region;
 
-/// Everything above the entry point: the lane-table records and every
-/// block-parallel helper, ending on `extern "C" __global__ void` so the entry
-/// name follows.
-///
-/// Shared with [`super::topk`], which emits a different body into the same
-/// `KernelKind::Fused` slot and therefore has to carry the identical ABI.
 pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_block0.cuh");
-/// The parameter list, ending mid-comparison against the lane-table ABI
-/// version the caller writes next.
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
-/// The per-lane preamble: the commit-slot bail-out, the shared status word,
-/// and the `descriptors` / `scratch` / `temporary` pointers a body indexes.
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-/// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots. Projected,
-/// not counted: an undercount here means a kernel reading the next lane's
-/// slot zero (`dispatch_lane * N + p.intr` in emitted device source).
 pub const PTIR_INTRINSIC_SLOTS: u32 = IntrinsicId::SLOTS;
 
-/// The ops `ptir_parallel_elementwise` in `fused_block0.cuh` has an arm for.
-///
-/// Answering `true` for a tag that helper does not handle is silent-wrong
-/// (untouched output, clean status word), not loud like the single-thread
-/// fallback's `m1_fault`. Hence the explicit list rather than tag ranges,
-/// which would silently absorb a later-allocated tag into a gap; and hence
-/// `parallel_elementwise_matches_the_cuda_runtime`, which checks the arms
-/// against the `.cuh` in both directions.
 fn parallel_elementwise(tag: u8) -> bool {
     matches!(
         tag,
@@ -104,7 +63,6 @@ fn parallel_elementwise(tag: u8) -> bool {
     )
 }
 
-/// A value's row decomposition: everything but the trailing dim is rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RowShape {
     fixed_rows: u64,
@@ -148,47 +106,22 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
     Some(shape)
 }
 
-/// Which `argmax` nodes may read a logits intrinsic's buffer directly, and
-/// which nodes that makes redundant. `source_value`/`requires_single_row`
-/// aren't used by emission but are carried for the engine's launch packer,
-/// so this stays the only implementation of the analysis.
-/// [`super::region_analysis::DirectArgmax`] is the sparse, typed form that
-/// reaches an engine; this is the dense per-node array on the way there.
 pub(crate) struct ArgmaxScan {
     pub(crate) intrinsic: Vec<u16>,
     pub(crate) skipped: Vec<u8>,
     pub(crate) source_value: Vec<u32>,
     pub(crate) requires_single_row: Vec<u8>,
-    /// Per node: the Gumbel-max chain this `argmax` heads, if it heads one.
     pub(crate) gumbel: Vec<Option<GumbelChain>>,
 }
 
-/// An `argmax` whose operand is `add([div(logits-chain, c)], rng_keyed
-/// gumbel)`: every value on the way read by nothing else, the logits chain
-/// reshapes only, `c` a single element. The scan reads the intrinsic
-/// straight and draws the noise per element (`ptir_fast_gumbel_argmax_intrinsic`),
-/// so the `add`, the `rng_keyed`, the `div` and the chain are elided — the
-/// same way a bare direct argmax elides its chain. Not exported to the
-/// engine's `DirectArgmax` records: those say the reduction may be folded
-/// into the LM head, and this one needs the logits themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GumbelChain {
     pub(crate) intrinsic: u16,
-    /// The `[2]` U32 state the noise is keyed on.
     pub(crate) state: u32,
-    /// The scalar the logits are divided by first, if they are.
     pub(crate) divisor: Option<u32>,
-    /// The noise value (the `rng_keyed` result): its descriptor sizes the
-    /// element base a row block draws at.
     pub(crate) noise: u32,
 }
 
-/// Whether a Gumbel-max head folds into the one-scan form. On unless an
-/// engine clears it (the CUDA shell does under `[engine] diagnostics =
-/// "gumbel-direct=off"`, the A/B arm that keeps the four launches the head
-/// was traced as). A static
-/// rather than an argument because the emitter is reached through the
-/// compile plane's cache key, which does not carry a per-boot flag.
 pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 fn gumbel_direct_enabled() -> bool {
@@ -244,9 +177,6 @@ pub(crate) fn analyze_direct_argmax(
         let mut value = reduction.args[0];
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
-        // The Gumbel-max head, if this is one: `add(l, n)` with `n` a Gumbel
-        // draw and `l` the logits, scaled or not. The chain walk below then
-        // starts at the logits with the head's nodes queued to be skipped.
         let mut gumbel: Option<(u32, Option<u32>, u32)> = None;
         if gumbel_direct_enabled()
             && single_consumer(value, node as u32)
@@ -331,10 +261,6 @@ pub(crate) fn analyze_direct_argmax(
                 _ => false,
             };
             if let Some((state, divisor, noise)) = gumbel {
-                // The draw keys each element by its place in the whole
-                // value, so the scan wants the logits and the noise to be
-                // one rectangle: the argmax's operand shape, or the one row
-                // of it a decode lane reads (the bare argmax's rule).
                 if exact_shape || runtime_single_row {
                     analysis.gumbel[node] = Some(GumbelChain {
                         intrinsic: op.intr,
@@ -362,19 +288,10 @@ pub(crate) fn analyze_direct_argmax(
     analysis
 }
 
-/// A `top_k` whose operand is the logits, scaled by one element or not,
-/// reached through reshapes: the select kernel reads the intrinsic plane
-/// straight (`order.rs`), so the scaled plane it would have ranked need
-/// never land in scratch — the streams that read it recompute it
-/// (`stream.rs`). Stage-wide, per node: a stream in one region asks about a
-/// `top_k` in another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TopKDirect {
-    /// The intrinsic slot (`OpView::intr`).
     pub(crate) intrinsic: u16,
-    /// The intrinsic op's node, for its `imm2` row offset.
     pub(crate) node: u32,
-    /// The one-element value the logits are divided by, if they are.
     pub(crate) divisor: Option<u32>,
 }
 
@@ -394,7 +311,6 @@ pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirec
         .collect()
 }
 
-/// The row geometry a region is launched over, when it is row-parallel.
 pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u64, u32)> {
     region
         .row_value
@@ -403,8 +319,6 @@ pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u6
         .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX))
 }
 
-/// Per value, how a row block of `geometry` sees it: 1 = its row of a value
-/// of the geometry, 2 = its element of a per-row vector, 0 = whole.
 pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
     let (fixed, extent) = geometry;
     stage
@@ -427,7 +341,6 @@ pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, 
         .collect()
 }
 
-/// `emit_fused_region_cuda`.
 pub fn emit_fused_region(
     entry_name: &str,
     stage: &CompiledStage,
@@ -458,12 +371,6 @@ pub fn emit_fused_region(
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
     source.push_str(PREAMBLE);
 
-    // A row-parallel region: the engine launches one block per row of the
-    // witness value, and this block owns row `lane_row`. It sees every
-    // multi-row value of the geometry (kind 1) as its own row, every per-row
-    // vector (kind 2: what a row reduction writes one element of) as its
-    // element, and everything else whole — through a block-local descriptor
-    // table and a per-value byte shift, so the helpers below run unchanged.
     let row_geometry = row_geometry(stage, region);
     let row_parallel = row_geometry.is_some();
     let row_kinds: Vec<u8> = row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
@@ -514,15 +421,12 @@ pub fn emit_fused_region(
 ");
     }
 
-    // The barrier-and-status block every op (and every stream) ends with.
     const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
     let direct_topk = analyze_direct_topk(stage);
     let streams = row_parallel.then(|| {
         super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped, &direct_topk)
     });
 
-    // A row-parallel region's nodes are emitted in the streams' order
-    // (`stream::emission_order`); any other region in the plan's.
     let order: Vec<usize> = match &streams {
         Some(streams) => streams.order.clone(),
         None => region.nodes.iter().map(|n| n.index()).collect(),
@@ -536,7 +440,6 @@ pub fn emit_fused_region(
         if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
         }
-        // A stream: this op and the elementwise run after it, one pass.
         if let Some(streams) = &streams {
             let mut pointer = |value: u32| {
                 let value = aliases.resolve(value);
@@ -547,12 +450,6 @@ pub fn emit_fused_region(
                 continue;
             }
         }
-        // A reshape's result element count must be no larger than its
-        // source's (both runtimes copy the result's element count out of
-        // the source), or aliasing would read past a too-short buffer.
-        // `region.sinks` is not also excluded (unlike `metal::fused`): a
-        // sink's operand is alias-resolved with every other operand below,
-        // so eliding a reshape that feeds one is sound here.
         if op.tag == tags::RESHAPE
             && !op.args.is_empty()
             && !region.outputs.contains(&base)
@@ -562,7 +459,6 @@ pub fn emit_fused_region(
             continue;
         }
 
-        // Reshape aliases are resolved before indexing the offsets table.
         let resolve = |value: u32| {
             let value = aliases.resolve(value);
             if row_parallel {
@@ -572,8 +468,6 @@ pub fn emit_fused_region(
             }
         };
         let mut slots = Slots::of(op, base, resolve);
-        // A Gumbel-max head reads its state, its divisor and the noise's
-        // descriptor by value, past the op's own operand slots.
         let gumbel = direct.gumbel[node].map(|chain| GumbelSlots {
             intrinsic: chain.intrinsic,
             state: resolve(chain.state),
@@ -587,9 +481,6 @@ pub fn emit_fused_region(
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");
         source.push_str("    p.rng_seed = 0u;\n");
         if matches!(op.tag, tags::RNG | tags::RNG_KEYED) {
-            // The element base (`fused_block0.cuh`): a row block keys its
-            // noise by position in the whole value. Zero for a whole-value
-            // block.
             source.push_str("    p.imm3 = lane_row * descriptors[p.o0].len;\n");
         }
 
@@ -616,8 +507,6 @@ pub fn emit_fused_region(
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
-            // A row block reads its row of the intrinsic (a whole-value
-            // block's `lane_row` is 0).
             source.push_str("    p.intrinsic_row_offset += lane_row;\n");
             slots.a0 =
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
@@ -636,9 +525,6 @@ pub fn emit_fused_region(
     Ok(source)
 }
 
-/// The per-op body: one runtime helper call, or the single-thread fallback.
-/// What a Gumbel-max head's scan reads past its own operand slots, as the
-/// expressions the emitted body spells them with.
 struct GumbelSlots {
     intrinsic: u16,
     state: String,
@@ -822,8 +708,6 @@ fn emit_body(
     }
 }
 
-/// `chan_put` is the only op that reconciles the lane's row validity against
-/// the committed cell, so it gets its own emitter.
 fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     let tag = op.tag;
     source.push_str("    const M1ValueDesc input = descriptors[p.a0];\n");
@@ -892,18 +776,6 @@ mod tests {
     use super::*;
     use crate::codegen::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
     
-    
-
-    /// `fused_block0.cuh` declares the lane table a sixth time, in CUDA's own
-    /// width spellings. `layout.rs` knew about five copies and not this one.
-    ///
-    /// The file's own `static_assert(sizeof(...))` lines do not cover it:
-    /// swapping two `m1_u32` fields, or `rng_state` with `commit_slot`, keeps
-    /// every size and moves what the kernel reads. The host would write
-    /// `page_count` where the kernel looks for `kv_len` and nothing would say
-    /// so — not at compile time, not at launch, not in a golden, because the
-    /// golden records the emitted kernel and this file is the runtime the
-    /// kernel is prefixed with.
     #[test]
     fn cuda_runtime_lane_table_matches_layout() {
         for declared in HOST_SHARED {

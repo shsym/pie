@@ -1,8 +1,3 @@
-//! Finding things in a plan. Every id a plan carries is dense and assigned
-//! in push order, so a lookup is an array index, checked on every access: if
-//! `buffers[i].id != BufferId(i)` something built the plan wrong, which is
-//! an `Internal` error rather than a silently slow path.
-
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -29,9 +24,6 @@ impl LoadPlan {
     }
 }
 
-/// Resolve a scheduled instruction by id, against a slice the caller owns
-/// (passes clone `instrs` before rewriting it, so they can't go through
-/// [`LoadPlan::instr`]). Same invariant: ids are dense.
 pub(crate) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&StorageInstr> {
     let found = instrs
         .get(id.0 as usize)
@@ -46,7 +38,6 @@ pub(crate) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&Stora
     Ok(found)
 }
 
-/// The id every instruction carries, whichever variant it is.
 pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
@@ -82,14 +73,9 @@ fn dense(found: u32, wanted: u32, what: &str) -> Result<()> {
     )))
 }
 
-/// Lookups that are *not* an array index: tensor ids interleave two
-/// allocators (a contract's own tensors, then generated scale tensors), so
-/// the tensor table is sparse where the buffer table is not. Built once by
-/// a pass that needs it rather than carried on the plan.
 pub struct PlanIndex {
     tensor: HashMap<TensorId, u32>,
     source: HashMap<TensorId, u32>,
-    /// What each `CreateView` output looks at. See [`PlanIndex::buffer_tensor`].
     view_input: HashMap<BufferId, BufferId>,
 }
 
@@ -117,12 +103,6 @@ impl PlanIndex {
         plan.sources.get(*self.source.get(&id)? as usize)
     }
 
-    /// The declaration behind a buffer, chasing views.
-    ///
-    /// A `CreateView` output declares no tensor: it is a window onto one, and
-    /// takes the elements of what it looks at, following the same chain
-    /// `resolve` walks for bytes. The chain terminates because `CreateView`
-    /// names an input that is already allocated.
     pub fn buffer_tensor<'a>(&self, plan: &'a LoadPlan, id: BufferId) -> Option<&'a TensorDecl> {
         let mut at = id;
         loop {

@@ -1,5 +1,3 @@
-//! One bound instance: its rings, per-stage buffers, and one fire. Buffers are unified-memory shared storage, so there is no stream or synchronize.
-
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::op::IntrinsicId;
@@ -16,35 +14,19 @@ use super::launch::{ChannelShape, Cursor, Prepared, Rings};
 use super::ports::{self, Envelope};
 use super::shared::SharedRing;
 
-/// What one fire produced; mirrors [`eta_exec::StepOutcome`] so the parity
-/// test can diff them directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fired {
-    /// Every stage ran and the cursors advanced.
     Committed,
-    /// Nothing launched: this channel didn't meet its declared requirement.
     Blocked(u32),
-    /// A stage's kernel declined internally; cursors unmoved, so a caller
-    /// may retry.
     Declined,
-    /// The instance is unusable and stays so; reachable from a device
-    /// fault as well as from the commit (see [`Session::fire`]).
     Faulted(String),
 }
 
-/// Why a fire would block: [`Session::readiness`]'s answer with the numbers
-/// it was computed from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Blocked {
-    /// The first channel whose requirement a fire now would not meet.
     pub channel: u32,
-    /// What the program declares it needs of that channel. `None` is a
-    /// channel with no stated requirement, which never blocks — so it never
-    /// appears here.
     pub needs: Option<Direction>,
-    /// Cells in the ring: `tail - head`.
     pub live: u64,
-    /// Cells the ring was declared to hold.
     pub capacity: u64,
 }
 
@@ -72,54 +54,25 @@ impl std::fmt::Display for Blocked {
     }
 }
 
-/// What the staging half of an attached fire answers
-/// ([`Session::stage_into`]); kept separate from [`Fired`] so a caller
-/// can't accidentally settle something that never flew or skip settling
-/// something that did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Launched {
-    /// The pass is in the caller's command buffer.
-    /// [`Session::settle_launched`] owes it a verdict, once that buffer has
-    /// landed.
     Airborne,
-    /// Nothing was encoded and nothing is owed: a blocked channel or a
-    /// poisoned instance.
     Refused(Fired),
 }
 
-/// One bound instance's device state.
-///
-/// Cursors are `u64` sequence numbers that never wrap, matching the host
-/// half's [`ChannelState`](eta_exec::ChannelState) so the two can be diffed.
 #[derive(Debug)]
 pub struct Session {
     rings: Rings,
     shapes: Vec<ChannelShape>,
-    /// Per-channel cursor; a device-only shared ring keeps its own instead
-    /// (see [`Session::cursors_now`]).
     cursors: Vec<Cursor>,
-    /// One per stage plan; `None` for a stage with nothing to launch.
     prepared: Vec<Option<Prepared>>,
-    /// Bitmask of intrinsics bound to a buffer, one bit per [`IntrinsicId`].
     bound: u64,
     poisoned: bool,
     fires: u64,
-    /// Stages encoded into a not-yet-settled command buffer, or `None` when
-    /// nothing is outstanding. At most one airborne pass per instance.
     airborne: Option<Vec<usize>>,
 }
 
 impl Session {
-    /// Allocate this instance's rings and per-stage buffers, then seed the
-    /// channels the program declares seeds for. `seeds` are wire cells, one
-    /// per `(channel, bytes)` pair. `extents` resolves the program's
-    /// symbolic value shapes.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when the compiled stages and plans are not
-    /// parallel, or a seed names a channel this instance does not carry or
-    /// is not one cell wide.
     pub fn bind(
         device: &Context,
         compiled: &Compiled,
@@ -166,7 +119,6 @@ impl Session {
             airborne: None,
         };
         for (channel, wire) in seeds {
-            // A shared ring is seeded once, by whichever attachment binds first.
             if let Some(ring) = session.rings.shared(*channel as usize)
                 && !ring.claim_seeding()
             {
@@ -185,19 +137,16 @@ impl Session {
         Ok(session)
     }
 
-    /// How many channels this instance carries.
     #[must_use]
     pub fn channels(&self) -> usize {
         self.shapes.len()
     }
 
-    /// Channel `channel`'s geometry.
     #[must_use]
     pub fn shape(&self, channel: u32) -> Option<ChannelShape> {
         self.shapes.get(channel as usize).copied()
     }
 
-    /// Channel `channel`'s cursor.
     #[must_use]
     pub fn cursor(&self, channel: u32) -> Option<Cursor> {
         let channel = channel as usize;
@@ -207,8 +156,6 @@ impl Session {
         self.cursors.get(channel).copied()
     }
 
-    /// Every channel's cursor. A shared ring's cursor lives in the ring
-    /// itself, since another session may last have moved it.
     #[must_use]
     pub fn cursors_now(&self) -> Vec<Cursor> {
         let mut cursors = self.cursors.clone();
@@ -220,33 +167,22 @@ impl Session {
         cursors
     }
 
-    /// How many fires have committed on this instance.
     #[must_use]
     pub const fn fires(&self) -> u64 {
         self.fires
     }
 
-    /// Whether this instance is unusable.
     #[must_use]
     pub const fn poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// How many unconsumed cells channel `channel` holds.
     #[must_use]
     pub fn depth(&self, channel: u32) -> u64 {
         self.cursor(channel)
             .map_or(0, |cursor| cursor.tail.saturating_sub(cursor.head))
     }
 
-    /// Push one wire cell into channel `channel`, answering `false` when
-    /// the ring has no room (back-pressure, not a drop). This plane packs
-    /// bools on the device, so the ring already holds wire bytes for every
-    /// dtype.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown channel or a cell of the wrong width.
     pub fn publish(&mut self, channel: u32, wire: &[u8]) -> Result<bool> {
         let shape = self.shape_of(channel)?;
         if self.depth(channel) >= u64::from(shape.capacity) {
@@ -275,13 +211,6 @@ impl Session {
         Ok(true)
     }
 
-    /// Take channel `channel`'s committed cell as wire bytes, advancing its
-    /// head; `None` when the ring is empty (an unknown channel has depth
-    /// zero, so it also answers `None`).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for whatever the read said.
     pub fn take(&mut self, channel: u32) -> Result<Option<Vec<u8>>> {
         if self.depth(channel) == 0 {
             return Ok(None);
@@ -296,35 +225,31 @@ impl Session {
         Ok(Some(cell))
     }
 
-    /// Channel `channel`'s cell at ring position `sequence`, as wire bytes,
-    /// touching no cursor. For diffing, not for serving.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an unknown channel.
+    pub fn feed_cell(&self, channel: u32) -> Result<Option<(&Buffer, u64, u64, eta_ir::Dtype)>> {
+        let slot = channel as usize;
+        let shape = self.shape_of(channel)?;
+        if self.depth(channel) == 0 {
+            return Ok(None);
+        }
+        let head = self.cursor(channel).unwrap_or_default().head;
+        let at = self.rings.cell_offset(slot, head)?;
+        Ok(Some((
+            self.rings.slab(slot)?,
+            at,
+            shape.cell_bytes() as u64,
+            shape.dtype,
+        )))
+    }
+
     pub fn peek(&self, channel: u32, sequence: u64) -> Result<Vec<u8>> {
         self.shape_of(channel)?;
         self.rings.read_cell(channel as usize, sequence)
     }
 
-    /// What this instance's descriptor ports hold right now — the cell at
-    /// each port's channel `head`. Nothing is consumed; only a commit
-    /// advances `head`.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for a port naming a channel this instance does not
-    /// carry or holding a cell of the wrong element type.
     pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
         ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
-    /// Point one intrinsic at a device buffer, for every stage of this
-    /// instance. The binding survives a fire.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] for an intrinsic past the side tables' pitch.
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: IntrinsicId,
@@ -340,17 +265,6 @@ impl Session {
         Ok(())
     }
 
-    /// Run every stage of `compiled` as one fire. Each stage's status maps:
-    /// `Committed`/`Running` -> commit, `Retry` -> Declined, `Fault`/`Unset`
-    /// -> Faulted. A device fault poisons the instance; the verdict folds
-    /// worst-first over every stage, and every stage still launches
-    /// regardless.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when the compiled stages and their plans are not
-    /// parallel. A program that merely refuses is [`Fired::Declined`] or
-    /// [`Fired::Faulted`], not an error; unmet inputs is [`Fired::Blocked`].
     pub fn fire(
         &mut self,
         device: &Context,
@@ -370,8 +284,6 @@ impl Session {
             return Ok(refused);
         }
 
-        // One read of the cursors for the whole fire, so a shared ring's
-        // counters can't move mid-loop.
         let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
@@ -388,17 +300,6 @@ impl Session {
         self.verdict(plan, &launched)
     }
 
-    /// Encode every stage of `compiled` into a command buffer someone else
-    /// owns, and do not commit it — the attached half of [`Session::fire`].
-    /// Does not wait; the verdict is read later by
-    /// [`Session::settle_launched`]. Uses the same gates as [`Session::fire`].
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Program`] when the compiled stages and their plans are not
-    /// parallel, when an intrinsic the program reads was never bound, or
-    /// this instance already has a pass airborne; [`Fault::Deviceless`] off
-    /// Apple.
     pub fn stage_into(
         &mut self,
         frame: &Frame,
@@ -435,17 +336,6 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// The staging half of [`Session::stage_into`] without the encode: the
-    /// gates, this fire's cursors and cells, the airborne mark. A
-    /// [`super::launch::Batch`] then encodes this instance's stages beside
-    /// its program's other instances, reading each stage through
-    /// [`Session::prepared_mut`]. The instance's own scratch is left alone —
-    /// its values live in the batch's pool this fire. Answers the refusal
-    /// when a gate refuses, `None` when the instance is airborne.
-    ///
-    /// # Errors
-    ///
-    /// As [`Session::stage_into`].
     pub fn prepare_airborne(
         &mut self,
         compiled: &Compiled,
@@ -479,16 +369,10 @@ impl Session {
         Ok(None)
     }
 
-    /// One stage's prepared tables, for a batch to lay down and encode.
     pub fn prepared_mut(&mut self, stage: usize) -> Option<&mut Prepared> {
         self.prepared.get_mut(stage).and_then(Option::as_mut)
     }
 
-    /// The verdict half of an attached fire: read the status every staged
-    /// stage left behind, and commit the cursors if they all agree. Caller
-    /// must wait for the command buffer to land first, or this reads the
-    /// previous fire's status. Answers [`Fired::Committed`] when nothing is
-    /// airborne.
     pub fn settle_launched(&mut self, plan: &ExecPlan) -> Result<Fired> {
         let Some(launched) = self.airborne.take() else {
             return Ok(Fired::Committed);
@@ -496,38 +380,35 @@ impl Session {
         self.verdict(plan, &launched)
     }
 
-    /// Drop the airborne mark without reading a verdict, for a staging
-    /// abandoned before its command buffer was committed. Reading the
-    /// status of a pass that never ran would answer `State::Unset` and
-    /// wrongly poison the instance. Caller must ensure that command buffer
-    /// is never committed.
     pub fn abandon_launched(&mut self) {
         self.airborne = None;
     }
 
-    /// Whether a pass of this instance is in a command buffer that has not
-    /// been settled.
     #[must_use]
     pub const fn is_airborne(&self) -> bool {
         self.airborne.is_some()
     }
 
-    /// The checks both fire paths run before anything is encoded, answering
-    /// `Some` with the verdict when one of them refuses.
     fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan) -> Result<Option<Fired>> {
         if self.poisoned {
             return Ok(Some(Fired::Faulted("instance is poisoned".to_string())));
         }
         stages_and_plans_agree(compiled)?;
 
-        // An unbound intrinsic's argument slot is read regardless, so this
-        // is the one check the host can make before the launch.
-        if plan.needs_logits && self.bound & (1u64 << (IntrinsicId::Logits as u32)) == 0 {
+        let readout_bound = [
+            IntrinsicId::Logits,
+            IntrinsicId::Velocity,
+            IntrinsicId::Hidden,
+        ]
+        .iter()
+        .any(|id| self.bound & (1u64 << (*id as u32)) != 0);
+        if plan.needs_logits && !readout_bound {
             return Err(Fault::program(
                 "program::session",
-                "this program reads the `logits` intrinsic and no buffer has been \
-                 bound to it; the emitted kernel reads the argument slot regardless \
-                 of whether anything was ever encoded into it",
+                "this program reads the fire's readout (`logits`, `velocity` or \
+                 `hidden`) and no buffer has been bound to it; the emitted kernel \
+                 reads the argument slot regardless of whether anything was ever \
+                 encoded into it",
             ));
         }
         if plan.needs_mtp_logits && self.bound & (1u64 << (IntrinsicId::MtpLogits as u32)) == 0 {
@@ -559,8 +440,6 @@ impl Session {
             ));
         }
 
-        // Checked in channel order so the caller retries on the first
-        // blocking name.
         if let Some(blocked) = self.blocked_channel(plan) {
             return Ok(Some(Fired::Blocked(blocked)));
         }
@@ -568,11 +447,7 @@ impl Session {
         Ok(None)
     }
 
-    /// Fold the status every stage in `launched` left behind, worst-first,
-    /// and commit the cursors if the fold is `Committed`. A device fault
-    /// poisons the instance.
     fn verdict(&mut self, plan: &ExecPlan, launched: &[usize]) -> Result<Fired> {
-        // Highest channel index a per-channel fault class can encode.
         let max_channel = u32::try_from(self.shapes.len().saturating_sub(1)).unwrap_or(u32::MAX);
 
         let mut verdict = Verdict::Committed;
@@ -609,17 +484,11 @@ impl Session {
         }
     }
 
-    /// The first channel whose declared requirement a fire right now would
-    /// not meet, or `None` when this instance is ready to fire. The
-    /// attachment path checks this over every attached instance before
-    /// anything launches.
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
         self.readiness(plan).map(|blocked| blocked.channel)
     }
 
-    /// [`Session::blocked_channel`], with the direction, depth and capacity
-    /// the answer was computed from.
     #[must_use]
     pub fn readiness(&self, plan: &ExecPlan) -> Option<Blocked> {
         for channel in 0..self.shapes.len() {
@@ -647,15 +516,9 @@ impl Session {
         None
     }
 
-    /// Advance the cursors of a fire that ran: a take advances the head only
-    /// if the ring held something; a put advances the tail and overflow
-    /// poisons the instance rather than wrapping. The capacity check counts
-    /// the take's credit, so a loop-carried channel commits at capacity 1.
     fn commit(&mut self, plan: &ExecPlan) -> std::result::Result<(), String> {
         let now = self.cursors_now();
         let mut next = now.clone();
-        // A shared ring's advance is a bump, collected here and applied
-        // below so a mid-loop refusal leaves nothing half-moved.
         let mut bumps: Vec<(usize, bool, bool)> = Vec::new();
         for (channel, cursor) in now.iter().enumerate() {
             if cursor.tail < cursor.head {
@@ -706,19 +569,14 @@ impl Session {
     }
 }
 
-/// What one stage's status says about the whole fire, before stages are
-/// folded together. Not public: [`Fired`] is the caller-facing vocabulary.
 #[derive(Clone, Debug)]
 enum Verdict {
-    /// The stage's commit region ran.
     Committed,
-    /// The stage refused from inside; cursors must not move.
     Declined,
     Faulted(String),
 }
 
 impl Verdict {
-    /// The worse of two stage verdicts: fault beats decline beats commit.
     fn worse(self, other: Verdict) -> Verdict {
         match (self, other) {
             (fault @ Verdict::Faulted(_), _) => fault,
@@ -729,7 +587,6 @@ impl Verdict {
     }
 }
 
-/// One stage's [`eta_exec::Status`], read as a [`Verdict`].
 fn verdict_of(
     package: &LaunchPackage,
     stage: usize,
@@ -737,8 +594,6 @@ fn verdict_of(
     max_channel: u32,
 ) -> Verdict {
     match status.state() {
-        // The fused kernel has no separate commit step: the status word
-        // lands at 1 (Running) exactly when every op ran and none refused.
         Some(eta_exec::State::Running) => Verdict::Committed,
         Some(eta_exec::State::Committed) => Verdict::Committed,
         Some(eta_exec::State::Retry) => Verdict::Declined,
@@ -749,9 +604,6 @@ fn verdict_of(
     }
 }
 
-/// The wire cells a host-half instance's rings hold, as [`Session::bind`]
-/// takes them. Cells are returned oldest first, so republishing them
-/// reproduces the ring's order.
 #[must_use]
 pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
     let mut seeds = Vec::new();
@@ -776,9 +628,6 @@ pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32,
     seeds
 }
 
-/// `compiled.stages` and `compiled.plans` must be parallel and
-/// index-aligned, or a stage's scratch and param stride would be sized from
-/// someone else's plan.
 fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
     stage_plans_are_parallel(
         &compiled
@@ -794,8 +643,6 @@ fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
     )
 }
 
-/// The decision [`stages_and_plans_agree`] makes, projected to signatures
-/// and "launches?" so it needs no device.
 fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()> {
     if stages.len() != plans.len() {
         return Err(Fault::program(
@@ -810,7 +657,6 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
         ));
     }
     for (index, (&(signature, launches), &plan)) in stages.iter().zip(plans).enumerate() {
-        // Only a launching stage is prepared, so only its signature matters.
         if launches && signature != plan {
             return Err(Fault::program(
                 "program::session",
@@ -831,12 +677,19 @@ mod tests {
 
     use super::{Verdict, verdict_of};
 
-    /// Carries the fault-class table.
     fn package() -> LaunchPackage {
         LaunchPackage {
             fault_classes: eta_compiler::codegen::fault::classes(),
             ..LaunchPackage::default()
         }
+    }
+
+    fn session_every_case() {
+        an_adapter_prologue_and_a_sampling_epilogue_are_one_fire();
+        two_launching_stages_each_get_their_own_plan();
+        a_stage_that_launches_nothing_is_not_compared();
+        a_kernel_readiness_miss_is_a_decline_and_not_a_fault();
+        a_fault_outranks_a_decline_in_either_order();
     }
 
     #[test]
@@ -845,20 +698,16 @@ mod tests {
             .expect("the plans are parallel and the launching stage is its own");
     }
 
-    #[test]
     fn two_launching_stages_each_get_their_own_plan() {
         super::stage_plans_are_parallel(&[(0xa11, true), (0xb22, true)], &[0xa11, 0xb22])
             .expect("both launch, both are prepared from their own plan");
     }
 
-    #[test]
     fn a_stage_that_launches_nothing_is_not_compared() {
         super::stage_plans_are_parallel(&[(0xa11, false)], &[0xdead])
             .expect("nothing is prepared from it");
     }
 
-    /// A readiness guard (Retry) is a Decline, not a Fault.
-    #[test]
     fn a_kernel_readiness_miss_is_a_decline_and_not_a_fault() {
         let status = eta_exec::Status {
             state: 2,
@@ -869,8 +718,6 @@ mod tests {
         assert!(matches!(verdict_of(&package(), 0, status, 3), Verdict::Declined));
     }
 
-    /// A fault outranks a decline regardless of arrival order.
-    #[test]
     fn a_fault_outranks_a_decline_in_either_order() {
         let fault = || Verdict::Faulted("stage 0: guard".to_string());
         assert!(matches!(

@@ -1,18 +1,18 @@
-/*
- * Copyright (c) 2024 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_DECODE_PARAMS_CUH_
 #define FLASHINFER_DECODE_PARAMS_CUH_
 
@@ -134,11 +134,7 @@ struct BatchDecodeParams {
   IdType* kv_chunk_size_ptr;
   bool* block_valid_mask;
   bool partition_kv;
-  // PIE: the query row each request's single row begins at, appended so the
-  // decode kernel can address a plane it was handed unsliced.  Upstream reads
-  // `q + batch_idx * q_stride_n`; with this vector it reads
-  // `q + q_indptr[batch_idx] * q_stride_n`, which is the same row whenever
-  // the vector is the launch's own (one row per decode request).
+
   IdType* q_indptr;
 
   __device__ __host__ BatchDecodeParams()
@@ -282,6 +278,6 @@ struct BatchDecodeParamsMLA {
   }
 };
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_DECODE_PARAMS_CUH_
+#endif

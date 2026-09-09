@@ -1,27 +1,13 @@
-//! Grammar normalization for the parser.
-//!
-//! Transforms a grammar into canonical form where:
-//! - Every rule body is `Choices(alts)` or a leaf expression
-//! - Each alternative in Choices is `Sequence(elems)` or a leaf
-//! - Each element of a Sequence is a leaf: ByteString, CharacterClass,
-//!   CharacterClassStar, RuleRef, Repeat, or EmptyString
-//! - No nested Choices or Sequences as Sequence elements
-
 use super::builder::GrammarBuilder;
 use super::{Expr, ExprId, Grammar, RuleId};
 
-/// Normalize a grammar into canonical form for the parser.
-///
-/// Nested Choices/Sequences in Sequence elements are extracted into auxiliary rules.
 pub fn normalize_grammar(grammar: &Grammar) -> Grammar {
     let mut builder = GrammarBuilder::new();
 
-    // First pass: create all original rules (so RuleIds are preserved)
     for rule in grammar.rules() {
         builder.add_rule(&rule.name);
     }
 
-    // Second pass: normalize each rule body, possibly adding auxiliary rules
     for (i, rule) in grammar.rules().iter().enumerate() {
         let body = normalize_expr(grammar, &mut builder, rule.body);
         builder.set_rule_body(RuleId(i as u32), body);
@@ -32,7 +18,6 @@ pub fn normalize_grammar(grammar: &Grammar) -> Grammar {
         .unwrap()
 }
 
-/// Normalize an expression. If it's a Sequence, ensure all elements are leaves.
 fn normalize_expr(grammar: &Grammar, builder: &mut GrammarBuilder, expr_id: ExprId) -> ExprId {
     match grammar.get_expr(expr_id) {
         Expr::EmptyString => builder.add_empty_string(),
@@ -58,7 +43,6 @@ fn normalize_expr(grammar: &Grammar, builder: &mut GrammarBuilder, expr_id: Expr
             let mut new_alts: Vec<ExprId> = Vec::new();
             for &eid in alts {
                 let normalized = normalize_expr(grammar, builder, eid);
-                // Flatten nested Choices: Choices([A, Choices([B, C])]) → Choices([A, B, C])
                 if let Expr::Choices(inner) = &builder.exprs[normalized.0 as usize] {
                     new_alts.extend_from_slice(inner);
                 } else {
@@ -70,7 +54,6 @@ fn normalize_expr(grammar: &Grammar, builder: &mut GrammarBuilder, expr_id: Expr
     }
 }
 
-/// Normalize a sequence element. If it's a Choices or Sequence, extract to auxiliary rule.
 fn normalize_sequence_element(
     grammar: &Grammar,
     builder: &mut GrammarBuilder,

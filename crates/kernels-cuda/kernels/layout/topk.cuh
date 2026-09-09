@@ -1,30 +1,20 @@
 #pragma once
 
-// topk.cuh — a row's argmax into one column of an i32 plane, and a row's k
-// largest entries sorted with their indices beside. The transcription of
-// `kernels-metal/kernels/layout/{argmax,topk}.metal`, with the same rule
-// throughout: ties go to the LOWEST column and a NaN never wins — the
-// epilogue's `reduce_argmax` rule, kept here so a draft the head chained on
-// is the token the verifier reads back from the same logits.
 
 #include "prelude/device.cuh"
 
 namespace pie::layout {
 
-// The row's elements widened: bf16 through the prelude's `Elem`, f32 as is
-// (the plane stamps both; `Elem<float>` is not a thing).
 __device__ __forceinline__ float topk_load(bf16 v) { return ::pie::Elem<bf16>::to_f32(v); }
 __device__ __forceinline__ float topk_load(float v) { return v; }
 
 constexpr unsigned TOPK_NONE = 0xFFFFFFFFu;
 
-// `a` beats `b` when it is larger, or equal at a lower index.
 __device__ __forceinline__ bool topk_beats(float av, unsigned ai, float bv, unsigned bi)
 {
     return av > bv || (av == bv && ai < bi);
 }
 
-// One warp's best `(value, index)` under `topk_beats`, answered on every lane.
 __device__ __forceinline__ void warp_best(float& v, unsigned& i)
 {
     for (int off = 16; off > 0; off >>= 1) {
@@ -37,11 +27,6 @@ __device__ __forceinline__ void warp_best(float& v, unsigned& i)
     }
 }
 
-/// **ONE ROW'S ARGMAX, WRITTEN INTO ONE COLUMN OF AN I32 PLANE.**
-///
-/// `y[row * depth + column] = argmax_c x[row, c]`, one block per row. Every
-/// thread scans a strided share of the row keeping its best `(value, index)`,
-/// the warps fold with shuffles, thread 0 folds the warps.
 template <class T>
 __global__ void argmax_rows(
     const T* __restrict__ x,
@@ -94,16 +79,6 @@ __global__ void argmax_rows(
 constexpr unsigned TOPK_THREADS = 128;
 constexpr unsigned TOPK_WARPS = TOPK_THREADS / 32;
 
-/// **THE K LARGEST ENTRIES OF EVERY ROW, SORTED, INDICES BESIDE.**
-///
-/// One block of `TOPK_THREADS` per row. Every thread walks a strided share
-/// of the row keeping its own sorted list of K `(value, index)` pairs — most
-/// candidates fail the list's floor and cost one compare — then the lists
-/// meet in shared memory and the block pops the global maximum K times: each
-/// thread offers its list's head, the warps fold, thread 0 picks across
-/// warps, the owner advances. `values` is `[rows, K]` f32, `indices`
-/// `[rows, K]` i32. `TOPK_THREADS x K x 8` bytes of shared memory: 16 KB at
-/// K = 16.
 template <class T, int K>
 __global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
     const T* __restrict__ x,
@@ -117,7 +92,6 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
     const unsigned lid = threadIdx.x;
     const T* src = x + static_cast<size_t>(row) * static_cast<size_t>(width);
 
-    // This thread's sorted list, best first.
     float lv[K];
     unsigned li[K];
 #pragma unroll
@@ -129,7 +103,7 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
         const float v = topk_load(src[c]);
         if (isnan(v)) continue;
         if (li[K - 1] != TOPK_NONE && !topk_beats(v, c, lv[K - 1], li[K - 1])) continue;
-        // Insert, shifting the tail down.
+
         int at = K - 1;
         while (at > 0 && (li[at - 1] == TOPK_NONE || topk_beats(v, c, lv[at - 1], li[at - 1]))) {
             lv[at] = lv[at - 1];
@@ -157,13 +131,12 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
     __syncthreads();
 
     for (int j = 0; j < K; ++j) {
-        // Offer this list's head.
+
         float hv = head < static_cast<unsigned>(K) ? lists_v[lid * K + head] : neg_inf();
         unsigned hi = head < static_cast<unsigned>(K) ? lists_i[lid * K + head] : TOPK_NONE;
         const unsigned my_i = hi;
         warp_best(hv, hi);
-        // The lane whose head won owns the pop; the lowest such lane if two
-        // hold one index (they cannot: every column lives on one thread).
+
         unsigned owner = (my_i != TOPK_NONE && my_i == hi) ? lid : TOPK_NONE;
         for (int off = 16; off > 0; off >>= 1) {
             owner = min(owner, __shfl_xor_sync(0xffffffffu, owner, off));
@@ -197,4 +170,4 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_rows(
     }
 }
 
-}  // namespace pie::layout
+}

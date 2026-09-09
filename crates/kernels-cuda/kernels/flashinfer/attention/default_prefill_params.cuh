@@ -1,26 +1,23 @@
-/*
- * Copyright (c) 2024 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FLASHINFER_PREFILL_PARAMS_CUH_
 #define FLASHINFER_PREFILL_PARAMS_CUH_
 
 #include <cuda_runtime.h>
 
-// PIE: REMOVED -- host-only `<cmath>`. 1 line of host C++, guarded out of every NVRTC compile
-// before it was removed, so removing it changes no compile. This marker is one a strip does NOT
-// undo; see MODIFICATIONS.
 #include <cstdint>
 
 #include "../page.cuh"
@@ -60,9 +57,6 @@ struct SinglePrefillParams {
 
   uint32_t partition_kv;
 
-// PIE: REMOVED -- both `__host__` constructors of `SinglePrefillParams`. 59 lines of host C++,
-// guarded out of every NVRTC compile before it was removed, so removing it changes no compile.
-// This marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_len;
@@ -87,8 +81,8 @@ struct BatchPrefillRaggedParams {
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* maybe_mask_indptr;
-  IdType* maybe_q_rope_offset;  // maybe_q_rope_offset is only used for fused-rope attention
-  IdType* maybe_k_rope_offset;  // maybe_k_rope_offset is only used for fused-rope attention
+  IdType* maybe_q_rope_offset;
+  IdType* maybe_k_rope_offset;
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
@@ -129,9 +123,6 @@ struct BatchPrefillRaggedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
-// PIE: REMOVED -- both `__host__` constructors of `BatchPrefillRaggedParams`. 105 lines of host
-// C++, guarded out of every NVRTC compile before it was removed, so removing it changes no
-// compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -154,7 +145,7 @@ struct BatchPrefillPagedParams {
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
   IdType* maybe_mask_indptr;
-  IdType* maybe_q_rope_offset;  // maybe_q_rope_offset is only used for fused-rope attention
+  IdType* maybe_q_rope_offset;
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
@@ -190,9 +181,6 @@ struct BatchPrefillPagedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
-// PIE: REMOVED -- both `__host__` constructors of `BatchPrefillPagedParams`. 87 lines of host
-// C++, guarded out of every NVRTC compile before it was removed, so removing it changes no
-// compile. This marker is one a strip does NOT undo; see MODIFICATIONS.
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -203,6 +191,6 @@ struct BatchPrefillPagedParams {
   }
 };
 
-}  // namespace flashinfer
+}
 
-#endif  // FLASHINFER_DECODE_PARAMS_CUH_
+#endif

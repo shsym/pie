@@ -46,11 +46,6 @@ import sys
 import numpy as np
 import torch
 
-
-# ---------------------------------------------------------------------------
-# families
-# ---------------------------------------------------------------------------
-
 def decode_flux2(latent: torch.Tensor, meta: dict, model_dir: str, device: str,
                  dtype: torch.dtype) -> np.ndarray:
     """`[grid_h, grid_w, row_width]` -> `[H, W, 3]` uint8, FLUX.2's way."""
@@ -60,18 +55,13 @@ def decode_flux2(latent: torch.Tensor, meta: dict, model_dir: str, device: str,
                                              torch_dtype=dtype).to(device)
     vae.eval()
 
-    # rows -> [1, C, h, w]; the guest wrote them h-major, which is the packed
-    # order `_unpack_latents_with_ids` scatters into.
     x = latent.permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
 
-    # The VAE's BatchNorm is the packed-space normalisation the pipeline
-    # applies BEFORE unpatchifying, so its 128 channels line up with a row.
     mean = vae.bn.running_mean.view(1, -1, 1, 1).to(x.device, x.dtype)
     std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1)
                      + vae.config.batch_norm_eps).to(x.device, x.dtype)
     x = x * std + mean
 
-    # 2x2 unpatchify: [1, 4c, h, w] -> [1, c, 2h, 2w].
     b, c, h, w = x.shape
     x = x.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)
     x = x.reshape(b, c // 4, h * 2, w * 2)
@@ -81,13 +71,7 @@ def decode_flux2(latent: torch.Tensor, meta: dict, model_dir: str, device: str,
     image = (image / 2 + 0.5).clamp(0, 1)[0].float().cpu().numpy()
     return (image.transpose(1, 2, 0) * 255).round().astype(np.uint8)
 
-
 FAMILIES = {"flux2": decode_flux2}
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 
 def resolve(path: str) -> str:
     """Expand `~` and a single glob (a HuggingFace `snapshots/*/` path)."""
@@ -98,7 +82,6 @@ def resolve(path: str) -> str:
             raise SystemExit(f"{path}: matches nothing")
         return hits[0]
     return path
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -146,7 +129,6 @@ def main() -> int:
     Image.fromarray(rgb).save(out)
     print(f"wrote   {out}  {rgb.shape[1]}x{rgb.shape[0]}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

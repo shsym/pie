@@ -1,53 +1,3 @@
-//! **DOES THE BLOCK DRAFTER PREDICT THE TARGET FIFTEEN TOKENS AHEAD?**
-//!
-//! Everything under this is proven: the drafter's planes bind, its context
-//! arm leaves the trunk's logits alone, and a draft block fires and answers
-//! (`the_block_drafter_loads_and_leaves_the_trunk_alone`). What none of that
-//! says is whether the drafter is predicting the TARGET or merely producing
-//! well-formed noise.
-//!
-//! **What this can and cannot see.** A host readout seat holds one row per
-//! lane and it is always the lane's LAST row — `Seated::readout` steers a
-//! guest epilogue's `IntrinsicId::Logits`, not this seat (`serve.rs`, "the
-//! guest's own row"). So the whole sixteen-wide proposal is not readable
-//! from here, and the accepted-prefix profile a round actually keeps belongs
-//! to the inferlet's test. What IS exactly readable is the block's last row:
-//! **the drafter's guess at the last position its block covers**,
-//! against what the target really produced there. That is the hardest
-//! position in the block, so agreement is a strong signal and disagreement
-//! is a weak one — which is why it is sampled at several anchors and over
-//! prompts of different shape rather than reported as one number.
-//!
-//! **The number itself has moved to the inferlet.**
-//! `tests/inferlets/dflash-block-acceptance` fires the same block and reads
-//! EVERY row's proposal through a guest epilogue, so it sees the accepted
-//! prefix rather than one position of it. What is left here is the path: a
-//! block fired at every anchor on the real checkpoint, with the context its
-//! anchor had.
-//!
-//! **A truncated block is NOT a window onto the full one, and this was tried.**
-//! Firing the block at every length 1..=16 and reading each last row would
-//! recover the whole proposal from a seat that hands back one row — four of
-//! the drafter's five layers are causal and windowed, so their view of row
-//! `L-1` is exactly the full block's, and only the last, full-attention
-//! layer sees fewer mask rows. It does not work: over twelve anchors the
-//! agreements land at positions 11-15 and NEVER at 0-2, which is the
-//! opposite of what a drafter does. The reason is that this is a block
-//! DIFFUSION model trained at one block width, so a length-1 block is far
-//! out of its distribution while a length-15 one is nearly in it. The
-//! accepted-prefix profile therefore needs the real sixteen-wide pass, and
-//! so it needs a guest epilogue reading `mtp.drafts`.
-//!
-//! Slot 0 decodes the truth autoregressively with the context arm running,
-//! so the drafter's kv rows carry the history a real round would give them;
-//! slot 1 prefills the same prompt, walks the same tokens, and fires one
-//! full block at each anchor.
-//!
-//! ```text
-//! PIE_DFLASH_ARTIFACT=... cargo test -p engine-metal --release \
-//!   --test the_block_drafters_proposals_are_measured -- --nocapture
-//! ```
-
 #![cfg(target_vendor = "apple")]
 
 use std::path::PathBuf;
@@ -59,9 +9,6 @@ use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
 
-/// A few prompts of different shape: a block drafter's acceptance is
-/// strongly content-dependent (math and code accept long blocks, open prose
-/// does not), so one prompt is not a reading.
 const PROMPTS: &[(&str, &[u32])] = &[
     ("prose", &[9707, 11, 847, 829, 374, 264, 1602, 2613, 3364, 911, 264]),
     ("repetition", &[16, 11, 220, 17, 11, 220, 18, 11, 220, 19, 11, 220]),
@@ -112,6 +59,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         .expect("the artifact holds every plane");
     drop(source);
     let mut shell = Shell::load(Boot {
+        voxels: None,
         trace,
         contract: &contract,
         checkpoint: &artifact,
@@ -137,14 +85,11 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     )
     .word();
 
-    // How many anchors to sample per prompt: each needs the truth `block`
-    // tokens past it, so the AR run walks `anchors + block` steps.
     const ANCHORS: usize = 4;
 
     let mut agreed = 0usize;
     let mut asked = 0usize;
     for (name, prompt) in PROMPTS {
-        // ── the target's own continuation, which is the truth ────────────
         shell.open(0).expect("the slot opens");
         let seeded = shell
             .fire(&[Lane {
@@ -168,7 +113,6 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
             truth.push(fed);
         }
 
-        // ── one full block at each anchor, its last row read back ────────
         shell.open(1).expect("the slot opens");
         shell
             .fire(&[Lane {
@@ -179,8 +123,6 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
             .expect("the prefill fires");
         let mut marks = String::new();
         for anchor_at in 0..ANCHORS {
-            // Walk slot 1 up to this anchor so its drafter context matches
-            // the truth run's, then fire the block anchored there.
             if anchor_at > 0 {
                 shell
                     .fire(&[Lane {
@@ -209,12 +151,6 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
             let drafted = shell
                 .fire_seated(&[seat])
                 .unwrap_or_else(|why| panic!("the draft block fires at anchor {anchor_at}: {why}"));
-            // The lane's last row. **A BLOCK DIFFUSION MODEL DENOISES EACH
-            // MASK INTO THE TOKEN AT ITS OWN POSITION**, so row `block-1`
-            // proposes position `anchor + block - 1`, not `+ block` — the
-            // anchor's own row proposes nothing new, which is why the
-            // checkpoint runs a sixteen-wide block at fifteen speculative
-            // tokens.
             let guess = argmax(&drafted[0]);
             let want = truth[anchor_at + block - 1];
             asked += 1;
@@ -236,17 +172,6 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         "\nthe block's LAST row agreed with the target at {agreed} of {asked} anchors \
          — the hardest position in the block; the accepted-prefix profile needs the inferlet"
     );
-    // **THE FLOOR IS ON THE HARDEST POSITION IN THE BLOCK**, which is all a
-    // host seat can see: it hands back a lane's LAST row, so this reads the
-    // token `block - 1` ahead and nothing nearer. A ported drafter that has
-    // lost its context — the failure this guards, and the one that actually
-    // happened: the trunk's residual stream is ONE buffer
-    // (`Elementwise::aliases`), so five tapped handles all read the LAST
-    // layer unless each is fused where it is taken — agrees at the last
-    // position essentially never. A working port agrees at a quarter of the
-    // anchors here, so a third of that is a floor with room under it and a
-    // dead drafter still below it. The accepted-prefix profile across every
-    // position is `tests/inferlets/dflash-block-acceptance`.
     assert!(
         agreed >= 2,
         "the block's last row agreed at {agreed} of {asked} anchors, which is a \

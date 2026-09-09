@@ -1,10 +1,3 @@
-//! A checkpoint's own files. [`read`] turns a snapshot directory into a
-//! [`Metadata`], [`zt`] a single container, [`diffusers`] a multi-component
-//! pipeline folder, [`write`] puts one back on disk, [`meta`] owns the
-//! reserved `__meta__/` names, and [`emit`]/[`serve`] are the `pie.serving/1`
-//! writer/reader pair. The only place in the crate where a path becomes a
-//! [`Metadata`].
-
 pub mod diffusers;
 pub mod emit;
 pub mod meta;
@@ -23,16 +16,11 @@ pub struct Metadata {
     pub tensors: Vec<RawTensor>,
 }
 
-/// What a checkpoint says about itself: a GGUF's key-value block. Read with
-/// [`parse_attributes`](crate::file::read::parse_attributes) rather than
-/// carried on [`Metadata`]. Flat, because GGUF's keys already are:
-/// `general.architecture`, then a block namespaced under whatever that says.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     by_key: std::collections::BTreeMap<String, Attribute>,
 }
 
-/// One key's value, as far as this type carries it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attribute {
     Uint(u64),
@@ -40,9 +28,6 @@ pub enum Attribute {
     Float(f64),
     Bool(bool),
     Text(String),
-    /// An array or a nested map, recorded as present and not as contents
-    /// (e.g. GGUF's `tokenizer.ggml.tokens`, which no reader of this type
-    /// wants in full). The key is kept so absence still means absent.
     Aggregate,
 }
 
@@ -64,7 +49,6 @@ impl Attributes {
         self.by_key.get(key)
     }
 
-    /// The value of `key`, when it is text.
     #[must_use]
     pub fn text(&self, key: &str) -> Option<&str> {
         match self.by_key.get(key)? {
@@ -73,19 +57,11 @@ impl Attributes {
         }
     }
 
-    /// Which architecture llama.cpp wrote this file for — `llama`, `qwen2`,
-    /// `gemma3`. The one key that is not namespaced, because it is the key
-    /// that says what the namespace is.
     #[must_use]
     pub fn architecture(&self) -> Option<&str> {
         self.text("general.architecture")
     }
 
-    /// This key-value block as a flat JSON object, with dotted keys left
-    /// dotted (`qwen2.block_count` stays one key, since the dots are part
-    /// of GGUF's naming convention rather than real nesting).
-    /// [`Attribute::Aggregate`] and a non-finite float both render as
-    /// `null`.
     #[must_use]
     pub fn to_json(&self) -> String {
         let map: serde_json::Map<String, serde_json::Value> = self
@@ -108,33 +84,16 @@ impl Attributes {
     }
 }
 
-/// GGUF's tokenizer tables, read whole. The one thing [`Attributes`]
-/// deliberately does not carry (a vocabulary is 150,000 strings, kept as
-/// [`Attribute::Aggregate`] there). Owned rather than borrowed since the
-/// source is a CBOR tree inside a memory map the caller has no reason to
-/// keep open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenizerTables {
-    /// `tokenizer.ggml.model` — `gpt2`, `llama`, `bert`, `rwkv`. Which
-    /// FAMILY of tokenizer, not which model.
     pub model: String,
-    /// `tokenizer.ggml.pre` — llama.cpp's name for a pre-tokenizer it has
-    /// hard-coded, `qwen2` or `llama-bpe`. Absent in older files. A name,
-    /// not a pattern: GGUF stores the identity where `tokenizer.json`
-    /// stores regexes.
     pub pre: Option<String>,
-    /// `tokenizer.ggml.tokens` — every token's text, in id order.
     pub tokens: Vec<String>,
-    /// `tokenizer.ggml.token_type` — one per token, parallel to `tokens`.
-    /// ggml's `llama_token_type`: 1 normal, 2 unknown, 3 control, 4 user
-    /// defined, 5 unused, 6 byte.
     pub token_types: Vec<i64>,
-    /// `tokenizer.ggml.merges` — `"left right"`, in rank order.
     pub merges: Vec<String>,
 }
 
 impl TokenizerTables {
-    /// Whether the file carried a tokenizer at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
@@ -172,37 +131,24 @@ impl Metadata {
         self.tensors.iter().find(|tensor| tensor.name == name)
     }
 
-    /// The checkpoint's weights — every object except pie's own metadata.
-    /// This is the enumeration a weight consumer wants, not `tensors`: pie
-    /// stores its compiled tokenizer and model descriptor as `u8`
-    /// objects indistinguishable from raw weights except by name.
     pub fn weights(&self) -> impl Iterator<Item = &RawTensor> {
         self.tensors
             .iter()
             .filter(|tensor| !meta::is_meta(&tensor.name))
     }
 
-    /// The artifact's metadata objects, in manifest order. Empty for every
-    /// checkpoint pie did not write.
     pub fn meta_objects(&self) -> impl Iterator<Item = &RawTensor> {
         self.tensors
             .iter()
             .filter(|tensor| meta::is_meta(&tensor.name))
     }
 
-    /// The metadata object named `path` (without the [`meta::META_PREFIX`]).
-    /// Its bytes come from [`read::read_meta`](crate::file::read::read_meta):
-    /// this layer addresses, the reader opens.
     pub fn meta_object(&self, path: &str) -> Option<&RawTensor> {
         let name = meta::meta_name(path);
         self.tensors.iter().find(|tensor| tensor.name == name)
     }
 }
 
-/// A checkpoint's tensors, indexed by name for one compile; the linear
-/// `Metadata::tensor_by_name` makes a 32k-tensor compile quadratic. Indexes
-/// weights only: a contract naming a metadata object ([`meta`]) fails to
-/// resolve.
 pub struct Sources<'a> {
     metadata: &'a Metadata,
     by_name: std::collections::HashMap<&'a str, u32>,
@@ -244,7 +190,6 @@ impl crate::contract::infer::CheckpointTypes for Sources<'_> {
 
 impl crate::contract::infer::CheckpointTypes for Metadata {
     fn tensor_type(&self, name: &str) -> Option<crate::contract::TensorType> {
-        // Weights only, for the same reason `Sources` indexes weights only.
         self.weights()
             .find(|tensor| tensor.name == name)
             .map(|raw| crate::contract::TensorType {
@@ -253,4 +198,3 @@ impl crate::contract::infer::CheckpointTypes for Metadata {
             })
     }
 }
-

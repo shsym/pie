@@ -1,11 +1,3 @@
-//! `attention.ragged` at a diffusion transformer's shape — 32k queries over
-//! 32k keys, 24 heads of width 128 — runs in tens of milliseconds, the
-//! tensor-core class and not the naive one; the number is printed per shape
-//! so a regression is a number and not a feeling. Ignored by default: it
-//! allocates ~1 GB and takes seconds.
-//!
-//! `CUDA_VISIBLE_DEVICES=<n> cargo test -p kernels-cuda --features cuda --release --test the_ragged_arm_runs_at_tensor_core_speed -- --ignored --nocapture`
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -17,8 +9,6 @@ use dtype::Dtype;
 use kernels_cuda::attn_ragged::{self, RaggedMask};
 use kernels_cuda::tensor::Tensor;
 
-/// Fires the arm over `groups` groups of `rows_per_group` rows each and
-/// reports the mean of `reps` fires after one warm fire.
 fn bench(rows_per_group: u32, groups: u32, q_heads: u32, kv_heads: u32, hd: u32, reps: u32) -> f64 {
     let rows = (rows_per_group * groups) as usize;
     let (qw, kw) = ((q_heads * hd) as usize, (kv_heads * hd) as usize);
@@ -63,7 +53,6 @@ fn bench(rows_per_group: u32, groups: u32, q_heads: u32, kv_heads: u32, hd: u32,
     }
     gpu.sync();
     let ms = started.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
-    // 4 flops per (query, key, head, dim): q·k and p·v, each a multiply-add.
     let flops = 4.0
         * f64::from(rows_per_group)
         * f64::from(rows_per_group)
@@ -81,15 +70,11 @@ fn bench(rows_per_group: u32, groups: u32, q_heads: u32, kv_heads: u32, hd: u32,
 #[test]
 #[ignore = "a benchmark: ~1 GB of device memory and seconds of tensor-core time"]
 fn the_ragged_arm_runs_at_tensor_core_speed() {
-    // The headline shape.
     let ms = bench(32 * 1024, 1, 24, 24, 128, 5);
-    // The naive kernel walks every key per (row, head) block with scalar
-    // fmas; at this shape that is seconds. Tensor cores are tens of ms.
     assert!(
         ms < 1000.0,
         "32k x 32k x 24 x 128 took {ms:.1} ms: not tensor-core class"
     );
-    // The other two stamps, and a ragged batch.
     bench(32 * 1024, 1, 16, 16, 256, 3);
     bench(32 * 1024, 1, 24, 24, 64, 5);
     bench(8 * 1024, 4, 24, 8, 128, 5);

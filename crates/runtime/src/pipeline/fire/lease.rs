@@ -1,24 +1,12 @@
-//! Device-geometry page leasing (grant/reclaim/free-list) and device-geometry
-//! pass detection. Physical page ids only; the engine needs no slot->physical
-//! table. Pin float is bounded by `(run-ahead depth) x B` pages.
-
-/// Tracks pages granted to each in-flight fire (FIFO); unused fresh grants
-/// are reclaimed as fires commit, and everything is reclaimed on drop.
 #[derive(Debug, Default)]
 pub struct PageLease {
-    /// Beam / lane width: fresh pages granted per fire.
     pub b: usize,
-    /// Free-list of reclaimed physical page ids, drawn before allocating anew.
     free: Vec<u32>,
-    /// Per-in-flight-fire grants, FIFO. `pending[i]` = the `b` ids granted to
-    /// the i-th oldest un-reclaimed fire.
     pending: std::collections::VecDeque<Vec<u32>>,
-    /// Fire-0 seed pages (one per lane), reclaimed only on pass drop.
     seed_pages: Vec<u32>,
 }
 
 impl PageLease {
-    /// A fresh lease for `b` lanes.
     pub fn new(b: usize) -> Self {
         PageLease {
             b,
@@ -28,13 +16,10 @@ impl PageLease {
         }
     }
 
-    /// Record the fire-0 seed pages; reclaimed on drop.
     pub fn seed(&mut self, pages: Vec<u32>) {
         self.seed_pages = pages;
     }
 
-    /// Draw `b` fresh page ids: free-list first, then `alloc`. Records the
-    /// grant on the pending FIFO for reclaim after the fire commits.
     pub fn grant<F: FnMut() -> u32>(&mut self, mut alloc: F) -> Vec<u32> {
         let mut pages = Vec::with_capacity(self.b);
         for _ in 0..self.b {
@@ -44,9 +29,6 @@ impl PageLease {
         pages
     }
 
-    /// Reclaim the oldest in-flight fire's unused fresh grants, per lane
-    /// `w_cont` (true = continued a shared tail, fresh page unused; false =
-    /// forked onto it, keep live). Returns the reclaimed ids. No-op if empty.
     pub fn reclaim_after_fire(&mut self, w_cont: &[bool]) -> Vec<u32> {
         let Some(grant) = self.pending.pop_front() else {
             return Vec::new();
@@ -61,7 +43,6 @@ impl PageLease {
         reclaimed
     }
 
-    /// Reclaim every page held (pass drop / failure). Returns the freed ids.
     pub fn reclaim_all(&mut self) -> Vec<u32> {
         let mut all = Vec::new();
         while let Some(grant) = self.pending.pop_front() {
@@ -72,44 +53,24 @@ impl PageLease {
         all
     }
 
-    // In-flight (un-reclaimed) fire count; test-only.
     #[cfg(test)]
     pub fn in_flight(&self) -> usize {
         self.pending.len()
     }
 }
 
-/// Physical-page leasing + channel bookkeeping for a device-geometry pass.
 pub struct DevGeo {
-    /// The physical-page lease (grant / reclaim / free-list bookkeeping).
     pub lease: PageLease,
-    /// Beam / lane width: fresh grants per fire.
     pub b: usize,
-    /// Dense channel index of the host-writer `fresh`-page input channel.
     pub fresh_dense: usize,
-    /// Dense channel index of the `w_cont` host-reader output ([b] bool).
     pub w_cont_dense: usize,
-    /// Whether the program binds an `AttnMask` descriptor channel. Unread in
-    /// production; kept for tests.
     #[allow(dead_code)]
     pub has_mask: bool,
-    /// Pool-owned geometry: the program reserves its own page pool and
-    /// resolves every write target in-graph, so `lease`/`fresh_dense`/
-    /// `w_cont_dense` are inert.
     pub pooled: bool,
-    /// The lanes' row split as the guest states it: one token a lane, or a
-    /// seeded, never-put `embed_indptr` (`[0, w]` for a one-lane window).
-    /// What the recurrent plan reads its rows off; `None` for a leased pass,
-    /// which resolves every row on the device.
     pub qo_indptr: Option<Vec<u32>>,
 }
 
 impl DevGeo {
-    /// A pool-owned device-geometry pass whose lanes `qo_indptr` cuts
-    /// (`detect_pooled_device_geometry`'s answer). One token a lane is the
-    /// decode shape and states no split; a lane of several rows — a
-    /// speculative window on a recurrent state — states it, so the fire
-    /// path can plan the rows the device will resolve.
     pub fn pooled(qo_indptr: Vec<u32>, has_mask: bool) -> Self {
         let lanes = qo_indptr.len().saturating_sub(1);
         DevGeo {
@@ -124,16 +85,6 @@ impl DevGeo {
     }
 }
 
-/// Detect a pool-owned device-geometry pass: every descriptor port is bound
-/// to a channel the program itself re-publishes, so the engine can resolve
-/// geometry from the channel cells with no page-lease handshake. A dense
-/// device `AttnMask`, when bound, must be a re-published bool channel; a
-/// pass with no mask is admitted too (a speculative window whose lanes are
-/// the staircase by their own `kv_len`), which is what lets its accepted
-/// count stay on the device. A loop whose pages are a constant the program
-/// never re-publishes is not this class and keeps the envelope path.
-///
-/// Returns the lane count (`EmbedTokens` extent).
 pub fn detect_pooled_device_geometry(
     container: &eta_ir::container::TraceContainer,
 ) -> Option<Vec<u32>> {
@@ -197,10 +148,6 @@ pub fn detect_pooled_device_geometry(
         return None;
     }
     let count = dims[0];
-    // The row split: one token a lane unless the guest seeded a split it
-    // never re-publishes. `[0, tokens]` is the one-lane WINDOW a recurrent
-    // state can take (its scan runs a lane's rows in order); any other seeded
-    // split is not a shape this class can state, and declines.
     match channel_of(Port::EmbedIndptr) {
         Some(split) if !republished(split) => {
             let declaration = container.channels.get(split)?;
@@ -219,9 +166,6 @@ pub fn detect_pooled_device_geometry(
     }
 }
 
-/// Detect a device-geometry pass: `WSlot`/`WOff` write descriptors bind
-/// device-produced channels, and `Pages` is `[B, P]` (`P > 1`). Returns
-/// `(B, fresh_dense, w_cont_dense)`; `None` for an ordinary decode.
 pub fn detect_device_geometry(
     container: &eta_ir::container::TraceContainer,
 ) -> Option<(usize, usize, usize)> {
@@ -265,7 +209,6 @@ pub fn detect_device_geometry(
 mod tests {
     use super::*;
 
-    // Monotonic page-id allocator for tests.
     fn allocator() -> impl FnMut() -> u32 {
         let mut next = 1000u32;
         move || {
@@ -273,6 +216,14 @@ mod tests {
             next += 1;
             id
         }
+    }
+
+    fn lease_every_case() {
+        grant_mints_b_pages_and_tracks_in_flight();
+        reclaim_returns_only_continued_lanes();
+        detect_device_geometry_identifies_b_fresh_and_wcont();
+        detect_device_geometry_rejects_plain_decode();
+        detect_device_geometry_rejects_single_page_width();
     }
 
     #[test]
@@ -287,12 +238,10 @@ mod tests {
         assert_eq!(lease.in_flight(), 2, "run-ahead: two fires in flight");
     }
 
-    #[test]
     fn reclaim_returns_only_continued_lanes() {
         let mut lease = PageLease::new(2);
         let mut alloc = allocator();
-        let _g = lease.grant(&mut alloc); // [1000, 1001]
-        // lane 0 continued (reclaim), lane 1 forked (keep).
+        let _g = lease.grant(&mut alloc);
         let reclaimed = lease.reclaim_after_fire(&[true, false]);
         assert_eq!(
             reclaimed,
@@ -317,17 +266,15 @@ mod tests {
         }
     }
 
-    // Channels: 0 pages[b,p], 1 w_slot[b], 2 w_off[b], 3 fresh[b] (Writer),
-    // 4 w_cont[b] bool (Reader).
     fn devgeo_container(b: u32, p: u32) -> TraceContainer {
         TraceContainer {
             names: vec![],
             channels: vec![
-                ch(Shape::matrix(b, p), Dtype::U32, HostRole::None), // 0 pages
-                ch(Shape::vector(b), Dtype::U32, HostRole::None),    // 1 w_slot
-                ch(Shape::vector(b), Dtype::U32, HostRole::None),    // 2 w_off
-                ch(Shape::vector(b), Dtype::U32, HostRole::Writer),  // 3 fresh
-                ch(Shape::vector(b), Dtype::Bool, HostRole::Reader), // 4 w_cont
+                ch(Shape::matrix(b, p), Dtype::U32, HostRole::None),
+                ch(Shape::vector(b), Dtype::U32, HostRole::None),
+                ch(Shape::vector(b), Dtype::U32, HostRole::None),
+                ch(Shape::vector(b), Dtype::U32, HostRole::Writer),
+                ch(Shape::vector(b), Dtype::Bool, HostRole::Reader),
             ],
             ports: vec![
                 PortBinding {
@@ -351,7 +298,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn detect_device_geometry_identifies_b_fresh_and_wcont() {
         let c = devgeo_container(2, 3);
         let (b, fresh, w_cont) = detect_device_geometry(&c).expect("device-geometry pass");
@@ -360,9 +306,7 @@ mod tests {
         assert_eq!(w_cont, 4, "w_cont = the host-Reader bool channel");
     }
 
-    #[test]
     fn detect_device_geometry_rejects_plain_decode() {
-        // Plain decode: KvLen only, no WSlot/WOff.
         let c = TraceContainer {
             names: vec![],
             channels: vec![ch(Shape::vector(1), Dtype::I32, HostRole::None)],
@@ -382,9 +326,7 @@ mod tests {
         );
     }
 
-    #[test]
     fn detect_device_geometry_rejects_single_page_width() {
-        // Pages is [b,1] (p == 1), not a multi-page beam.
         let mut c = devgeo_container(2, 1);
         c.channels[0] = ch(Shape::matrix(2, 1), Dtype::U32, HostRole::None);
         assert!(
@@ -414,7 +356,6 @@ mod pooled_tests {
         }
     }
 
-    // Every descriptor port bound to a channel the epilogue re-publishes.
     fn masked_decode(lanes: u32, pool: u32) -> TraceContainer {
         let decls = [
             (Port::EmbedTokens, Shape::vector(lanes), Dtype::I32),
@@ -451,6 +392,13 @@ mod pooled_tests {
         container
     }
 
+    fn lease_1_every_case() {
+        masked_loop_carried_decode_is_pooled_device_geometry();
+        a_mask_free_decode_that_republishes_every_port_is_pooled_too();
+        a_decode_whose_pages_are_a_constant_keeps_the_envelope_path();
+        a_host_driven_descriptor_is_not_pooled_device_geometry();
+    }
+
     #[test]
     fn masked_loop_carried_decode_is_pooled_device_geometry() {
         assert_eq!(
@@ -463,10 +411,6 @@ mod pooled_tests {
         );
     }
 
-    /// A mask is not what makes the class: a loop that re-publishes every
-    /// descriptor port states its geometry in-graph with or without one (a
-    /// speculative window's lanes are the staircase by their own `kv_len`).
-    #[test]
     fn a_mask_free_decode_that_republishes_every_port_is_pooled_too() {
         let mut container = masked_decode(2, 128);
         let mask = container
@@ -478,9 +422,6 @@ mod pooled_tests {
         assert_eq!(detect_pooled_device_geometry(&container), Some(vec![0, 1, 2]));
     }
 
-    /// What keeps the envelope path is a page table the program never
-    /// re-publishes — the ordinary decode loop, whose pages are a constant.
-    #[test]
     fn a_decode_whose_pages_are_a_constant_keeps_the_envelope_path() {
         let mut container = masked_decode(1, 128);
         let mask = container
@@ -507,7 +448,6 @@ mod pooled_tests {
         );
     }
 
-    #[test]
     fn a_host_driven_descriptor_is_not_pooled_device_geometry() {
         let mut container = masked_decode(1, 128);
         let pages = container

@@ -1,39 +1,9 @@
-//! **A GATHER CARRIES ITS IDS' ROW SPACE, NOT `Dim::Tokens`.**
-//!
-//! ```text
-//! cargo test -p model-dsl --test a_gather_lands_on_its_ids_axis
-//! ```
-//!
-//! `.wiki/alto/multimodal.md` §9.2 rests a whole design on one sentence —
-//! "`layout.embed` types its output off its ids' row space and does not care
-//! which axis that is" — and the sentence was **false when it was written**.
-//! `ops::layout::embed` minted `tensor(Dim::Tokens, ..)` literally, so a
-//! patch-axis gather would have answered a TOKEN rectangle: cut at the token
-//! window, sized by `max_tokens`, and assigned to the trunk's capture unit.
-//! Three wrongs, none of them loud, and no test could see it because every
-//! text that existed passed `Input::tokens`, whose row space IS `Dim::Tokens`.
-//!
-//! So the claim is a test now rather than a reading:
-//!
-//! ```text
-//! (a) a TOKEN-axis gather answers a `[Dim::Tokens, hidden]` rectangle, which
-//!     is what every text before the towers depends on
-//! (b) a PATCH-axis gather answers `[Dim::Patches, hidden]` — the second row
-//!     axis reaching the same op with no arm of its own
-//! (c) the interpolating gather says the same thing, on both axes
-//! (d) and the axis is not how a text picks the op
-//! ```
-//!
-//! Traced rather than asserted on a builder: `trace_hybrid` is the only door
-//! that mints an `Input`, so the gate runs the arithmetic a model text runs.
-
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
 };
 use model_ir::{Dim, Layout, Operation, Trace, Ty};
 
-/// The fact vocabulary a one-op trace needs: none.
 struct NoFacts;
 
 impl Classify for NoFacts {
@@ -45,14 +15,12 @@ impl Classify for NoFacts {
     }
 }
 
-/// Which axis the gather under test reads.
 #[derive(Clone, Copy)]
 enum Axis {
     Tokens,
     Patches,
 }
 
-/// Which gather.
 #[derive(Clone, Copy)]
 enum Gather {
     Plain,
@@ -83,8 +51,6 @@ impl ForwardHybrid for OneGather {
             Gather::Plain => 1,
             Gather::Weighted => TAPS,
         };
-        // The token axis's own id vector is what every text before the towers
-        // hands this op; the patch axis's is the new stream.
         let ids = match self.axis {
             Axis::Tokens => inputs.tokens(),
             Axis::Patches => inputs.patch_embed_rows(taps),
@@ -99,7 +65,6 @@ impl ForwardHybrid for OneGather {
     }
 }
 
-/// The `Ty` of the one gather node's output.
 fn gathered(axis: Axis, gather: Gather) -> Ty {
     let trace: Trace = trace_hybrid("one_gather", &OneGather { axis, gather }, Platform::Cuda);
     let out = trace
@@ -122,7 +87,12 @@ fn leading(ty: &Ty) -> Dim {
     }
 }
 
-/// (a) and (b): the plain gather follows its ids onto either axis.
+fn a_gather_lands_on_its_ids_axis_every_case() {
+    the_plain_gather_follows_its_ids_onto_either_axis();
+    the_interpolating_gather_follows_its_ids_too();
+    the_axis_is_not_how_a_text_picks_the_op();
+}
+
 #[test]
 fn the_plain_gather_follows_its_ids_onto_either_axis() {
     let tokens = gathered(Axis::Tokens, Gather::Plain);
@@ -152,8 +122,6 @@ fn the_plain_gather_follows_its_ids_onto_either_axis() {
     );
 }
 
-/// (c): the interpolating gather says the same thing.
-#[test]
 fn the_interpolating_gather_follows_its_ids_too() {
     assert_eq!(
         leading(&gathered(Axis::Tokens, Gather::Weighted)),
@@ -167,8 +135,6 @@ fn the_interpolating_gather_follows_its_ids_too() {
     );
 }
 
-/// (d): one op kind per gather, and the axis is not part of the choice.
-#[test]
 fn the_axis_is_not_how_a_text_picks_the_op() {
     for axis in [Axis::Tokens, Axis::Patches] {
         let trace = trace_hybrid(

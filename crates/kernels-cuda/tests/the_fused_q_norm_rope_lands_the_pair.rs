@@ -1,8 +1,3 @@
-//! `rope::rmsnorm_rope_partial_q` (per-head rmsnorm then the q-only partial
-//! rope, one launch) lands what the two launches land on the host, within
-//! bf16 rounding, on a full-rotary head, a partial one, and under a staged
-//! window that retires padded rows.
-
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -88,12 +83,16 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
     }
 }
 
+fn the_fused_q_norm_rope_lands_the_pair_every_case() {
+    a_full_rotary_head_lands_the_pair();
+    a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed();
+}
+
 #[test]
 fn a_full_rotary_head_lands_the_pair() {
     check(256, 4, 256, None);
 }
 
-#[test]
 fn a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed() {
     check(256, 8, 128, None);
     check(128, 2, 64, Some((6, 4, 1)));

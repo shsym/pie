@@ -1,6 +1,3 @@
-//! The routed-expert residency tier: a wired slab of expert seats, smaller
-//! than the bank, swapped in from a host band table between fire segments.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -15,113 +12,60 @@ use crate::error::{Fault, Result};
 use crate::host_source::HostSource;
 use crate::mapping::Mapping;
 
-/// A param's other device planes, by `Trace::params` index — which move together.
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
-/// What a plan wants and what a budget allows, decided from the trace and
-/// the load plan's pairings alone. The empty plan means full residency.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
-    /// One entry per streamed BAND, in param order.
     bands: Vec<BandPlan>,
-    /// One entry per streamed GROUP, in router order.
     groups: Vec<GroupPlan>,
-    /// `param index -> how many experts of it the slab seats`, consulted by
-    /// [`weights::places`](crate::weights) to reserve a bank smaller than declared.
     resident_of: BTreeMap<usize, u32>,
-    /// `param index -> where its whole plane lives in the host band table`.
     host_of: BTreeMap<usize, u64>,
-    /// How many seats every group's slab has. Zero for the empty plan.
     slots: u32,
     device_bytes: u64,
     host_bytes: u64,
-    /// The gathered class's half of this plan (`crate::gather`), sized in
-    /// the same pass before the expert slab is sized against what's left.
     gathered: crate::gather::Plan,
 }
 
-/// One streamed band: a param sliced by a routing vector's expert count.
 #[derive(Debug, Clone)]
 pub struct BandPlan {
-    /// Index into `Trace::params`.
     pub param: usize,
-    /// The param's own name, which is the plan's and the contract's.
     pub name: String,
-    /// The bank's leading axis.
     pub experts: u32,
-    /// How many of them the wired slab seats.
     pub slots: u32,
-    /// One expert's bytes — the seat stride, uniform across the band.
     pub stride: u64,
-    /// Which [`GroupPlan`] this band moves with.
     pub group: usize,
 }
 
-/// One streamed group: a router, and every expert-indexed param read
-/// against the vector it writes — the unit of residency, since one
-/// rewrite of `routes` re-indexes every band in the group at once.
-/// The experts one expert-major pass seats: half the slab, so the other
-/// half can be filled for the next pass while this one runs on the device.
 #[must_use]
 pub fn pass_group(slots: u32) -> u32 {
-    // `diagnostics = "pass-half=off"`: the whole slab in one pass.
     if !crate::diag::on().pass_half {
         return slots.max(1);
     }
     (slots / 2).max(1)
 }
 
-/// A run being walked in expert-major passes (`Tier::pass_at`).
 #[derive(Clone, Debug)]
 struct Passing {
     row_offset: u32,
     rows: u32,
-    /// The routing vector as the router wrote it: expert ids.
     ids: Vec<i32>,
-    /// The distinct experts, in first-appearance order, cut into groups of
-    /// at most the slab's seats — one per pass.
     groups: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GroupPlan {
-    /// The routing vector this group's bands are indexed by, rewritten at the segment cut.
     pub routes: ValueId,
-    /// How many experts the router declares.
     pub experts: u32,
-    /// How many of them the slab seats.
     pub slots: u32,
-    /// Indices into [`Plan::bands`], ascending by param.
     pub bands: Vec<usize>,
-    /// The route prediction as `hint`: `[tokens, k]` ranked experts for
-    /// the NEXT group. `None` if none.
     pub hint: Option<ValueId>,
 }
 
 impl Plan {
-    /// The residency plan for `trace` under `budget`. `None` (uncapped)
-    /// answers the empty plan; a stated budget is met by seating fewer
-    /// experts, never by holding fewer dense planes. `planes` pairs a
-    /// quantized bank's scales and zero points to stay seated with its codes.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Param`] for a param whose dtype has no element size or whose
-    /// band shape breaks the uniformity proof; [`Fault::Residency`] for a
-    /// budget that cannot hold the dense planes plus one seat of every band,
-    /// or a capped budget over a plan with nothing routed to hold less of.
     pub fn of(trace: &Trace, planes: &Attachments, budget: Option<u64>) -> Result<Plan> {
         Plan::beside(trace, planes, budget, crate::gather::Plan::default())
     }
 
-    /// The same plan, beside a gathered class that already holds some
-    /// planes CPU-side (`crate::gather::Plan::params`). `gathered` is an
-    /// exclusion, not a second budget: those bytes are in neither `full`
-    /// nor the dense floor. [`Plan::of`] is this with an empty set.
-    ///
-    /// # Errors
-    ///
-    /// [`Plan::of`]'s.
     pub fn beside(
         trace: &Trace,
         planes: &Attachments,
@@ -144,7 +88,6 @@ impl Plan {
             });
         };
         if budget >= full {
-            // Budget covers everything: no streaming.
             return Ok(Plan {
                 device_bytes: full,
                 gathered,
@@ -162,7 +105,6 @@ impl Plan {
             )));
         }
 
-        // Dense floor: planes that aren't streamed bands are held whole.
         let streamed: BTreeSet<usize> = bands.iter().map(|band| band.param).collect();
         let dense: u64 = bytes
             .iter()
@@ -170,7 +112,6 @@ impl Plan {
             .filter(|(at, _)| !streamed.contains(at) && !held.contains(at))
             .map(|(_, plane)| plane.next_multiple_of(crate::weights::ALIGN))
             .sum();
-        // Lifted out so the sweep below can read `bands` while writing it back into.
         let strides: Vec<u64> = bands.iter().map(|band| band.stride).collect();
         let seats = |n: u32| -> u64 {
             strides
@@ -178,9 +119,6 @@ impl Plan {
                 .map(|stride| (u64::from(n) * stride).next_multiple_of(crate::weights::ALIGN))
                 .sum()
         };
-        // A pass seats half the slab (`pass_group`) and one row of a fire
-        // routes to the router's fan-out of experts, so the slab must seat
-        // twice that — or a one-row fire is refused at its first cut.
         let fan = groups
             .iter()
             .filter_map(|group| fan_out(trace, group.routes))
@@ -203,7 +141,6 @@ impl Plan {
             )));
         }
 
-        // One seat count for the whole plan, walked down from the full bank.
         let experts = groups[0].experts;
         let slack = budget - dense;
         let mut slots = 0u32;
@@ -222,7 +159,6 @@ impl Plan {
             group.slots = slots;
         }
         let resident_of = bands.iter().map(|band| (band.param, slots)).collect();
-        // Host band table layout: bands in param order, each whole.
         let mut host_bytes = 0u64;
         let mut host_of = BTreeMap::new();
         for band in &bands {
@@ -241,79 +177,63 @@ impl Plan {
         })
     }
 
-    /// The gathered half of this plan — empty except for a capped Flash-Next load.
     #[must_use]
     pub fn gathered(&self) -> &crate::gather::Plan {
         &self.gathered
     }
 
-    /// Does this load stream any band?
     #[must_use]
     pub fn streams(&self) -> bool {
         !self.bands.is_empty()
     }
 
-    /// The bands it streams, in param order.
     #[must_use]
     pub fn bands(&self) -> &[BandPlan] {
         &self.bands
     }
 
-    /// The groups it streams, in router order.
     #[must_use]
     pub fn groups(&self) -> &[GroupPlan] {
         &self.groups
     }
 
-    /// How many seats every group's slab has — `0` for a full-residency plan.
     #[must_use]
     pub fn slots(&self) -> u32 {
         self.slots
     }
 
-    /// How many experts of `param` the slab seats, or `None` if held whole.
     #[must_use]
     pub fn resident(&self, param: usize) -> Option<u32> {
         self.resident_of.get(&param).copied()
     }
 
-    /// Where `param`'s whole plane lives in the host band table, or `None` if it lands on the device.
     #[must_use]
     pub fn host_at(&self, param: usize) -> Option<u64> {
         self.host_of.get(&param).copied()
     }
 
-    /// What this plan demands of the device, in bytes — what
-    /// [`Residency::admit`](engine::load::Residency::admit) is asked with.
     #[must_use]
     pub fn device_demand(&self) -> u64 {
         self.device_bytes + self.gathered.device_demand()
     }
 
-    /// What this plan demands of a host tier: zero, always, on unified memory.
     #[must_use]
     pub fn host_demand(&self) -> u64 {
         let _ = self.host_bytes;
         0
     }
 
-    /// How many bytes the host band table holds, for the cold arm's
-    /// [`HostSource::open`](crate::host_source::HostSource::open) — unread by a warm load.
     #[must_use]
     pub fn source_bytes(&self) -> u64 {
         self.host_bytes
     }
 }
 
-/// The streamed bands and groups a trace declares, with the uniformity
-/// proof checked. A band is a param some routed op reads at an
-/// expert-indexed port, determined by the op, not a naming convention.
 fn found(
     trace: &Trace,
     planes: &Attachments,
     bytes: &[u64],
 ) -> Result<(Vec<BandPlan>, Vec<GroupPlan>)> {
-    // Routers first: expert count is the router's field.
     let mut arity: BTreeMap<u32, u32> = BTreeMap::new();
     let mut hints: BTreeMap<u32, ValueId> = BTreeMap::new();
     let mut order: Vec<ValueId> = Vec::new();
@@ -347,8 +267,6 @@ fn found(
             | Linear::MoeTopkSqrtSoftplus {
                 routes, experts, ..
             }
-            // The lookup router reads no logits, so it's not a `MoeTopk*` by
-            // name, but it writes the same `routes` vector.
             | Linear::MoeHashRoute {
                 routes, experts, ..
             } => (*routes, *experts),
@@ -359,7 +277,6 @@ fn found(
         }
     }
 
-    // Expert-indexed reads, joined to the router that wrote their routing vector.
     let mut of_group: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     let mut routers_of: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     for node in &trace.nodes {
@@ -400,11 +317,6 @@ fn found(
             }
         }
     }
-    // **A BANK TWO ROUTERS INDEX STAYS RESIDENT.** A seat number means one
-    // group's seat, and a band shared between two groups would be re-indexed
-    // twice — so such a band (a draft head's experts, routed once per chain
-    // step) is not a streamed band at all: it is held whole, as a dense plane
-    // is, and costs the budget its full size.
     let shared: BTreeSet<usize> = routers_of
         .iter()
         .filter(|(_, routers)| routers.len() > 1)
@@ -417,7 +329,6 @@ fn found(
     let mut declared: Option<u32> = None;
     for routes in order {
         let Some(mut params) = of_group.remove(&routes.0) else {
-            // A router nothing expert-indexed reads isn't a group.
             continue;
         };
         params.retain(|at| !shared.contains(at));
@@ -426,7 +337,6 @@ fn found(
         }
         params.sort_unstable();
         let experts = arity[&routes.0];
-        // Every group in a plan states the same expert count.
         match declared {
             None => declared = Some(experts),
             Some(first) if first != experts => {
@@ -491,9 +401,6 @@ fn found(
     Ok((bands, groups))
 }
 
-/// How many experts one row of the router writing `routes` picks — the
-/// bound on distinct experts `rows` rows can name, which is what sizes a
-/// streamed segment's sub-batch (`slots / fan_out` rows fit the slab).
 #[must_use]
 pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
     trace.nodes.iter().find_map(|node| match &node.op {
@@ -510,7 +417,6 @@ pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
     })
 }
 
-/// The `Trace::params` row a value id names, or a refusal.
 fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
     match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
         Some(Def::Weight(w)) => Ok(*w as usize),
@@ -522,20 +428,6 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
     }
 }
 
-/// Where the walk is cut, one entry per region of the compiled template:
-/// the routing vector the router in that region writes, or `None`. The cut
-/// falls after the deciding node and before the nodes that read.
-///
-/// Only a router whose bands `plan` STREAMS cuts anything: a mixture over a
-/// resident bank (a draft head's experts, held whole because two routers
-/// index them) needs no seat swapped, and a cut is a blocking commit — two
-/// of them a fire, for nothing, on every plain decode.
-///
-/// # Errors
-///
-/// [`Fault::Residency`] when the plan streams and a region holds two
-/// streamed routers: the cut would fall after both, encoding the first
-/// mixture against un-swapped seats.
 pub fn cuts(
     trace: &Trace,
     compiled: &CompiledModel,
@@ -558,8 +450,6 @@ pub fn cuts(
                 | Linear::MoeTopkSoftmaxScaled { routes, .. }
                 | Linear::MoeTopkSigmoid { routes, .. }
                 | Linear::MoeTopkSqrtSoftplus { routes, .. }
-                // The lookup router decides a mixture the same way the ranked
-                // four do.
                 | Linear::MoeHashRoute { routes, .. } => *routes,
                 _ => continue,
             };
@@ -587,71 +477,46 @@ pub fn cuts(
     Ok(out)
 }
 
-/// One band, seated: where its experts are on both sides, and the seat's width.
 #[derive(Debug)]
 struct Band {
-    /// The param's own name, for a refusal that names it.
     name: String,
-    /// Byte offset of seat 0 inside the device weight store.
     at: u64,
-    /// Byte offset of expert 0 inside the host band table.
     from: u64,
-    /// One expert's bytes.
     stride: u64,
 }
 
-/// One group's wired slab: which expert is in which seat, and which seats
-/// the segment in flight may not lose.
 #[derive(Debug)]
 struct Slab {
     experts: u32,
     slots: u32,
     bands: Vec<Band>,
-    /// `expert -> seat`, or `None` for an expert the slab does not hold.
     seat_of: Vec<Option<u32>>,
-    /// `seat -> expert`, or `None` for a seat nothing has been copied into.
     in_seat: Vec<Option<u32>>,
-    /// A seat the segment being built will read; released at the next cut.
     pinned: Vec<bool>,
-    /// The tick each seat was last routed to or filled at — [`Tier::evict`]
-    /// takes the least recent unpinned seat (true LRU).
     last_used: Vec<u64>,
 }
 
-/// What one group's residency looks like from outside — the only observable a swap has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupResidency {
-    /// The group's first band, by name — what a reader recognises it as.
     pub name: String,
-    /// How many experts the router declares.
     pub experts: u32,
-    /// How many of them the slab seats.
     pub slots: u32,
-    /// Which expert is in which seat, ascending by seat; `None` if uncopied.
     pub in_seat: Vec<Option<u32>>,
 }
 
-/// The host bytes themselves, under whichever arm produced them.
 #[derive(Debug)]
 enum Bytes {
-    /// The cold arm's staging: an unlinked temporary file, written once.
     Landed(HostSource),
-    /// The warm arm's: the serving artifact's own `PROT_READ` mapping.
     Artifact(Arc<Mapping>),
 }
 
-/// Where a seat copy reads from: [`Source::landed`] (cold) reads the
-/// landing sink's host table, [`Source::artifact`] (warm) reads the
-/// serving artifact's mapping. Both are CPU-read-only.
 #[derive(Debug)]
 pub struct Source {
     bytes: Bytes,
-    /// `param index -> byte offset of expert 0 of that band`, in `bytes`.
     bands: BTreeMap<usize, u64>,
 }
 
 impl Source {
-    /// The cold arm's source: the staging file, at the plan's host-table offsets.
     #[must_use]
     pub fn landed(plan: &Plan, host: HostSource) -> Source {
         Source {
@@ -660,7 +525,6 @@ impl Source {
         }
     }
 
-    /// The cold arm's source, at caller-stated offsets — used by `crate::gather`.
     #[must_use]
     pub fn from_host(host: HostSource, bands: BTreeMap<usize, u64>) -> Source {
         Source {
@@ -669,8 +533,6 @@ impl Source {
         }
     }
 
-    /// The warm arm's source: the mapped artifact, at per-band offsets
-    /// `bands` recovered from its serving manifest.
     #[must_use]
     pub fn artifact(map: Arc<Mapping>, bands: BTreeMap<usize, u64>) -> Source {
         Source {
@@ -679,7 +541,6 @@ impl Source {
         }
     }
 
-    /// What this source is made of, as one word.
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self.bytes {
@@ -688,9 +549,6 @@ impl Source {
         }
     }
 
-    /// What's actually behind these bytes: `(file size, link count)`, or
-    /// `None` for no file at all — `(bytes, 0)` for `landed` (unlinked),
-    /// `(bytes, links >= 1)` for `artifact`.
     #[must_use]
     pub fn backing(&self) -> Option<(u64, u64)> {
         match &self.bytes {
@@ -699,13 +557,10 @@ impl Source {
         }
     }
 
-    /// Where expert 0 of `param`'s band lies in these bytes.
     pub(crate) fn at(&self, param: usize) -> Option<u64> {
         self.bands.get(&param).copied()
     }
 
-    /// The file a seat copy may `pread` out of, if this source has one.
-    /// `None` only for an empty cold source.
     pub(crate) fn file(&self) -> Option<&std::fs::File> {
         match &self.bytes {
             Bytes::Landed(host) => host.file(),
@@ -713,7 +568,6 @@ impl Source {
         }
     }
 
-    /// `len` bytes at `from`, or `None` for a span that leaves the source.
     pub(crate) fn get(&self, from: usize, len: usize) -> Option<&[u8]> {
         let all: &[u8] = match &self.bytes {
             Bytes::Landed(host) => host,
@@ -722,7 +576,6 @@ impl Source {
         all.get(from..from.checked_add(len)?)
     }
 
-    /// How many bytes the source holds — the bound a refusal names.
     pub(crate) fn len(&self) -> u64 {
         match &self.bytes {
             Bytes::Landed(host) => host.len() as u64,
@@ -730,8 +583,6 @@ impl Source {
         }
     }
 
-    /// Hand the source to the pager, once, after landing and the identity
-    /// prefix have finished reading it. A no-op for the artifact arm.
     pub(crate) fn settle(&mut self) {
         match &mut self.bytes {
             Bytes::Landed(host) => host.settle(),
@@ -740,102 +591,49 @@ impl Source {
     }
 }
 
-/// The tier: the host band table, a wired slab per group, and the seat
-/// bookkeeping between them. Holds a retain of the weight store, not a
-/// borrow; safe because every seat write happens between two command
-/// buffers, after a blocking commit, with no encode in flight.
 #[derive(Debug)]
 pub struct Tier {
-    /// A retain of the weight store — where seats live.
     store: Store,
-    /// Every expert of every streamed band, in a file-backed mapping — the
-    /// cold arm's staging file or the warm arm's artifact. CPU-read-only:
-    /// no kernel addresses this, since a GPU-touched mapped page wires.
     source: Source,
     slabs: Vec<Slab>,
-    /// `routes value -> slab index`.
     of_routes: BTreeMap<u32, usize>,
-    /// How many seat copies this load has done.
     swaps: u64,
-    /// How many segment cuts this load has taken.
     segments: u64,
-    /// Threads a segment's seat copies spread over (`seat-threads=<n>`).
     threads: usize,
-    /// Seats decided but not yet filled — `(slab, seat, expert)` — between a
-    /// segment's rewrite pass and its [`Tier::flush`].
     pending: Vec<(usize, u32, u32)>,
-    /// The recency tick: one per seat touch, monotone, never zero.
     tick: u64,
-    /// How many distinct `(segment, expert)` lookups found the expert seated.
     hits: u64,
-    /// How many had to seat it.
     misses: u64,
-    /// Wall time inside [`Tier::segment`], and inside [`Tier::flush`] alone.
     cut_ns: u64,
     copy_ns: u64,
-    /// Wall time the cut spent waiting on its blocking commit.
     wait_ns: u64,
-    /// `routes value -> the prediction its router carries` ([`GroupPlan::hint`]).
     hint_of: BTreeMap<u32, ValueId>,
-    /// Per slab: the prediction read at the previous group's cut for this
-    /// one, or `None`.
     predicted: Vec<Option<Vec<Vec<u32>>>>,
-    /// Per slab: the run an expert-major walk is in the middle of — its
-    /// original routing vector and the expert groups its passes seat.
     passing: Vec<Option<Passing>>,
-    /// The route prefetch in flight: the next group's predicted experts
-    /// being read on another thread. Joined at the next cut.
     inflight: Option<std::thread::JoinHandle<Result<()>>>,
-    /// The source's file, shared with the prefetch thread.
     file: Option<std::sync::Arc<std::fs::File>>,
-    /// Whether predicted experts are prefetched, or only scored.
     prefetch: bool,
-    /// How many predicted experts per row the prefetch reads ([`PREFETCH_K`]).
     prefetch_k: usize,
-    /// `route-dump=<path>`: every cut's true routes appended as one line
-    /// `slab<TAB>id id …` per token row.
     dump: Option<std::io::BufWriter<std::fs::File>>,
-    /// The prediction's score, over every cut that had one to check.
     prediction: Prediction,
 }
 
-/// How good a route prediction is, counted at the cuts — [`Tier::prediction`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Prediction {
-    /// True experts checked against a prediction.
     pub total: u64,
-    /// Of them, how many the prediction's top 6, 8, 12 and 16 contained.
     pub covered: [u64; 4],
-    /// True experts that were not seated at the cut — the misses.
     pub misses: u64,
-    /// Of the misses, how many the prediction's top 6, 8, 12 and 16 contained.
     pub saved: [u64; 4],
-    /// How many experts the prefetch read ahead, since the load.
     pub prefetched: u64,
 }
 
-/// How many predicted experts per token row the prefetch reads ahead by
-/// default (`prefetch-k=<n>` overrides) — fewer than the router's fan-out,
-/// since a wrong pick is a whole expert read for nothing.
 const PREFETCH_K: usize = 4;
 
-/// The prediction prefixes [`Prediction`] scores.
 pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
 
-/// How many threads seat copies are spread over by default: the measured
-/// plateau of `pread` on this box is reached at four and flat past eight.
 const SEAT_THREADS: usize = 8;
 
 impl Tier {
-    /// Open the tier `plan` describes, reading experts out of `source`;
-    /// `offsets` is `param index -> byte offset of seat 0 inside the store`.
-    /// Initial seating is the identity prefix (seat `i` holds expert `i`).
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a seat or source span that leaves its bound,
-    /// [`Fault::Residency`] for a band the source states no offset for,
-    /// [`Fault::Deviceless`] off Apple.
     pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
         let mut tier = Tier {
             store: store.clone(),
@@ -876,8 +674,6 @@ impl Tier {
                 .iter()
                 .map(|&band| {
                     let band = &plan.bands[band];
-                    // A band the source can't place means the source and
-                    // plan weren't built from each other — refused by name.
                     let from = tier.source.at(band.param).ok_or_else(|| {
                         Fault::Residency(format!(
                             "the seat source states no offset for band `{}` (param {}), \
@@ -905,7 +701,6 @@ impl Tier {
                 last_used: vec![0; group.slots as usize],
             });
         }
-        // The prefix goes through the same batched `pread` path a segment uses.
         for at in 0..tier.slabs.len() {
             for seat in 0..tier.slabs[at].slots {
                 tier.slabs[at].in_seat[seat as usize] = Some(seat);
@@ -919,24 +714,11 @@ impl Tier {
             .file()
             .and_then(|file| file.try_clone().ok())
             .map(std::sync::Arc::new);
-        // Counter starts after the prefix fill, so `Tier::motion` counts only serving.
         tier.swaps = 0;
-        // Source handed to the pager once fully written and read; pages go
-        // dirty -> clean/reclaimable, and a later seat copy faults them back.
         tier.source.settle();
         Ok(tier)
     }
 
-    /// One segment cut: read the routing vector the region just wrote, seat
-    /// every expert it names, and rewrite it in place to name seats.
-    /// Callers must have already committed and waited for prior encodes.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a routing vector this fire minted no handle
-    /// row for, [`Fault::Residency`] for a segment routing to more distinct
-    /// experts than the slab seats or to an undeclared one,
-    /// [`Fault::Ceiling`] for a span that leaves a reservation.
     pub fn segment(
         &mut self,
         arena: &mut Buffer,
@@ -956,13 +738,11 @@ impl Tier {
         out
     }
 
-    /// The prediction the router writing `routes` carries, if any ([`GroupPlan::hint`]).
     #[must_use]
     pub fn hint_for(&self, routes: ValueId) -> Option<ValueId> {
         self.hint_of.get(&routes.0).copied()
     }
 
-    /// Read one `[rows, width]` i32 rectangle's window out of the arena.
     fn read_rows(
         arena: &mut Buffer,
         handles: &Handles,
@@ -987,9 +767,6 @@ impl Tier {
             .collect())
     }
 
-    /// Score the prediction made for this group, against what the router
-    /// chose and what the slab held, before this cut seats anything — then
-    /// read the prediction this router makes for the next group.
     #[allow(clippy::too_many_arguments)]
     fn predict(
         &mut self,
@@ -1052,8 +829,6 @@ impl Tier {
         span: MaskSpan,
         pass: (u32, u32),
     ) -> Result<u32> {
-        // ── Whatever the prefetch was still reading into the seats this
-        //    segment is about to name has to have landed first.
         self.join_inflight()?;
         if pass.1 > 1 {
             return self.pass_at(at, arena, handles, routes, rect, span, pass);
@@ -1062,8 +837,6 @@ impl Tier {
         Ok(1)
     }
 
-    /// One row-cut segment (the legacy piece): seat every expert the span
-    /// routes to and rewrite the vector to seats.
     #[allow(clippy::too_many_arguments)]
     fn segment_rows(
         &mut self,
@@ -1078,8 +851,6 @@ impl Tier {
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
-        // Previous segment completed (caller's blocking commit), so nothing
-        // is reading a seat any more.
         for seat in &mut self.slabs[at].pinned {
             *seat = false;
         }
@@ -1112,7 +883,6 @@ impl Tier {
                 let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
             }
         }
-        // Seat then rewrite in one pass, so a repeated id costs one copy.
         for entry in raw.chunks_exact_mut(4) {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
@@ -1131,12 +901,8 @@ impl Tier {
             let seat = self.seat(at, expert)?;
             entry.copy_from_slice(&(seat as i32).to_le_bytes());
         }
-        // The decisions were serial (the clock is one hand); the copies they
-        // decided are independent and go out together.
         self.flush()?;
         arena.write(first, &raw)?;
-        // ── And the NEXT group's predicted experts start reading now, while
-        //    the device runs this segment.
         if self.prefetch {
             if let Some(rows) = self.predicted.get(at + 1).cloned().flatten() {
                 self.prefetch(at + 1, &rows)?;
@@ -1145,13 +911,6 @@ impl Tier {
         Ok(())
     }
 
-    /// One expert-major pass over a whole run (`compose::pass_spans`): pass
-    /// 0 reads the run's routing vector and cuts its distinct experts into
-    /// groups of at most the slab's seats; pass `p` seats group `p` and
-    /// writes the vector as seat indices for that group's experts and `-1`
-    /// for every other entry, which the routed kernels skip (`route_sort`
-    /// drops a negative pair, `route_scatter` leaves its row, the matvec
-    /// returns). Each expert is copied once per run, not once per piece.
     #[allow(clippy::too_many_arguments)]
     fn pass_at(
         &mut self,
@@ -1218,13 +977,6 @@ impl Tier {
                     order.push(expert);
                 }
             }
-            // The experts already in a seat lead — what the last fire left
-            // in this slab — so pass 0 copies as little as it can. (Reading
-            // the next slab's PREDICTED first group ahead on a layer's last
-            // pass was tried here and evicted more of that than it seated:
-            // copies 40.5k → 47.4k on a 182-row GLM prefill.) Groups are a
-            // partition the tail sums slot by slot, so their order moves
-            // no bits.
             let seat_of = &self.slabs[at].seat_of;
             let (mut leading, trailing): (Vec<u32>, Vec<u32>) =
                 order.into_iter().partition(|&e| seat_of[e as usize].is_some());
@@ -1248,8 +1000,6 @@ impl Tier {
             )
         };
         let _ = passes;
-        // Seat this pass's group, then write the vector: seats for the
-        // group, `-1` for the rest.
         let mut seat_of: BTreeMap<u32, i32> = BTreeMap::new();
         for &expert in &group {
             let seat = self.seat(at, expert)?;
@@ -1279,8 +1029,6 @@ impl Tier {
         }
         self.flush()?;
         arena.write(first, &raw)?;
-        // The NEXT pass's group starts reading now, into the half of the
-        // slab this pass does not touch, while the device runs this one.
         if self.prefetch {
             if let Some(next) = next {
                 self.prefetch_group(at, &next)?;
@@ -1289,9 +1037,6 @@ impl Tier {
         Ok(self.passing[at].as_ref().map_or(0, |p| p.groups.len() as u32))
     }
 
-    /// Read `experts` of slab `at` ahead on a thread, into unpinned seats
-    /// only — the current pass's seats stay pinned and untouched. Joined at
-    /// the next cut (`join_inflight`), where the seats are then hits.
     fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
         let Some(file) = self.file.clone() else {
             return Ok(());
@@ -1337,7 +1082,6 @@ impl Tier {
         Ok(())
     }
 
-    /// Wait for the prefetch in flight, if any, and surface its refusal.
     fn join_inflight(&mut self) -> Result<()> {
         match self.inflight.take() {
             Some(handle) => handle.join().unwrap_or_else(|_| {
@@ -1349,14 +1093,10 @@ impl Tier {
         }
     }
 
-    /// Read the predicted experts of slab `at` ahead, on a thread: each
-    /// unseated expert in the top [`PREFETCH_K`] of a row's prediction is
-    /// seated and pinned, then `pread` on a thread joined at the next cut.
     fn prefetch(&mut self, at: usize, rows: &[Vec<u32>]) -> Result<()> {
         let Some(file) = self.file.clone() else {
             return Ok(());
         };
-        // Previous segment's pins release here: this cut's commit proves it completed.
         for pin in &mut self.slabs[at].pinned {
             *pin = false;
         }
@@ -1375,8 +1115,6 @@ impl Tier {
                 self.tick += 1;
                 continue;
             }
-            // A slab with no free seat prefetches nothing rather than
-            // refusing: the sync cut will read what it needs.
             let Ok(seat) = self.evict(at) else {
                 break;
             };
@@ -1413,13 +1151,9 @@ impl Tier {
         Ok(())
     }
 
-    /// Where expert `expert` of slab `at` sits, seating it if needed, and
-    /// pinning it either way since the segment being built reads it.
     fn seat(&mut self, at: usize, expert: u32) -> Result<u32> {
         if let Some(seat) = self.slabs[at].seat_of[expert as usize] {
             let slab = &mut self.slabs[at];
-            // A repeat inside one segment is neither a hit nor a miss: only
-            // the first lookup of a segment counts.
             if !slab.pinned[seat as usize] {
                 self.hits += 1;
             }
@@ -1433,8 +1167,6 @@ impl Tier {
         if let Some(held) = self.slabs[at].in_seat[seat as usize] {
             self.slabs[at].seat_of[held as usize] = None;
         }
-        // Claimed now, so a repeat in this segment hits it and eviction
-        // can't hand it out twice; filled later at `flush`.
         let slab = &mut self.slabs[at];
         slab.in_seat[seat as usize] = Some(expert);
         slab.seat_of[expert as usize] = Some(seat);
@@ -1445,9 +1177,6 @@ impl Tier {
         Ok(seat)
     }
 
-    /// Fill every pending seat, every band of each — `pread` out of the
-    /// source's file across [`Tier::threads`] threads where the source has
-    /// one, the mapping `memcpy` otherwise.
     fn flush(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -1484,12 +1213,6 @@ impl Tier {
         Ok(())
     }
 
-    /// Least recently used, over the unpinned seats of one slab.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Residency`] when every seat is pinned: this segment routes to
-    /// more distinct experts than the slab has room for.
     fn evict(&mut self, at: usize) -> Result<u32> {
         let slab = &self.slabs[at];
         let victim = (0..slab.slots)
@@ -1508,10 +1231,6 @@ impl Tier {
         })
     }
 
-    // A seat copy writes OVER an existing seat's bytes, never a new
-    // allocation, so the wired footprint stays exactly the slab's `slots`.
-
-    /// Every group's occupancy, in plan order.
     #[must_use]
     pub fn residency(&self) -> Vec<GroupResidency> {
         self.slabs
@@ -1525,43 +1244,35 @@ impl Tier {
             .collect()
     }
 
-    /// `(band copies, segment cuts)` since the load.
     #[must_use]
     pub fn motion(&self) -> (u64, u64) {
         (self.swaps, self.segments)
     }
 
-    /// `(hits, misses)` of the seat cache since the load. The prefix fill counts as neither.
     #[must_use]
     pub fn hits(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
 
-    /// How the route predictions scored, over every cut that checked one.
     #[must_use]
     pub fn prediction(&self) -> Prediction {
         self.prediction
     }
 
-    /// `(cut ns, seat-copy ns, blocking-commit wait ns)` since the load.
     #[must_use]
     pub fn host_time(&self) -> (u64, u64, u64) {
         (self.cut_ns, self.copy_ns, self.wait_ns)
     }
 
-    /// The cut's blocking commit took `ns`.
     pub fn note_wait(&mut self, ns: u64) {
         self.wait_ns += ns;
     }
 
-    /// `(backing file size, link count)`, or `None` with no file behind it.
-    /// Read [`Tier::source_kind`] to tell the two arms apart.
     #[must_use]
     pub fn source(&self) -> Option<(u64, u64)> {
         self.source.backing()
     }
 
-    /// Which source this tier's seat copies read from: `"landed"` or `"artifact"`.
     #[must_use]
     pub fn source_kind(&self) -> &'static str {
         self.source.kind()
@@ -1570,8 +1281,6 @@ impl Tier {
 
 impl Drop for Tier {
     fn drop(&mut self) {
-        // A prefetch still writing into a slab that is about to be released
-        // must land (or fail) first; its verdict has nobody left to hear it.
         let _ = self.join_inflight();
     }
 }

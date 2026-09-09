@@ -1,15 +1,9 @@
-//! `Rope`: neox rotations, in place on the projection they turn. One entry
-//! per IR variant; every arm rotates halves, so the interleaved layouts that
-//! reach a shader do so as a stated flag, never as a different loop.
-
 use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, head_group, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
-/// The YaRN ramp a partial rope states beside its theta (the IR's
-/// `elemwise::Yarn`, restated here because this crate names no IR).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Yarn {
     pub factor: f32,
@@ -22,7 +16,6 @@ const FILE: &str = "elemwise/rope_neox.metal";
 
 const UNSCALED: f32 = 1.0;
 
-/// One thread per rotated pair, per head, per row.
 fn rope_grid(
     op: &'static str,
     rotary: u32,
@@ -56,8 +49,6 @@ fn positions_stream(op: &'static str, positions: Tensor, x: Tensor) {
     );
 }
 
-/// The geometric arm: frequencies straight off `base`, full-width rotation
-/// stated by its own extent.
 #[allow(clippy::too_many_arguments)]
 fn rotate_geometric(
     ctx: &Ctx<'_>,
@@ -84,8 +75,6 @@ fn rotate_geometric(
     )
 }
 
-/// The proportional arm: the rotated span's frequencies spread over the head
-/// width, for partial rotations.
 #[allow(clippy::too_many_arguments)]
 fn rotate_proportional(
     ctx: &Ctx<'_>,
@@ -112,12 +101,6 @@ fn rotate_proportional(
     )
 }
 
-/// The tail arm: the rotation sits over the last `rotary` lanes of each head.
-///
-/// The tail rotation. `sign` is `-1` for the inverse (the angle negated) and
-/// `1` otherwise; `yarn` is the layer's ramp or `None`, and when it is `Some`
-/// the ramp bounds are derived here over the ROTATED width exactly as the
-/// reference's `precompute_freqs(dim = rotary, ...)` derives them.
 #[allow(clippy::too_many_arguments)]
 fn rotate_tail(
     ctx: &Ctx<'_>,
@@ -164,7 +147,6 @@ fn rotate_tail(
     )
 }
 
-/// The YaRN interpolation ramp, precomputed host-side.
 #[derive(Clone, Copy)]
 struct Ramp {
     factor: f32,
@@ -197,7 +179,6 @@ fn ramp_bounds(
     (low_dim, high_dim)
 }
 
-/// The ramped arm: YaRN's interpolated frequencies over the whole head.
 #[allow(clippy::too_many_arguments)]
 fn rotate_ramped(
     ctx: &Ctx<'_>,
@@ -286,7 +267,6 @@ pub fn partial_q(
     )
 }
 
-/// Partial rope over the last `rotary_dim` lanes of each head.
 #[allow(clippy::too_many_arguments)]
 pub fn partial_last(
     ctx: &Ctx<'_>,

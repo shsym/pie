@@ -1,5 +1,3 @@
-//! Focused regression tests for bugs found during the Rust rewrite.
-
 mod common;
 
 #[path = "regressions/compiler.rs"]

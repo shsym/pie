@@ -1,7 +1,3 @@
-//! One stage, encoded: the device rings, the buffers one fire binds, and
-//! the dispatch that runs a region — carved into fused and grouped forms,
-//! chosen per region since Metal's argument-slot ABI has a channel ceiling.
-
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -21,28 +17,18 @@ use super::compile::{Form, Region, StreamedStep};
 use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 use super::shared::SharedRing;
 
-/// The buffer index the first channel's committed cell binds at, below
-/// status/descriptors/params/offsets/scratch/temporary/logits.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const FIRST_CHANNEL_BUFFER: usize = 7;
 
-/// Width, in bytes, of one element of `lane.logits_base`'s rectangle.
-/// Always 2 (bf16); the score plane (F32) is separate. See [`Prepared::regroup`].
 const INTRINSIC_ELEMENT_BYTES: u64 = 2;
 
-/// Threads a grouped LIBRARY sampler's threadgroup must have — the
-/// nucleus/top-k kernels require exactly 256 and refuse any other width.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(super) const LIBRARY_SAMPLER_THREADS: usize = 256;
 
-/// Threads a grouped fused region's threadgroup gets, at most — the
-/// argmax reduction buffer is sized to this and faults `0xB3` above it.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(super) const REGION_THREADS: u32 =
     eta_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS;
 
-/// One reservation's address at `offset`. Errors ([`Fault::Program`])
-/// off Apple and for an offset outside the reservation.
 fn address_of(buffer: &Buffer, offset: u64) -> Result<u64> {
     buffer.address_at(offset).ok_or_else(|| {
         Fault::program(
@@ -56,24 +42,16 @@ fn address_of(buffer: &Buffer, offset: u64) -> Result<u64> {
     })
 }
 
-/// What a ring cell's offset is rounded up to: the widest alignment any
-/// scalar it holds asks for. See [`ChannelShape::cell_stride`].
 const CELL_ALIGN: usize = 16;
 
-/// One channel's ring geometry, as the launch package declares it. Unlike
-/// the CUDA twin, Metal packs bools on the device, so there is one width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelShape {
-    /// How many cells the ring holds, not counting the spare.
     pub capacity: u32,
-    /// Lanes in one cell.
     pub numel: usize,
-    /// The cell's element type.
     pub dtype: Dtype,
 }
 
 impl ChannelShape {
-    /// The shape one declared channel states.
     #[must_use]
     pub fn of(declared: &LaunchChannel) -> ChannelShape {
         ChannelShape {
@@ -88,34 +66,25 @@ impl ChannelShape {
         }
     }
 
-    /// Bytes in one cell — the only cell this plane has.
     #[must_use]
     pub fn cell_bytes(&self) -> usize {
         eta_exec::wire_cell_bytes(self.dtype, self.numel)
     }
 
-    /// Bytes from one cell to the next. Rounded up to [`CELL_ALIGN`] (a
-    /// bound offset must be aligned) — may exceed [`ChannelShape::cell_bytes`].
     #[must_use]
     pub fn cell_stride(&self) -> usize {
         self.cell_bytes().next_multiple_of(CELL_ALIGN).max(CELL_ALIGN)
     }
 }
 
-/// The device rings, one buffer per channel — not one slab like the CUDA
-/// twin, so an overrun is a bounds check rather than a cross-channel read.
 #[derive(Debug)]
 pub struct Rings {
     slabs: Vec<Buffer>,
     shapes: Vec<ChannelShape>,
-    /// The channels whose ring is not this instance's: `Some` for a
-    /// device-only channel two passes share (the slab is a clone).
     shared: Vec<Option<Arc<SharedRing>>>,
 }
 
 impl Rings {
-    /// Reserve one ring per shape: `capacity + 1` cells (the spare makes
-    /// full/empty distinguishable). `adopted` rings are kept as-is; errors: bad shape or geometry.
     pub fn allocate(
         device: &Context,
         shapes: &[ChannelShape],
@@ -125,7 +94,6 @@ impl Rings {
         let mut shared = Vec::with_capacity(shapes.len());
         for (channel, shape) in shapes.iter().enumerate() {
             if let Some(ring) = adopted.get(channel).and_then(Option::as_ref) {
-                // The two declarations must agree, or one ring is addressed at two strides.
                 if ring.shape() != *shape {
                     return Err(Fault::program(
                         "program::launch",
@@ -161,32 +129,26 @@ impl Rings {
         })
     }
 
-    /// The ring `channel` shares with other instances, or `None` if owned alone.
     #[must_use]
     pub fn shared(&self, channel: usize) -> Option<&Arc<SharedRing>> {
         self.shared.get(channel).and_then(Option::as_ref)
     }
 
-    /// How many channels this instance carries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.slabs.len()
     }
 
-    /// Whether it carries none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.slabs.is_empty()
     }
 
-    /// One channel's shape.
     #[must_use]
     pub fn shape(&self, channel: usize) -> Option<ChannelShape> {
         self.shapes.get(channel).copied()
     }
 
-    /// Where one cell begins inside its ring, in bytes: `sequence %
-    /// (capacity + 1)` is the slot. Errors for an unknown channel.
     pub fn cell_offset(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape(channel).ok_or_else(|| {
             Fault::program(
@@ -198,7 +160,6 @@ impl Rings {
         Ok((sequence % cells) * shape.cell_stride() as u64)
     }
 
-    /// The buffer one channel's ring lives in.
     pub(crate) fn slab(&self, channel: usize) -> Result<&Buffer> {
         self.slabs.get(channel).ok_or_else(|| {
             Fault::program(
@@ -208,7 +169,6 @@ impl Rings {
         })
     }
 
-    /// Write one cell's wire bytes; errors for an unknown channel or a mis-sized payload.
     pub fn write_cell(&mut self, channel: usize, sequence: u64, bytes: &[u8]) -> Result<()> {
         let at = self.cell_offset(channel, sequence)?;
         let width = self
@@ -226,7 +186,6 @@ impl Rings {
         self.slabs[channel].write(at, bytes)
     }
 
-    /// Read one cell's wire bytes; errors for a channel this instance doesn't carry.
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
         let at = self.cell_offset(channel, sequence)?;
         let width = self
@@ -238,151 +197,85 @@ impl Rings {
     }
 }
 
-/// Where one channel stands this fire: committed front, pending back (sequence numbers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
-    /// The cell a take reads.
     pub head: u64,
-    /// The cell a put writes.
     pub tail: u64,
 }
 
-/// Rows the per-intrinsic tables carry: `IntrinsicId::SLOTS`, one past the
-/// largest id — an overflowed id reads the next slot rather than faulting.
 const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
 
-/// One intrinsic's rectangle, as this plane binds one: base/stride/offset
-/// ARE the Metal binding; `width` is kept for the grouped form's stride.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Slot {
-    /// The allocation the rectangle lives in, retained for the binding's life.
     base: Buffer,
-    /// Row start in bytes — the CUDA side's `row_offset`, pre-multiplied.
     offset: u64,
-    /// Row width in elements: the fused bounds check, the grouped stride (`GroupLayout::vocab`).
     width: u32,
 }
 
-/// What a stage's own ops say about an intrinsic's rectangle — the
-/// reader's claim, argued with at bind rather than assumed.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Declared {
-    /// Row width the reader's output resolved to — a CEILING, not an equality.
     width: u32,
-    /// Rows of that width the reader gathers. Grouped walks by pitch;
-    /// single-lane walks consecutively and is only right for one row.
     rows: u32,
-    /// Most elements any one reader gathers (element count, not bytes).
     elements: u64,
 }
 
-/// One channel's two bound cells, resolved for this fire.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Bound {
-    /// The ring the two cells live in, retained for the binding's life.
     slab: Buffer,
     committed: u64,
     pending: u64,
 }
 
-// The grouped seat
-
-/// `M3GroupLayout` — the grouped kernel's scalar arguments, in one record.
-/// A second spelling of emitted text, tied to it by
-/// [`tests::the_group_layout_matches_the_emitted_struct`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct GroupLayout {
-    /// Lanes this launch covers; a threadgroup past it returns.
     lane_count: u32,
-    /// The per-lane stride of `all_descriptors`.
     value_count: u32,
-    /// The per-lane stride of `all_scratch`.
     scratch_stride: u32,
-    /// Where the temporary begins inside one lane's scratch.
     temporary_offset: u32,
-    /// Row width of `lane.logits_base`'s rectangle — the grouped gather's stride.
     vocab: u32,
-    /// The per-lane stride of `channel_bindings`.
     reserved0: u32,
-    /// Rows per lane the library samplers grid by: `dispatch_lane =
-    /// threadgroup / reserved1`. Zero makes those kernels return without running.
     reserved1: u32,
-    /// The per-lane stride of `params`.
     reserved2: u32,
 }
 
-/// `M3RowMeta` — where one lane's rows live in `row_indices`, pinned like [`GroupLayout`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct RowMeta {
-    /// This lane's first entry in `row_indices`.
     offset: u32,
-    /// How many entries are the lane's.
     count: u32,
-    /// Where DRAFT rows begin, from `offset`: trunk is
-    /// `[offset, offset + mtp_offset)`, draft is the rest.
     mtp_offset: u32,
-    /// Padding. Zero.
     reserved: u32,
 }
 
-/// Everything the grouped form binds that single-lane does not. Built at
-/// `lane_count = 1`: channels move out of argument slots into a threadgroup.
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Grouped {
-    /// The lane table: `LaneHeader`, per-lane `LaneRecord`s, then the flat
-    /// `LaneChannelSlot` array. Bound whole at buffer 0.
     table: Buffer,
-    /// The table's geometry, so an offset is asked for rather than computed.
     shape: LaneShape,
-    /// One [`GroupLayout`] per region, identical but for `reserved1` — a
-    /// shared record would race a dispatch.
     layouts: Vec<Buffer>,
-    /// Stage-local channel slot → dense channel index, indexing the lane's
-    /// slot window (a constant on the CUDA twin; a table here).
     bindings: Buffer,
-    /// One byte per (lane, dense channel): already put this fire? How
-    /// grouped keeps `current_k` across a threadgroup. Zeroed every fire.
     pending_flags: Buffer,
-    /// Dispatch lane → lane-record index; identity here (the emitted kernel's indirection).
     lane_indices: Buffer,
-    /// One [`RowMeta`] per lane.
     row_meta: Buffer,
-    /// The rows of `lane.logits_base` this fire reads, trunk block first.
     row_indices: Buffer,
-    /// Rows in the trunk block, which is also where the draft block begins.
     trunk_rows: u32,
-    /// Rows in the draft block. Zero for a stage that reads no draft column.
     draft_rows: u32,
-    /// The [`GroupLayout`] each `layouts` entry holds, kept so a word can
-    /// change without reading a reservation back.
     layout_words: Vec<GroupLayout>,
-    /// The one lane's record, kept the same way: changed here, then the
-    /// whole record is written back rather than patched at an offset.
     record: LaneRecord,
-    /// Where the draft rows begin, as `set_rows` was last told; a [`Batch`]
-    /// re-lays the lane's rows from it.
     draft_base: u32,
 }
 
-/// Lanes one grouped launch of a single instance covers. One: an instance's
-/// own tables seat itself. A frame that carries several instances of one
-/// program launches them together through a [`Batch`] instead.
 const GROUPED_LANES: u32 = 1;
 
-/// The lane a single-instance grouped launch is.
 const THE_LANE: u32 = 0;
 
 impl Grouped {
-    /// Carve and fill everything the grouped form binds that doesn't change
-    /// per fire. `None` if the planner says grouped can't cover this stage.
     fn build(
         device: &Context,
         plan: &LaunchStagePlan,
@@ -413,7 +306,6 @@ impl Grouped {
                 flags: 0,
             }),
         )?;
-        // The commit slot is the status word's address: dereferenced first, so zero would null-deref.
         let commit_slot = status.address_at(0).ok_or_else(|| {
             Fault::program(
                 "program::launch",
@@ -438,7 +330,6 @@ impl Grouped {
         })?;
         table.write(at, &record_bytes(&record))?;
 
-        // The per-lane stride of `channel_bindings`.
         let stride = u32::try_from(plan.channel_bindings.len()).map_err(|_| {
             Fault::program("program::launch", "more channels than a u32 can count")
         })?;
@@ -463,7 +354,6 @@ impl Grouped {
         let rows = u64::from(trunk_rows) + u64::from(draft_rows);
         let row_indices = Buffer::zeroed(device, rows.max(1) * size_of::<u32>() as u64)?;
 
-        // One layout per region; `reserved1` is an upper bound on rows, not an exact count.
         let scratch_layout = layout(descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
@@ -518,8 +408,6 @@ impl Grouped {
         }))
     }
 
-    /// Point every region's layout at a rectangle `vocab` elements wide.
-    /// The grouped gather indexes `row_indices[…] * vocab`.
     fn set_vocab(&mut self, vocab: u32) -> Result<()> {
         for (words, buffer) in self.layout_words.iter_mut().zip(self.layouts.iter_mut()) {
             words.vocab = vocab;
@@ -528,8 +416,6 @@ impl Grouped {
         Ok(())
     }
 
-    /// Write the one lane's `RowMeta` and the rows it names: trunk rows
-    /// first, draft rows after `draft_base`; `mtp_offset` marks the split.
     fn set_rows(&mut self, draft_base: u32) -> Result<()> {
         self.draft_base = draft_base;
         let bytes: Vec<u8> = (0..self.trunk_rows)
@@ -548,7 +434,6 @@ impl Grouped {
         self.row_meta.write(0, &record_bytes(&meta))
     }
 
-    /// Point the lane at the rectangle its readout lives in.
     fn set_logits(&mut self, base: u64, row_offset: u32, row_count: u32) -> Result<()> {
         self.record.logits_base = base;
         self.record.logits_row_offset = row_offset;
@@ -556,25 +441,18 @@ impl Grouped {
         self.write_record()
     }
 
-    /// Point the lane at its block of the observability slab — a separate
-    /// reservation from the readout. Zero for none bound; the gather faults, not derefs.
     fn set_scores(&mut self, base: u64, row_stride: u32) -> Result<()> {
         self.record.attn_score_base = base;
         self.record.attn_score_row_stride = row_stride;
         self.write_record()
     }
 
-    /// Point the lane at its run of the draft head's token plane — its own
-    /// reservation, pitched by the head's depth. Zero for none bound; the
-    /// emitted gather faults rather than dereferencing it.
     fn set_drafts(&mut self, base: u64, depth: u32) -> Result<()> {
         self.record.mtp_drafts_base = base;
         self.record.mtp_drafts_depth = depth;
         self.write_record()
     }
 
-    /// Write the one lane's record back whole, rather than patched at a
-    /// field offset. Errors if the lane is outside its own table.
     fn write_record(&mut self) -> Result<()> {
         let at = self.shape.record_offset(THE_LANE).ok_or_else(|| {
             Fault::program("program::launch", "the one lane is outside the lane table")
@@ -582,8 +460,6 @@ impl Grouped {
         self.table.write(at, &record_bytes(&self.record))
     }
 
-    /// Resolve this fire's channel cells into the lane's slot window, and
-    /// clear last fire's put flags. Errors when a cell has no device address.
     fn refresh(&mut self, bindings: &[u32], bound: &[Bound]) -> Result<()> {
         let bytes = self.pending_flags.bytes();
         self.pending_flags.zero_span(0, bytes)?;
@@ -609,77 +485,45 @@ impl Grouped {
     }
 }
 
-/// Everything one stage binds for one fire.
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
-    /// `M1Status`, 16 bytes at buffer 0; starts at `state = 1` every fire.
     status: Buffer,
     descriptors: Buffer,
     params: Buffer,
     offsets: Buffer,
-    /// The values' scratch AND the temporary after it: one allocation,
-    /// bound twice (`scratch` at 4, `temporary` at 5).
     scratch: Buffer,
-    /// One rectangle per intrinsic id. `None` at the trunk's slot (6) binds
-    /// nil; elsewhere `None` binds nothing (a nil there could clobber a channel).
     intrinsics: [Option<Slot>; INTRINSIC_SLOTS],
-    /// What this stage's ops declared about each intrinsic they read,
-    /// argued with at bind. `None` if unread, or unread as a gather output.
     declared: [Option<Declared>; INTRINSIC_SLOTS],
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
     temporary_offset: u32,
-    /// This stage's local channel slot → the instance's dense channel index.
     bindings: Vec<u32>,
-    /// Resolved cells, in stage-local slot order; filled by [`Prepared::refresh`].
     bound: Vec<Bound>,
-    /// The grouped form's tables, built whenever the stage could take that
-    /// path; which regions do is [`super::compile`]'s call.
     grouped: Option<Grouped>,
-    /// Which intrinsics each FUSED region reads, as a bitmask indexed by
-    /// region — checked at encode, once [`Region::form`] is known.
     region_intrinsics: Vec<u64>,
-    /// Intrinsics bound WIDER than readers' declared row, across >1 row —
-    /// the shape needing a row stride the fused gather doesn't have.
     strided: u64,
-    /// The bytes behind `descriptors`, `params` and `offsets`, kept so a
-    /// [`Batch`] can lay this instance's copy at its dispatch lane.
     descriptor_bytes: Vec<u8>,
     param_bytes: Vec<u8>,
     offset_bytes: Vec<u8>,
-    /// The resolved value descriptors, for sizing a streamed region's grids.
     descriptor_table: Vec<ValueDesc>,
 }
 
-/// `M4Step` — the streamed kernel's per-dispatch word, bound at 11 with
-/// `setBytes`. Spelled here and in `eta_compiler::codegen::metal::streamed`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct StepWord {
-    /// The op (`case`) this dispatch runs.
     index: u32,
-    /// A reduction's level, or 0 / 1 for an argmax's partial / final pass.
     level: u32,
-    /// How many groups the argmax's partial pass had, for its final pass.
     groups: u32,
     reserved: u32,
 }
 
-/// `scratch-no-zero`: skip the host memset of a fire's scratch, to measure
-/// what the host's touch of those pages costs the device.
 fn scratch_zeroing_skipped() -> bool {
     crate::diag::on().scratch_no_zero
 }
 
-/// The streamed form's measurement knobs, as this module reads them.
-/// `streamed-groups=n` caps the blocks a wide dispatch spreads over;
-/// `streamed-repeat=n` issues each wide dispatch n times (or each dispatch of
-/// the kind `streamed-repeat-kind=wide|partial|single|reduce|argmax`) — all
-/// are idempotent, so this prices a dispatch; `streamed-limit=k` runs only the
-/// first k steps, which breaks the program and times what ran.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct StreamedKnobs {
@@ -689,8 +533,12 @@ struct StreamedKnobs {
     limit: usize,
 }
 
-/// The boot's word list, in this module's own vocabulary. `StepKind` is
-/// private here, so the mapping from the typed word lives here too.
+const READOUT_INTRINSICS: [IntrinsicId; 3] = [
+    IntrinsicId::Logits,
+    IntrinsicId::Velocity,
+    IntrinsicId::Hidden,
+];
+
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn streamed_knobs() -> StreamedKnobs {
     let diag = crate::diag::on();
@@ -708,27 +556,12 @@ fn streamed_knobs() -> StreamedKnobs {
     }
 }
 
-/// Most element blocks one streamed dispatch spreads over. Every thread of
-/// every block walks the kernel's preamble — a chain of dependent loads from
-/// the lane table — before it touches an element, so a wide grid pays that
-/// chain once per wave of resident threads: measured on the emitted kernel,
-/// a 248k-element pass cost 55 µs at 1024 blocks and 22 µs at 64, with the
-/// loop itself a third of the latter. Sixty-four blocks of a few hundred
-/// threads fill the device once; each thread then strides a handful of
-/// elements.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const STREAMED_MAX_GROUPS: u32 = 64;
 
-/// Level-`l + 1` chunks one threadgroup of a reduce dispatch folds; the
-/// runtime's `M4_REDUCE_CHUNKS_PER_GROUP`. A dispatch at level `l` covers
-/// `32 × this` level-`l` chunks per group.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const REDUCE_CHUNKS_PER_GROUP: u32 = 4;
 
-/// The threadgroup a streamed region is dispatched with: the pipeline's
-/// widest, capped at the region ceiling, rounded down to a power of two of
-/// at least 32 — the reductions fold across SIMD groups and divide the
-/// group into rounds, so its width must divide evenly.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(super) fn streamed_threads(max_total: usize) -> usize {
     let capped = max_total.clamp(1, REGION_THREADS as usize);
@@ -736,11 +569,6 @@ pub(super) fn streamed_threads(max_total: usize) -> usize {
     pow2.max(32)
 }
 
-/// The dispatches a streamed region's step table unfolds into for these
-/// descriptors: `(word, groups along x)`. A `Wide` step is one dispatch over
-/// its result's length; `Single` one group; `Reduce` one per tree level, each
-/// over that level's chunks; `Argmax` a partial pass over the row and a final
-/// pass over the partials.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn streamed_dispatches(
     steps: &[StreamedStep],
@@ -761,7 +589,6 @@ fn streamed_dispatches(
         }
     };
     for (position, step) in steps.iter().enumerate().take(knobs.limit) {
-        // The kernel's `case` is the step's position in the table.
         let word = StepWord {
             index: u32::try_from(position).unwrap_or(u32::MAX),
             ..StepWord::default()
@@ -787,14 +614,8 @@ fn streamed_dispatches(
             }
             StepKind::Reduce => {
                 let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
-                // A dispatch folds level `l` (and `l + 1` inside the
-                // threadgroup); its groups cover level `l`'s chunks, one chunk
-                // per thread, per row.
                 let mut count = desc.last;
                 let mut at = 0u32;
-                // The runtime folds two levels per dispatch, a group owning
-                // `REDUCE_CHUNKS_PER_GROUP` chunks of the upper one; rows are
-                // walked inside the group.
                 for level in reduce_dispatch_levels(desc.last) {
                     while at < level {
                         count = count.div_ceil(32);
@@ -815,7 +636,6 @@ fn streamed_dispatches(
             }
             StepKind::Argmax => {
                 let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
-                // One candidate per (row, group) lands in the temporary.
                 let candidate_bytes = 16u64;
                 let fit = (temporary_bytes / candidate_bytes / u64::from(desc.rows.max(1)))
                     .clamp(1, u64::from(STREAMED_MAX_GROUPS)) as u32;
@@ -841,9 +661,6 @@ fn streamed_dispatches(
             }
         }
     }
-    // `streamed-nop=n`: n dispatches of one group that hit the kernel's
-    // `default: return` — the production floor of a dispatch of this kernel
-    // with these bindings, with no op behind it.
     let nops = crate::diag::on().streamed_nop;
     for _ in 0..nops {
         out.push((
@@ -885,13 +702,8 @@ fn streamed_dispatches(
     out
 }
 
-/// What two instances must agree on to share one [`Batch`]: the grouped
-/// kernel strides its per-dispatch-lane tables by these, so a member whose
-/// numbers differ would read another member's values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BatchKey {
-    /// A hash of the descriptor, param, offset and binding bytes: members
-    /// that share it share the tables, so the batch lays them down once.
     content: u64,
     channel_count: u32,
     channel_slots_per_lane: u32,
@@ -903,8 +715,6 @@ pub struct BatchKey {
 }
 
 impl Prepared {
-    /// Carve every buffer one stage needs, for a single-lane fire. Errors
-    /// on a bad value shape, scratch overflow, or an unbound put channel.
     pub fn build(
         device: &Context,
         plan: &LaunchStagePlan,
@@ -916,7 +726,6 @@ impl Prepared {
         let value_count = u32::try_from(plan.value_types.len())
             .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
 
-        // The value descriptors, and the scratch they size.
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -940,14 +749,12 @@ impl Prepared {
         let temporary_offset = u32::try_from(scratch_layout.temporary)
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
 
-        // Op params: the shared record, uploaded as-is (`M1OpParams` field for field).
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut declared: [Option<Declared>; INTRINSIC_SLOTS] = [None; INTRINSIC_SLOTS];
         let mut result_base = 0u32;
         for op in &plan.ops {
             let mut record = OpParams::of(op, result_base, OpRuntime::default());
             if let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) {
-                // `sink_bytes` IS the cell: the put faults if the value is wider.
                 let dense = plan
                     .channel_bindings
                     .get(channel as usize)
@@ -973,8 +780,6 @@ impl Prepared {
                     Fault::program("program::launch", "a channel cell past what a u32 counts")
                 })?;
             }
-            // What this stage's readers claim about each rectangle's geometry;
-            // rank-1 outputs (e.g. `mtp_drafts`) claim nothing.
             if let Some(intrinsic) = op.intrinsic
                 && let Some(seat) = declared.get_mut(intrinsic as usize)
                 && let Some(out) = descriptors.get(record.o0 as usize)
@@ -1024,30 +829,26 @@ impl Prepared {
         let scratch = Buffer::zeroed(device, scratch_bytes)?;
         let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
 
-        // The grouped tables, carved beside the argument-slot seats — a stage may mix both forms.
         let lanes = LaneShape::of(
             GROUPED_LANES,
             u32::try_from(shapes.len()).map_err(|_| {
                 Fault::program("program::launch", "more channels than a u32 can count")
             })?,
         );
-        // The two row blocks `row_indices` carries: trunk is what readers
-        // declared, draft is the larger of that and `mtp_rows`. A reader
-        // with no declare gets one row, not zero.
         let reads = |wanted: IntrinsicId| {
             plan.ops
                 .iter()
                 .any(|op| op.intrinsic.is_some_and(|id| id as usize == wanted as usize))
         };
-        // A stage that reads the draft plane without reading `logits` (a
-        // block drafter's guest asks the head what it proposes and nothing
-        // else) still spans its readout rows: `drafts_len` ids at depth one
-        // are that many rows, which is what the plane's guard
-        // (`emit_mtp_drafts`) multiplies the depth by. A chained head's
-        // guest also reads `logits`, so this never widens what it declared.
-        let trunk_rows = declared[IntrinsicId::Logits as usize]
-            .map_or(0, |it| it.rows)
-            .max(u32::from(reads(IntrinsicId::Logits)))
+        let trunk_rows = READOUT_INTRINSICS
+            .iter()
+            .map(|id| {
+                declared[*id as usize]
+                    .map_or(0, |it| it.rows)
+                    .max(u32::from(reads(*id)))
+            })
+            .max()
+            .unwrap_or(0)
             .max(plan.drafts_len);
         let draft_rows = declared[IntrinsicId::MtpLogits as usize]
             .map_or(0, |it| it.rows)
@@ -1066,7 +867,6 @@ impl Prepared {
             draft_rows,
         )?;
 
-        // Which intrinsics each fused region reads; `compile::grouped_region` agrees by construction.
         let region_intrinsics = plan
             .fused
             .iter()
@@ -1104,8 +904,6 @@ impl Prepared {
         })
     }
 
-    /// The numbers a [`Batch`] member must share; `None` when this stage has
-    /// no grouped seat, so it cannot be batched at all.
     #[must_use]
     pub fn batch_key(&self) -> Option<BatchKey> {
         use std::hash::{Hash, Hasher};
@@ -1127,29 +925,20 @@ impl Prepared {
         })
     }
 
-    /// Resolve this fire's cells and reset everything a fire starts from.
-    /// Errors when a stage-local slot names an uncarried channel.
     pub fn refresh(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
         self.refresh_cells(rings, cursors)?;
         if scratch_zeroing_skipped() {
             return Ok(());
         }
-        // Zeroed every fire: an unwritten slot would read back the last fire's leftovers.
         let bytes = self.scratch.bytes();
         self.scratch.zero_span(0, bytes)
     }
 
-    /// The scratch half of [`Prepared::refresh`], for a stage that was
-    /// staged through [`Prepared::refresh_cells`] but has no grouped seat and
-    /// so runs on its own scratch after all.
     pub fn zero_scratch(&mut self) -> Result<()> {
         let bytes = self.scratch.bytes();
         self.scratch.zero_span(0, bytes)
     }
 
-    /// [`Prepared::zero_scratch`] on the device: a blit in `frame`'s order,
-    /// then a fresh compute pass. What a batch does for its pool
-    /// (`Batch::encode`), for the instance that launches alone.
     #[cfg(target_vendor = "apple")]
     pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
         if scratch_zeroing_skipped() {
@@ -1161,8 +950,6 @@ impl Prepared {
         Ok(())
     }
 
-    /// [`Prepared::refresh`] without the scratch: what a [`Batch`] member
-    /// needs, since its values live in the batch's pool and not here.
     pub fn refresh_cells(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
         self.bound.clear();
         self.bound.reserve(self.bindings.len());
@@ -1190,16 +977,12 @@ impl Prepared {
             reserved1: 0,
         };
         self.status.write(0, &record_bytes(&ready))?;
-        // The same cells, as addresses in the lane table — a mixed stage would else hand grouped a stale table.
         if let Some(grouped) = self.grouped.as_mut() {
             grouped.refresh(&self.bindings, &self.bound)?;
         }
         Ok(())
     }
 
-    /// Point one intrinsic's slot at the rectangle a model fire produced.
-    /// `width` is argued with: the declared width is a ceiling, not an
-    /// equality. Errors for an unbindable, mismatched or unstrideable rectangle.
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: IntrinsicId,
@@ -1228,7 +1011,6 @@ impl Prepared {
                     ),
                 )
             })?;
-        // The element type is picked by intrinsic id, so this side can't disagree with the kernel.
         let element = eta_compiler::codegen::metal::m2_intrinsic_element_bytes(intrinsic as u16)
             .map(u64::from)
             .ok_or_else(|| {
@@ -1237,7 +1019,6 @@ impl Prepared {
                     format!("{intrinsic:?} has no element width in the M2 slot table"),
                 )
             })?;
-        // The token plane is the one integer rectangle: four bytes an id.
         let wanted = match intrinsic {
             IntrinsicId::MtpDrafts => Dtype::I32,
             _ if element == 4 => Dtype::F32,
@@ -1254,7 +1035,6 @@ impl Prepared {
             ));
         }
         if let Some(declared) = declared {
-            // The declared width is a ceiling: only asking for MORE than it is refused.
             if declared.width > width {
                 return Err(Fault::program(
                     "program::launch",
@@ -1267,8 +1047,6 @@ impl Prepared {
                     ),
                 ));
             }
-            // The multi-row read is where the forms part: fused walks with no
-            // stride (only one row lands right); grouped carries a row pitch.
             if declared.width < width && declared.rows > 1 && !self.strideable(intrinsic) {
                 return Err(Fault::program(
                     "program::launch",
@@ -1288,7 +1066,6 @@ impl Prepared {
                     ),
                 ));
             }
-            // The reader walks `out0.len` elements off the offset — the bound the kernel can't check itself.
             let reach = offset.saturating_add(declared.elements.saturating_mul(element));
             if reach > base.bytes() {
                 return Err(Fault::Ceiling {
@@ -1298,7 +1075,6 @@ impl Prepared {
                 });
             }
         }
-        // `strided` is recomputed, not or-ed, so a rebind clears it as readily as it sets it.
         let bit = 1u64 << (intrinsic as u32);
         if declared.is_some_and(|it| it.width < width && it.rows > 1) {
             self.strided |= bit;
@@ -1313,16 +1089,12 @@ impl Prepared {
         self.regroup()
     }
 
-    /// Whether a narrow multi-row read of `intrinsic` has a form that serves
-    /// it: a grouped seat, and an id the grouped emitter will bind.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     fn strideable(&self, intrinsic: IntrinsicId) -> bool {
         self.grouped.is_some()
             && eta_compiler::codegen::metal::m3_intrinsic_bindable(intrinsic as u16)
     }
 
-    /// Refuse a SINGLE-LANE region that reads an intrinsic bound at a
-    /// shape only a strided form can serve. An unplaceable region index is refused too.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     fn no_stride_owed(&self, region: &Region) -> Result<()> {
         let reads = self
@@ -1346,13 +1118,10 @@ impl Prepared {
         ))
     }
 
-    /// Re-derive the grouped form's rectangle words from the slot table.
-    /// `logits`/`mtp_logits` share `lane.logits_base`; `attn_score` has its own base.
     fn regroup(&mut self) -> Result<()> {
         if self.grouped.is_none() {
             return Ok(());
         }
-        // The score rectangle is a separate reservation, derived first so a scores-only read still gets it.
         let (score_base, score_stride) =
             match self.intrinsics[IntrinsicId::AttnScore as usize].as_ref() {
                 Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
@@ -1362,7 +1131,6 @@ impl Prepared {
             .as_mut()
             .expect("the seat was there one statement ago")
             .set_scores(score_base, score_stride)?;
-        // The token plane likewise: its own base and pitch (the depth).
         let (drafts_base, drafts_depth) =
             match self.intrinsics[IntrinsicId::MtpDrafts as usize].as_ref() {
                 Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
@@ -1372,13 +1140,14 @@ impl Prepared {
             .as_mut()
             .expect("the seat was there one statement ago")
             .set_drafts(drafts_base, drafts_depth)?;
-        let Some(trunk) = self.intrinsics[IntrinsicId::Logits as usize].as_ref() else {
+        let Some(trunk) = READOUT_INTRINSICS
+            .iter()
+            .find_map(|id| self.intrinsics[*id as usize].as_ref())
+        else {
             return Ok(());
         };
-        // Stride is the rectangle's own row width — may express a narrow read of more than one row.
         let width = trunk.width;
         let logits_base = address_of(&trunk.base, trunk.offset)?;
-        // Where the draft block starts; zero unless it's the same reservation a whole row-count apart.
         let stride = u64::from(trunk.width) * INTRINSIC_ELEMENT_BYTES;
         let draft_base = self.intrinsics[IntrinsicId::MtpLogits as usize]
             .as_ref()
@@ -1401,8 +1170,6 @@ impl Prepared {
         grouped.set_rows(draft_base)
     }
 
-    /// Encode one generated region into a pass someone else opened, and do
-    /// not commit — safe to call inside `serve::enqueue`, unlike [`Prepared::launch_region`].
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
             Form::Fused => self.encode_fused(frame, region, &self.scratch, 0),
@@ -1411,9 +1178,6 @@ impl Prepared {
         }
     }
 
-    /// Encode one streamed region for this instance alone: the grouped
-    /// bindings plus the step word, one dispatch per entry of the region's
-    /// table, a grid of `groups × 1`.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_streamed(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
@@ -1493,10 +1257,6 @@ impl Prepared {
         }
     }
 
-    /// Encode one single-lane region with its values at `scratch_at` inside
-    /// `scratch` — this instance's own scratch at zero, or its dispatch
-    /// lane's slot of a [`Batch`] pool when the stage's grouped regions ran
-    /// there, so both forms read and write the same values.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_fused(
         &self,
@@ -1525,25 +1285,35 @@ impl Prepared {
                     scratch_at + self.temporary_offset as usize,
                     5,
                 );
-                // The slot table, one `setBuffer` per bound rectangle. The trunk's
-                // index is always written (nil OK); every other unbound slot is left unwritten.
+                let readout = READOUT_INTRINSICS
+                    .iter()
+                    .find_map(|id| self.intrinsics[*id as usize].as_ref());
+                match readout {
+                    Some(bound) => encoder.setBuffer_offset_atIndex(
+                        Some(bound.base.raw()),
+                        usize::try_from(bound.offset).unwrap_or(0),
+                        eta_compiler::codegen::metal::M2_LOGITS_BUFFER,
+                    ),
+                    None => encoder.setBuffer_offset_atIndex(
+                        None,
+                        0,
+                        eta_compiler::codegen::metal::M2_LOGITS_BUFFER,
+                    ),
+                }
                 for (slot, held) in self.intrinsics.iter().enumerate() {
                     let Some(at) = u16::try_from(slot)
                         .ok()
                         .and_then(eta_compiler::codegen::metal::m2_intrinsic_buffer)
+                        .filter(|at| *at != eta_compiler::codegen::metal::M2_LOGITS_BUFFER)
                     else {
                         continue;
                     };
-                    match held {
-                        Some(bound) => encoder.setBuffer_offset_atIndex(
+                    if let Some(bound) = held {
+                        encoder.setBuffer_offset_atIndex(
                             Some(bound.base.raw()),
                             usize::try_from(bound.offset).unwrap_or(0),
                             at,
-                        ),
-                        None if at == eta_compiler::codegen::metal::M2_LOGITS_BUFFER => {
-                            encoder.setBuffer_offset_atIndex(None, 0, at);
-                        }
-                        None => {}
+                        );
                     }
                 }
                 for (local, bound) in self.bound.iter().enumerate() {
@@ -1574,8 +1344,6 @@ impl Prepared {
         }
     }
 
-    /// Encode one grouped region: eleven fixed bindings, a residency
-    /// declaration per reservation an address reaches, and a threadgroup per lane.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_grouped(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
@@ -1643,7 +1411,6 @@ impl Prepared {
                 resident(&held.base, MTLResourceUsage::Read);
             }
 
-            // A library sampler declines any width but 256; fused takes the narrower of its buffer width and the pipeline's.
             let rows = grouped
                 .layout_words
                 .get(region.region_index as usize)
@@ -1681,8 +1448,6 @@ impl Prepared {
         }
     }
 
-    /// Encode and run one generated region, and wait for it — the host
-    /// reads status/cells/scratch right after. Errors on GPU refusal or off Apple.
     pub fn launch_region(
         &self,
         device: &Context,
@@ -1704,8 +1469,6 @@ impl Prepared {
         }
     }
 
-    /// The kernel's verdict, whole — `eta_exec::Status`, so a refusal can be
-    /// named (`eta_exec::describe_fault`) rather than merely counted.
     pub fn status(&self) -> Result<Status> {
         let mut bytes = [0u8; eta_exec::STATUS_BYTES];
         self.status.read(0, &mut bytes)?;
@@ -1717,51 +1480,29 @@ impl Prepared {
         })
     }
 
-    /// How many channel slots this stage binds.
     #[must_use]
     pub const fn channel_count(&self) -> u32 {
         self.channel_count
     }
 
-    /// How many values this stage's scratch carries.
     #[must_use]
     pub const fn value_count(&self) -> u32 {
         self.value_count
     }
 
-    /// How wide one lane's scratch is.
     #[must_use]
     pub const fn scratch_stride(&self) -> u32 {
         self.scratch_stride
     }
 }
 
-/// One `#[repr(C)]` record's bytes. `T` must have no padding holes with
-/// meaning — this file's records are flat `u32` structs.
-/// Several instances of one program, launched together: one lane table, one
-/// scratch pool, and one dispatch per grouped region with a threadgroup per
-/// member. The grouped kernel was written for this shape — it strides its
-/// per-lane tables by `dispatch_lane` and reads its record through
-/// `lane_indices[dispatch_lane]` — and without it a frame carrying sixteen
-/// samplers of one program dispatched each alone: sixteen threadgroups one
-/// after another on a device that runs them side by side, so the epilogue
-/// grew with the lane count while the forward did not.
-///
-/// A batch is keyed by [`BatchKey`]: what the kernel strides by. Members
-/// that share the key share the descriptor, param, offset and binding
-/// tables, which are laid down once at build; per fire the batch writes
-/// each member's lane record, channel slots and row table, and zeroes the
-/// scratch and flags it will use.
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Batch {
     key: BatchKey,
-    /// Dispatch lanes this batch seats; grown by rebuilding.
     lanes: u32,
     shape: LaneShape,
     table: Buffer,
-    /// `lanes` copies of the members' shared descriptor bytes, one per
-    /// dispatch lane (the kernel strides by `layout->value_count`).
     descriptors: Buffer,
     params: Buffer,
     offsets: Buffer,
@@ -1770,7 +1511,6 @@ pub struct Batch {
     lane_indices: Buffer,
     row_meta: Buffer,
     row_indices: Buffer,
-    /// `lanes × scratch_stride`: every member's values for one fire.
     scratch: Buffer,
     layouts: Vec<Buffer>,
     layout_words: Vec<GroupLayout>,
@@ -1778,8 +1518,6 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// A batch seating `lanes` members shaped like `template`. Errors when
-    /// the template has no grouped seat or a table does not fit.
     pub fn build(device: &Context, template: &Prepared, lanes: u32) -> Result<Batch> {
         let key = template.batch_key().ok_or_else(|| {
             Fault::program(
@@ -1872,23 +1610,16 @@ impl Batch {
         })
     }
 
-    /// What this batch was built for.
     #[must_use]
     pub fn key(&self) -> BatchKey {
         self.key
     }
 
-    /// Dispatch lanes this batch seats.
     #[must_use]
     pub fn lanes(&self) -> u32 {
         self.lanes
     }
 
-    /// Lay every member's lane down and encode each region once, in stage
-    /// order: a grouped region as one dispatch of `members.len()`
-    /// threadgroups, a single-lane region once per member with its values at
-    /// that member's slot of the pool. Errors when a member does not match
-    /// the key, when there are more members than lanes, or on a device fault.
     pub fn encode(
         &mut self,
         frame: &mut Frame,
@@ -1907,17 +1638,11 @@ impl Batch {
             return Ok(());
         }
         let stride = u64::from(self.key.scratch_stride);
-        // What a fire starts from: no puts yet, no values yet.
         self.pending_flags.zero_span(
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
         if !scratch_zeroing_skipped() {
-            // On the device, not the host: a `memset` of the pool through the
-            // shared mapping was a third of a millisecond of host time per
-            // fire for a vocabulary-wide program, on the critical path between
-            // one fire's readout and the next's commit. The blit is ordered by
-            // the command buffer and costs the device a fraction of that.
             #[cfg(target_vendor = "apple")]
             {
                 frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
@@ -2021,8 +1746,6 @@ impl Batch {
         Ok(())
     }
 
-    /// One streamed region for every member: the batch's bindings, then one
-    /// dispatch per step over a grid of `groups × count`.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_streamed(
         &self,
@@ -2108,12 +1831,6 @@ impl Batch {
         }
     }
 
-    /// `kernel-dump=<dir>`: beside a streamed region's source, its lane-0
-    /// tables as `<entry>.tables` — `[value_count, params_per_lane,
-    /// scratch_stride, temporary_offset]` as `u32`s, the 32-byte layout
-    /// word, then the descriptors, the op params and the offsets — so a
-    /// standalone harness can replay one lane of this dispatch table against
-    /// the very shapes the program ran with. Written once per entry.
     #[cfg(target_vendor = "apple")]
     fn dump_streamed_tables(&self, region: &Region, template: &Prepared) -> Result<()> {
         let Some(dir) = crate::diag::on().kernel_dump.as_deref() else {
@@ -2151,9 +1868,6 @@ impl Batch {
         Ok(())
     }
 
-    /// One grouped region for every member: the batch's eleven bindings, a
-    /// residency declaration per member reservation, `count` threadgroups
-    /// (times the rows for a library sampler).
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn encode_grouped(
         &self,
@@ -2255,8 +1969,6 @@ impl Batch {
     }
 }
 
-/// Issue a streamed region's dispatches: the step word at 11, then a grid of
-/// `groups × lanes` threadgroups of `threads`.
 #[cfg(target_vendor = "apple")]
 fn dispatch_streamed(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
@@ -2296,7 +2008,6 @@ fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
     bytes.to_vec()
 }
 
-/// A slice of records, end to end.
 fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     records.iter().flat_map(record_bytes).collect()
 }
@@ -2304,6 +2015,14 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch_every_case() {
+        a_channel_this_instance_does_not_carry_is_refused_by_number();
+        the_shared_op_record_is_the_emitted_one();
+        the_first_channel_binds_where_the_emitter_writes_it();
+        the_group_layout_matches_the_emitted_struct();
+        the_grouped_samplers_take_the_bindings_this_file_writes();
+    }
 
     #[test]
     fn a_channel_this_instance_does_not_carry_is_refused_by_number() {
@@ -2316,22 +2035,15 @@ mod tests {
         assert!(said.contains('2'), "the refusal names the channel: {said}");
     }
 
-    #[test]
     fn the_shared_op_record_is_the_emitted_one() {
-        // `M1OpParams` is sixteen `uint`s; a drift here computes garbage silently.
         assert_eq!(size_of::<OpParams>(), 64);
         assert_eq!(size_of::<Status>(), 16);
     }
 
-    #[test]
     fn the_first_channel_binds_where_the_emitter_writes_it() {
-        // `emit_fused_region` writes `7 + channel * 2` / `8 + channel * 2`.
         assert_eq!(FIRST_CHANNEL_BUFFER, 7);
     }
 
-    /// `M3GroupLayout`/`M3RowMeta` have no host struct to pin via `offset_of!`,
-    /// so they're compared against the emitted text — a drift shifts every field after, silently.
-    #[test]
     fn the_group_layout_matches_the_emitted_struct() {
         let preamble = eta_compiler::codegen::metal::preamble::grouped_preamble();
         let fields = |name: &str| -> Vec<String> {
@@ -2373,11 +2085,7 @@ mod tests {
         assert_eq!(size_of::<RowMeta>(), 4 * size_of::<u32>());
     }
 
-    /// The eleven bindings every grouped kernel takes, read off the
-    /// emitter's text — a mismatch wouldn't fault, just compute garbage.
-    #[test]
     fn the_grouped_samplers_take_the_bindings_this_file_writes() {
-        // In binding order, so a reader sees the ABI rather than a count.
         const BOUND: [&str; 11] = [
             "lane_bytes",
             "all_descriptors",

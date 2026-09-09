@@ -4,28 +4,6 @@
 
 namespace pie::layout {
 
-/// **THE GATHER THAT INTERPOLATES** (`.wiki/alto/multimodal.md` §9.2).
-///
-/// `y[r] = sum over t of weights[r, t] * table[ids[r, t]]`, one block per
-/// output row, threads striding the width.
-///
-/// The vision towers store one learned position grid at `num_grid_per_side^2`
-/// and resample it to each image's own grid; upstream writes that as
-/// `(pos_embed(interp_indices) * interp_weights[:, :, None]).sum(1)` over
-/// `[patches, taps]` indices and weights, which is this expression with the
-/// sum moved inside. Four taps for bilinear, sixteen for bicubic — read off
-/// the operand rather than stated, because the operand carries it.
-///
-/// **THE ACCUMULATION IS f32 AND THE WEIGHTS ARRIVE f32.** Upstream multiplies
-/// a float weight into a float-promoted embedding and sums; a bf16 running sum
-/// over four taps would round four times, and a bf16 WEIGHT would move the
-/// resample by more than the gather it feeds. Only the write is in the model
-/// element.
-///
-/// **OUT-OF-RANGE IDS CLAMP TO ROW ZERO**, which is `embed`'s own rule one
-/// file over: a gather with an index it cannot honour reads a defined row
-/// rather than an address, and the vector was checked host-side before the
-/// launch.
 template <class T>
 __global__ void embed_weighted(
     const i32* __restrict__ ids,
@@ -38,14 +16,9 @@ __global__ void embed_weighted(
     const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
+
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And `win[1]` is where those live rows start: the `[rows, taps]` `ids`
-    // and `weights` streams and `y` are row planes handed at their base and
-    // move together. `table` is the GRID the ids read, whose row axis is the
-    // id's and not this launch's, and never moves.
+
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const i32* row_ids = ids + static_cast<long long>(row) * taps;

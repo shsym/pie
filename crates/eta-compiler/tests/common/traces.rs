@@ -1,6 +1,3 @@
-//! Shared trace builders for the ETA integration tests and golden vectors.
-//! (`#[path]`-included by `eta_examples.rs` and `eta_golden.rs` — one
-//! definition, so the golden files and the example tests cannot drift.)
 #![allow(dead_code)]
 
 use eta_compiler::eval::interp::Value;
@@ -12,7 +9,6 @@ use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{ModelProfile, Port, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 
-/// Tiny SSA builder: push an op, get its first result id.
 pub struct B {
     pub ops: Vec<Op>,
 }
@@ -64,14 +60,8 @@ pub fn const_port(port: Port, dtype: Dtype, shape: Shape, words: &[u32]) -> Port
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Masked gumbel-greedy decode
-// ═══════════════════════════════════════════════════════════════════════════
-
 pub const VOCAB: u32 = 32;
 
-/// Channels: 0 tok (loop), 1 out (host-read), 2 mask (host-fed bool[vocab]),
-/// 3 len (in-graph counter), 4 rng (state [key,ctr]).
 pub fn section3_trace() -> TraceContainer {
     let mut b = B::new();
     let logits2 = b.p(Op::IntrinsicVal {
@@ -83,35 +73,34 @@ pub fn section3_trace() -> TraceContainer {
         value: logits2,
         shape: Shape::vector(VOCAB),
     });
-    let r = b.p(Op::ChanTake(4)); // rng state [key, ctr]
-    let m = b.p(Op::ChanTake(2)); // mask (readiness input)
+    let r = b.p(Op::ChanTake(4));
+    let m = b.p(Op::ChanTake(2));
     let g = expand::gumbel(&mut b.ops, r, Shape::vector(VOCAB));
     let masked = expand::mask_apply(&mut b.ops, logits, m);
     let sum = b.p(Op::Add(masked, g));
-    let t = b.p(Op::ReduceArgmax(sum)); // scalar i32
-    // rng.put(add(r, [0,1])) — counter advances in-graph (ping-pong)
-    let ctr1 = b.p(Op::Iota { len: 2 }); // [0, 1] u32
+    let t = b.p(Op::ReduceArgmax(sum));
+    let ctr1 = b.p(Op::Iota { len: 2 });
     let r2 = b.p(Op::Add(r, ctr1));
     b.p(Op::ChanPut { chan: 4, value: r2 });
     let t1 = b.p(Op::Reshape {
         value: t,
         shape: Shape::vector(1),
     });
-    b.p(Op::ChanPut { chan: 0, value: t1 }); // tok
+    b.p(Op::ChanPut { chan: 0, value: t1 });
     let l = b.p(Op::ChanTake(3));
     let one = b.cu32(1);
     let l2 = b.p(Op::Add(l, one));
-    b.p(Op::ChanPut { chan: 3, value: l2 }); // len
-    b.p(Op::ChanPut { chan: 1, value: t1 }); // out
+    b.p(Op::ChanPut { chan: 3, value: l2 });
+    b.p(Op::ChanPut { chan: 1, value: t1 });
 
     TraceContainer {
         names: vec![],
         channels: vec![
-            chan(Shape::vector(1), Dtype::I32, HostRole::None, true), // 0 tok
-            chan(Shape::vector(1), Dtype::I32, HostRole::Reader, false), // 1 out
-            chan(Shape::vector(VOCAB), Dtype::Bool, HostRole::Writer, false), // 2 mask
-            chan(Shape::vector(1), Dtype::U32, HostRole::None, true), // 3 len
-            chan(Shape::vector(2), Dtype::U32, HostRole::None, true), // 4 rng
+            chan(Shape::vector(1), Dtype::I32, HostRole::None, true),
+            chan(Shape::vector(1), Dtype::I32, HostRole::Reader, false),
+            chan(Shape::vector(VOCAB), Dtype::Bool, HostRole::Writer, false),
+            chan(Shape::vector(1), Dtype::U32, HostRole::None, true),
+            chan(Shape::vector(2), Dtype::U32, HostRole::None, true),
         ],
         ports: vec![
             PortBinding {
@@ -153,31 +142,20 @@ pub fn flat_logits(fav: usize, x: f32) -> Value {
     Value::F32(l)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Beam epilogue (reorder = gathers, divergence = freeze)
-// ═══════════════════════════════════════════════════════════════════════════
+pub const BB: u32 = 2;
+pub const V: u32 = 8;
+pub const P: u32 = 3;
+pub const PAGE: u32 = 4;
 
-pub const BB: u32 = 2; // beams
-pub const V: u32 = 8; // vocab
-pub const P: u32 = 3; // page slots per row
-pub const PAGE: u32 = 4; // tokens per page
-
-/// Channels, in declaration order:
-/// 0 pages [B,P] u32 · 1 lens [B,P] u32 · 2 klen [B] u32 · 3 kvm [B,P*page]
-/// bool · 4 pos [B] u32 · 5 np [B] u32 · 6 tslot [B] u32 · 7 tfill [B] u32 ·
-/// 8 w_slot [B] u32 · 9 w_off [B] u32 · 10 toks [B] i32 · 11 scores [B] f32 ·
-/// 12 fresh [B] u32 (host-fed) · 13 out [B] i32 · 14 out_par [B] u32 ·
-/// 15 out_scr [B] f32.
 pub fn beam_trace() -> TraceContainer {
     let mut b = B::new();
-    let scores = b.p(Op::ChanTake(11)); // [B]
+    let scores = b.p(Op::ChanTake(11));
     let logits = b.p(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
         shape: Shape::matrix(BB, V),
         dtype: Dtype::F32,
     });
     let lsm = expand::log_softmax(&mut b.ops, logits, Shape::matrix(BB, V));
-    // broadcast [B] -> [B,V] must left-align as [B,1]; reshape first.
     let s1 = b.p(Op::Reshape {
         value: scores,
         shape: Shape::matrix(BB, 1),
@@ -194,11 +172,10 @@ pub fn beam_trace() -> TraceContainer {
     let s = b.p(Op::TopK {
         input: candf,
         k: BB,
-    }); // s, s+1 = i
+    });
     let i = s + 1;
     let vc = b.cu32(V);
-    let parent = b.p(Op::Div(i, vc)); // integer division: flat id → row
-    // reorder = row gathers
+    let parent = b.p(Op::Div(i, vc));
     let pg = {
         let t = b.p(Op::ChanTake(0));
         b.p(Op::Gather {
@@ -228,7 +205,6 @@ pub fn beam_trace() -> TraceContainer {
         })
     };
     let lanes = b.p(Op::Iota { len: BB });
-    // heir[p] = p's designated child (duplicate scatters: last wins)
     let heir = b.p(Op::ScatterSet {
         base: lanes,
         idx: parent,
@@ -272,7 +248,6 @@ pub fn beam_trace() -> TraceContainer {
         let t = b.p(Op::Mul(lanes, pc));
         b.p(Op::Add(t, n2m1))
     };
-    // pages
     let pgf = b.p(Op::Reshape {
         value: pg,
         shape: Shape::vector(BB * P),
@@ -290,7 +265,6 @@ pub fn beam_trace() -> TraceContainer {
         chan: 0,
         value: pg3,
     });
-    // lens (the single source) + derivatives
     let off1 = b.p(Op::Add(off, one));
     let plf = b.p(Op::Reshape {
         value: pl,
@@ -313,17 +287,11 @@ pub fn beam_trace() -> TraceContainer {
         let t = b.p(Op::Mul(n2m1, pagec));
         b.p(Op::Add(t, off1))
     };
-    // klen/kvm are pure derivatives of `lens`, recomputed each step: drain
-    // the stale cell (take, value unused) before refilling — under the
-    // capacity-1 full/empty bits a put without a drain would back-pressure
-    // forever on step 2. A prose sketch of a beam epilogue elides this
-    // drain; a trace cannot.
     b.p(Op::ChanTake(2));
     b.p(Op::ChanPut {
         chan: 2,
         value: klen,
     });
-    // kvm[b][j*page+o] = o < lens[b][j]
     let io = b.p(Op::Iota { len: PAGE });
     let io3 = b.p(Op::Reshape {
         value: io,
@@ -346,19 +314,17 @@ pub fn beam_trace() -> TraceContainer {
         value: kvm3,
         shape: Shape::matrix(BB, P * PAGE),
     });
-    b.p(Op::ChanTake(3)); // drain (see klen note)
+    b.p(Op::ChanTake(3));
     b.p(Op::ChanPut {
         chan: 3,
         value: kvm,
     });
-    // pos (logical length, ping-pong)
     let pos = b.p(Op::ChanTake(4));
     let pos2 = b.p(Op::Add(pos, one));
     b.p(Op::ChanPut {
         chan: 4,
         value: pos2,
     });
-    // bookkeeping
     b.p(Op::ChanPut { chan: 5, value: n2 });
     b.p(Op::ChanPut {
         chan: 6,
@@ -376,7 +342,6 @@ pub fn beam_trace() -> TraceContainer {
         chan: 9,
         value: off,
     });
-    // tokens + scores + host-facing
     let tok_u = b.p(Op::Rem(i, vc));
     let tok = b.p(Op::Cast {
         value: tok_u,
@@ -401,27 +366,27 @@ pub fn beam_trace() -> TraceContainer {
     TraceContainer {
         names: vec![],
         channels: vec![
-            u32c(Shape::matrix(BB, P), HostRole::None, true), // 0 pages
-            u32c(Shape::matrix(BB, P), HostRole::None, true), // 1 lens
-            u32c(Shape::vector(BB), HostRole::None, true),    // 2 klen
+            u32c(Shape::matrix(BB, P), HostRole::None, true),
+            u32c(Shape::matrix(BB, P), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
             chan(
                 Shape::matrix(BB, P * PAGE),
                 Dtype::Bool,
                 HostRole::None,
                 true,
-            ), // 3 kvm
-            u32c(Shape::vector(BB), HostRole::None, true),    // 4 pos
-            u32c(Shape::vector(BB), HostRole::None, true),    // 5 np
-            u32c(Shape::vector(BB), HostRole::None, true),    // 6 tslot
-            u32c(Shape::vector(BB), HostRole::None, true),    // 7 tfill
-            u32c(Shape::vector(BB), HostRole::None, true),    // 8 w_slot
-            u32c(Shape::vector(BB), HostRole::None, true),    // 9 w_off
-            chan(Shape::vector(BB), Dtype::I32, HostRole::None, true), // 10 toks
-            chan(Shape::vector(BB), Dtype::F32, HostRole::None, true), // 11 scores
-            u32c(Shape::vector(BB), HostRole::Writer, false), // 12 fresh
-            chan(Shape::vector(BB), Dtype::I32, HostRole::Reader, false), // 13 out
-            u32c(Shape::vector(BB), HostRole::Reader, false), // 14 out_par
-            chan(Shape::vector(BB), Dtype::F32, HostRole::Reader, false), // 15 out_scr
+            ),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::None, true),
+            chan(Shape::vector(BB), Dtype::I32, HostRole::None, true),
+            chan(Shape::vector(BB), Dtype::F32, HostRole::None, true),
+            u32c(Shape::vector(BB), HostRole::Writer, false),
+            chan(Shape::vector(BB), Dtype::I32, HostRole::Reader, false),
+            u32c(Shape::vector(BB), HostRole::Reader, false),
+            chan(Shape::vector(BB), Dtype::F32, HostRole::Reader, false),
         ],
         ports: vec![
             PortBinding {

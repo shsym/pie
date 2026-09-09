@@ -1,43 +1,3 @@
-//! **THE HUNYUANIMAGE 3 ROWS TRACE, CLASSIFY AND BAKE AT ONE RANK AND AT
-//! FOUR: AN 80 B MoE TRUNK THAT IS BOTH A DIFFUSION ROW AND A GENERATIVE
-//! ONE, A CANVAS WHOSE `<timestep>` ROW RIDES IN ITS OWN LANE, A 2-D ROPE
-//! NESTED IN A 1-D ONE, AND A CONV IMAGE HEAD ON THE VOXEL AXIS.**
-//!
-//! ```text
-//! cargo test -p models --test the_hunyuan_image_3_rows_bake
-//! ```
-//!
-//! `hunyuanimage3-80b-a13b` is the catalog's first row that fills BOTH
-//! fact columns — `Sku::diffusion` (it is a `forward-diffusion` pass kind,
-//! design D10) and `Sku::generative` (readings, latent space, schedule,
-//! design D12) — and its first `tp = 4` row. `hunyuanimage3-mini` is the
-//! parity fixture `scripts/imagegen/hy3_golden.py --mini` writes. What is
-//! asserted:
-//!
-//! ```text
-//! (a) every row traces on every platform with one kv space, one kv row a
-//!     layer, and the seams `out`, `hidden` and `pixels` (twice)
-//! (b) the ports the trace reads are the ports the facts declare, at the
-//!     facts' widths and kind-relative indices, and the named ports
-//!     resolve to `model::port`
-//! (c) the four readings' lanes classify into distinct classes where every
-//!     merge resolves, and the AR decode arm is a fifth class
-//! (d) every rope turns the whole head as two equal `(y, x)` blocks in the
-//!     `Split` form at theta 10 000, and only the trunk turns
-//! (e) the canvas reads `attention.masked` with the causal bound LIFTED,
-//!     the AR arms read the causal prefill and decode, and every layer
-//!     appends its kv exactly once
-//! (f) the MoE is a renormalised top-k softmax over the whole expert bank
-//!     plus one always-on shared expert, and the routed banks are quantized
-//!     on the flagship and bf16 on the miniature
-//! (g) both fact columns agree with the trace: the canvas is the row's
-//!     image rows, the latent is `{32, patch 1, /16}`, the schedule is
-//!     Flow at shift 3
-//! (h) every row bakes on every platform under a voxel ladder, at tp1 and
-//!     at tp4, and the tp4 row states a collective after each o-proj and
-//!     each MoE
-//! ```
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
@@ -84,7 +44,17 @@ fn ranks(sku: &str) -> u32 {
     row(sku).recipe.tp
 }
 
-/// (a)
+fn the_hunyuan_image_3_rows_bake_every_case() {
+    every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
+    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_lane_the_facts_list_classifies_into_its_own_class();
+    every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form();
+    the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix();
+    the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_expert();
+    both_fact_columns_state_what_the_trace_does();
+    every_row_bakes_on_every_platform_at_its_own_rank();
+}
+
 #[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
@@ -143,8 +113,6 @@ fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
     traced
 }
 
-/// (b)
-#[test]
 fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -196,8 +164,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         assert_eq!(denoise.readout, ReadoutKind::Hidden);
         assert_eq!(denoise.readout_width, d.hidden);
 
-        // ONE voxel port an arm, the timestep's sinusoid packed beside the
-        // clip: the CUDA shell seats one voxel width a fire.
         let image_in = &facts.readings[usize::from(IMAGE_IN)];
         assert_eq!(
             at(image_in, "latent"),
@@ -224,8 +190,6 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
     }
 }
 
-/// (c)
-#[test]
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -234,7 +198,6 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let facts = row(sku).generative.as_ref().expect("generative facts");
         let catalog = row(sku);
         let mut seen: Vec<(String, usize)> = Vec::new();
-        // The four readings' lanes, plus the AR decode step: five classes.
         let lanes: Vec<(String, u8, Stream, u32)> = facts
             .readings
             .iter()
@@ -274,8 +237,6 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
     }
 }
 
-/// (d)
-#[test]
 fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -311,7 +272,6 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
             );
         }
         assert_eq!(d.rope_dims(), [half, half, 0, 0], "{sku}");
-        // The x axis is a rung below the y axis; the family says by how much.
         let scale = model::rope_x_scale(d.head_dim);
         assert!(
             scale < 1.0 && scale > 0.5,
@@ -332,8 +292,6 @@ fn continue_none<T>() -> Option<T> {
     None
 }
 
-/// (e)
-#[test]
 fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -369,8 +327,6 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
     }
 }
 
-/// (f)
-#[test]
 fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_expert() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
@@ -400,9 +356,6 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
             quantized,
             "{sku}: the routed banks are quantized on the flagship rows alone"
         );
-        // The shared expert is an ordinary dense SwiGLU beside the routed
-        // sum: two plain matmuls and one plain `mlp_swiglu` a layer, over
-        // and above the routed pair.
         let swiglus = plan
             .nodes
             .iter()
@@ -412,8 +365,6 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
     }
 }
 
-/// (g)
-#[test]
 fn both_fact_columns_state_what_the_trace_does() {
     for sku in ROWS {
         let catalog = row(sku);
@@ -484,8 +435,6 @@ fn both_fact_columns_state_what_the_trace_does() {
     }
 }
 
-/// What the runtime's `validate_generative` demands, restated here so the
-/// facts are checked where they are written.
 fn validate(facts: &models::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
@@ -510,8 +459,6 @@ fn budget() -> model_compiler::Budget {
     }
 }
 
-/// (h)
-#[test]
 fn every_row_bakes_on_every_platform_at_its_own_rank() {
     for platform in PLATFORMS {
         for sku in ROWS {
@@ -536,8 +483,6 @@ fn every_row_bakes_on_every_platform_at_its_own_rank() {
             );
         }
     }
-    // The tp4 rows meet their partial sums twice a layer: after `o_proj`
-    // (heads cut) and after the MoE (expert banks cut).
     for sku in [TP1, TP4] {
         let plan = trace(sku, Platform::Cuda);
         let d = dims(sku);

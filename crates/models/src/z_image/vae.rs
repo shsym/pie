@@ -1,75 +1,18 @@
-//! The FLUX 16-channel `AutoencoderKL` (Z-Image's VAE) as two readings on
-//! the voxel axis (design D8, `IMAGEGEN_CONTRACT.md` §6): `vae.decode`
-//! takes the DiT's latent and lands pixels, `vae.encode` takes pixels and
-//! lands the posterior mean. `vae/config.json` restated as constants:
-//! `block_out_channels [128, 256, 512, 512]`, `layers_per_block 2`,
-//! `norm_num_groups 32`, `latent_channels 16`, `scaling_factor 0.3611`,
-//! `shift_factor 0.1159`, no `quant_conv`/`post_quant_conv`, SiLU
-//! everywhere, attention in the mid blocks.
-//!
-//! | reading | port (`Voxels`, clip `{1, h, w}`) | lands (`pixels` seam) |
-//! |---|---|---|
-//! | `vae.decode` | `latent` `[h·w, 16]`, the DiT-space latent | `[8h·8w, 3]` f32 in `[-1, 1]` (clamping and `uint8` are the frames layer's) |
-//! | `vae.encode` | `pixels` `[H·W, 3]` in `[-1, 1]` | `[H/8·W/8, 16]`, the posterior MEAN (`conv_out`'s first 16 channels) |
-//!
-//! The decoder denormalises itself (`z / scaling_factor + shift_factor`,
-//! the reference pipeline's step before `vae.decode`); the encoder hands
-//! the raw mean back and the guest applies `(mean − shift) · scaling`
-//! (FLUX and Z-Image take the mean, never a sample). Both readings run
-//! over ONE clip per lane — an image, `t = 1` — and the grid is the port's.
-//!
-//! # Structure (diffusers `vae.py`)
-//!
-//! ```text
-//! decode: conv_in 16→512 · mid(res, attn, res) · up0(res×3 @512, ↑2 conv)
-//!         · up1(res×3 @512, ↑2 conv) · up2(res 512→256, res×2, ↑2 conv)
-//!         · up3(res 256→128, res×2) · GroupNorm+SiLU · conv_out 128→3
-//! encode: conv_in 3→128 · down0(res×2 @128, ↓2) · down1(res 128→256, res, ↓2)
-//!         · down2(res 256→512, res, ↓2) · down3(res×2 @512) · mid
-//!         · GroupNorm+SiLU · conv_out 512→32 = [mean | logvar], of which
-//!         only the mean's 16 output channels are declared and read
-//! res:    x + conv2(silu(gn2(conv1(silu(gn1(x)))))), a 1×1 conv on the
-//!         skip where the width changes
-//! attn:   x + to_out(softmax(q·kᵀ/√512)·v), q/k/v off gn(x), one head
-//! ↓2:     F.pad(x, (0, 1, 0, 1)) then conv 3×3 stride 2 (pad_back)
-//! ↑2:     nearest ×2 then conv 3×3
-//! ```
-//!
-//! # Numerics contract
-//!
-//! Conv weights are bf16 (as stored), activations bf16 between launches,
-//! every convolution and projection accumulating fp32 with one rounding at
-//! the store; GroupNorm statistics fp32 Welford; the attention fp32 scores,
-//! softmax and accumulation (`upcast_softmax`). The reference runs the VAE
-//! in fp32 (`force_upcast`), so a port differs by one bf16 rounding per
-//! launch — the parity gate (`scripts/imagegen/zimage_golden.py --vae`)
-//! holds at `cos ≥ 0.999`, `max |err| ≤ 0.05` on pixels in `[-1, 1]`.
-
 use model_dsl::ops::spatial::{self, Conv};
 use model_dsl::{Dtype, Input, Value, Weight, ops, seam};
 
 use super::forward::Facts;
 use super::model::{CHANNELS, Linear, port};
 
-/// `scaling_factor`: the DiT's latent is the posterior mean times this.
 pub const SCALING_FACTOR: f32 = 0.3611;
-/// `shift_factor`: subtracted from the mean before the scaling.
 pub const SHIFT_FACTOR: f32 = 0.1159;
-/// `norm_num_groups`.
 pub const GN_GROUPS: u32 = 32;
-/// Every GroupNorm's epsilon (`resnet_eps`, and the attention's `eps`).
 pub const GN_EPS: f32 = 1e-6;
-/// `block_out_channels`.
 pub const BLOCK_CHANNELS: [u32; 4] = [128, 256, 512, 512];
-/// `layers_per_block`: resnets per encoder block; a decoder block has one more.
 pub const LAYERS_PER_BLOCK: u32 = 2;
-/// `in_channels` / `out_channels`: RGB.
 pub const RGB: u32 = 3;
-/// `kh·kw` of every 3×3 convolution.
 const TAPS3: u32 = 9;
 
-/// A convolution's plane (`[C_out, C_in·taps]` bf16, tap-major at load) and
-/// its `[C_out]` f32 bias.
 pub struct ConvW {
     pub w: Weight,
     pub bias: Weight,
@@ -95,7 +38,6 @@ impl ConvW {
     }
 }
 
-/// `torch.nn.GroupNorm(32, C)`'s affine planes, `[C]` f32.
 pub struct Norm {
     pub weight: Weight,
     pub bias: Weight,
@@ -110,7 +52,6 @@ impl Norm {
     }
 }
 
-/// `ResnetBlock2D`: `conv_shortcut` only where the width changes.
 pub struct ResBlock {
     pub norm1: Norm,
     pub conv1: ConvW,
@@ -132,8 +73,6 @@ impl ResBlock {
     }
 }
 
-/// The mid block's `Attention`: one head as wide as the row, biased
-/// projections, a residual.
 pub struct AttnBlock {
     pub norm: Norm,
     pub q: Linear,
@@ -156,7 +95,6 @@ impl AttnBlock {
     }
 }
 
-/// `UNetMidBlock2D`: resnet, attention, resnet.
 pub struct Mid {
     pub res0: ResBlock,
     pub attn: AttnBlock,
@@ -173,15 +111,11 @@ impl Mid {
     }
 }
 
-/// `UpDecoderBlock2D`: resnets, then `Upsample2D` (nearest ×2 + conv) on
-/// every block but the last.
 pub struct UpBlock {
     pub resnets: Vec<ResBlock>,
     pub upsample: Option<ConvW>,
 }
 
-/// `DownEncoderBlock2D`: resnets, then `Downsample2D` (pad + stride-2
-/// conv) on every block but the last.
 pub struct DownBlock {
     pub resnets: Vec<ResBlock>,
     pub downsample: Option<ConvW>,
@@ -203,25 +137,17 @@ pub struct Encoder {
     pub conv_out: ConvW,
 }
 
-/// The whole VAE.
 pub struct Vae {
-    /// The `[CHANNELS]` row of [`SHIFT_FACTOR`], in the trunk's dtype — a
-    /// weight because the IR has no scalar-add; derived at import.
     pub shift: Weight,
-    /// The encoder's `conv_out` is stored `[2·CHANNELS, 512, 3, 3]` (`[mean
-    /// | logvar]`); the plan declares its first `CHANNELS` output rows only
-    /// (the mean is the latent FLUX and Z-Image take), sliced at import.
     pub encoder_out_stored: u32,
     pub decoder: Decoder,
     pub encoder: Encoder,
 }
 
 impl Vae {
-    /// The FLUX VAE under `vae.`, its projections in `banks`.
     #[must_use]
     pub fn flux(banks: Dtype) -> Vae {
         let top = BLOCK_CHANNELS[BLOCK_CHANNELS.len() - 1];
-        // The decoder walks the channel list reversed: 512, 512, 256, 128.
         let mut up = Vec::new();
         let mut c_prev = top;
         for (i, &c) in BLOCK_CHANNELS.iter().rev().enumerate() {
@@ -277,16 +203,10 @@ impl Vae {
     }
 }
 
-/// The `vae.decode` reading: the DiT-space latent on the `Voxels` port,
-/// denormalised, through the decoder to `[8h·8w, 3]` pixels in `[-1, 1]`
-/// on the `pixels` seam beside their grid.
 pub fn decode(arm: &Input<Facts>, vae: &Vae) -> Value {
     let d = &vae.decoder;
     let mut grid = arm.grid();
     let z = arm.voxels(port::VOXELS, CHANNELS, Dtype::Bf16);
-    // `z / scaling_factor + shift_factor`. `add` is the one fresh copy of a
-    // port rectangle this IR has (`2z`); the scale and the shift after it
-    // run in place on the copy, never on the port's own cell.
     let z = ops::elemwise::add(&z, &z);
     let z = ops::elemwise::add_bias(
         &vae.shift,
@@ -310,9 +230,6 @@ pub fn decode(arm: &Input<Facts>, vae: &Vae) -> Value {
     y
 }
 
-/// The `vae.encode` reading: `[H·W, 3]` pixels in `[-1, 1]` on the
-/// `Voxels` port through the encoder to the posterior mean `[H/8·W/8, 16]`
-/// on the `pixels` seam beside its grid.
 pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
     let e = &vae.encoder;
     let mut grid = arm.grid();
@@ -323,8 +240,6 @@ pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
             h = resnet(&h, &grid, res);
         }
         if let Some(conv) = &block.downsample {
-            // `Downsample2D`: zeros behind the box on h and w, then 3x3 at
-            // stride 2 with no padding of its own.
             let (y, y_grid) = spatial::conv3d(
                 &h,
                 &grid,
@@ -339,15 +254,11 @@ pub fn encode(arm: &Input<Facts>, vae: &Vae) -> Value {
     }
     h = mid(&h, &grid, &e.mid);
     let h = group_norm(&h, &grid, &e.norm_out, true);
-    // `DiagonalGaussianDistribution`'s `[mean | logvar]`, of which the
-    // plan's `conv_out` is the mean's rows alone (the latent FLUX and
-    // Z-Image take; the logvar is never computed).
     let mean = conv3(&h, &grid, &e.conv_out);
     seam::at(seam::PIXELS, &[&mean, &grid]);
     mean
 }
 
-/// A box-keeping 3×3 (or 1×1) convolution with its bias.
 fn conv3(x: &Value, grid: &Value, conv: &ConvW) -> Value {
     let shape = match conv.taps {
         1 => Conv::conv2d([1, 1], [1, 1], [0, 0]),
@@ -360,7 +271,6 @@ fn group_norm(x: &Value, grid: &Value, norm: &Norm, silu: bool) -> Value {
     spatial::group_norm(x, grid, GN_GROUPS, &norm.weight, &norm.bias, GN_EPS, silu)
 }
 
-/// `ResnetBlock2D`, `output_scale_factor 1`, no time embedding, no dropout.
 fn resnet(x: &Value, grid: &Value, r: &ResBlock) -> Value {
     let h = group_norm(x, grid, &r.norm1, true);
     let h = conv3(&h, grid, &r.conv1);
@@ -373,15 +283,12 @@ fn resnet(x: &Value, grid: &Value, r: &ResBlock) -> Value {
     ops::elemwise::add(&skip, &h)
 }
 
-/// `UNetMidBlock2D`.
 fn mid(x: &Value, grid: &Value, m: &Mid) -> Value {
     let h = resnet(x, grid, &m.res0);
     let h = attention(&h, grid, &m.attn);
     resnet(&h, grid, &m.res1)
 }
 
-/// The mid block's `Attention(heads=1, dim_head=C, residual_connection=True,
-/// rescale_output_factor=1, upcast_softmax=True)` behind its own GroupNorm.
 fn attention(x: &Value, grid: &Value, a: &AttnBlock) -> Value {
     let h = group_norm(x, grid, &a.norm, false);
     let linear =

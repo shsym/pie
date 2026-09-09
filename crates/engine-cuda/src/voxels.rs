@@ -1,24 +1,3 @@
-//! The third row axis's seat (design D8): what a load reserves for a plan
-//! that states voxel rows, and how one fire's clips become the device
-//! tables the `spatial.*` kernels read.
-//!
-//! A fire's clips arrive per lane as boxes `[t, h, w]` beside the port's
-//! payload rows; the composition places each lane's clips at
-//! `clip_offset`/`voxel_offset` on the voxel axis, and this module lays
-//! the port grid (`RuntimeInput::Grid`, `{t, h, w, row_offset}` per clip
-//! in fire order), the token-side grid (`RuntimeInput::TokenGrid`, when the
-//! plan reads one) and the payload rectangle out in that order, then stages
-//! them below the fire's other inputs: device bytes of their own, no
-//! pinned mirror, pageable-safe (the driver copies before the call
-//! returns), the way the patch axis's payload is staged.
-//!
-//! **ONE VOXEL CLASS PER FIRE (M0).** Every spatial kernel takes the whole
-//! grid table and finds a row's lane itself (`seat::Reads::Nothing`: it
-//! reads no window seat), so a voxel-axis launch runs over the fire's
-//! whole voxel rectangle. A fire whose clip-carrying lanes fall in two
-//! classes would have each class's region compute over the other's rows
-//! too; the shell refuses that at prepare rather than compute it twice.
-
 use model_compiler::VoxelLadder;
 use model_exec::fire::LaneRow;
 use model_ir::Dtype;
@@ -27,42 +6,25 @@ use crate::device::Buffer;
 use crate::error::{Fault, Result};
 use kernels_cuda::Tensor;
 
-/// The voxel axis's reservation, or `None` for a load whose plan states no
-/// voxel row.
 #[derive(Debug, Clone)]
 pub struct Seat {
-    /// Most port voxel rows one fire may carry (`VoxelLadder::max_voxels`).
     pub rows: u64,
-    /// Most clips one fire may carry (`VoxelLadder::max_clips`).
     pub clips: u64,
-    /// The widest voxel port the plan reads (what the payload rectangle is
-    /// reserved at), or `0` for a plan that reads no voxel port (a decoder
-    /// fed by `spatial.unpatchify` from tokens).
     pub channels: u32,
-    /// Every voxel port width the plan reads, ascending — one per reading
-    /// that takes a clip (a VAE's decoder reads 16 channels, its encoder
-    /// 3). A fire's payload is at one of them (M0: one voxel class a fire).
     pub widths: Vec<u32>,
-    /// The port's element.
     pub dtype: Dtype,
-    /// The patch a `RuntimeInput::TokenGrid` reader states, or `None` for
-    /// a plan that reads none.
     pub token_patch: Option<[u32; 3]>,
 }
 
 impl Seat {
-    /// One port element's bytes.
     fn elem_bytes(&self) -> u64 {
         model_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
     }
 
-    /// One port row's bytes at the widest port.
     fn row_bytes(&self) -> u64 {
         u64::from(self.channels) * self.elem_bytes()
     }
 
-    /// The seat a plan states, against a ladder: the ceilings are the
-    /// ladder's, the port's width and element the plan's own.
     #[must_use]
     pub fn of(trace: &model_ir::Trace, ladder: &VoxelLadder) -> Seat {
         let mut channels = 0u32;
@@ -99,7 +61,6 @@ impl Seat {
     }
 }
 
-/// Where the voxel tables sit on the device: one buffer, three regions.
 pub struct Store {
     seat: Seat,
     buffer: Buffer,
@@ -109,37 +70,22 @@ pub struct Store {
     payload: u64,
 }
 
-/// The device handles one fire's clips resolve to.
 #[derive(Debug, Clone, Copy)]
 pub struct Handles {
-    /// `[clips, 4]` i32: the port grid.
     pub grid: Tensor,
-    /// `[clips, 4]` i32: the token-side grid, or `None` for a plan that
-    /// reads none.
     pub token_grid: Option<Tensor>,
-    /// `[voxel rows, channels]`: the port payload, or `None` for a plan
-    /// that reads no voxel port.
     pub voxels: Option<Tensor>,
-    /// `[clips]` i32: the recurrent slot of each clip's lane.
     pub slots: Tensor,
 }
 
-/// One lane's clips as the caller submits them, already in the port's
-/// element: `payload` is `Σ t·h·w` rows of `channels` elements, clips
-/// concatenated in the order `clips` lists them.
 #[derive(Debug, Clone, Copy)]
 pub struct Clips<'a> {
-    /// Which lane of the submission these clips belong to.
     pub lane: u32,
-    /// Each clip's box `[t, h, w]` at the port's resolution.
     pub clips: &'a [[u32; 3]],
-    /// The port rows, `Σ t·h·w` of them, in the port's element; empty for
-    /// a plan that reads no voxel port.
     pub payload: &'a [u8],
 }
 
 impl Clips<'_> {
-    /// How many port voxel rows these clips total.
     #[must_use]
     pub fn voxels(&self) -> u64 {
         self.clips
@@ -149,48 +95,17 @@ impl Clips<'_> {
     }
 }
 
-/// The host side of one fire's voxel tables, laid out in fire order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Tables {
-    /// `{t, h, w, row_offset}` per clip, in fire order.
     pub grid: Vec<i32>,
-    /// `{t/pt, h/ph, w/pw, token_row_offset}` per clip, in fire order;
-    /// empty for a plan that reads none.
     pub token_grid: Vec<i32>,
-    /// The port payload, clips in fire order. EMPTY when every lane feeds
-    /// its port from a channel (`PortKind::Voxels` in `Lane::ports`): the
-    /// payload region is then filled device to device at `enqueue`, and
-    /// nothing crosses the host bus.
     pub payload: Vec<u8>,
-    /// The port width the payload's rows are at — one of the seat's
-    /// `widths`, the one this fire's reading takes; `0` for a fire that
-    /// fed no voxel port. A channel-fed fire states it from the seat the
-    /// feed names, since it stages no bytes to read it off.
     pub channels: u32,
-    /// How many port voxel rows the payload region holds this fire —
-    /// `Σ t·h·w` over every lane's clips. Carried rather than derived from
-    /// `payload`, which a channel-fed fire leaves empty.
     pub rows: u64,
-    /// The recurrent slot of each clip's lane, in fire order.
     pub slots: Vec<i32>,
 }
 
 impl Tables {
-    /// Lay one fire's clips out in fire order. `lanes` is the composition's
-    /// lane table (fire order, carrying each lane's `source`, `clip_offset`
-    /// and `voxel_offset`); `of_lane[source]` is that lane's submission or
-    /// `None`; `slot_of[source]` its recurrent slot.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::VoxelPayload`] for a payload whose bytes are not `Σ t·h·w`
-    /// port rows at a width the plan reads (or two lanes at two widths), a
-    /// clip box that does not divide by the token patch, or a lane whose
-    /// token rows are not its clips' token count.
-    /// `fed` is the width of the voxel port this fire's lanes feed from a
-    /// CHANNEL, or `0` when none does: a channel-fed lane submits its clips
-    /// with an empty payload, so its width cannot be read off bytes that
-    /// were never staged, and the seat the feed names states it instead.
     pub fn of(
         seat: &Seat,
         lanes: &[LaneRow],
@@ -200,13 +115,8 @@ impl Tables {
     ) -> Result<Tables> {
         let clips_total: usize = lanes.iter().map(|lane| lane.clips as usize).sum();
         let voxels_total: usize = lanes.iter().map(|lane| lane.voxels as usize).sum();
-        // The payload's width is read off the first lane that fed one and
-        // must be a width the plan reads; every other lane agrees with it.
         let elem = seat.elem_bytes() as usize;
         let mut channels = 0u32;
-        // Does any lane hand over bytes at all? A fire whose every voxel
-        // port is channel-fed stages none: the payload region is filled
-        // device to device instead.
         let host_fed = of_lane
             .iter()
             .flatten()
@@ -324,11 +234,6 @@ impl Tables {
 }
 
 impl Store {
-    /// Reserve the tables at the seat's ceilings.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::OutOfMemory`] or [`Fault::Device`] for the allocation.
     pub fn reserve(seat: Seat) -> Result<Store> {
         let align = |bytes: u64| bytes.next_multiple_of(256);
         let grid = 0u64;
@@ -351,25 +256,16 @@ impl Store {
         })
     }
 
-    /// The seat this store was reserved at.
     #[must_use]
     pub fn seat(&self) -> Seat {
         self.seat.clone()
     }
 
-    /// Bytes the reservation holds.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.buffer.bytes() as u64
     }
 
-    /// One fire's tables onto the device, on `stream`, ahead of the
-    /// launches that read them.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a fire past the reserved tables,
-    /// [`Fault::Device`] for the copies.
     pub fn stage(&mut self, stream: *mut core::ffi::c_void, tables: &Tables) -> Result<Handles> {
         let clips = (tables.grid.len() / 4) as u64;
         if clips > self.seat.clips {
@@ -416,18 +312,6 @@ impl Store {
     }
 }
 
-/// The host twin of a later resolution's grid (D8): the `[Clips, 4]` table
-/// value `grid` would hold, computed from the fire's PORT grid rather than
-/// read back off the device.
-///
-/// Every grid past the port's is a VALUE — `Spatial::Grid { grid, rule, y }`,
-/// one single-block launch per resolution — so nothing on the host knows
-/// where a lane's pixels begin until that launch has run. An epilogue's
-/// `pixels()` binding has to know BEFORE the walk (the intrinsic's base is a
-/// device address the guest program reads), so the chain is replayed here
-/// through `GridRule::apply`, the rule's own host twin. `None` for a `grid`
-/// that is not reachable from the port grid by `Spatial::Grid` alone, or
-/// whose rules do not map a box the fire submitted.
 #[must_use]
 pub(crate) fn host_grid(
     trace: &model_ir::Trace,
@@ -436,9 +320,6 @@ pub(crate) fn host_grid(
 ) -> Option<Vec<i32>> {
     use model_ir::{Def, Operation, RuntimeInput, Spatial};
 
-    // Which `Spatial::Grid` writes each value, walked backwards from `grid`
-    // to the port input. The chain is short (one rule per resolution) and a
-    // trace states each grid once, so a linear scan per link is cheap.
     let mut rules = Vec::new();
     let mut at = grid;
     loop {
@@ -454,8 +335,6 @@ pub(crate) fn host_grid(
         })?;
         rules.push(step.1);
         at = step.0;
-        // A cycle would be a malformed trace; the bound is the trace's own
-        // value count, which every chain is shorter than.
         if rules.len() > trace.values.len() {
             return None;
         }
@@ -473,13 +352,6 @@ fn i32_bytes(values: &[i32]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }
 }
 
-/// A payload's `f32` numbers in the port's element, little-endian —
-/// round-to-nearest-even into bf16, as the patch path does.
-///
-/// # Errors
-///
-/// The `&'static str` an `Error::Unsupported` carries, for a port element
-/// this marshal cannot write.
 pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
         Dtype::Bf16 => Ok(values
@@ -493,17 +365,6 @@ pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>
     }
 }
 
-/// The load-time relabelling of every convolution weight
-/// (`ParamLayout::ConvTapsMajor`): the checkpoint landed the natural
-/// `[C_out, C_in·taps]` rectangle; the kernel reads `[C_out, taps·C_in]`.
-/// Each such plane is copied aside, relabelled back into its own bytes by
-/// `conv_weight_taps_major`, and the copy freed — once, before the first
-/// fire, so no dispatch arm ever sees the natural order.
-///
-/// # Errors
-///
-/// [`Fault::Device`] for a copy, [`Fault::Unbound`] for the launch or for
-/// a conv weight that landed as something other than one dense plane.
 pub(crate) fn relabel_conv_weights(
     device: &crate::device::Context,
     trace: &model_ir::Trace,
@@ -538,7 +399,6 @@ pub(crate) fn relabel_conv_weights(
         .map_err(|fault| Fault::Unbound {
             what: format!("`{}`: {fault}", param.name),
         })?;
-        // The copy is freed on return; the launch that read it must be done.
         device.synchronize()?;
     }
     Ok(())

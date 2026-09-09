@@ -1,35 +1,7 @@
-//! Expands a lane's run-length mask ([`Mask`]) into the dense table
-//! `attention.masked` reads: one byte per (fire token row, key position)
-//! pair, rows are absolute fire rows, and `attention_mask_enabled[row]`
-//! gates the row. Differs from the CUDA sibling (which packs bits with a
-//! per-lane byte-offset span table): this plane's shaders take one scalar
-//! stride and treat `kp >= stride` as masked out, so there's no per-lane
-//! offset to put.
-//!
-//! Causality is folded into the expansion even though the shaders also
-//! apply their own causal bound (redundant, but keeps the staged table
-//! meaning the same regardless of which sdpa arm runs) — except for a
-//! [`LaneMask::bidirectional`] lane, whose rows keep every key of the
-//! extent their mask keeps and whose `enabled` word is 2 instead of 1, which
-//! tells the shaders the mask is authoritative and the causal upper bound
-//! does not apply to that row. The sliding window is NOT folded in:
-//! `Attention::Masked` states it per node, so the shaders take it as their
-//! own scalar argument.
-//!
-//! `Masking::Extent` (one restriction re-applied to every row) and
-//! `Masking::Rows` (one restriction per row) both land in the same dense
-//! plane. A per-row mask may only choose among keys causality already
-//! allows, never add one; a mismatched row count is refused
-//! ([`Fault::MaskRows`]) rather than silently reused.
-
 use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
 
-/// A device-resolved dense `[rows, keys]` rectangle of bools, run-length
-/// encoded here and handed to [`stage`]. `stride` is the rectangle's own
-/// key width (the pool's, not the lane's extent), clipped the same as any
-/// longer mask.
 #[must_use]
 pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     let rows = cells.len().checked_div(stride).unwrap_or(0);
@@ -37,9 +9,6 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
         (0..rows)
             .map(|row| {
                 let mut runs: Vec<u32> = Vec::new();
-                // Alternating lengths, masked-out first — `Mask`'s own
-                // encoding, so a row that opens kept opens with a
-                // zero-length dropped run.
                 let mut keeping = false;
                 let mut run = 0u32;
                 for &kept in &cells[row * stride..(row + 1) * stride] {
@@ -60,69 +29,32 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     )
 }
 
-/// One lane's mask, with the geometry that says what shape it expands to.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneMask<'a> {
-    /// The lane's masking, or `None` for a lane that carries none.
-    /// `Masking::Rows` must state exactly [`rows`](LaneMask::rows) of them,
-    /// or it's refused by name ([`Fault::MaskRows`]).
     pub mask: Option<&'a Masking>,
-    /// How many KV tokens the slot held BEFORE this fire.
     pub have: u32,
-    /// How many token rows this fire feeds it.
     pub rows: u32,
-    /// Every row reads every key of the extent (a denoiser's canvas): the
-    /// causal bound is not folded in and the row's `enabled` word is 2.
     pub bidirectional: bool,
 }
 
-/// A fire's mask plane and the flags that gate it: one dense
-/// `[rows][stride]` rectangle in fire row order (no lane offsets).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// `[rows * stride]`: 1 keeps the pair, 0 drops it. Row `r` of the fire
-    /// starts at `r * stride`.
     pub bytes: Vec<u8>,
-    /// `[rows]`: whether that row's plane is consulted at all — 0 no mask,
-    /// 1 a mask under the causal bound, 2 a mask that is authoritative (a
-    /// bidirectional lane, no causal upper bound). Rows of a
-    /// lane that stated no mask are 0, and the shaders then read neither
-    /// the plane nor the stride bound.
     pub enabled: Vec<u8>,
-    /// Key positions from one row's plane to the next — the widest masked
-    /// lane's post-append KV length, and the bound the shaders themselves
-    /// enforce with `kp >= attention_mask_stride`.
     pub stride: u32,
 }
 
-/// Expand a fire's lane masks, in fire (seriated) row order. `Ok(None)`
-/// means no lane stated a mask, so the shell binds neither seat.
-///
-/// # Errors
-///
-/// [`Fault::Mask`]: a mask shorter than the lane's post-append KV length
-/// (refused, not padded, since the missing positions would read as masked
-/// out); a longer mask is accepted and clipped. [`Fault::MaskRows`]: a
-/// [`Masking::Rows`] with a different row count than the lane feeds.
-/// [`Fault::Ceiling`]: more key positions than a `u32` stride can name, or a
-/// plane too large for host memory.
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
     }
 
-    // Pass one: check every stated extent, and find the stride (the widest
-    // masked lane's; an unmasked neighbour must not make every masked row
-    // pay for it).
     let mut widest = 0u64;
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let Some(masking) = lane.mask else {
             continue;
         };
-        // The stride is the extent's, not the mask's, so a longer mask's
-        // surplus is clipped. Every stated restriction is checked, not just
-        // the first, since a short row truncates like a short extent.
         for mask in masking.masks() {
             if mask.total < kv {
                 return Err(Fault::Mask {
@@ -132,8 +64,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 });
             }
         }
-        // Row count, checked after the extents and before the allocation,
-        // same order as the CUDA sibling.
         if let Some(stated) = masking.stated_rows()
             && stated != lane.rows as usize
         {
@@ -164,9 +94,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         stride,
     };
 
-    // Pass two: the runs. `Extent` is walked once per lane and applied to
-    // every row (only the causal bound moves); `Rows` walks once per row,
-    // each under its own bound.
     let mut row = 0usize;
     for lane in lanes {
         let Some(masking) = lane.mask else {
@@ -186,8 +113,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     let end = at_position.saturating_add(u64::from(run)).min(kv);
                     if index % 2 == 1 {
                         for key in at_position..end {
-                            // Causal, read from the key's side: the first
-                            // row that may see key `key` is `key - have`.
                             let first = if lane.bidirectional {
                                 0
                             } else {
@@ -207,8 +132,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             Masking::Rows(masks) => {
                 for (q, mask) in masks.iter().enumerate() {
                     let q = q as u64;
-                    // Same bound, read from the row's side, inclusive: row
-                    // `q` stands at `have + q` and may reach its own key.
                     let bound = if lane.bidirectional {
                         kv
                     } else {
@@ -235,10 +158,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     Ok(Some(out))
 }
 
-/// One cell of the plane, kept. A free function so both walks above write
-/// through the same address (`row * stride + key`, absolute fire row); a
-/// bounds miss is a no-op rather than a panic, since stride and row count
-/// come from the same `have + rows` the callers walk.
 fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
     let cell = row * u64::from(stride) + key;
     if let Some(word) = bytes.get_mut(cell as usize) {
@@ -250,12 +169,16 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
 mod tests {
     use super::*;
 
-    /// A row count that is not the lane's is refused by name.
-    /// A bidirectional lane keeps the keys AFTER a row that its mask keeps,
-    /// and its rows say so with the word 2.
+    fn mask_every_case() {
+        a_bidirectional_lane_keeps_the_keys_after_the_row();
+        a_per_row_mask_of_the_wrong_height_is_refused();
+        a_short_per_row_mask_is_refused_for_its_extent_first();
+        a_fire_with_no_masks_stages_nothing();
+        a_mask_short_of_its_lanes_extent_is_refused();
+    }
+
     #[test]
     fn a_bidirectional_lane_keeps_the_keys_after_the_row() {
-        // Two rows appended to one held key, an all-keeping extent mask.
         let all = Masking::Extent(Mask::new(vec![0, 3], 3));
         let causal = stage(&[LaneMask {
             mask: Some(&all),
@@ -277,7 +200,6 @@ mod tests {
         .unwrap();
         assert_eq!(wide.enabled, vec![2, 2]);
         assert_eq!(wide.bytes, vec![1, 1, 1, 1, 1, 1]);
-        // Per-row masks may reach past the row too.
         let rows = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![1, 2], 3)]);
         let wide = stage(&[LaneMask {
             mask: Some(&rows),
@@ -290,7 +212,6 @@ mod tests {
         assert_eq!(wide.bytes, vec![1, 1, 1, 0, 1, 1]);
     }
 
-    #[test]
     fn a_per_row_mask_of_the_wrong_height_is_refused() {
         let short = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![0, 3], 3)]);
         let refused = stage(&[LaneMask {
@@ -322,9 +243,6 @@ mod tests {
         );
     }
 
-    /// A per-row masking short of the extent is refused for the extent
-    /// first, before the row count is checked.
-    #[test]
     fn a_short_per_row_mask_is_refused_for_its_extent_first() {
         let short = Masking::Rows(vec![Mask::new(vec![0, 2], 2), Mask::new(vec![0, 2], 2)]);
         let refused = stage(&[LaneMask {
@@ -346,9 +264,6 @@ mod tests {
         );
     }
 
-    /// A fire nobody masked binds nothing, so a masked consumer refuses in
-    /// its own name rather than reading a blanked rectangle.
-    #[test]
     fn a_fire_with_no_masks_stages_nothing() {
         let staged = stage(&[LaneMask {
             mask: None,
@@ -360,8 +275,6 @@ mod tests {
         assert_eq!(staged, None);
     }
 
-    /// A mask short of its lane's extent is refused by name.
-    #[test]
     fn a_mask_short_of_its_lanes_extent_is_refused() {
         let mask = Masking::Extent(Mask::new(vec![0, 4], 4));
         let refused = stage(&[LaneMask {
