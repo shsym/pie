@@ -218,3 +218,7 @@ pie-tart
 
 # Derived JavaScript-facing WIT world (npm run derive-wit / generate-bindings)
 sdk/inferlet/javascript/wit/
+
+# Run output and scratch: `out/` was committed once already.
+out/
+marlin_scratch/

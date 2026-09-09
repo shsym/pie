@@ -7,16 +7,29 @@ use std::time::Duration;
 use ::runtime::inferlet::program::{Manifest, ProgramName};
 use worker::WorkerHandle;
 
-pub const DEFAULT_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca";
+fn snapshot_in_hub(repo: &str) -> String {
+    let home = std::env::var("HF_HOME").unwrap_or_else(|_| {
+        format!("{}/.cache/huggingface", std::env::var("HOME").unwrap_or_default())
+    });
+    let hub = format!("{home}/hub/models--{}", repo.replace('/', "--"));
+    let snapshots = std::path::Path::new(&hub).join("snapshots");
+    std::fs::read_dir(&snapshots)
+        .ok()
+        .and_then(|mut dir| dir.next().and_then(Result::ok))
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .unwrap_or_else(|| snapshots.to_string_lossy().into_owned())
+}
 
-pub const DEFAULT_GDN_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
+pub const DEFAULT_REPO: &str = "Qwen/Qwen3-0.6B";
+
+pub const DEFAULT_GDN_REPO: &str = "Qwen/Qwen3.5-0.8B";
 
 pub fn snapshot() -> String {
-    std::env::var("PIE_CUDA_TEST_SNAPSHOT").unwrap_or_else(|_| DEFAULT_SNAPSHOT.to_string())
+    std::env::var("PIE_CUDA_TEST_SNAPSHOT").unwrap_or_else(|_| snapshot_in_hub(DEFAULT_REPO))
 }
 
 pub fn gdn_snapshot() -> String {
-    std::env::var("PIE_CUDA_TEST_GDN_SNAPSHOT").unwrap_or_else(|_| DEFAULT_GDN_SNAPSHOT.to_string())
+    std::env::var("PIE_CUDA_TEST_GDN_SNAPSHOT").unwrap_or_else(|_| snapshot_in_hub(DEFAULT_GDN_REPO))
 }
 
 pub fn cuda_toml_for(snapshot_path: &str) -> String {

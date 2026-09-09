@@ -23,7 +23,6 @@ fn snapshot() -> Option<PathBuf> {
     let usable = |path: &Path| path.join("tokenizer.json").exists() && container(path).is_some();
     let homes = [
         std::env::var("HOME").unwrap_or_default(),
-        "/Users/ingim".to_string(),
     ];
     homes.iter().find_map(|home| {
         let snapshots = Path::new(home)
