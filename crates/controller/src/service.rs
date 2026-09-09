@@ -1,7 +1,9 @@
 use std::io;
 
 use futures::{Stream, StreamExt, future};
-use tarpc::serde_transport::{tcp, unix};
+use tarpc::serde_transport::tcp;
+#[cfg(unix)]
+use tarpc::serde_transport::unix;
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::task::JoinHandle;
@@ -56,14 +58,27 @@ pub(crate) async fn serve(
         .strip_prefix("unix://")
         .or_else(|| listen_addr.strip_prefix("unix:"))
     {
-        let incoming = unix::listen(path, Bincode::default).await?;
-        tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/uds)");
-        Ok(tokio::spawn(async move {
-            tokio::select! {
-                _ = serve_loop(incoming, server) => {}
-                _ = cancel.cancelled() => {}
-            }
-        }))
+        #[cfg(unix)]
+        {
+            let incoming = unix::listen(path, Bincode::default).await?;
+            tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/uds)");
+            Ok(tokio::spawn(async move {
+                tokio::select! {
+                    _ = serve_loop(incoming, server) => {}
+                    _ = cancel.cancelled() => {}
+                }
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, server, cancel);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{listen_addr}: a `unix://` control address is distributed serving, which needs a unix-domain socket; this build is single-node and speaks `tcp://`"
+                ),
+            ))
+        }
     } else {
         let tcp_addr = listen_addr.strip_prefix("tcp://").unwrap_or(listen_addr);
         let incoming = tcp::listen(tcp_addr, Bincode::default).await?;

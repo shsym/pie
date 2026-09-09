@@ -8,7 +8,9 @@ use controller_api::GatewayEndpoint;
 use futures::StreamExt;
 use ids::{ReqId, SessionId, WorkerId};
 use runtime::server::ClientId;
-use tarpc::serde_transport::{tcp, unix};
+use tarpc::serde_transport::tcp;
+#[cfg(unix)]
+use tarpc::serde_transport::unix;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};
 use worker_api::{
@@ -37,12 +39,22 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .strip_prefix("unix://")
         .or_else(|| addr.strip_prefix("unix:"))
     {
-        let mut conn = unix::connect(path, dispatch_codec);
-        conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
-        let transport = conn
-            .await
-            .with_context(|| format!("dialing gateway at {addr}"))?;
-        connect_gateway_link(transport)
+        #[cfg(unix)]
+        {
+            let mut conn = unix::connect(path, dispatch_codec);
+            conn.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
+            let transport = conn
+                .await
+                .with_context(|| format!("dialing gateway at {addr}"))?;
+            connect_gateway_link(transport)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            anyhow::bail!(
+                "{addr}: a `unix://` gateway address is distributed serving, which needs a unix-domain socket; this build is single-node and speaks `tcp://`"
+            )
+        }
     } else {
         let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
         let mut conn = tcp::connect(tcp_addr, dispatch_codec);

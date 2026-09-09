@@ -16,7 +16,7 @@ on:
         type: string
         default: "nightly"
       desktop:
-        description: "Build the desktop GPU artifacts (Windows x86_64 CUDA, macOS arm64 Metal)"
+        description: "Build the desktop GPU artifacts (macOS arm64 Metal + wgpu, Windows x86_64 CUDA + Vulkan, Linux x86_64 Vulkan + wgpu)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -107,23 +107,83 @@ jobs:
             # libcudart.so.12 and six in .so.13, and a mismatch segfaults
             # inside the driver rather than returning an error.
             features: cuda
-            # nvcc builds one real+PTX arch; the PTX keeps the artifact
-            # forward-JIT-able on newer NVIDIA GPUs.
-            cuda_arch: "75"
+          - label: x86_64-linux-vulkan
+            runner: ubuntu-latest
+            platform: linux
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend: vulkan
+            features: vulkan
+          - label: aarch64-linux-vulkan
+            runner: ubuntu-large-arm64
+            platform: linux
+            triple: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            backend: vulkan
+            features: vulkan
+          - label: x86_64-windows-vulkan
+            runner: windows-latest
+            platform: windows
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+            backend: vulkan
+            features: vulkan
+          - label: x86_64-linux-wgpu
+            runner: ubuntu-latest
+            platform: linux
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend: wgpu
+            features: wgpu
+          - label: aarch64-macos-wgpu
+            runner: macos-15
+            platform: macos
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+            backend: wgpu
+            features: wgpu
     runs-on: ${{ matrix.target.runner }}
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target.triple }}
 
-      - name: Install build deps (macOS Metal only)
+      - name: Install build deps (macOS only)
         if: matrix.target.platform == 'macos'
         run: brew install cmake ninja libomp
+
+      - name: Install Slang (vulkan only)
+        if: matrix.target.backend == 'vulkan'
+        shell: bash
+        env:
+          SLANG_VERSION: '2026.17'
+        run: |
+          set -euxo pipefail
+          case "${{ matrix.target.triple }}" in
+            aarch64-*) slang_arch=aarch64 ;;
+            *)         slang_arch=x86_64 ;;
+          esac
+          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
+            asset="slang-${SLANG_VERSION}-windows-${slang_arch}.zip"
+          else
+            asset="slang-${SLANG_VERSION}-linux-${slang_arch}.tar.gz"
+          fi
+          url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/${asset}"
+          mkdir -p "${RUNNER_TEMP}/slang"
+          curl -fsSL -o "${RUNNER_TEMP}/${asset}" "$url"
+          if [[ "${asset}" == *.zip ]]; then
+            7z x -o"${RUNNER_TEMP}/slang" "${RUNNER_TEMP}/${asset}"
+            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc.exe" >> "$GITHUB_ENV"
+          else
+            tar xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/slang"
+            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc" >> "$GITHUB_ENV"
+          fi
+          "${RUNNER_TEMP}/slang/bin/slangc" -v || true
 
       - name: Install CUDA toolkit (windows cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
@@ -168,9 +228,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
-            export CMAKE_CUDA_ARCHITECTURES='${{ matrix.target.cuda_arch }}'
-          fi
           if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
             # ggml-cuda produces many long object paths. Keep the target root
             # short enough for the legacy 260-character path limit on Windows.
@@ -241,56 +298,40 @@ jobs:
           exit 1
 
   # =========================================================================
-  # Per-compute-capability CUDA matrix on GH-hosted larger runners with a
-  # manylinux_2_28 base — binaries with a glibc 2.28 floor (RHEL 8 / Ubuntu
-  # 20.04 / Debian 11).
+  # CUDA matrix on GH-hosted larger runners with a manylinux_2_28 base —
+  # binaries with a glibc 2.28 floor (RHEL 8 / Ubuntu 20.04 / Debian 11).
   #
-  # Matrix = compute-capability × CUDA-version × os-arch; each leg builds a
-  # SINGLE SM, so the build parallelizes (wall-clock ~= one arch, not a
-  # 6-arch fatbin) and each binary is small. The installer detects the GPU's
-  # compute capability and picks the matching asset. Built inside
-  # nvidia/cuda:X.Y-devel-rockylinux8 containers on ubuntu-large-{x64,arm64}.
+  # Matrix = CUDA-version × os-arch. Device code is compiled at runtime by
+  # NVRTC and cached on disk, so the binary carries no SM-specific code and
+  # one artifact per architecture serves every compute capability. Built
+  # inside nvidia/cuda:X.Y-devel-rockylinux8 containers on
+  # ubuntu-large-{x64,arm64}.
   # Opt-in via the `cuda_manylinux` workflow input.
   # =========================================================================
   cuda-manylinux:
     if: inputs.cuda_manylinux
     needs: prepare-release
-    name: cuda / ${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }} / cuda-${{ matrix.cuda.short }}
+    name: cuda / ${{ matrix.target.os_arch }} / cuda-${{ matrix.cuda.short }}
     runs-on: ${{ matrix.target.runner }}
-    # One compute-capability per job (not a 6-arch fatbin), so each leg is
-    # quick and the legs run in parallel across the larger runners. Keep a
-    # generous net for cold caches.
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # Per-compute-capability: CC × CUDA-version × os-arch. Each entry
-        # builds ONE arch. The installer detects the GPU's compute capability
-        # (nvidia-smi, or the PIE_CC override) and picks the matching asset.
         cuda:
           # One row today (CUDA 12 was cut; the driver floor is r580), kept
           # as a matrix axis rather than flattened, because the next CUDA
           # major re-enters as a second row.
           - { version: "13.0.0", short: "13.0", feature: cuda }
         target:
-          # x86_64: Ampere (80/86), Ada (89), Hopper (90), Blackwell DC (100) + consumer (120).
-          - { os_arch: x86_64,  cc: "80",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: x86_64,  cc: "86",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: x86_64,  cc: "89",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: x86_64,  cc: "90",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: x86_64,  cc: "100", runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: x86_64,  cc: "120", runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          # aarch64: Grace-Hopper (90), Grace-Blackwell (100).
-          - { os_arch: aarch64, cc: "90",  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
-          - { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
+          - { os_arch: x86_64,  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
+          - { os_arch: aarch64, runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
-      ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-linux-cuda${{ matrix.cuda.short }}-sm${{ matrix.target.cc }}.tar.gz
-      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.target.cc }}
+      ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-linux-cuda${{ matrix.cuda.short }}.tar.gz
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Bootstrap container
         shell: bash
@@ -308,6 +349,13 @@ jobs:
             cmake ninja-build \
             gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ \
             libnccl libnccl-devel
+          # `gh` so this job uploads the same way the desktop legs do. The
+          # `softprops/action-gh-release` step it replaces ignored `tag_name`
+          # inside this container and fell back to `github.ref`, a branch with
+          # no release, which the API then refused.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y --setopt=install_weak_deps=False gh
           # Pin compiler explicitly: `source enable` only adjusts PATH —
           # cmake-rs probes CC/CXX env vars and otherwise picks
           # `/usr/bin/cc` (gcc-8.5, no <span> / C++20). Same nvcc
@@ -341,8 +389,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: build-cuda-${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: build-cuda-${{ matrix.target.os_arch }}-sm${{ matrix.target.cc }}-${{ matrix.cuda.short }}-
+          key: build-cuda-${{ matrix.target.os_arch }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: build-cuda-${{ matrix.target.os_arch }}-${{ matrix.cuda.short }}-
 
       - name: cargo build (release-min)
         shell: bash
@@ -371,13 +419,23 @@ jobs:
           tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
           ls -la dist/
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.tag }}
-          files: dist/${{ env.ARTIFACT_NAME }}
-          fail_on_unmatched_files: true
-          make_latest: false
+      - name: Upload to release (--clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "dist/${ARTIFACT_NAME}"
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "${TAG}" "dist/${ARTIFACT_NAME}" --clobber --repo "${GITHUB_REPOSITORY}"; then
+              exit 0
+            fi
+            echo "upload attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
+            sleep $((attempt * 10))
+          done
+          echo "upload failed after retries" >&2
+          exit 1
 
   # =========================================================================
   # Refresh the release notes once after all builds finish.

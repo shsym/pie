@@ -79,13 +79,13 @@ pub(crate) fn fire_timing_now_us() -> u64 {
 }
 
 pub(crate) fn ledger_monotonic_ns() -> u64 {
-    let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) };
-    assert_eq!(status, 0, "CLOCK_MONOTONIC is unavailable");
-    let value = unsafe { value.assume_init() };
-    (value.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(value.tv_nsec as u64)
+    // `Instant` is the monotonic clock on every platform this ships to. The
+    // epoch is the first call rather than boot, which the ledger does not
+    // care about: every consumer reads these as deltas or as trace ordering,
+    // never against a wall clock or a device timestamp.
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn handle_registry() -> &'static RwLock<Vec<Option<SchedulerHandle>>> {
@@ -157,10 +157,8 @@ const DEFAULT_FRAME_SIZE: usize = 2;
 static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn configured_submit_depth() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .submit_depth()
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .submit_depth()
 }
 
 pub fn set_seal_default_ready(ready: bool) {
@@ -209,17 +207,13 @@ pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), Recon
 }
 
 pub fn channel_capacity() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .channel_capacity(configured_frame_size())
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .channel_capacity(configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .submit_depth()
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .submit_depth()
         * configured_frame_size()
 }
 
@@ -337,9 +331,8 @@ pub fn submit_async(
 }
 
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
-    crate::engine::get_spec(engine_idx).map_or(::engine::MemoryDomain::HostPinned, |s| {
-        s.device_domain
-    })
+    crate::engine::get_spec(engine_idx)
+        .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
 }
 
 pub(crate) fn nudge(engine_idx: usize) {

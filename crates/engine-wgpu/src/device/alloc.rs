@@ -327,8 +327,6 @@ impl FileWriter {
         for &(into, _, len) in jobs {
             self.slab.span(into, len)?;
         }
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
         let threads = threads.clamp(1, 16);
         let core = &self.slab.core;
         for &(into, from, len) in jobs {
@@ -343,7 +341,7 @@ impl FileWriter {
                     || (!piece.is_multiple_of(4) && at + piece == len && piece < 8)
                 {
                     let mut bytes = vec![0u8; piece as usize];
-                    pread_jobs(fd, &[(bytes.as_mut_ptr() as usize, src, piece)], 1)?;
+                    pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src, piece)], 1)?;
                     self.slab.write(dst, &bytes)?;
                     at += piece;
                     continue;
@@ -367,12 +365,12 @@ impl FileWriter {
                         split.push((base + off as usize, src + off, n));
                         off += n;
                     }
-                    pread_jobs(fd, &split, threads)?;
+                    pread_jobs(file, &split, threads)?;
                 }
                 if whole < piece {
                     let tail = piece - whole;
                     let mut bytes = vec![0u8; tail as usize];
-                    pread_jobs(fd, &[(bytes.as_mut_ptr() as usize, src + whole, tail)], 1)?;
+                    pread_jobs(file, &[(bytes.as_mut_ptr() as usize, src + whole, tail)], 1)?;
                     self.slab.write(dst + whole, &bytes)?;
                 }
                 at += piece;
@@ -382,7 +380,7 @@ impl FileWriter {
     }
 }
 
-fn pread_jobs(fd: i32, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()> {
+fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()> {
     let threads = threads.clamp(1, jobs.len().max(1));
     let per = jobs.len().div_ceil(threads).max(1);
     let failed: std::sync::Mutex<Option<Fault>> = std::sync::Mutex::new(None);
@@ -391,7 +389,7 @@ fn pread_jobs(fd: i32, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()>
             let failed = &failed;
             scope.spawn(move || {
                 for &(dst, from, len) in chunk {
-                    if let Err(why) = unsafe { pread_all(fd, dst as *mut u8, from, len) } {
+                    if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
                         *failed
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
@@ -410,30 +408,23 @@ fn pread_jobs(fd: i32, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()>
     }
 }
 
-unsafe fn pread_all(fd: i32, dst: *mut u8, from: u64, len: u64) -> Result<()> {
+unsafe fn pread_all(file: &std::fs::File, dst: *mut u8, from: u64, len: u64) -> Result<()> {
     let mut done = 0u64;
     while done < len {
         let want = usize::try_from(len - done)
             .unwrap_or(usize::MAX)
             .min(1 << 30);
-        let got = unsafe {
-            libc::pread(
-                fd,
-                dst.add(done as usize).cast::<libc::c_void>(),
-                want,
-                libc::off_t::try_from(from + done).unwrap_or(libc::off_t::MAX),
-            )
-        };
-        if got < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        // SAFETY: `dst + done` is `want` writable bytes inside the span.
+        let got = match unsafe { pread_chunk(file, dst.add(done as usize), from + done, want) } {
+            Ok(got) => got,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                return Err(Fault::Device {
+                    call: "pread",
+                    why: err.to_string(),
+                });
             }
-            return Err(Fault::Device {
-                call: "pread",
-                why: err.to_string(),
-            });
-        }
+        };
         if got == 0 {
             return Err(Fault::Device {
                 call: "pread",
@@ -443,4 +434,42 @@ unsafe fn pread_all(fd: i32, dst: *mut u8, from: u64, len: u64) -> Result<()> {
         done += got as u64;
     }
     Ok(())
+}
+/// Reads one positional chunk. Both arms are positional and leave the file
+/// cursor alone, so the worker threads may share one `&File`.
+#[cfg(unix)]
+unsafe fn pread_chunk(
+    file: &std::fs::File,
+    dst: *mut u8,
+    at: u64,
+    want: usize,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `dst` is `want` writable bytes the caller vouches for.
+    let got = unsafe {
+        libc::pread(
+            file.as_raw_fd(),
+            dst.cast::<libc::c_void>(),
+            want,
+            libc::off_t::try_from(at).unwrap_or(libc::off_t::MAX),
+        )
+    };
+    if got < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(got as usize)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn pread_chunk(
+    file: &std::fs::File,
+    dst: *mut u8,
+    at: u64,
+    want: usize,
+) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    // SAFETY: `dst` is `want` writable bytes the caller vouches for.
+    let buf = unsafe { std::slice::from_raw_parts_mut(dst, want) };
+    file.seek_read(buf, at)
 }

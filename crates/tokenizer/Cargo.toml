@@ -35,3 +35,6 @@ harness = false
 [[bench]]
 name = "tiktoken"
 harness = false
+
+[lints]
+workspace = true

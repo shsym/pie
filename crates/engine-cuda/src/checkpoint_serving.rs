@@ -207,8 +207,33 @@ enum Failed {
     Rotten(String),
 }
 
-pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> {
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, at)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        match file.seek_read(&mut buf[done..], at + done as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the spill file ends inside a block",
+                ));
+            }
+            Ok(n) => done += n,
+            Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(why) => return Err(why),
+        }
+    }
+    Ok(())
+}
+
+pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> {
 
     let file = std::fs::File::open(&refill.path)
         .map_err(|why| format!("{}: {why}", refill.path.display()))?;
@@ -291,7 +316,7 @@ pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> 
                                 &mut scratch[..len]
                             }
                         };
-                        if let Err(why) = file.read_exact_at(bytes, at) {
+                        if let Err(why) = read_exact_at(&file, bytes, at) {
                             outcome = Err(Failed::Read(format!("read at {at}: {why}")));
                             break;
                         }
@@ -376,6 +401,7 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn checkpoint_serving_every_case() {
         a_plane_is_found_by_its_name_and_not_by_where_it_sits();
         a_reservation_wider_than_the_plane_is_answered_inside_the_mapping();
@@ -383,7 +409,6 @@ mod tests {
         an_ordinary_checkpoint_is_not_a_serving_artifact();
     }
 
-    #[test]
     fn a_plane_is_found_by_its_name_and_not_by_where_it_sits() {
         let dir = tmp("byname");
         let path = dir.join("m.zt");

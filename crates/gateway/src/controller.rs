@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use controller_api::{Ack, ControlClient, GatewayInfo, RoutingTable};
 use ids::{GatewayId, NodeId};
-use tarpc::serde_transport::{tcp, unix};
+use tarpc::serde_transport::tcp;
+#[cfg(unix)]
+use tarpc::serde_transport::unix;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
@@ -104,10 +106,20 @@ pub(crate) async fn connect_controller(addr: &str) -> Result<ControlClient> {
         .strip_prefix("unix://")
         .or_else(|| addr.strip_prefix("unix:"))
     {
-        let conn = unix::connect(path, Bincode::default)
-            .await
-            .with_context(|| format!("dialing controller at {addr}"))?;
-        Ok(ControlClient::new(cfg, conn).spawn())
+        #[cfg(unix)]
+        {
+            let conn = unix::connect(path, Bincode::default)
+                .await
+                .with_context(|| format!("dialing controller at {addr}"))?;
+            Ok(ControlClient::new(cfg, conn).spawn())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, cfg);
+            anyhow::bail!(
+                "{addr}: a `unix://` control address is distributed serving, which needs a unix-domain socket; this build is single-node and speaks `tcp://`"
+            )
+        }
     } else {
         let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
         let conn = tcp::connect(tcp_addr, Bincode::default)

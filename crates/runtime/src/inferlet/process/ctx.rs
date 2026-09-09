@@ -4,12 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
-use wasmtime_wasi_http::p3::{
-    WasiHttpCtxView as P3WasiHttpCtxView, WasiHttpHooks, WasiHttpView as P3WasiHttpView,
-};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use super::ProcessId;
 use super::output::LogStream;
@@ -83,16 +79,6 @@ impl WasiView for ProcessCtx {
     }
 }
 
-impl WasiHttpView for ProcessCtx {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: &mut self.http_ctx,
-            table: &mut self.resource_table,
-            hooks: Default::default(),
-        }
-    }
-}
-
 pub struct PieHttpHooks {
     network_allowed: bool,
 }
@@ -104,9 +90,9 @@ impl WasiHttpHooks for PieHttpHooks {
     }
 }
 
-impl P3WasiHttpView for ProcessCtx {
-    fn http(&mut self) -> P3WasiHttpCtxView<'_> {
-        P3WasiHttpCtxView {
+impl WasiHttpView for ProcessCtx {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
             ctx: &mut self.http_ctx,
             table: &mut self.resource_table,
             hooks: &mut self.http_hooks,
@@ -153,7 +139,7 @@ impl ProcessCtx {
             std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
 
             builder
-                .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
+                .preopened_dir(&scratch_dir, "/scratch", FsPerms::ReadWrite)
                 .expect("failed to preopen scratch dir");
             Some(scratch_dir)
         } else {
@@ -172,25 +158,15 @@ impl ProcessCtx {
                 .env("PYTHONUNBUFFERED", "1");
 
             builder
-                .preopened_dir(
-                    runtime_dir.join("python"),
-                    "python",
-                    DirPerms::READ,
-                    FilePerms::READ,
-                )
+                .preopened_dir(runtime_dir.join("python"), "python", FsPerms::ReadOnly)
                 .expect("failed to preopen python dir");
 
             builder
-                .preopened_dir(
-                    runtime_dir.join("bundled"),
-                    "bundled",
-                    DirPerms::READ,
-                    FilePerms::READ,
-                )
+                .preopened_dir(runtime_dir.join("bundled"), "bundled", FsPerms::ReadOnly)
                 .expect("failed to preopen bundled dir");
 
             builder
-                .preopened_dir(site_packages_dir, "0", DirPerms::READ, FilePerms::READ)
+                .preopened_dir(site_packages_dir, "0", FsPerms::ReadOnly)
                 .expect("failed to preopen site-packages dir");
         }
 

@@ -20,3 +20,6 @@ default = []
 [dependencies]
 
 dtype = { path = "../dtype" }
+
+[lints]
+workspace = true

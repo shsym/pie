@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -81,7 +80,8 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
                 args.source,
                 if known.is_empty() {
                     "this build knows no head for that target — pass the head with `--aux` and \
-                     the row with `--sku`".to_string()
+                     the row with `--sku`"
+                        .to_string()
                 } else {
                     format!("it knows {}", known.join(", "))
                 }
@@ -798,7 +798,7 @@ fn stage_overlay(head: &Source, out_file: &Path) -> Result<Overlay> {
             .ok_or_else(|| anyhow!("'{}' points at a file the overlay lacks", raw.name))?;
         let mut bytes = vec![0u8; usize::try_from(raw.span_bytes)?];
         std::fs::File::open(&file.path)
-            .and_then(|f| f.read_exact_at(&mut bytes, raw.file_offset))
+            .and_then(|f| read_exact_at(&f, &mut bytes, raw.file_offset))
             .with_context(|| format!("cannot read '{}' from {}", raw.name, file.path))?;
         let decl = TensorDecl {
             id: TensorId(u32::try_from(id)?),
@@ -1069,6 +1069,32 @@ fn remove_cache_file(path: &Path) -> Result<()> {
 }
 
 use checkpoint::consume::{SourceLedger, release};
+
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, at)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        match file.seek_read(&mut buf[done..], at + done as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the checkpoint ends inside a span",
+                ));
+            }
+            Ok(n) => done += n,
+            Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(why) => return Err(why),
+        }
+    }
+    Ok(())
+}
 
 pub(crate) struct Spool {
     path: PathBuf,
@@ -1469,7 +1495,8 @@ pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
         if !path.exists() {
             continue;
         }
-        let raw = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let raw =
+            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         serde_json::from_slice::<serde_json::Value>(&raw)
             .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
         return Ok(Some(raw));
@@ -1958,7 +1985,7 @@ fn read_chunk<'a>(
                 .open(chunk.path)?,
         ),
     };
-    file.read_exact_at(&mut buffer[..chunk.len], chunk.offset)?;
+    read_exact_at(file, &mut buffer[..chunk.len], chunk.offset)?;
     if let Some(ledger) = consume
         && ledger.last_read(Path::new(chunk.path), chunk.offset, chunk.len as u64)
     {
@@ -2046,6 +2073,7 @@ impl TensorSink for Handoff<'_> {
 mod tests {
     use super::*;
 
+    #[test]
     fn import_every_case() {
         a_banks_planes_publish_in_schedule_order_not_declaration_order();
         the_dry_run_states_one_checkpoint_of_peak_when_the_decode_releases();
@@ -2057,7 +2085,6 @@ mod tests {
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
     }
 
-    #[test]
     fn a_banks_planes_publish_in_schedule_order_not_declaration_order() {
         use checkpoint::types::{BufferId, DType, InstrId};
 
@@ -2157,6 +2184,7 @@ mod tests {
         assert_eq!(store_archive_name(Path::new("archive.zt")), None);
     }
 
+    #[cfg(unix)]
     fn a_destination_that_is_the_source_is_recognized_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("archive.zt");

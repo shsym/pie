@@ -482,13 +482,9 @@ fn available_memory() -> u64 {
 }
 
 struct SpillArena {
-    at: *mut u8,
+    map: memmap2::MmapMut,
     len: usize,
 }
-
-// SAFETY: `at` is a private MAP_SHARED mapping this struct alone owns; the
-// file behind it is unlinked at creation, so no other process can reach it.
-unsafe impl Send for SpillArena {}
 
 impl SpillArena {
     fn new(len: usize) -> Result<SpillArena> {
@@ -510,41 +506,18 @@ impl SpillArena {
                 "the arena spill file does not grow to {len} bytes: {why}"
             )))
         })?;
-        // SAFETY: a fresh shared mapping over a file this fn just created and
-        // sized; length and protections are stated, fd may close after mmap.
-        let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len.max(1),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(Fault::Load(checkpoint::error::Error::Checkpoint(
-                "the arena spill file does not map".to_string(),
-            )));
-        }
-        Ok(SpillArena {
-            at: at.cast(),
-            len,
-        })
+        // SAFETY: a fresh shared mapping over a file this fn just created,
+        // sized, and unlinked, so no other process can reach it.
+        let map = unsafe { memmap2::MmapMut::map_mut(&file) }.map_err(|why| {
+            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+                "the arena spill file does not map: {why}"
+            )))
+        })?;
+        Ok(SpillArena { map, len })
     }
 
     fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: the mapping is `len` writable bytes this struct owns.
-        unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
-    }
-}
-
-impl Drop for SpillArena {
-    fn drop(&mut self) {
-        // SAFETY: unmapping the mapping this struct created.
-        unsafe {
-            libc::munmap(self.at.cast(), self.len.max(1));
-        }
+        &mut self.map[..self.len]
     }
 }
 

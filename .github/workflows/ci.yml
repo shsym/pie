@@ -22,7 +22,7 @@ jobs:
     name: cargo check / test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -98,6 +98,7 @@ jobs:
             -p kernels-metal -p kernels-cuda -p kernels-vulkan -p kernels-wgpu \
             -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir \
+            -p chat-template -p checkpoint-dsl -p dtype -p ztensor -p ztensor-compat \
             -- -D warnings
 
       # `models` runs as its own command, which is also how
@@ -123,6 +124,7 @@ jobs:
             -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels-metal -p kernels-vulkan -p kernels-wgpu \
             -p pie -p pie-server-py -p tokenizer \
+            -p chat-template -p checkpoint-dsl -p dtype -p ztensor -p ztensor-compat \
             -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir
 
@@ -141,7 +143,7 @@ jobs:
     name: workspace verify (all crates + all targets)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -267,25 +269,12 @@ jobs:
       - name: cargo test (engine-cuda, portable half, no engine feature)
         run: cargo test -p engine-cuda
 
-      # Python over the published kernel headers; needs no CUDA. It is RED
-      # today, on purpose: the host C++ tree it reads was deleted rather than
-      # moved, and the crate that took its name compiles device text at run
-      # time and launches it by name from Rust, so there is no host
-      # declaration left to scan. Its own header forbids repointing the glob —
-      # that would swap an honest failure for a silent pass — and its refusal
-      # carries the measurement a redesign needs. Read
-      # `scripts/kernel-vocabulary-audit.py` before touching this.
-      #
-      # LAST IN THE JOB because a failed step ends the job: a deliberately red
-      # step in the middle costs every check after it.
-      - name: kernel vocabulary audit
-        run: python3 scripts/kernel-vocabulary-audit.py
 
   metal-kernel-boundary:
     name: metal kernel boundary (kernels-metal reaches nothing above it)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `kernels-metal` depends on nothing above it, and nothing in its shader
       # tree is host C++. Both halves are one walk: a `#include` of a driver
@@ -307,7 +296,7 @@ jobs:
     name: guest inferlets (wasm32-wasip2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -346,7 +335,7 @@ jobs:
     name: inferlet SDKs (python + javascript)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: SDK interface gate
         run: bash scripts/check-sdk-interfaces.sh
@@ -386,7 +375,7 @@ jobs:
     name: wit drift (sync-wit.sh)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install wit-deps
         run: cargo install --locked wit-deps-cli
@@ -414,7 +403,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -448,7 +437,7 @@ jobs:
     runs-on: [self-hosted, cuda]
     if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

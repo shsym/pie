@@ -582,14 +582,60 @@ impl Drop for Pinned {
                 unsafe {
                     let _ = cudarc::runtime::sys::cudaHostUnregister(self.host.cast());
                 }
-                // SAFETY: unmapping the mapping `Pinning::uninit` made, once.
-                unsafe {
-                    libc::munmap(self.host.cast(), self.bytes.max(1));
-                }
+                unmap_anon(self.host, self.bytes);
             }
             #[cfg(not(feature = "cuda"))]
             Origin::Allocated => {}
         }
+    }
+}
+
+#[cfg(unix)]
+fn map_anon(bytes: usize) -> Option<*mut u8> {
+    // SAFETY: a fresh private anonymous mapping of a stated length; no fd and
+    // no offset are involved, and the pages belong to nobody else.
+    let at = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if at == libc::MAP_FAILED { None } else { Some(at.cast()) }
+}
+
+#[cfg(unix)]
+fn unmap_anon(at: *mut u8, bytes: usize) {
+    // SAFETY: unmapping a mapping `map_anon` made, exactly once.
+    unsafe {
+        libc::munmap(at.cast(), bytes.max(1));
+    }
+}
+
+#[cfg(windows)]
+fn map_anon(bytes: usize) -> Option<*mut u8> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: a fresh committed reservation of a stated length, owned by nobody else.
+    let at = unsafe {
+        VirtualAlloc(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if at.is_null() { None } else { Some(at.cast()) }
+}
+
+#[cfg(windows)]
+fn unmap_anon(at: *mut u8, _bytes: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    // SAFETY: releasing a reservation `map_anon` made, exactly once.
+    unsafe {
+        VirtualFree(at.cast(), 0, MEM_RELEASE);
     }
 }
 
@@ -604,31 +650,17 @@ unsafe impl Send for Pinning {}
 
 impl Pinning {
     pub fn uninit(bytes: usize) -> Result<Pinning> {
-        // SAFETY: a fresh private anonymous mapping of a stated length; no fd and no offset are involved, and the pages belong to nobody else.
-        let at = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                bytes.max(1),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
+        let Some(at) = map_anon(bytes) else {
             return Err(Fault::Device {
                 call: "mmap",
                 code: -1,
             });
-        }
+        };
         #[cfg(target_os = "linux")]
         unsafe {
-            libc::madvise(at, bytes.max(1), libc::MADV_HUGEPAGE)
+            libc::madvise(at.cast(), bytes.max(1), libc::MADV_HUGEPAGE)
         };
-        Ok(Pinning {
-            host: at.cast(),
-            bytes,
-        })
+        Ok(Pinning { host: at, bytes })
     }
 
     #[must_use]
@@ -684,10 +716,7 @@ impl Pinning {
 
 impl Drop for Pinning {
     fn drop(&mut self) {
-        // SAFETY: unmapping the mapping `Pinning::uninit` made, exactly once — `lock` forgets the value rather than reaching here.
-        unsafe {
-            libc::munmap(self.host.cast(), self.bytes.max(1));
-        }
+        unmap_anon(self.host, self.bytes);
     }
 }
 
