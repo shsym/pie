@@ -1,6 +1,6 @@
 [package]
 name = "text-completion"
-version = "0.1.0"
+version = "0.3.0"
 description = "Greedy text completion, host-driven — the serving door's end-to-end fixture"
 authors = ["Pie Team"]
 
