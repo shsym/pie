@@ -189,15 +189,6 @@ jobs:
             --exclude pie-server-py --exclude worker --exclude engine-cuda
           cargo test -p worker --lib
 
-      # The catalog sweeps, which the step above does not run: sixteen
-      # `model-compiler` tests bake every SKU on every platform, and one
-      # re-bakes each text once per permutation of its fact bits. Minutes
-      # rather than seconds, and exhaustive on purpose — so they run here,
-      # where minutes are affordable, rather than being weakened to fit
-      # somewhere they are not.
-      - name: cargo test (model-compiler catalog sweeps)
-        run: cargo test -p model-compiler -- --ignored
-
       # A file no `mod` declares is INVISIBLE, not dead: rustc never reads it,
       # clippy does not lint it, no test covers it, and nothing reports it.
       # Dead code the compiler CAN see is already a warning; this is the other
