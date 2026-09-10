@@ -63,6 +63,14 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.engine);
+        if let Some(refusal) = past_the_seat(
+            ws.page_len().unwrap_or(0),
+            u64::from(pages),
+            stores.context_pages,
+            stores.kv_page_size,
+        ) {
+            return Ok(Err(refusal));
+        }
         let range = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.reserve(ws.id, pages as u64)
         });
@@ -257,4 +265,25 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         ws.release();
         Ok(())
     }
+}
+
+/// A claim that would take the working set past what the engine seats in one
+/// sequence is refused here, before any pages are pumped: a fire refused later
+/// at submit has already fouled the pipeline.
+fn past_the_seat(have: u64, asked: u64, seat_pages: u64, page_size: u32) -> Option<String> {
+    if seat_pages == 0 {
+        return None;
+    }
+    let want = have.saturating_add(asked);
+    if want <= seat_pages {
+        return None;
+    }
+    let tokens = |pages: u64| pages.saturating_mul(u64::from(page_size));
+    Some(format!(
+        "this working set would hold {want} pages ({} tokens) and this engine seats \
+         {seat_pages} pages ({} tokens) in one sequence; raise `[engine] max_model_len` \
+         or send fewer tokens",
+        tokens(want),
+        tokens(seat_pages),
+    ))
 }
