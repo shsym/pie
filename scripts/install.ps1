@@ -5,7 +5,8 @@
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.5.0).
-#   PIE_FLAVOR        cuda (the only published Windows build; native CUDA, default).
+#   PIE_FLAVOR        cuda (native CUDA, needs an NVIDIA GPU; default) or vulkan
+#                     (any Vulkan 1.2 device).
 #   PIE_INSTALL_DIR   Install location for pie.exe (default: %LOCALAPPDATA%\Pie\bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
