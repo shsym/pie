@@ -63,7 +63,8 @@ fn plus_one(op: &Operation) -> bool {
 }
 
 /// Gemma 4's attention prologue: split the packed qkv row, norm q and k per
-/// head and v without a scale, rotate q and k, and write k and v to the cache.
+/// head and v without a scale, rotate q and k (proportionally on a global
+/// layer), and write k and v to the cache.
 fn qkv_qknorm_rope_vnorm_write() -> Rule {
     let rope = |partial: bool| {
         template(move |p| {
@@ -75,7 +76,8 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
             let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [W]), d, eps);
             let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [W]), d, eps);
             let (q, k) = if partial {
-                elemwise::rope_partial(&q, &k, &positions, p.u32("rotary"), d, theta)
+                let span = Some(p.u32("span"));
+                elemwise::rope_partial(&q, &k, &positions, p.u32("rotary"), d, theta, span)
             } else {
                 elemwise::rope_full(&q, &k, &positions, d, theta, false)
             };
@@ -114,6 +116,7 @@ fn qkv_qknorm_rope_vnorm_write() -> Rule {
             && rotary > 0
             && rotary <= d
             && rotary % 2 == 0
+            && m.get_u32("span").is_none_or(|span| span == d / 2)
             && m.u32("kv_width") % d == 0
     })
 }
@@ -457,8 +460,8 @@ fn rmsnorm_rope_partial_q() -> Rule {
         let y =
             elemwise::rmsnorm_per_head(&p.rows("x", W), &p.weight("weight", [W]), d, p.f32("eps"));
         p.name("y", &y);
-        let q_out =
-            elemwise::rope_partial_q(&y, &positions, p.u32("rotary_dim"), d, p.f32("theta"));
+        let (rotary_dim, theta, span) = (p.u32("rotary_dim"), p.f32("theta"), p.u32("span"));
+        let q_out = elemwise::rope_partial_q(&y, &positions, rotary_dim, d, theta, Some(span));
         p.export("q_out", &q_out);
     });
     Rule::new("elementwise.rmsnorm_rope_partial_q", [pattern], |m| {
@@ -470,6 +473,7 @@ fn rmsnorm_rope_partial_q() -> Rule {
             positions: m.value("positions"),
             rotary_dim: m.u32("rotary_dim"),
             theta: m.f32("theta"),
+            span: m.u32("span"),
             y: m.value("y"),
             q_out: m.value("q_out"),
         }

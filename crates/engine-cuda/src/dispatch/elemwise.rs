@@ -178,6 +178,7 @@ impl Run<'_> {
                 positions,
                 rotary_dim,
                 theta,
+                span,
                 y,
                 q_out: _,
             } => elemwise::rope::rmsnorm_rope_partial_q(
@@ -189,6 +190,7 @@ impl Run<'_> {
                 self.tensor(*positions),
                 *rotary_dim,
                 *theta,
+                *span,
                 &mut self.tensor(*y),
             ),
             Fused::NormModulate {
@@ -485,6 +487,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                span,
                 q_out: _,
                 k_out: _,
             } => elemwise::rope::partial(
@@ -495,6 +498,7 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
                 *theta,
+                *span,
             ),
             Elementwise::RopeMrope {
                 q,
@@ -531,6 +535,7 @@ impl Run<'_> {
                 rotary_dim,
                 head_dim,
                 theta,
+                span,
                 q_out: _,
             } => elemwise::rope::partial_q(
                 self.ctx(),
@@ -539,6 +544,7 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
                 *theta,
+                *span,
             ),
             Elementwise::RopePartialLast {
                 q,

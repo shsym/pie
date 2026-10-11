@@ -1875,7 +1875,15 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "elemwise",
         name: "rope_partial",
-        params: &["q", "k", "positions", "rotary_dim", "head_dim", "theta"],
+        params: &[
+            "q",
+            "k",
+            "positions",
+            "rotary_dim",
+            "head_dim",
+            "theta",
+            "span",
+        ],
         call: |a, heap| {
             let q: Value = a.next()?;
             let k: Value = a.next()?;
@@ -1883,10 +1891,13 @@ pub(crate) static OPS: &[Op] = &[
             let rotary_dim: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
+            let span: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_partial", || {
-                    ops::elemwise::rope_partial(&q, &k, &positions, rotary_dim, head_dim, theta)
+                    ops::elemwise::rope_partial(
+                        &q, &k, &positions, rotary_dim, head_dim, theta, span,
+                    )
                 })?,
             )
         },
@@ -1894,17 +1905,18 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "elemwise",
         name: "rope_partial_q",
-        params: &["q", "positions", "rotary_dim", "head_dim", "theta"],
+        params: &["q", "positions", "rotary_dim", "head_dim", "theta", "span"],
         call: |a, heap| {
             let q: Value = a.next()?;
             let positions: Value = a.next()?;
             let rotary_dim: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
             let theta: f32 = a.next()?;
+            let span: Option<u32> = a.next()?;
             result(
                 heap,
                 dsl("elemwise.rope_partial_q", || {
-                    ops::elemwise::rope_partial_q(&q, &positions, rotary_dim, head_dim, theta)
+                    ops::elemwise::rope_partial_q(&q, &positions, rotary_dim, head_dim, theta, span)
                 })?,
             )
         },
