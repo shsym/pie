@@ -1,8 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
@@ -61,7 +58,9 @@ pub fn composed() -> Vec<Fire> {
                 }
             }
             for bm in RT_ROW_TILES {
-                out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm)));
+                for k16 in [false, true] {
+                    out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm, k16)));
+                }
             }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
@@ -126,8 +125,11 @@ pub fn qmm_name(
 const RT_ROW_TILES: [i32; 2] = [32, 64];
 const RT_COLS: u32 = 64;
 
-fn qmm_rt_name(group: i32, bits: i32, bm: i32) -> &'static str {
-    symbol(&format!("affine_qmm_rt_bf16_gs_{group}_b_{bits}_bm_{bm}"))
+fn qmm_rt_name(group: i32, bits: i32, bm: i32, k16: bool) -> &'static str {
+    let block = if k16 { "_k16" } else { "" };
+    symbol(&format!(
+        "affine_qmm_rt{block}_bf16_gs_{group}_b_{bits}_bm_{bm}"
+    ))
 }
 
 /// The one-row point loads 128 bits of codes at once, which must stay
@@ -333,19 +335,7 @@ pub fn qmv_grid(op: &'static str, vecs: i32, out_vec_size: i32) -> Result<[u32; 
     Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
 }
 
-fn symbol(name: &str) -> &'static str {
-    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut map = INTERNED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = map.get(name) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    map.insert(name.to_owned(), leaked);
-    leaked
-}
+use crate::encode::symbol;
 
 pub struct Scratch<'a> {
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
@@ -473,7 +463,7 @@ pub fn act_x_wt(
         let bm = if m > 32 { 64 } else { 32 };
         let rows = (m as u32).div_ceil(bm as u32);
         return ctx.fire(
-            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm)).apply(Grid::of(
+            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm, tuned.qmm_rt_k16)).apply(Grid::of(
                 [
                     (n as u32).div_ceil(RT_COLS) * (RT_COLS / 4),
                     rows * (bm as u32 / 4),

@@ -81,6 +81,8 @@ pub struct DeviceTuning {
     /// Batched quantized projections on the register-tiled point (a 4x4
     /// block per invocation) rather than the plain tiled one.
     pub qmm_register_tiles: bool,
+    /// A 16-wide K block on the register-tiled point; faster on PowerVR (2.5x) and Adreno.
+    pub qmm_rt_k16: bool,
 
     /// A one-row quantized projection (decode) on the 128-bit-load point
     /// that folds with subgroup shuffles; needs subgroups of 32 or more.
@@ -116,6 +118,7 @@ impl Default for DeviceTuning {
             sdpa_split_groups: 128,
             sdpa_split_min_keys: 256,
             qmm_register_tiles: false,
+            qmm_rt_k16: true,
             qmv_one_row: false,
             qmv_one_row_lanes: 32,
             qmv_one_row_rows: 1,
@@ -149,6 +152,7 @@ impl DeviceTuning {
         // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
         // carrying two rows each.
         if info.vendor == Vendor::Imagination {
+            t.qmm_register_tiles = true;
             t.qmv_one_row = info.subgroup_size >= 32;
             t.qmv_one_row_lanes = 8;
             t.qmv_one_row_rows = 2;
@@ -182,6 +186,7 @@ impl DeviceTuning {
             sdpa_split_groups,
             sdpa_split_min_keys,
             qmm_register_tiles,
+            qmm_rt_k16,
             qmv_one_row,
             qmv_one_row_lanes,
             qmv_one_row_rows,
@@ -227,6 +232,7 @@ pub struct Overrides {
     pub sdpa_split_groups: Option<u32>,
     pub sdpa_split_min_keys: Option<u32>,
     pub qmm_register_tiles: Option<bool>,
+    pub qmm_rt_k16: Option<bool>,
     pub qmv_one_row: Option<bool>,
     pub qmv_one_row_lanes: Option<u32>,
     pub qmv_one_row_rows: Option<u32>,
