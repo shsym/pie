@@ -98,7 +98,17 @@ impl Context {
     }
 
     #[must_use]
-    pub fn info(&self) -> kernels_wgpu::DeviceInfo {
+    pub fn chip(&self) -> crate::chip::Device {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn storage_buffers(&self) -> u32 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn workgroup_limits(&self) -> (u32, u32) {
         match self.never {}
     }
 

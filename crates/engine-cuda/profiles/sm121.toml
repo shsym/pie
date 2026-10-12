@@ -1,0 +1,9 @@
+api = 1
+
+[target]
+tier    = "sm_121"
+assumes = { cc = 121 }
+
+[kernel]
+gemv.bf16 = "narrow"
+mla.path  = "naive"

@@ -16,8 +16,6 @@ use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-const BUDGET: i64 = 1 << 24;
-
 /// For request `r < requests` (lane `r` of the pool and segment `r` of
 /// `q.indptr`) and query head `h`, slab row
 /// `(lane_offset + r) · plane_stride + plane + h` becomes the mean, over the
@@ -121,6 +119,7 @@ pub fn capture(
         let qv = cx.read(q.data)?;
         let keys = cx.read(pool.keys)?;
         let slab = cx.read(scores)?;
+        let budget = cx.tuning().chunks.budget;
         let f = cx.func();
         let geom = geometry(
             f,
@@ -163,7 +162,7 @@ pub fn capture(
         };
         let c = {
             let width = (h.kvh * h.d).max(ob * h.qh());
-            let c = (BUDGET / (nr * width)).max(8);
+            let c = (budget / (nr * width)).max(8);
             let c = if c <= 1 {
                 1
             } else {

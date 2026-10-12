@@ -24,6 +24,11 @@
 //!   activation rows in that order, decode the whole bank to bf16 once and
 //!   run one `chlo.ragged_dot`, then un-permute with the inverse sort.
 //!
+//! Where the bank is plain (bf16, or pre-scaled f8, no group factors) and a
+//! block of it fits VMEM, the grouped-matmul kernel (`crate::mosaic::gmm`)
+//! is preferred over all of these past the slice case. `kernel.moe.path`
+//! may force any formulation.
+//!
 //! The bytes floor is the active experts' bytes: at batch 64 with top-4 of
 //! 32 experts and diverse tokens nearly every expert is active and the
 //! whole bank streams (e5m2: ~0.55 ms a gpt-oss layer on v6e). An exact
@@ -46,6 +51,7 @@ use crate::linear::quant::{
     Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
 };
 use crate::tensor::{Bank, Tensor};
+use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
 
@@ -697,53 +703,6 @@ pub fn group_routes(ctx: &Ctx<'_>, groups: u32, routes: Tensor) -> Result<(), Er
 
 // ------------------------------------------------------------ expert compute
 
-/// Up to this many f32 partials (`rows · experts · N`, times the group count
-/// for a codes bank) a routed matmul runs every activation row against every
-/// expert in one dot and picks each pair's row: the whole bank streams
-/// through the MXU once with only a free convert in front of it (measured on
-/// v6e: gpt-oss's 32-expert gate/up bank in 0.45 ms pre-scaled, at HBM
-/// speed). Past it, the pairs are sorted by expert into one ragged dot over
-/// the bank decoded to bf16.
-const DENSE_ALL: i64 = 1 << 27;
-
-/// What multiplying one expert sliced out of the bank costs at least, in
-/// bank bytes streamed: a dot over a dynamic slice of an expert's rows runs
-/// ~15 us on v6e however small the expert (measured: gpt-oss's 16.6 MB
-/// gate/up expert at the HBM rate, its 8.3 MB down expert in the same time).
-/// Independent slices overlap; a loop over them pays this per step.
-const SLICE_BYTES: i64 = 18 << 20;
-
-/// Up to this many routed pairs, a fire slices each pair's expert out and
-/// multiplies its row alone (one or two tokens' fan-out), when that costs
-/// less than streaming the bank (gpt-oss at one token: 0.11 ms a layer
-/// against 0.67 ms for the banks).
-const SLICE_PAIRS: i64 = 8;
-
-/// What one row tile of the loop over active experts costs, in
-/// nanoseconds (v6e, gpt-oss at 64 tokens, real routing): an expert's dot
-/// over a dynamic slice of the bank runs at the HBM rate (~1,200 bytes a ns)
-/// but not under ~14 us, whatever the expert (its 8.3 MB down expert takes
-/// 14.6 us, its 16.6 MB gate/up expert 13.8 us).
-const LOOP_TILE_NS: i64 = 14_000;
-const LOOP_ROW_NS: i64 = 10;
-
-/// What streaming the whole bank through one dot costs, in nanoseconds:
-/// the bank at ~1,450 bytes a ns plus ~5.5 ps a partial (every row
-/// against every expert, then picked; the pick relayouts them), measured
-/// as for the loop (gate/up at 64 rows 0.38 ms, down at 256 rows 0.33 ms).
-const WHOLE_BYTES_PER_NS: i64 = 1_450;
-const WHOLE_PARTIAL_FS: i64 = 5_500;
-
-thread_local! {
-    /// Tiles the loop over active experts multiplies per step
-    /// (`PIE_XLA_MOE_UNROLL`, default 2).
-    static LOOP_UNROLL: i64 = std::env::var("PIE_XLA_MOE_UNROLL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&u: &i64| (1..=8).contains(&u))
-        .unwrap_or(2);
-}
-
 /// How an expert bank is stored. Every form is expert-major and flat:
 /// expert `e`, output row `n`, contracted column `k` sits at `(e*N + n)*K + k`
 /// (one scale/zero point per `group` codes of a row), however the engine
@@ -1059,10 +1018,6 @@ fn ragged_dot(cx: &mut Cx<'_>, x: Val, w: Val, sizes: Val) -> Result<Val, Error>
     Ok(cx.op_named("chlo.ragged_dot", &[x, w, sizes], attrs, vec![out])[0])
 }
 
-/// Rows of one tile of the grouped matmul kernel (bf16 rows pack in pairs
-/// of sublanes: 16 is the least whole tile).
-const GMM_TM: i64 = 16;
-
 /// `table[ids]` for a short i32 `table` (`[E]`) and `[n]` i32 `ids` in
 /// range, as a one-hot select and sum: XLA lowers a gather from a table this
 /// small to a serial chain of scalar selects (v6e: ~40 us over 768 ids).
@@ -1080,7 +1035,7 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 
 /// The grouped-matmul kernel (`crate::mosaic::gmm`) for this bank, when its
 /// weights are plain (bf16 or pre-scaled f8, no group factors) and a block
-/// of them fits VMEM. `PIE_XLA_MOE_GMM=0` turns it off.
+/// of them fits VMEM, unless the profile's `kernel.moe.path` rules it out.
 ///
 /// It reads each routed expert once, at the DMA rate (~1.4 TB/s), with no
 /// per-expert launch. vLLM-TPU's `gmm_v2` streams the same experts in the
@@ -1092,10 +1047,9 @@ fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
 /// Keep the XLA around the call free of gathers from short tables
 /// (`pick_small`) and of per-row column offsets: XLA lowers both to serial
 /// scalar code, which cost more than the kernel saved.
-fn gmm_spec(fan: Fan, bank: &Read, elem: Elem) -> Option<crate::mosaic::gmm::Gmm> {
+fn gmm_spec(fan: Fan, bank: &Read, elem: Elem, tuning: Tuning) -> Option<crate::mosaic::gmm::Gmm> {
     use crate::mosaic::gmm::{Gmm, Orient};
-    let off = std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0")
-        && !std::env::var("PIE_XLA_MOE_PATH").is_ok_and(|v| v == "gmm");
+    let off = !tuning.moe_gmm();
     if off
         || bank.factor.is_some()
         || !matches!(bank.codes, Codes::Weights(_))
@@ -1104,10 +1058,13 @@ fn gmm_spec(fan: Fan, bank: &Read, elem: Elem) -> Option<crate::mosaic::gmm::Gmm
         return None;
     }
     let (p, e) = (fan.pairs(), fan.experts);
+    let tm = tuning.moe_gmm_tm;
     let spec = Gmm {
         // Every active expert's rows round up to whole tiles.
-        tiles: (p + GMM_TM - 1) / GMM_TM + e.min(p),
-        tm: GMM_TM,
+        tiles: (p + tm - 1) / tm + e.min(p),
+        tm,
+        block_bytes: tuning.moe_gmm_block_bytes,
+        vmem_cap: tuning.vmem_cap(),
         k: fan.k,
         n: fan.n,
         experts: e,
@@ -1119,7 +1076,7 @@ fn gmm_spec(fan: Fan, bank: &Read, elem: Elem) -> Option<crate::mosaic::gmm::Gmm
 
 /// The routed matmul through the grouped-matmul kernel: the pairs sorted by
 /// expert (unrouted last), each expert's run of rows padded to whole tiles
-/// of `GMM_TM`, one tile per grid step against its expert's weights, and
+/// of `tm` rows, one tile per grid step against its expert's weights, and
 /// each pair's row picked back out. Only the routed experts' weights move.
 /// f32 `[P, N]`.
 fn gmm(
@@ -1265,6 +1222,7 @@ fn routed(
     bias: Option<Val>,
     prev: Val,
 ) -> Result<Val, Error> {
+    let tuning = cx.tuning();
     let (p, e, n, k) = (fan.pairs(), fan.experts, fan.n, fan.k);
     let groups = k / i64::from(form.group());
     let r = cx.reshape(routes, &[p])?;
@@ -1290,29 +1248,33 @@ fn routed(
     let expert_bytes = bank_bytes / e;
     // How many active experts (row tiles) the loop runs for less than the
     // whole bank, whose dot also lands a partial per row and expert.
-    let tile = loop_tile(fan);
-    let whole_ns = bank_bytes / WHOLE_BYTES_PER_NS + r8 * e * n * WHOLE_PARTIAL_FS / 1_000_000;
-    let tile_ns = (expert_bytes / 1_200).max(LOOP_TILE_NS + tile * LOOP_ROW_NS);
+    let tile = loop_tile(fan, tuning);
+    let c = tuning.moe_costs;
+    let whole_ns =
+        bank_bytes / c.whole_bytes_per_ns.max(1) + r8 * e * n * c.whole_partial_fs / 1_000_000;
+    let tile_ns =
+        (expert_bytes / c.slice_bytes_per_ns.max(1)).max(c.loop_tile_ns + tile * c.loop_row_ns);
     let worth = whole_ns / tile_ns;
-    // `PIE_XLA_MOE_PATH=slice|loop|all|ragged|gmm` forces a formulation
-    // (tests reach each with small shapes; `gmm` falls back to `all` for a
-    // bank the kernel does not read).
-    let forced = std::env::var("PIE_XLA_MOE_PATH").ok();
-    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()));
-    let path = match forced.as_deref() {
-        Some("gmm") if grouped.is_none() => "all",
-        Some(path) => path,
-        None if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => "slice",
-        None if r8 * e * n * fold > DENSE_ALL => "ragged",
+    // A forced `gmm` falls back to `all` for a bank the kernel does not read.
+    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()), tuning);
+    let path = match tuning.moe_path {
+        MoePath::Gmm if grouped.is_none() => MoePath::All,
+        MoePath::Auto { .. }
+            if p <= c.slice_pairs && p * expert_bytes.max(c.slice_bytes) < bank_bytes =>
+        {
+            MoePath::Slice
+        }
+        MoePath::Auto { .. } if r8 * e * n * fold > c.dense_all => MoePath::Ragged,
         // Past a token or two: each routed expert read once, at the DMA
         // rate, with no per-expert launch (see `gmm_spec`).
-        None if grouped.is_some() => "gmm",
-        None if worth < 2 => "all",
-        None if worth >= p => "loop",
-        None => "active",
+        MoePath::Auto { .. } if grouped.is_some() => MoePath::Gmm,
+        MoePath::Auto { .. } if worth < 2 => MoePath::All,
+        MoePath::Auto { .. } if worth >= p => MoePath::Loop,
+        MoePath::Auto { .. } => MoePath::Active,
+        forced => forced,
     };
     let y = match path {
-        "slice" => {
+        MoePath::Slice => {
             // Each pair's expert sliced out of the bank and multiplied by its
             // row alone: independent dots XLA overlaps, no join.
             let mut ys = Vec::with_capacity(p as usize);
@@ -1326,16 +1288,16 @@ fn routed(
             }
             cx.concat(&ys, 0)?
         }
-        "all" => every_expert(cx, &bank, fan, x, ids, groups)?,
-        "gmm" => match grouped {
+        MoePath::All => every_expert(cx, &bank, fan, x, ids, groups)?,
+        MoePath::Gmm => match grouped {
             Some(spec) => gmm(cx, spec, fan, &bank, x, r, valid, ids)?,
             None => every_expert(cx, &bank, fan, x, ids, groups)?,
         },
-        "loop" => {
+        MoePath::Loop => {
             let plan = plan_active(cx, fan, x, r, valid)?;
             run_active(cx, &plan, &bank, fan, groups, None)?
         }
-        "active" => {
+        MoePath::Active => {
             // The loop over the experts the fire routes to, unless more are
             // active than it is worth: then the whole bank. Both run inside
             // loops whose trip count the fire's routes decide (0 steps for
@@ -1351,7 +1313,7 @@ fn routed(
                 |_, a| Ok(a[0]),
                 |f, _| {
                     let mut env = Sealed;
-                    let mut cx = Cx::new(f, &mut env);
+                    let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
                     let all = every_expert(&mut cx, &bank, fan, x, ids, groups).map_err(sealed)?;
                     let done = cx.const_i(Elem::Pred, 0, &[]);
                     Ok(vec![done, all])
@@ -1360,7 +1322,7 @@ fn routed(
             let many = cx.broadcast(many, &[p, n], &[])?;
             cx.select(many, whole, looped)?
         }
-        _ => {
+        MoePath::Ragged | MoePath::Auto { .. } => {
             // Sort the pairs by expert (unrouted last), run one ragged dot over
             // the whole bank, and put the rows back.
             let top = cx.const_i(Elem::I32, e, &[p]);
@@ -1453,14 +1415,10 @@ fn every_expert(
 }
 
 /// The rows of one tile of the loop over active experts: the fire's tokens
-/// (a token routes to an expert once), at most 128 (`PIE_XLA_MOE_TILE`
-/// lowers the cap, for tuning).
-fn loop_tile(fan: Fan) -> i64 {
+/// (a token routes to an expert once), at most `kernel.moe.loop_tile_max`.
+fn loop_tile(fan: Fan, tuning: Tuning) -> i64 {
     let p = fan.pairs();
-    let most = std::env::var("PIE_XLA_MOE_TILE")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(128);
+    let most = tuning.moe_loop_tile_max;
     ((fan.tokens.max(1) + 7) / 8 * 8)
         .min(most)
         .min((p + 7) / 8 * 8)
@@ -1485,7 +1443,7 @@ struct Active {
 /// one tile per active expert unless a router repeats one).
 fn plan_active(cx: &mut Cx<'_>, fan: Fan, x: Val, r: Val, valid: Val) -> Result<Active, Error> {
     let (p, e) = (fan.pairs(), fan.experts);
-    let tile = loop_tile(fan);
+    let tile = loop_tile(fan, cx.tuning());
     let top = cx.const_i(Elem::I32, e, &[p]);
     let key = cx.select(valid, r, top)?;
     let iota = cx.iota(Elem::I32, &[p], 0);
@@ -1557,11 +1515,12 @@ fn run_active(
     groups: i64,
     skip: Option<Val>,
 ) -> Result<Val, Error> {
+    let tuning = cx.tuning();
     let (p, n, k) = (fan.pairs(), fan.n, fan.k);
     let tile = plan.tile;
     let ys = cx.const_f(Elem::F32, 0.0, &[p + tile, n]);
     let j0 = cx.const_i(Elem::I32, 0, &[]);
-    let per = LOOP_UNROLL.with(|u| *u);
+    let per = tuning.moe_loop_unroll;
     let per_v = cx.const_i(Elem::I32, per, &[]);
     let more = cx.const_i(Elem::I32, per - 1, &[]);
     let steps = cx.add(plan.steps, more)?;
@@ -1580,7 +1539,7 @@ fn run_active(
         |f, a| f.compare(Cmp::Lt, a[0], steps),
         |f, a| {
             let mut env = Sealed;
-            let mut cx = Cx::new(f, &mut env);
+            let mut cx = Cx::new(f, &mut env).with_tuning(tuning);
             let (j, mut ys) = (a[0], a[1]);
             let step = (|| -> Result<Val, Error> {
                 let per_v = cx.const_i(Elem::I32, per, &[]);

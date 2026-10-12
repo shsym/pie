@@ -114,6 +114,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the drafting shell loads");

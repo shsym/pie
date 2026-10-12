@@ -3,6 +3,7 @@ use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use crate::tuning::GdnScan;
 
 const CONV_GROUP: u32 = 256;
 
@@ -83,34 +84,19 @@ gdn_scan_points!(
     (32, 8, 8),
 );
 
-fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
+/// `(lanes a head, value rows a simdgroup)` of a scan.
+fn lanes_rows(scan: GdnScan) -> (u32, u32) {
+    match scan {
+        GdnScan::Simd { rows } => (GDN_SCAN_LANES, rows),
+        GdnScan::Staged { .. } => (8, 2),
     }
-    gdn_scan_launch_at(
-        shape,
-        requests,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_point,
-    )
 }
 
-fn gdn_staged_launch_at(
-    shape: &Delta,
-    requests: u32,
-    rows: u32,
-    lanes: u32,
-    vrows: u32,
-) -> Option<Grid> {
-    if lanes != 8
-        || vrows != 2
-        || shape.k_dim != 128
-        || shape.v_dim != 128
-        || requests == 0
-        || rows / requests < 32
-    {
+fn gdn_staged_launch_at(shape: &Delta, requests: u32, rows: u32, scan: GdnScan) -> Option<Grid> {
+    let GdnScan::Staged { min_rows } = scan else {
+        return None;
+    };
+    if shape.k_dim != 128 || shape.v_dim != 128 || requests == 0 || rows / requests < min_rows {
         return None;
     }
     Some(Grid::of(
@@ -119,42 +105,10 @@ fn gdn_staged_launch_at(
     ))
 }
 
-fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
-    }
-    gdn_scan_launch_at(
-        shape,
-        rows,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_step_point,
-    )
-}
-
-fn gdn_scan_committed_launch(
-    shape: &Delta,
-    lanes: u32,
-) -> Option<(&'static str, &'static str, Grid)> {
-    let tuned = crate::tuning::current();
-    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
-        return None;
-    }
-    gdn_scan_launch_at(
-        shape,
-        lanes,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-        gdn_scan_committed_point,
-    )
-}
-
 fn gdn_scan_launch_at(
     shape: &Delta,
     requests: u32,
-    lanes: u32,
-    vrows: u32,
+    (lanes, vrows): (u32, u32),
     point: fn(u32, u32, u32) -> Option<(&'static str, &'static str)>,
 ) -> Option<(&'static str, &'static str, Grid)> {
     if ![8, GDN_SCAN_LANES].contains(&lanes)
@@ -450,6 +404,7 @@ pub fn gdn_prep(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: Tensor,
     z: Tensor,
     gates: Tensor,
@@ -467,7 +422,12 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
-    if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows) {
+    if let Some((point, stamp, grid)) = gdn_scan_launch_at(
+        &shape,
+        rows,
+        lanes_rows(tuning.gdn_scan()),
+        gdn_scan_step_point,
+    ) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[
@@ -508,6 +468,7 @@ pub fn gated_delta(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: RaggedTensor,
     z: Tensor,
     gates: Tensor,
@@ -537,14 +498,7 @@ pub fn gated_delta_chunked(
         stated(OP, shape.k_dim)?.arg(),
         stated(OP, shape.v_dim)?.arg(),
     ];
-    let tuned = crate::tuning::current();
-    if let Some(grid) = gdn_staged_launch_at(
-        &shape,
-        lanes,
-        qkv.data.rows,
-        tuned.gdn_scan_lanes,
-        tuned.gdn_scan_rows,
-    ) {
+    if let Some(grid) = gdn_staged_launch_at(&shape, lanes, qkv.data.rows, tuning.gdn_scan()) {
         return ctx.fire(
             Fire::at(
                 "attn/ssm_gdn_staged.metal",
@@ -555,7 +509,9 @@ pub fn gated_delta_chunked(
             &args,
         );
     }
-    if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes) {
+    if let Some((point, stamp, grid)) =
+        gdn_scan_launch_at(&shape, lanes, lanes_rows(tuning.gdn_scan()), gdn_scan_point)
+    {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &args,
@@ -703,6 +659,8 @@ pub fn kda_committed(
 mod tests {
     use super::*;
 
+    const STAGED: GdnScan = GdnScan::Staged { min_rows: 32 };
+
     const D27B: Delta = Delta {
         k_heads: 16,
         v_heads: 48,
@@ -714,22 +672,22 @@ mod tests {
     fn ssm_every_case() {
         the_three_scans_share_one_geometry();
         a_shape_the_stamp_does_not_name_falls_back();
-        assert!(gdn_staged_launch_at(&D27B, 4, 127, 8, 2).is_none());
+        assert!(gdn_staged_launch_at(&D27B, 4, 127, STAGED).is_none());
         assert_eq!(
-            gdn_staged_launch_at(&D27B, 4, 128, 8, 2),
+            gdn_staged_launch_at(&D27B, 4, 128, STAGED),
             Some(Grid::of([8, 64, 4 * 48], [8, 16, 1]))
         );
-        assert!(gdn_staged_launch_at(&D27B, 4, 2048, 32, 4).is_none());
-        assert!(gdn_staged_launch_at(&D27B, 0, 0, 8, 2).is_none());
-        assert!(gdn_staged_launch_at(&Delta { v_dim: 64, ..D27B }, 4, 2048, 8, 2).is_none());
-        assert!(gdn_staged_launch_at(&Delta { k_dim: 64, ..D27B }, 4, 2048, 8, 2).is_none());
+        assert!(gdn_staged_launch_at(&D27B, 4, 2048, GdnScan::Simd { rows: 4 }).is_none());
+        assert!(gdn_staged_launch_at(&D27B, 0, 0, STAGED).is_none());
+        assert!(gdn_staged_launch_at(&Delta { v_dim: 64, ..D27B }, 4, 2048, STAGED).is_none());
+        assert!(gdn_staged_launch_at(&Delta { k_dim: 64, ..D27B }, 4, 2048, STAGED).is_none());
     }
 
     fn the_three_scans_share_one_geometry() {
-        let plain = gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_point).expect("stamped");
-        let step = gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_step_point).expect("stamped");
+        let plain = gdn_scan_launch_at(&D27B, 3, (32, 4), gdn_scan_point).expect("stamped");
+        let step = gdn_scan_launch_at(&D27B, 3, (32, 4), gdn_scan_step_point).expect("stamped");
         let committed =
-            gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_committed_point).expect("stamped");
+            gdn_scan_launch_at(&D27B, 3, (32, 4), gdn_scan_committed_point).expect("stamped");
         assert_eq!(plain.0, "gated_delta_scan_bfloat16_l_32_v_4_p_4");
         assert_eq!(step.0, "gated_delta_scan_step_bfloat16_l_32_v_4_p_4");
         assert_eq!(
@@ -740,25 +698,26 @@ mod tests {
         assert_eq!(plain.2, step.2);
         assert_eq!(plain.2, committed.2);
         assert_eq!(plain.2, Grid::of([32, 32, 3 * 48], [32, 4, 1]));
-        let packed = gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_point).expect("packed");
-        let packed_step = gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_step_point).expect("packed");
+        let packed = gdn_scan_launch_at(&D27B, 3, (8, 2), gdn_scan_point).expect("packed");
+        let packed_step =
+            gdn_scan_launch_at(&D27B, 3, (8, 2), gdn_scan_step_point).expect("packed");
         let packed_commit =
-            gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_committed_point).expect("packed");
+            gdn_scan_launch_at(&D27B, 3, (8, 2), gdn_scan_committed_point).expect("packed");
         assert_eq!(packed.0, "gated_delta_scan_bfloat16_l_8_v_2_p_16");
         assert_eq!(packed.2, Grid::of([8, 64, 3 * 48], [8, 16, 1]));
         assert_eq!(packed.2, packed_step.2);
         assert_eq!(packed.2, packed_commit.2);
-        assert!(gdn_scan_launch_at(&D27B, 3, 8, 4, gdn_scan_point).is_none());
-        assert!(gdn_scan_launch_at(&D27B, 3, 0, 2, gdn_scan_point).is_none());
+        assert!(gdn_scan_launch_at(&D27B, 3, (8, 4), gdn_scan_point).is_none());
+        assert!(gdn_scan_launch_at(&D27B, 3, (0, 2), gdn_scan_point).is_none());
     }
 
     fn a_shape_the_stamp_does_not_name_falls_back() {
         let odd = Delta { k_dim: 100, ..D27B };
-        assert!(gdn_scan_launch(&odd, 1).is_none());
+        assert!(gdn_scan_launch_at(&odd, 1, (32, 4), gdn_scan_point).is_none());
         let deep = Delta { k_dim: 512, ..D27B };
-        assert!(gdn_scan_launch(&deep, 1).is_none());
+        assert!(gdn_scan_launch_at(&deep, 1, (32, 4), gdn_scan_point).is_none());
         let ragged = Delta { v_dim: 66, ..D27B };
-        assert!(gdn_scan_launch(&ragged, 1).is_none());
+        assert!(gdn_scan_launch_at(&ragged, 1, (32, 4), gdn_scan_point).is_none());
     }
 }
 
@@ -840,6 +799,7 @@ pub fn causal_conv1d_committed(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_committed(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,
@@ -858,7 +818,12 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
-    if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes) {
+    if let Some((point, stamp, grid)) = gdn_scan_launch_at(
+        &shape,
+        lanes,
+        lanes_rows(tuning.gdn_scan()),
+        gdn_scan_committed_point,
+    ) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
             &[

@@ -198,16 +198,14 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         budget: Budget::new(2, 16),
         patches: None,
         voxels: Some(VoxelLadder::new(max_voxels, 2)),
-        profile: None,
         page_size: 16,
         context: 64,
         slots: 2,
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        graphs: Graphs::Off,
         knobs: Knobs {
-            recording: Recording::Off,
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
         cache_dir: None,

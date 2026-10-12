@@ -18,6 +18,7 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
+    pub ctas_per_sm: u32,
 }
 
 impl Request<'_> {
@@ -45,7 +46,7 @@ impl Request<'_> {
 }
 
 #[must_use]
-const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, cc_major: u32) -> u32 {
+const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32) -> u32 {
     if head_dim >= 512 {
         if avg_packed_qo_len <= 32 {
             return 16;
@@ -54,10 +55,10 @@ const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, cc_major: u
     }
     if avg_packed_qo_len > 64 && head_dim < 256 {
         128
-    } else if cc_major >= 8 {
-        if avg_packed_qo_len > 16 { 64 } else { 16 }
-    } else {
+    } else if avg_packed_qo_len > 16 {
         64
+    } else {
+        16
     }
 }
 
@@ -90,10 +91,10 @@ fn search_kv_chunk_size(
     (enable_cuda_graph || low < max_kv_len, low)
 }
 
-fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) -> (u32, u64) {
+fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32) -> (u32, u64) {
     let batch = u64::from(batch.max(1));
     let max_seq_len = u64::from(rows).saturating_sub(batch - 1);
-    let tile = determine_cta_tile_q(max_seq_len * group, head_dim, cc_major);
+    let tile = determine_cta_tile_q(max_seq_len * group, head_dim);
     let tiles = (u64::from(rows) * group).div_ceil(u64::from(tile)) + batch - 1;
     (tile, tiles)
 }
@@ -116,11 +117,12 @@ pub fn graph_padding(
     num_kv_heads: u32,
     head_dim: u32,
     device: &Device,
+    ctas_per_sm: u32,
 ) -> (u32, u64) {
     let kv_heads = num_kv_heads.max(1);
     let group = u64::from((num_qo_heads / kv_heads).max(1));
-    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim, device.cc_major);
-    let floor = u64::from(2 * device.num_sm.max(1)) / u64::from(kv_heads);
+    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
+    let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
     (tile, floor.max(tiles))
 }
 
@@ -146,7 +148,7 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let kv_pages = spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let group = u64::from(req.num_qo_heads / req.num_kv_heads);
 
-    let max_grid_size = 2 * u64::from(device.num_sm);
+    let max_grid_size = u64::from(req.ctas_per_sm.max(1)) * u64::from(device.num_sm);
     let max_batch_size_if_split =
         u32::try_from(max_grid_size / u64::from(req.num_kv_heads)).unwrap_or(u32::MAX);
 
@@ -154,20 +156,10 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let min_kv_chunk_size = u64::from((128 / req.page_size).max(1));
 
     let (cta_tile_q, total_num_tiles_q) = if req.enable_cuda_graph {
-        graph_tiles(
-            req.total_num_rows,
-            req.batch_size,
-            group,
-            req.head_dim,
-            device.cc_major,
-        )
+        graph_tiles(req.total_num_rows, req.batch_size, group, req.head_dim)
     } else {
         let sum: u64 = packed_qo_lens.iter().sum();
-        let tile = determine_cta_tile_q(
-            sum / u64::from(req.batch_size),
-            req.head_dim,
-            device.cc_major,
-        );
+        let tile = determine_cta_tile_q(sum / u64::from(req.batch_size), req.head_dim);
         let tiles = packed_qo_lens
             .iter()
             .map(|&packed| packed.div_ceil(u64::from(tile)))
@@ -477,6 +469,7 @@ mod tests {
                         page_size: 16,
                         enable_cuda_graph: graph,
                         window_left: None,
+                        ctas_per_sm: 2,
                     };
                     let sched = schedule("test", &req, &Device::L40S).unwrap();
                     let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();

@@ -17,16 +17,8 @@ pub struct CudaNativeEngineOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    pub graphs: Option<String>,
-    pub recording: Option<String>,
-    pub pad: Option<bool>,
-    pub bodies: Option<bool>,
-    pub bodies_mem: Option<u32>,
-    pub fallback_copy: Option<bool>,
-    pub grouped: Option<bool>,
     pub diagnostics: Option<String>,
     pub nccl_transport: Option<String>,
-    pub side_streams: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,7 +30,6 @@ pub struct MetalEngineOptions {
     pub max_model_len: Option<u32>,
     pub max_state_slots: Option<u32>,
     pub diagnostics: Option<String>,
-    pub tuning: toml::Table,
     #[serde(skip)]
     pub device: String,
     #[serde(skip)]
@@ -54,7 +45,6 @@ impl Default for MetalEngineOptions {
             max_model_len: None,
             max_state_slots: None,
             diagnostics: None,
-            tuning: toml::Table::new(),
             device: "metal:0".to_string(),
             verbose: false,
         }
@@ -180,6 +170,9 @@ pub struct XlaEngineOptions {
     /// The longest sequence (prompt + output) one lane holds, in tokens.
     /// Omit for the engine default (4096).
     pub max_model_len: Option<u32>,
+    /// Trace and compile the fire shapes a server meets first at load, so
+    /// no early request waits on a compile. Slower to load.
+    pub prewarm: bool,
 }
 
 impl Default for XlaEngineOptions {
@@ -191,6 +184,7 @@ impl Default for XlaEngineOptions {
             max_forward_requests: 64,
             max_state_slots: None,
             max_model_len: None,
+            prewarm: false,
         }
     }
 }

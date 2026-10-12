@@ -211,6 +211,7 @@ pub struct Signature {
 pub struct Tracer<'h> {
     handles: &'h Handles,
     state: RefCell<State>,
+    tuning: kernels_xla::tuning::Tuning,
 }
 
 /// Where the pack's own parameter is kept among the traced roots.
@@ -228,6 +229,7 @@ impl<'h> Tracer<'h> {
     #[must_use]
     pub fn new(handles: &'h Handles) -> Self {
         Self {
+            tuning: kernels_xla::tuning::Tuning::DEFAULT,
             handles,
             state: RefCell::new(State {
                 pack_len: 0,
@@ -237,6 +239,12 @@ impl<'h> Tracer<'h> {
                 written: BTreeMap::new(),
             }),
         }
+    }
+
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
+        self.tuning = tuning;
+        self
     }
 
     /// Declares how long the fire's input pack is (see `Source::Packed`).
@@ -360,7 +368,8 @@ fn root_value(
         // A sub-byte codes plane lands with its rows padded to whole
         // 128-lane tiles (`crate::weights::gemm_only`).
         let rows = if ty.elem.bits() < 8 {
-            (ty.dims[0] + 127) / 128 * 128
+            let tile = crate::weights::CODES_TILE as i64;
+            (ty.dims[0] + tile - 1) / tile * tile
         } else {
             ty.dims[0]
         };
@@ -513,7 +522,7 @@ impl Emit for Tracer<'_> {
             params,
             written,
         };
-        let mut cx = Cx::new(func, &mut lens);
+        let mut cx = Cx::new(func, &mut lens).with_tuning(self.tuning);
         body(&mut cx)
     }
 }

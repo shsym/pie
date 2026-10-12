@@ -267,6 +267,7 @@ fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usiz
         page_size: PAGE_SIZE as i32,
         seq_stride: width as u64,
         head_stride: head_dim as u64,
+        q8: false,
     }
 }
 
@@ -299,8 +300,18 @@ fn decode_over(
     };
     let ot = Tensor::new(ho, rows as u32, (Q_HEADS * head_dim) as u32, Dtype::Bf16);
     rig.fire(|s| {
-        attn::decode(s, qt, plan, pool, None, head_dim as u32, sm_scale, ot)
-            .expect("decode launch");
+        attn::decode(
+            s,
+            &engine_metal::chip::tuning("", false),
+            qt,
+            plan,
+            pool,
+            None,
+            head_dim as u32,
+            sm_scale,
+            ot,
+        )
+        .expect("decode launch");
     });
     bf16_floats(&rig.handles.read(ho, obytes).expect("read out"))
 }

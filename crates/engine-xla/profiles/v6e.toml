@@ -1,0 +1,29 @@
+api = 1
+
+[target]
+assumes = { generation = 6 }
+
+[provenance]
+measured = [
+  "kernel.attn.block_keys",
+  "kernel.attn.block_rows",
+  "kernel.attn.budget_mi",
+  "kernel.attn.per_row_max",
+  "kernel.moe.cost.dense_all_mi",
+  "kernel.moe.cost.loop_row_ns",
+  "kernel.moe.cost.loop_tile_ns",
+  "kernel.moe.cost.slice_bytes_per_ns",
+  "kernel.moe.cost.slice_mib",
+  "kernel.moe.cost.slice_pairs",
+  "kernel.moe.cost.whole_bytes_per_ns",
+  "kernel.moe.cost.whole_partial_fs",
+  "kernel.moe.gmm_block_mib",
+  "kernel.moe.gmm_tm",
+  "kernel.moe.loop_tile_max",
+  "kernel.moe.loop_unroll",
+  "kernel.moe.path",
+  "kernel.quant.decode",
+  "layout.embed_fold",
+  "layout.gemm_transpose",
+  "layout.mxfp4_prescale",
+]

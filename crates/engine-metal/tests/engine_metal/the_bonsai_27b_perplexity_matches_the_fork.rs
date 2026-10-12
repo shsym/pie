@@ -215,6 +215,7 @@ fn the_bonsai_27b_perplexity_matches_the_fork() {
         runahead: engine::runahead::Runahead::F1,
         residency,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
     });
     let mut shell = match shell {
         Ok(shell) => shell,

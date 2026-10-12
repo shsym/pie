@@ -255,6 +255,7 @@ fn the_bonsai_27b_serves_ptq1_0_and_matches_the_fork_oracle() {
         runahead: engine::runahead::Runahead::F1,
         residency,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
     });
     let mut shell = match shell {
         Ok(shell) => shell,

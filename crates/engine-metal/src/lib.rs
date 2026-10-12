@@ -15,6 +15,7 @@ pub mod api;
 pub mod arena;
 pub mod blob;
 pub mod boot;
+pub mod chip;
 pub mod device;
 pub mod diag;
 mod dispatch;
@@ -44,6 +45,7 @@ mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tune;
 pub mod weights;
 pub mod window;
 

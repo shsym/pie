@@ -26,17 +26,6 @@ use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 /// The slot a write that must not land is routed to.
 pub(crate) const DROP: i64 = i32::MAX as i64;
 
-/// Tokens per chunk of the scalar-decay (GDN) chunked scan: `LONG_CHUNK`
-/// when the fire's lanes average at least that many rows, else `CHUNK`
-/// (every lane pads its last chunk).
-const CHUNK: i64 = 64;
-
-const LONG_CHUNK: i64 = 128;
-
-/// Tokens per chunk of the per-channel-decay (KDA) chunked scan: its
-/// intra-chunk decay is a `[C, C, d]` product, so it chunks finer.
-const KDA_CHUNK: i64 = 16;
-
 /// The GDN's q/k l2-norm epsilon, as the GPU kernels state it.
 const GDN_EPS: f64 = 1e-6;
 
@@ -307,12 +296,6 @@ pub(crate) fn land_slots(
     )?;
     f.reshape(out, &[n, width])
 }
-
-/// Lanes a decode-form delta rule moves per gather → step → scatter round:
-/// small enough that a round's gathered and updated states stay on chip
-/// (a whole 64-lane fire of 1 MiB states does not, and every intermediate
-/// then goes through HBM).
-const DECODE_ROUND_BYTES: i64 = 32 << 20;
 
 // -------------------------------------------------------------------- lanes
 
@@ -1417,11 +1400,11 @@ impl DeltaIn {
         }
     }
 
-    fn chunk(&self, rows: i64, lanes: i64) -> i64 {
+    fn chunk(&self, rows: i64, lanes: i64, c: crate::tuning::SsmChunks) -> i64 {
         match self {
-            Self::Gdn { .. } if rows >= LONG_CHUNK * lanes.max(1) => LONG_CHUNK,
-            Self::Gdn { .. } => CHUNK,
-            Self::Kda { .. } => KDA_CHUNK,
+            Self::Gdn { .. } if rows >= c.long_chunk * lanes.max(1) => c.long_chunk,
+            Self::Gdn { .. } => c.chunk,
+            Self::Kda { .. } => c.kda_chunk,
         }
     }
 
@@ -1515,10 +1498,11 @@ fn delta(
         DeltaLanes::Decode => i64::from(rows),
         DeltaLanes::Ragged(ip) | DeltaLanes::Committed(ip, _) => ip.elements() as i64 - 1,
     };
-    let chunk = input.chunk(i64::from(rows), lanes_n);
-    let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
     let t = i64::from(rows);
     ctx.emit(&mut |cx| {
+        let tuning = cx.tuning();
+        let chunk = input.chunk(t, lanes_n, tuning.ssm);
+        let chunk = chunk.min(i64::from(rows.next_power_of_two().max(8)));
         let raw = input.raw(cx)?;
         let slab = cx.read(state.state)?;
         let (yv, slab) = match lanes {
@@ -1535,7 +1519,7 @@ fn delta(
                 let round = if per == 1 {
                     t
                 } else {
-                    (DECODE_ROUND_BYTES / (stride * 4)).clamp(1, t)
+                    (tuning.decode_round_bytes() / (stride * 4)).clamp(1, t)
                 };
                 let mut slab = slab;
                 let mut ys = Vec::new();

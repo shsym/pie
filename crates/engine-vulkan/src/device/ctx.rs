@@ -93,7 +93,12 @@ pub(crate) struct Core {
     pub(crate) allocated: AtomicU64,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
-    pub(crate) cores: u32,
+    /// The narrowest subgroup a pipeline runs at.
+    pub(crate) subgroup_min: u32,
+    /// `requiredSubgroupSize` for every pipeline, where the device can pin
+    /// one: 32, which the coopmat and decode attention kernels assume.
+    pub(crate) pinned: Option<u32>,
+    pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
     pub(crate) vendor_id: u32,
     pub(crate) api_version: u32,
@@ -425,6 +430,18 @@ impl Drop for PipelineCache {
     }
 }
 
+/// The staging buffer holds the `Core` that holds it; left in place, that
+/// cycle leaks the device after every load until `vkCreateDevice` fails.
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.core
+            .transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .staging = None;
+    }
+}
+
 impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Context")
@@ -498,10 +515,7 @@ impl Context {
             None
         };
         match Self::finish(entry, instance, messenger, boot, share, props2) {
-            Ok(context) => {
-                kernels_vulkan::tuning::describe(context.info());
-                Ok(context)
-            }
+            Ok(context) => Ok(context),
             Err((fault, Some((instance, messenger)))) => {
                 unsafe {
                     if let Some((debug, m)) = messenger {
@@ -575,10 +589,23 @@ impl Context {
         let name = name.clone();
         let props = unsafe { instance.get_physical_device_properties(physical) };
         let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut sizes = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let sized = props.api_version >= vk::API_VERSION_1_3;
         {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+            if sized {
+                p2 = p2.push_next(&mut sizes);
+            }
             unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
         }
+        // The narrowest subgroup a pipeline may be compiled at: a driver
+        // that varies the width (Intel: 8 to 32) reports its default as
+        // `subgroupSize`, which a kernel folding 32 lanes cannot rely on.
+        let subgroup_min = if sized && sizes.min_subgroup_size > 0 {
+            sizes.min_subgroup_size.min(subgroup.subgroup_size.max(1))
+        } else {
+            subgroup.subgroup_size.max(1)
+        };
         let device_exts =
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
@@ -602,22 +629,9 @@ impl Context {
                 .unwrap_or(false)
         };
 
-        let cores = if has_extension(&device_exts, ash::nv::shader_sm_builtins::NAME) {
-            let mut sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sm);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            sm.shader_sm_count
-        } else if has_extension(&device_exts, ash::amd::shader_core_properties::NAME) {
-            let mut cu = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
-            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut cu);
-            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
-            cu.shader_engine_count
-                * cu.shader_arrays_per_engine_count
-                * cu.compute_units_per_shader_array
-        } else {
-            0
-        }
-        .max(16);
+        let cores = kernels_vulkan::cores::shader_cores(&device_exts, &mut |p2| unsafe {
+            instance.get_physical_device_properties2(physical, p2);
+        });
 
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -637,6 +651,17 @@ impl Context {
             unsafe { instance.get_physical_device_features2(physical, &mut query) };
         }
         let core = unsafe { instance.get_physical_device_features(physical) };
+        // Pin every pipeline to 32 lanes where the driver allows it (AMD
+        // RDNA defaults to 64, Intel varies 8 to 32).
+        let size_control = api_13 && f13.subgroup_size_control == vk::TRUE;
+        let pinned = (size_control
+            && sizes.min_subgroup_size <= 32
+            && sizes.max_subgroup_size >= 32
+            && sizes
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE))
+        .then_some(32u32);
+        let subgroup_min = pinned.unwrap_or(subgroup_min);
         let enabled = Enabled {
             shader_int16: core.shader_int16 == vk::TRUE,
             shader_int64: core.shader_int64 == vk::TRUE,
@@ -645,13 +670,13 @@ impl Context {
             storage_8bit: f12.storage_buffer8_bit_access == vk::TRUE,
             memory_model: f12.vulkan_memory_model == vk::TRUE
                 && f12.vulkan_memory_model_device_scope == vk::TRUE,
-            subgroup_size_control: api_13 && f13.subgroup_size_control == vk::TRUE,
+            subgroup_size_control: size_control,
             memory_budget,
             coopmat: coopmat_shape
                 && fcm.cooperative_matrix == vk::TRUE
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
-                && subgroup.subgroup_size == 32,
+                && (pinned == Some(32) || subgroup.subgroup_size == 32),
         };
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
@@ -785,7 +810,9 @@ impl Context {
             messenger,
             allocated: AtomicU64::new(0),
             name: name.clone(),
-            subgroup_size: subgroup.subgroup_size.max(1),
+            subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
+            subgroup_min,
+            pinned,
             cores,
             device_local,
             vendor_id: props.vendor_id,
@@ -833,12 +860,28 @@ impl Context {
 
     #[must_use]
     pub fn cores(&self) -> u32 {
-        self.core.cores
+        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
     }
 
     #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         self.core.subgroup_size
+    }
+
+    /// The narrowest subgroup any pipeline runs at.
+    #[must_use]
+    pub fn lanes(&self) -> u32 {
+        self.core.subgroup_min
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
+        kernels_vulkan::tuning::Limits {
+            cores: self.cores(),
+            lanes: self.lanes(),
+            shared_bytes: self.core.limits.max_compute_shared_memory_size,
+            invocations: self.core.limits.max_compute_work_group_invocations,
+        }
     }
 
     #[must_use]
@@ -867,14 +910,13 @@ impl Context {
     }
 
     #[must_use]
-    pub fn info(&self) -> kernels_vulkan::DeviceInfo {
-        kernels_vulkan::DeviceInfo {
-            vendor: kernels_vulkan::DeviceInfo::vendor_of(self.core.vendor_id),
-            subgroup_size: self.core.subgroup_size,
-            max_workgroup_invocations: self.core.limits.max_compute_work_group_invocations,
-            max_shared_bytes: self.core.limits.max_compute_shared_memory_size,
+    pub fn chip(&self) -> crate::chip::Device {
+        crate::chip::Device {
+            name: self.core.name.clone(),
+            vendor: profile::vendor::of_pci(self.core.vendor_id),
+            subgroup: self.core.subgroup_min,
+            cores: self.core.cores,
             coopmat: self.core.features.coopmat,
-            multiprocessors: self.core.cores,
         }
     }
 

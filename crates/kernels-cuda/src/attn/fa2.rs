@@ -179,8 +179,7 @@ pub(crate) fn decode<P>(
     at: DecodePoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry =
-        DecodeGeometry::derive(op, at.head_dim, at.group_size, KvWidth::BF16, &at.device)?;
+    let geometry = DecodeGeometry::derive(op, at.head_dim, at.group_size, KvWidth::BF16)?;
 
     ctx.fire(
         op,
@@ -201,14 +200,8 @@ pub(crate) fn prefill<P>(
     at: PrefillPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = PrefillGeometry::derive(
-        op,
-        at.head_dim,
-        at.cta_tile_q,
-        KvWidth::BF16,
-        false,
-        &at.device,
-    )?;
+    let geometry =
+        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_symbol(op, &geometry, at.arm)?).apply(
@@ -238,14 +231,8 @@ pub(crate) fn prefill_ragged<P>(
     at: RaggedPoint,
     params: &P,
 ) -> Result<(), Error> {
-    let geometry = PrefillGeometry::derive(
-        op,
-        at.head_dim,
-        at.cta_tile_q,
-        KvWidth::BF16,
-        false,
-        &at.device,
-    )?;
+    let geometry =
+        PrefillGeometry::derive(op, at.head_dim, at.cta_tile_q, KvWidth::BF16, &at.device)?;
     ctx.fire(
         op,
         Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(
@@ -448,7 +435,7 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
     if let Some(known) = cache.lock().ok().and_then(|held| held.get(&key).copied()) {
         return known;
     }
-    let answer = decode_blocks_per_sm_uncached(head_dim, group_size, device);
+    let answer = decode_blocks_per_sm_uncached(head_dim, group_size);
     if let Ok(mut held) = cache.lock() {
         held.insert(key, answer);
     }
@@ -456,11 +443,11 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
 }
 
 #[cfg(feature = "cuda")]
-fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
+fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> {
     use cudarc::driver::sys as dr;
 
     const OP: &str = "attention.plan_decode";
-    let geometry = DecodeGeometry::derive(OP, head_dim, group_size, KvWidth::BF16, device).ok()?;
+    let geometry = DecodeGeometry::derive(OP, head_dim, group_size, KvWidth::BF16).ok()?;
     let entrypoint = decode_symbol(OP, &geometry, DecodeArm::Full).ok()?;
     let root = crate::jit::Root::of(FILE)?;
     let resolved = crate::jit::cache::resolve(&root, entrypoint).ok()?;
@@ -549,7 +536,6 @@ impl DecodeGeometry {
         head_dim: u32,
         group_size: u32,
         kv: KvWidth,
-        dev: &Device,
     ) -> Result<Self, Error> {
         if head_dim == 0 {
             return Err(refuse(op, "fa2 decode head_dim is zero (decode.cuh:762)"));
@@ -585,7 +571,7 @@ impl DecodeGeometry {
         } else {
             1
         };
-        let num_stages_smem = if dev.cc_major >= 8 { 2 } else { 1 };
+        let num_stages_smem = 2;
         let staged = 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * kv.0;
         let offsets = tile_size_per_bdx * num_threads * KvWidth::POINTER;
         let exchange = 2 * bdy * bdz * 4;
@@ -664,7 +650,6 @@ impl PrefillGeometry {
         head_dim: u32,
         cta_tile_q: u32,
         kv: KvWidth,
-        use_fp16_qk_reduction: bool,
         dev: &Device,
     ) -> Result<Self, Error> {
         if !matches!(cta_tile_q, 16 | 32 | 64 | 128) {
@@ -739,7 +724,6 @@ impl PrefillGeometry {
                 dev.max_smem_per_block_optin
             }
         };
-        let _ = use_fp16_qk_reduction;
         let max_mma_kv_reg = 8 / num_mma_q;
         if per_block <= fixed_smem || (per_block - fixed_smem) < per_mma_kv {
             return Err(refuse(

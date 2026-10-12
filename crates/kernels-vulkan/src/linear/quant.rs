@@ -3,6 +3,7 @@
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
+use crate::tuning::Qmm;
 
 const QMM_FILE: &str = "quant/qmm_t.slang";
 const QMM_RT_FILE: &str = "quant/qmm_rt.slang";
@@ -13,105 +14,38 @@ const GROUPS: [i32; 3] = [32, 64, 128];
 
 const WIDTHS: [i32; 3] = [2, 4, 8];
 
-#[allow(dead_code)]
-pub(crate) fn qmm_stamps_width(bits: u32) -> bool {
-    i32::try_from(bits).is_ok_and(|bits| WIDTHS.contains(&bits))
-}
-
 const TILES: [i32; 2] = [32, 16];
 
 const ROW_TILES: [i32; 4] = [64, 32, 16, 8];
 
 const FRAG_ROWS: i32 = 8;
 
-#[must_use]
-pub fn qmm_group(bm: i32) -> [u32; 3] {
+fn qmm_group(bm: i32) -> [u32; 3] {
     [32, 2, if bm < 2 * FRAG_ROWS { 1 } else { 2 }]
 }
 
 const QMV_GROUP: [u32; 3] = [32, 4, 1];
 
-const QMV_MAX_VECS: i32 = 4;
-
 const QMV_CHUNK: i32 = 32;
 
-const QMM_BK: i32 = 32;
+pub(crate) const QMM_BK: i32 = 32;
 
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 const BN_RUNGS: [i32; 2] = [16, 32];
 
-#[must_use]
-pub fn composed() -> Vec<Fire> {
-    let mut out = Vec::new();
-    for &gs in &GROUPS {
-        for &b in &WIDTHS {
-            out.push(Fire::at(
-                QMV_FILE,
-                qmv_name("quant.qmv", "", gs, b).expect("an axis point"),
-            ));
-            if qmv1_fits(gs, b) {
-                for lanes in QMV1_LANES {
-                    for rows in QMV1_ROWS_PER_LANE {
-                        out.push(Fire::at(QMV1_FILE, qmv1_name(gs, b, lanes, rows)));
-                    }
-                }
-            }
-            for bm in RT_ROW_TILES {
-                for k16 in [false, true] {
-                    out.push(Fire::at(QMM_RT_FILE, qmm_rt_name(gs, b, bm, k16)));
-                }
-            }
-            for &bm in &ROW_TILES {
-                for &bn in &TILES {
-                    out.push(Fire::at(
-                        QMM_FILE,
-                        qmm_name("quant.qmm_t", "", gs, b, bm, bn).expect("an axis point"),
-                    ));
-                }
-            }
-        }
-    }
-    out
+pub(crate) fn qmm_stamped(group: i64, bits: i64) -> bool {
+    i32::try_from(group).is_ok_and(|g| GROUPS.contains(&g))
+        && i32::try_from(bits).is_ok_and(|b| WIDTHS.contains(&b))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Point {
-    pub entry: &'static str,
-
-    pub stamp: &'static str,
-}
-
-pub fn qmm_point(
+fn qmm_name(
     op: &'static str,
-    form: &str,
-    stamp: &str,
-    group: i32,
-    bits: i32,
-    bm: i32,
-    bn: i32,
-) -> Result<Point, Error> {
-    let _ = stamp;
-    Ok(Point {
-        entry: qmm_name(op, form, group, bits, bm, bn)?,
-        stamp: "",
-    })
-}
-
-pub fn qmm_name(
-    op: &'static str,
-    form: &str,
     group: i32,
     bits: i32,
     bm: i32,
     bn: i32,
 ) -> Result<&'static str, Error> {
-    if !form.is_empty() {
-        return Err(refuse(
-            op,
-            format!("no tiled point is instantiated in the `{form}` form"),
-        ));
-    }
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
     check(op, &ROW_TILES, bm, "row tile")?;
@@ -121,8 +55,7 @@ pub fn qmm_name(
     )))
 }
 
-/// The register-tiled point's row tiles; its column tile is 64.
-const RT_ROW_TILES: [i32; 2] = [32, 64];
+/// The register-tiled point's column tile.
 const RT_COLS: u32 = 64;
 
 fn qmm_rt_name(group: i32, bits: i32, bm: i32, k16: bool) -> &'static str {
@@ -134,7 +67,7 @@ fn qmm_rt_name(group: i32, bits: i32, bm: i32, k16: bool) -> &'static str {
 
 /// The one-row point loads 128 bits of codes at once, which must stay
 /// inside one scale group.
-fn qmv1_fits(group: i32, bits: i32) -> bool {
+pub(crate) fn qmv1_fits(group: i64, bits: i64) -> bool {
     matches!(bits, 4 | 8) && 128 / bits <= group
 }
 
@@ -148,81 +81,22 @@ fn qmv1_name(group: i32, bits: i32, lanes: u32, rows: u32) -> &'static str {
     }
 }
 
-/// Lanes a row of the one-row point can take.
-const QMV1_LANES: [u32; 3] = [32, 16, 8];
-
-/// Rows one lane of the one-row point can carry.
-const QMV1_ROWS_PER_LANE: [u32; 2] = [1, 2];
-
-pub fn qmm_precast_name(
-    op: &'static str,
-    before: &str,
-    after: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (before, after, bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn qmv_point(op: &'static str, form: &str, group: i32, bits: i32) -> Result<Point, Error> {
-    Ok(Point {
-        entry: qmv_name(op, form, group, bits)?,
-        stamp: "",
-    })
-}
-
-pub fn qmv_name(
-    op: &'static str,
-    form: &str,
-    group: i32,
-    bits: i32,
-) -> Result<&'static str, Error> {
-    if !form.is_empty() && form != "fast" {
-        return Err(refuse(
-            op,
-            format!("no vector point is instantiated in the `{form}` form"),
-        ));
-    }
+/// The vector point at `vecs` activation rows a workgroup: 4 carries the
+/// plain name, 1, 2 and 8 a `_v` suffix.
+fn qmv_name(op: &'static str, group: i32, bits: i32, vecs: u32) -> Result<&'static str, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
-    Ok(symbol(&format!("affine_qmv_bf16_gs_{group}_b_{bits}")))
-}
-
-pub fn qmv_rows_point(
-    op: &'static str,
-    group: i32,
-    bits: i32,
-    rows: i32,
-    packs: i32,
-) -> Result<Point, Error> {
-    let _ = (group, bits, rows, packs);
-    Err(Error::Unsupported { op })
-}
-
-pub fn precast_point(
-    op: &'static str,
-    form: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (form, bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn routed_fp16_point(op: &'static str, bm: i32, bn: i32) -> Result<&'static str, Error> {
-    let _ = (bm, bn);
-    Err(Error::Unsupported { op })
-}
-
-pub fn mxfp4_routed_point(
-    op: &'static str,
-    form: &str,
-    bm: i32,
-    bn: i32,
-) -> Result<&'static str, Error> {
-    let _ = (form, bm, bn);
-    Err(Error::Unsupported { op })
+    if !matches!(vecs, 1 | 2 | 4 | 8) {
+        return Err(refuse(
+            op,
+            format!("no vector point reads {vecs} rows a workgroup"),
+        ));
+    }
+    Ok(symbol(&if vecs == 4 {
+        format!("affine_qmv_bf16_gs_{group}_b_{bits}")
+    } else {
+        format!("affine_qmv_bf16_gs_{group}_b_{bits}_v{vecs}")
+    }))
 }
 
 fn check(op: &'static str, points: &[i32], v: i32, what: &'static str) -> Result<(), Error> {
@@ -232,19 +106,7 @@ fn check(op: &'static str, points: &[i32], v: i32, what: &'static str) -> Result
         .ok_or_else(|| refuse(op, format!("no point is instantiated at {what} {v}")))
 }
 
-#[must_use]
-pub fn bm_rung(rows: i32) -> i32 {
-    let mut best = BM_RUNGS[0];
-    for &rung in &BM_RUNGS[1..] {
-        if rows >= rung {
-            best = rung;
-        }
-    }
-    best
-}
-
-#[must_use]
-pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
+fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
     let rows = rows.max(1);
     let capacity = capacity.max(1);
     let fits = |rung: i32| {
@@ -263,8 +125,7 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
         .or_else(|| fits(BM_RUNGS[0]))
 }
 
-#[must_use]
-pub fn bn_unsplit(out_width: i32, row_tiles: i32, crossover_tg: i32) -> Option<i32> {
+fn bn_unsplit(out_width: i32, row_tiles: i32, crossover_tg: i32) -> Option<i32> {
     if out_width % BN_RUNGS[0] != 0 {
         return None;
     }
@@ -274,25 +135,9 @@ pub fn bn_unsplit(out_width: i32, row_tiles: i32, crossover_tg: i32) -> Option<i
     Some(BN_RUNGS[0])
 }
 
-pub fn qmm_grid(
-    op: &'static str,
-    n: i32,
-    bn: i32,
-    m: i32,
-    bm: i32,
-    split_k: i32,
-) -> Result<[u32; 3], Error> {
-    if n <= 0 {
-        return Err(refuse(op, "the column count is zero"));
-    }
-    if m <= 0 {
-        return Err(refuse(op, "the row count is zero"));
-    }
-    if bn <= 0 || bm <= 0 {
-        return Err(refuse(op, "the tile is zero"));
-    }
-    if split_k <= 0 {
-        return Err(refuse(op, "the k split is zero"));
+fn qmm_grid(op: &'static str, n: i32, bn: i32, m: i32, bm: i32) -> Result<[u32; 3], Error> {
+    if n <= 0 || m <= 0 || bn <= 0 || bm <= 0 {
+        return Err(refuse(op, "a dimension of the tiled grid is zero"));
     }
     if m % bm != 0 {
         return Err(refuse(
@@ -317,7 +162,7 @@ pub fn qmm_grid(
             group[1],
             "the row tiles",
         )?,
-        lanes(split_k.unsigned_abs(), group[2], "the k splits")?,
+        lanes(1, group[2], "the k splits")?,
     ])
 }
 
@@ -337,64 +182,65 @@ pub fn qmv_grid(op: &'static str, vecs: i32, out_vec_size: i32) -> Result<[u32; 
 
 use crate::encode::symbol;
 
-pub struct Scratch<'a> {
-    pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
+const QMM_CM_TILE: u32 = 64;
+
+fn qmm_cm_name(op: &'static str, group: i32, bits: i32) -> Result<&'static str, Error> {
+    check(op, &GROUPS, group, "group size")?;
+    check(op, &WIDTHS, bits, "bit width")?;
+    Ok(symbol(&format!("affine_qmm_t_cm_bf16_gs_{group}_b_{bits}")))
 }
 
-pub const QMM_CM_TILE: u32 = 64;
-
-pub fn qmm_cm_name(op: &'static str, group: i32, bits: i32) -> Result<&'static str, Error> {
-    Ok(match (group, bits) {
-        (32, 2) => "affine_qmm_t_cm_bf16_gs_32_b_2",
-        (32, 4) => "affine_qmm_t_cm_bf16_gs_32_b_4",
-        (32, 8) => "affine_qmm_t_cm_bf16_gs_32_b_8",
-        (64, 2) => "affine_qmm_t_cm_bf16_gs_64_b_2",
-        (64, 4) => "affine_qmm_t_cm_bf16_gs_64_b_4",
-        (64, 8) => "affine_qmm_t_cm_bf16_gs_64_b_8",
-        (128, 2) => "affine_qmm_t_cm_bf16_gs_128_b_2",
-        (128, 4) => "affine_qmm_t_cm_bf16_gs_128_b_4",
-        (128, 8) => "affine_qmm_t_cm_bf16_gs_128_b_8",
-        _ => {
-            return Err(refuse(
-                op,
-                format!("no coopmat tile is instantiated for {bits}-bit groups of {group}"),
-            ));
-        }
-    })
+/// The `kernel.qmm` variant an entry belongs to.
+#[must_use]
+pub fn ran(entry: &str) -> Option<&'static str> {
+    if entry.starts_with("affine_qmm_t_cm_") {
+        Some("coopmat")
+    } else if entry.starts_with("affine_qmm_rt_") {
+        Some("register_tiled")
+    } else if entry.starts_with("affine_qmm_t_") {
+        Some("tiled")
+    } else if entry.starts_with("affine_qmv1_") {
+        Some("one_row")
+    } else if entry.starts_with("affine_qmv_") {
+        Some("qmv")
+    } else {
+        None
+    }
 }
 
 pub fn matmul(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, y, scratch, capacity_rows)
+    act_x_wt(ctx, tuning, "linear.matmul", act, w, y, capacity_rows)
 }
 
 pub fn lm_head(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.lm_head", act, w, y, scratch, capacity_rows)
+    act_x_wt(ctx, tuning, "linear.lm_head", act, w, y, capacity_rows)
 }
 
+/// Runs the first `kernel.qmm` rung that fits and can run; a tiled rung
+/// declines where the row capacity cannot hold its padding.
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     op: &'static str,
     act: Tensor,
     w: Bank,
     y: Tensor,
-    scratch: Scratch<'_>,
     capacity_rows: u32,
 ) -> Result<(), Error> {
-    let _ = scratch;
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
 
     let Some(biases) = w.biases else {
@@ -428,139 +274,98 @@ pub fn act_x_wt(
         stated(op, columns)?,
         stated(op, contraction)?,
     );
-    let tuned = crate::tuning::current();
-    let min_batch = i32::try_from(tuned.qmm_min_batch(false, false)).unwrap_or(i32::MAX);
-
-    if crate::tuning::device().coopmat && m >= min_batch && k % QMM_BK == 0 {
-        let name = qmm_cm_name(op, group, bits)?;
-        return ctx.fire(
-            Fire::at(QMM_FILE, name).apply(Grid::of(
-                [
-                    (n as u32).div_ceil(QMM_CM_TILE) * 32,
-                    (m as u32).div_ceil(QMM_CM_TILE) * 4,
-                    1,
-                ],
-                [32, 4, 1],
-            )),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-            ],
-        );
+    let args = [
+        w.codes.arg(),
+        w.scales.arg(),
+        biases.arg(),
+        act.arg(),
+        y.arg_mut(),
+        k.arg(),
+        n.arg(),
+        m.arg(),
+    ];
+    let at = tuning.qmm_at(rows, columns, contraction, w.bits, w.group);
+    for choice in tuning.qmm(&at) {
+        match choice {
+            Qmm::Coopmat => {
+                let name = qmm_cm_name(op, group, bits)?;
+                return ctx.fire(
+                    Fire::at(QMM_FILE, name).apply(Grid::of(
+                        [
+                            (n as u32).div_ceil(QMM_CM_TILE) * 32,
+                            (m as u32).div_ceil(QMM_CM_TILE) * 4,
+                            1,
+                        ],
+                        [32, 4, 1],
+                    )),
+                    &args,
+                );
+            }
+            Qmm::RegisterTiled { bm, k16 } => {
+                let row_tiles = rows.div_ceil(bm);
+                return ctx.fire(
+                    Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm as i32, k16)).apply(
+                        Grid::of(
+                            [
+                                columns.div_ceil(RT_COLS) * (RT_COLS / 4),
+                                row_tiles * (bm / 4),
+                                1,
+                            ],
+                            [RT_COLS / 4, bm / 4, 1],
+                        ),
+                    ),
+                    &args,
+                );
+            }
+            Qmm::Tiled { crossover_tg } => {
+                let crossover = i32::try_from(crossover_tg).unwrap_or(i32::MAX);
+                let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
+                if let Some((bm, padded)) = mb_block(m, capacity)
+                    && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
+                {
+                    return ctx.fire(
+                        Fire::at(QMM_FILE, qmm_name(op, group, bits, bm, bn)?)
+                            .apply(Grid::of(qmm_grid(op, n, bn, padded, bm)?, qmm_group(bm))),
+                        &args,
+                    );
+                }
+            }
+            Qmm::OneRow {
+                lanes,
+                rows: per_lane,
+            } => {
+                return ctx.fire(
+                    Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, per_lane)).apply(Grid::of(
+                        // 256 invocations land 256 / lanes rows, `per_lane` each.
+                        [columns.div_ceil(256 / lanes * per_lane) * 64, 4, 1],
+                        [64, 4, 1],
+                    )),
+                    &args,
+                );
+            }
+            Qmm::Qmv { vecs } => {
+                let chunk = if bits == 8 { 16 } else { QMV_CHUNK };
+                if k % chunk != 0 {
+                    return Err(refuse(
+                        op,
+                        format!(
+                            "the vector point walks the contraction in {chunk}-code chunks; \
+                             this batch is {m} x {k}"
+                        ),
+                    ));
+                }
+                let vec_blocks = rows.div_ceil(vecs);
+                return ctx.fire(
+                    Fire::at(QMV_FILE, qmv_name(op, group, bits, vecs)?).apply(Grid::of(
+                        [32 * columns.div_ceil(8), 4 * vec_blocks, 1],
+                        QMV_GROUP,
+                    )),
+                    &args,
+                );
+            }
+        }
     }
-    if tuned.qmm_register_tiles
-        && m >= min_batch
-        && k % QMM_BK == 0
-        && GROUPS.contains(&group)
-        && WIDTHS.contains(&bits)
-    {
-        let bm = if m > 32 { 64 } else { 32 };
-        let rows = (m as u32).div_ceil(bm as u32);
-        return ctx.fire(
-            Fire::at(QMM_RT_FILE, qmm_rt_name(group, bits, bm, tuned.qmm_rt_k16)).apply(Grid::of(
-                [
-                    (n as u32).div_ceil(RT_COLS) * (RT_COLS / 4),
-                    rows * (bm as u32 / 4),
-                    1,
-                ],
-                [RT_COLS / 4, bm as u32 / 4, 1],
-            )),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-            ],
-        );
-    }
-    let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
-    let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
-    if m >= min_batch
-        && k % QMM_BK == 0
-        && let Some((bm, padded)) = mb_block(m, capacity)
-        && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
-    {
-        return ctx.fire(
-            Fire::at(QMM_FILE, qmm_name(op, "", group, bits, bm, bn)?)
-                .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-            ],
-        );
-    }
-    let (lanes, rows) = (tuned.qmv_one_row_lanes, tuned.qmv_one_row_rows);
-    if m == 1
-        && tuned.qmv_one_row
-        && QMV1_LANES.contains(&lanes)
-        && QMV1_ROWS_PER_LANE.contains(&rows)
-        && qmv1_fits(group, bits)
-        && GROUPS.contains(&group)
-        && (k * bits) % 128 == 0
-        && k % 8 == 0
-    {
-        return ctx.fire(
-            Fire::at(QMV1_FILE, qmv1_name(group, bits, lanes, rows)).apply(Grid::of(
-                // 256 invocations land 256 / lanes rows each `rows` deep.
-                [(n as u32).div_ceil(256 / lanes * rows) * 64, 4, 1],
-                [64, 4, 1],
-            )),
-            &[
-                w.codes.arg(),
-                w.scales.arg(),
-                biases.arg(),
-                act.arg(),
-                y.arg_mut(),
-                k.arg(),
-                n.arg(),
-                m.arg(),
-            ],
-        );
-    }
-    let chunk = if bits == 8 { 16 } else { QMV_CHUNK };
-    if k % chunk != 0 {
-        return Err(refuse(
-            op,
-            format!(
-                "the vector point walks the contraction in {chunk}-code chunks; this \
-                 batch is {m} x {k}"
-            ),
-        ));
-    }
-
-    let vec_blocks = (m as u32).div_ceil(QMV_MAX_VECS as u32);
-    ctx.fire(
-        Fire::at(QMV_FILE, qmv_name(op, "", group, bits)?).apply(Grid::of(
-            [32 * (n as u32).div_ceil(8), 4 * vec_blocks, 1],
-            QMV_GROUP,
-        )),
-        &[
-            w.codes.arg(),
-            w.scales.arg(),
-            biases.arg(),
-            act.arg(),
-            y.arg_mut(),
-            k.arg(),
-            n.arg(),
-            m.arg(),
-        ],
-    )
+    unreachable!("`kernel.qmm` ends on the vector kernel, which serves every shape")
 }
 
 fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), Error> {

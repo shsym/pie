@@ -1,5 +1,7 @@
 pub mod attn;
 pub mod collective;
+#[cfg(feature = "probe")]
+pub mod cores;
 pub mod elemwise;
 pub mod encode;
 pub mod error;
@@ -19,4 +21,4 @@ pub use encode::{
 pub use error::Error;
 pub use sources::{CENSUS, MODULES, census, module};
 pub use tensor::{Bank, Comm, KvPool, RaggedTensor, RecurrentPool, Tensor};
-pub use tuning::{DeviceInfo, DeviceTuning, Vendor};
+pub use tuning::Tuning;

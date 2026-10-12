@@ -46,7 +46,7 @@ pub fn capture(
     if super::q8::enabled(pool, head_dim) {
         return Err(refuse(
             OP,
-            "score capture is not yet supported with PIE_METAL_KV_Q8=1",
+            "score capture is not yet supported with `kernel.sdpa.kv_q8` on",
         ));
     }
     if window.is_some() {
@@ -220,6 +220,7 @@ mod tests {
             page_size: 16,
             seq_stride: u64::from(kv_heads) * u64::from(head_dim),
             head_stride: u64::from(head_dim),
+            q8: false,
         }
     }
 

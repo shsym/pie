@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
-use engine_cuda::{Boot, Graphs, Lane, Shell};
+use engine_cuda::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
@@ -148,7 +148,10 @@ fn fixture(text: Text) -> Fixture {
     }
 }
 
-fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
+fn load(fixture: &Fixture, grouped: bool) -> engine_cuda::Result<Shell> {
+    let chip = engine_cuda::chip::profile(&format!(
+        "[kernel]\nmoe.grouped = {grouped}\n[engine]\ngraphs = \"off\"\n"
+    ));
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -156,15 +159,16 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
         budget: Budget::new(1, fixture.text.ceiling),
         patches: None,
         voxels: None,
-        profile: None,
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        knobs: engine_cuda::Knobs {
+            chip: Some(chip),
+            ..engine_cuda::Knobs::default()
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
@@ -174,8 +178,12 @@ fn load(fixture: &Fixture) -> engine_cuda::Result<Shell> {
     })
 }
 
-fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    let mut shell = load(fixture)?;
+fn fire_at(
+    fixture: &Fixture,
+    tokens: u32,
+    grouped: bool,
+) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
+    let mut shell = load(fixture, grouped)?;
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
     let prompt: Vec<u32> = (0..tokens).map(|t| (t * 7 + 11) % 2048).collect();
@@ -192,13 +200,6 @@ fn fire_at(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>
         tokens: &prompt,
     }])?;
     Ok((rows, start.elapsed().as_secs_f64() * 1e3))
-}
-
-fn fire_at_ungrouped(fixture: &Fixture, tokens: u32) -> engine_cuda::Result<(Vec<Vec<f32>>, f64)> {
-    unsafe { std::env::set_var("PIE_NO_MOE_GROUP", "1") };
-    let answer = fire_at(fixture, tokens);
-    unsafe { std::env::remove_var("PIE_NO_MOE_GROUP") };
-    answer
 }
 
 #[test]
@@ -222,13 +223,13 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         )
     };
 
-    let (logits, _) = fire_at(&fixture, WIDE).expect(
+    let (logits, _) = fire_at(&fixture, WIDE, true).expect(
         "a prefill of 65600 routes fires — if this refused, the engine never reached the \
          grouped leg and the routed matmul is still one GEMV per route",
     );
     finite(&logits[0], "the wide prefill");
 
-    let why = fire_at_ungrouped(&fixture, WIDE)
+    let why = fire_at(&fixture, WIDE, false)
         .expect_err("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
         .to_string();
     assert!(
@@ -246,8 +247,8 @@ fn the_two_legs_answer_the_same_model() {
     }
     let fixture = fixture(MICRO);
 
-    let (grouped, grouped_ms) = fire_at(&fixture, BOTH).expect("the grouped leg fires");
-    let (gemv, gemv_ms) = fire_at_ungrouped(&fixture, BOTH).expect("the per-route GEMV fires");
+    let (grouped, grouped_ms) = fire_at(&fixture, BOTH, true).expect("the grouped leg fires");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, false).expect("the per-route GEMV fires");
     finite(&grouped[0], "grouped");
     finite(&gemv[0], "gemv");
 
@@ -309,8 +310,8 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     }
     let fixture = fixture(UNCACHED);
 
-    let (grouped, grouped_ms) = fire_at(&fixture, BOTH).expect("the grouped leg fires");
-    let (gemv, gemv_ms) = fire_at_ungrouped(&fixture, BOTH).expect("the per-route GEMV fires");
+    let (grouped, grouped_ms) = fire_at(&fixture, BOTH, true).expect("the grouped leg fires");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, false).expect("the per-route GEMV fires");
     finite(&grouped[0], "grouped");
     finite(&gemv[0], "gemv");
 

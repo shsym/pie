@@ -17,12 +17,12 @@ use engine::program::{
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
-use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
+use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
 use poem_ir::Trace;
 
 use crate::error::Fault;
 use crate::program::Session as ProgramSession;
-use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
+use crate::serve::{Attached, Boot, Knobs, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
@@ -38,12 +38,11 @@ impl Default for World {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceBoot {
     pub ordinal: i32,
     pub world: World,
     pub comm: Option<Arc<crate::comm::Comm>>,
-    pub graphs: Graphs,
     pub knobs: Knobs,
     pub cache_dir: Option<std::path::PathBuf>,
     pub adapter_dir: Option<std::path::PathBuf>,
@@ -191,7 +190,9 @@ impl Cuda {
 
 fn fault(fault: Fault) -> Error {
     match fault {
-        Fault::Runtimeless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::Runtimeless | Fault::Device { .. } | Fault::Unsupported(_) => {
+            Error::Device(fault.to_string())
+        }
         Fault::Bake(_)
         | Fault::Load(_)
         | Fault::Param { .. }
@@ -246,12 +247,22 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// Powers of two from the floor up to `max_tokens`, with `steps - 1` more
+/// between each pair.
 #[must_use]
-pub(crate) fn default_lattice(max_tokens: u32) -> Vec<u32> {
-    let mut lattice: Vec<u32> =
-        core::iter::successors(Some(LATTICE_FLOOR), |point| point.checked_mul(2))
-            .take_while(|point| *point < max_tokens)
-            .collect();
+pub(crate) fn default_lattice(max_tokens: u32, steps: u32) -> Vec<u32> {
+    let steps = steps.max(1);
+    let mut lattice: Vec<u32> = Vec::new();
+    for i in 0u32.. {
+        let point = (f64::from(LATTICE_FLOOR) * 2f64.powf(f64::from(i) / f64::from(steps))).ceil();
+        if point >= f64::from(max_tokens) {
+            break;
+        }
+        let point = point as u32;
+        if lattice.last() != Some(&point) {
+            lattice.push(point);
+        }
+    }
     lattice.push(max_tokens);
     lattice
 }
@@ -259,9 +270,9 @@ pub(crate) fn default_lattice(max_tokens: u32) -> Vec<u32> {
 pub(crate) const LATTICE_FLOOR: u32 = 1;
 
 #[must_use]
-pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32) -> Vec<u32> {
+pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32, steps: u32) -> Vec<u32> {
     if stated.is_empty() {
-        default_lattice(max_tokens)
+        default_lattice(max_tokens, steps)
     } else {
         stated
     }
@@ -442,14 +453,6 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
-        if !self.boot.graphs.records() {
-            eprintln!(
-                "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
-{:?}, not \"on\"): every fire launches eagerly, which costs per-step host time; \
-intended for diagnostics, not serving",
-                self.boot.graphs
-            );
-        }
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -474,7 +477,6 @@ intended for diagnostics, not serving",
             budget: bake_budgets(&budgets),
             patches,
             voxels,
-            profile: None::<DeviceProfile>,
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
@@ -485,7 +487,6 @@ intended for diagnostics, not serving",
             } else {
                 self.boot.ordinal
             },
-            graphs: self.boot.graphs,
             knobs: self.boot.knobs.clone(),
             cache_dir: self.boot.cache_dir.as_deref(),
             runahead: engine::runahead::Runahead::of(frames_in_flight),

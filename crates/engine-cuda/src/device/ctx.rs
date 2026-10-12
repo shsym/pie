@@ -71,8 +71,8 @@ pub struct Context {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     slabs: Slabs,
     device: Device,
-    toggles: Toggles,
     capability: (i32, i32),
+    name: String,
 }
 
 impl Context {
@@ -135,7 +135,19 @@ impl Context {
                         Some(peers) => ctx.with_comm(comm.raw()).with_peers(peers),
                     },
                 };
-                let device = Device::probe(&ctx).unwrap_or(Device::L40S);
+                let Some(device) = Device::probe(&ctx) else {
+                    return Err(Fault::Unsupported(format!(
+                        "device {ordinal} would not say its multiprocessor count, compute \
+                         capability or shared memory"
+                    )));
+                };
+                if device.cc_major < Device::FLOOR_MAJOR {
+                    return Err(Fault::Unsupported(format!(
+                        "device {ordinal} is compute capability {}.x; the CUDA engine serves \
+                         sm_80 (Ampere) and newer",
+                        device.cc_major
+                    )));
+                }
                 Ok(Context {
                     ordinal,
                     stream,
@@ -147,8 +159,10 @@ impl Context {
                     conditional: None,
                     events: Vec::new(),
                     device,
-                    toggles: Toggles::from_env(),
                     capability: capability(ordinal),
+                    name: crate::chip::probe(ordinal)
+                        .map(|(name, _)| name)
+                        .unwrap_or_default(),
                 })
             }
         }
@@ -263,7 +277,10 @@ impl Context {
             Ok(Side {
                 stream,
                 cublas,
-                ctx: Ctx::on(stream).with_cublas(cublas).with_slabs(self.slabs),
+                ctx: Ctx::on(stream)
+                    .with_cublas(cublas)
+                    .with_slabs(self.slabs)
+                    .with_tuning(self.ctx.tuning()),
             })
         }
     }
@@ -328,7 +345,18 @@ impl Context {
 
     #[must_use]
     pub fn toggles(&self) -> Toggles {
-        self.toggles
+        Toggles::of(self.ctx.tuning())
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Lay a load's kernel decisions on this context, before it opens side
+    /// streams.
+    pub fn set_tuning(&mut self, tuning: kernels_cuda::tuning::Tuning) {
+        self.ctx.set_tuning(tuning);
     }
 
     #[must_use]

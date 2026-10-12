@@ -357,6 +357,8 @@ pub fn cuts(
     Ok(cuts)
 }
 
+/// Bodies a load keeps beside `mem_mb`: the count bounds host bookkeeping and
+/// graph handles, which bytes do not measure.
 pub const MAX_BODIES: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

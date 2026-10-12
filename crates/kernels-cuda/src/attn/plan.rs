@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::attn::{sched_decode, sched_mla, sched_prefill, sched_sm90};
+use crate::attn::{sched_decode, sched_mla, sched_prefill};
 
 use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
@@ -14,8 +14,11 @@ pub struct Device {
 }
 
 impl Device {
+    pub const FLOOR_MAJOR: u32 = 8;
+
+    /// For tests; never a stand-in for a device the probe could not read.
     pub const L40S: Self = Self {
-        num_sm: 148,
+        num_sm: 142,
         cc_major: 8,
         max_smem_per_sm: 102_400,
         max_smem_per_block_optin: 101_376,
@@ -211,29 +214,6 @@ impl PrefillPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrefillPlanSm90 {
-    pub info: PrefillPlanSm90Info,
-    pub int_upload: Vec<u8>,
-    pub int_bytes: usize,
-    pub workspace: Workspace,
-    pub shape: Shape,
-    pub total_tokens: u32,
-    pub causal: bool,
-    pub device: Device,
-}
-
-impl PrefillPlanSm90 {
-    pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
-        upload(
-            ctx,
-            "attention.plan_prefill_sm90",
-            &self.int_upload,
-            self.workspace.int_ptr,
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlaPlan {
     pub info: MlaPlanInfo,
     pub int_upload: Vec<u8>,
@@ -268,22 +248,24 @@ pub struct Toggles {
     pub force_split_small: bool,
 
     pub window_split: bool,
+
+    pub chunk_floor_128: bool,
+
+    pub prefill_ctas_per_sm: u32,
+
+    pub static_max_requests: u32,
 }
 
 impl Toggles {
     #[must_use]
-    pub fn from_env() -> Self {
+    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: truthy("PIE_CUDA_FORCE_SPLIT_KV_SMALL"),
-            window_split: truthy("PIE_CUDA_WINDOW_SPLIT_KV"),
+            force_split_small: tuning.decode_split_small,
+            window_split: tuning.decode_split_window,
+            chunk_floor_128: tuning.decode_chunk_floor_128,
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
+            static_max_requests: tuning.decode_static_max_requests,
         }
-    }
-}
-
-fn truthy(key: &str) -> bool {
-    match std::env::var(key) {
-        Ok(v) => v != "0",
-        Err(_) => false,
     }
 }
 
@@ -353,12 +335,8 @@ pub fn plan_decode(
 
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
-        && sched_decode::can_use_static_nonsplit(
-            shape.num_requests,
-            device.cc_major,
-            enable_cuda_graph,
-            toggles,
-        ) {
+        && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
+    {
         sched_decode::static_nonsplit(
             OP,
             shape.num_requests,
@@ -377,6 +355,7 @@ pub fn plan_decode(
             page_size: shape.page_size,
             head_dim: shape.head_dim,
             enable_cuda_graph,
+            chunk_floor_128: toggles.chunk_floor_128,
         };
         sched_decode::plan(
             OP,
@@ -412,6 +391,7 @@ pub fn plan_prefill(
     enable_cuda_graph: bool,
     mask_indptr: Option<Tensor>,
     device: &Device,
+    toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
     const OP: &str = "attention.plan_prefill";
@@ -433,6 +413,7 @@ pub fn plan_prefill(
         page_size: shape.page_size,
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
     let (built, capturable, graph_refusal) =
@@ -487,47 +468,6 @@ pub fn plan_prefill(
 pub use crate::attn::sched_prefill::{
     graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
 };
-
-#[allow(clippy::too_many_arguments)]
-pub fn plan_prefill_sm90(
-    qo_indptr: &[i32],
-    kv_indptr: &[i32],
-    kv_len: &[i32],
-    total_tokens: u32,
-    shape: Shape,
-    live: Live,
-    causal: bool,
-    enable_cuda_graph: bool,
-    device: &Device,
-    workspace: Workspace,
-) -> Result<PrefillPlanSm90, Error> {
-    const OP: &str = "attention.plan_prefill_sm90";
-    some_requests(OP, &shape)?;
-    let req = sched_sm90::Request {
-        qo_indptr,
-        kv_indptr,
-        kv_len_arr: kv_len,
-        total_num_rows: total_tokens,
-        batch_size: shape.num_requests,
-        live,
-        num_qo_heads: shape.num_q_heads,
-        num_kv_heads: shape.num_kv_heads,
-        head_dim: shape.head_dim,
-        causal,
-        enable_cuda_graph,
-    };
-    let built = sched_sm90::plan(OP, &req, device, workspace.int_bytes)?;
-    Ok(PrefillPlanSm90 {
-        info: built.info,
-        int_upload: built.int_upload,
-        int_bytes: built.int_bytes,
-        workspace,
-        shape,
-        total_tokens,
-        causal,
-        device: *device,
-    })
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(
@@ -637,19 +577,6 @@ pub struct PrefillPlanInfo {
     pub block_valid_mask_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PrefillPlanSm90Info {
-    pub qo_tile_indices_offset: Option<u32>,
-    pub qo_indptr_offset: Option<u32>,
-    pub kv_indptr_offset: Option<u32>,
-    pub qo_len_offset: Option<u32>,
-    pub kv_len_offset: Option<u32>,
-    pub head_indices_offset: Option<u32>,
-    pub work_indptr_offset: Option<u32>,
-    pub batch_indices_offset: Option<u32>,
-    pub same_schedule_for_all_heads: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

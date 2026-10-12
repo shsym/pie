@@ -32,6 +32,8 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
+    /// `$PIE_HOME/profiles`, where a user's device profiles live.
+    pub profiles: Option<std::path::PathBuf>,
 }
 
 struct PendingStep {
@@ -503,6 +505,7 @@ impl Engine for Metal {
             memory_share: residency.device_memory_share,
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
+            profiles: self.boot.profiles.clone(),
         })
         .map_err(fault)?;
 

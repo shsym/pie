@@ -26,35 +26,41 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.
-    let device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    let chip = match boot.knobs.chip.clone() {
+        Some(chip) => chip,
+        None => {
+            let (major, minor) = device.capability();
+            let measured = crate::chip::facts(
+                u32::try_from(major).unwrap_or(0),
+                u32::try_from(minor).unwrap_or(0),
+                device.device().num_sm,
+            );
+            let (chip, report) =
+                crate::chip::resolve(device.name(), &measured, boot.knobs.profiles.as_deref());
+            crate::chip::SHELF.tell_untuned(device.name(), &report);
+            chip
+        }
+    };
+    device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    let engine = crate::chip::Engine::of(&chip);
 
     kernels_cuda::disk::install(boot.cache_dir);
 
     let stated_buckets = std::mem::take(&mut boot.budget.buckets);
-    boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
+    boot.budget.buckets = crate::api::lattice(
+        stated_buckets.clone(),
+        boot.budget.max_tokens,
+        engine.lattice_steps,
+    );
 
-    let mut profile = boot.profile.take().unwrap_or(DeviceProfile {
-        sms: device.device().num_sm,
-        ..DeviceProfile::default()
-    });
-    if let Some(streams) = boot.knobs.side_streams {
-        profile.side_streams = streams;
+    let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
+    let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
+    let mut kernels = poem_compiler::fuse::flags::kernels(&chip);
+    if !boot.knobs.diagnostics.fuse_chains {
+        kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
     }
-    profile.exclusive = crate::EXCLUSIVE
-        .iter()
-        .map(|op| (*op).to_string())
-        .collect();
-    profile.grouped = if boot.knobs.grouped {
-        crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
-    } else {
-        Vec::new()
-    };
-    let kernels: &[&str] = if boot.knobs.diagnostics.fuse_chains {
-        &crate::FUSED
-    } else {
-        &crate::UNCHAINED
-    };
-    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -98,7 +104,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if !stated_buckets.is_empty() {
             buckets.push(tokens);
         }
-        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
         budget
     };
     let asked_tokens = boot.budget.max_tokens;
@@ -123,11 +129,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 &budget,
                 &facts,
                 &device.device(),
+                device.toggles(),
                 &crate::exports::schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(windowed)
     };
-    let tokens = crate::store::tokens_within(asked_tokens, floor, after_weights / 2, working_at);
+    let share = after_weights / 100 * u64::from(engine.working_set_percent);
+    let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
     if tokens != asked_tokens {
         eprintln!(
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
@@ -208,6 +216,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     }
     Ok(Baked {
         device,
+        engine,
         compiled,
         budgets,
         profile,
@@ -233,6 +242,7 @@ fn refit(
     profile: &DeviceProfile,
     paging: Paging,
     table: &crate::run::WeightTable,
+    engine: crate::chip::Engine,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
@@ -258,7 +268,7 @@ fn refit(
             .filter(|bucket| *bucket < tokens)
             .collect();
         buckets.push(tokens);
-        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget.buckets = crate::api::lattice(buckets, tokens, engine.lattice_steps);
         budget
     };
     let budgets_at = |budget: &Budget| Budgets {
@@ -299,6 +309,7 @@ fn refit(
                 &budget,
                 &facts,
                 &device.device(),
+                device.toggles(),
                 &schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(tiles)
@@ -326,7 +337,11 @@ fn refit(
         let room = live
             .saturating_sub(sequence)
             .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
-        Ok(if owed { room.min(live / 2) } else { room })
+        Ok(if owed {
+            room.min(live / 100 * u64::from(engine.working_set_percent))
+        } else {
+            room
+        })
     };
     let floor = TOKENS_FLOOR.min(asked_tokens);
     let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
@@ -408,6 +423,7 @@ impl Shell {
         let mut boot = boot;
         let Baked {
             mut device,
+            engine,
             compiled,
             budgets,
             profile,
@@ -481,6 +497,7 @@ impl Shell {
             &profile,
             paging,
             weights.table(),
+            engine,
         )?;
         let paging = paging.windowed(
             crate::store::window_of(&boot.trace)?,
@@ -699,6 +716,7 @@ impl Shell {
             poem_exec::fire::max_runs(&compiled),
             poem_exec::fire::fragmentable(&compiled),
             device.device(),
+            device.toggles(),
             boot.runahead,
             patch_seat,
             mrope_seat,
@@ -779,12 +797,12 @@ impl Shell {
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,
-            graphs: boot.graphs,
-            copies: boot.knobs.copies,
-            pad: boot.knobs.pad(),
+            graphs: engine.graphs,
+            copies: engine.copies,
+            pad: engine.recording.pad(),
             golden_arm: Golden::Off,
-            bodies: boot.knobs.bodies(),
-            bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies: engine.recording.bodies(),
+            bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -807,7 +825,7 @@ impl Shell {
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
-                "engine-cuda: [engine] graphs is on but this load armed a dense rotor, \
+                "engine-cuda: engine.graphs is on but this load armed a dense rotor, \
                  so every fire walks eagerly and nothing is recorded — a rotation's \
                  backpressure is a host cursor and a replayed graph has no walk{}",
                 if shell.bodies {
@@ -821,9 +839,9 @@ impl Shell {
         }
         if !shell.graphs.records() {
             eprintln!(
-                "engine-cuda: [engine] graphs is {}, a diagnostic mode — every fire \
+                "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
                  walks eagerly (~470 kernel launches of host time per decode step) \
-                 with nothing captured; leave the key unstated to serve bodies",
+                 with nothing captured; a profile serves `on` with bodies",
                 match shell.graphs {
                     Graphs::Off => "off",
                     Graphs::Shaped => "shaped",
@@ -832,10 +850,10 @@ impl Shell {
             );
         } else if !shell.bodies {
             eprintln!(
-                "engine-cuda: [engine] bodies is off under [engine] graphs = on, a \
+                "engine-cuda: engine.recording keeps no bodies under engine.graphs = on, a \
                  diagnostic arm — bodies are the only recorded path, so every fire walks \
                  eagerly (~470 kernel launches of host time per decode step) with nothing \
-                 captured; leave the key unstated to serve them"
+                 captured; a profile serves `bodies`"
             );
         }
         // The cache rows are declared last, from what the card has left: once
@@ -1189,6 +1207,7 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 
 pub(super) struct Baked {
     pub(super) device: Context,
+    pub(super) engine: crate::chip::Engine,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,

@@ -231,6 +231,7 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
     })
     .map_err(|e| e.to_string())
 }

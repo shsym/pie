@@ -1,202 +1,181 @@
-use std::sync::OnceLock;
+//! The hardware-dependent decisions the WebGPU kernels read, and [`Tuning`],
+//! the values one load runs under.
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Vendor {
-    Nvidia,
-    Amd,
-    Intel,
-    Apple,
-    #[default]
-    Other,
+use profile::{Decision, Domain, Profile, Registry, Var};
+
+pub const FACTS: &[Var] = &[
+    Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
+    // Absent without the subgroup feature.
+    Var::fixed("subgroup_min", Domain::COUNT),
+    Var::fixed("cores", Domain::COUNT),
+    Var::fixed("f16", Domain::Bool),
+];
+
+pub const AXES: &[&str] = &["rows"];
+
+/// The kernel a dense affine-quantised matmul runs: the first rung whose
+/// shape it fits that can run. `fill` is how full the device is: eighths of
+/// a wave of 32x64 output tiles over its cores, as on Vulkan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.qmm",
+    shape(rows, fill: derived; n, k, bits, group),
+    default = r#"[
+        { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+        "qmv",
+    ]"#,
+    fits = Qmm::fits_shape,
+    tune = search
+)]
+pub enum Qmm {
+    /// The tiled kernel, through workgroup memory.
+    #[partial]
+    Tiled {
+        /// Workgroups a tiling must fill before a 32-wide column tile pays.
+        #[constant(range(1..=1_000_000), default = 160)]
+        crossover_tg: u32,
+    },
+    /// The vector kernel.
+    Qmv,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeviceInfo {
-    pub vendor: Vendor,
-
-    pub subgroups: bool,
-
-    pub f16: bool,
-
-    pub max_workgroup_invocations: u32,
-
-    pub max_shared_bytes: u32,
-
-    pub max_storage_buffer_binding: u64,
-
-    pub max_storage_buffers: u32,
-
-    pub cores: u32,
+impl Qmm {
+    fn fits_shape(&self, at: &QmmAt) -> bool {
+        match self {
+            Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
+            Qmm::Qmv => true,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceTuning {
-    pub qmm_min_batch: u32,
+/// The row tile a routed matmul sorts its pairs into, by pairs per expert;
+/// 1 leaves the pairs unsorted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.moe.tile_rows",
+    shape(per_expert: derived),
+    constant(set(1, 16, 32, 64)),
+    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#,
+    tune = search
+)]
+pub struct MoeTileRows(pub u32);
 
-    pub qmm_min_batch_moe: u32,
+/// The fewest rows per request that take the tiled attention kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
+pub struct SdpaTileRowsPerRequest(pub u32);
 
-    pub qmm_min_batch_emulated: u32,
-
-    pub qmm_bn_crossover_tg: u32,
-
-    pub moe_tile_mid_per: u32,
-
-    pub moe_tile_wide_per: u32,
-
-    pub fp16_qmm: bool,
-
-    pub sdpa_tile_min_rows_per_request: u32,
-
-    pub sdpa_mma: bool,
-
-    pub gdn_scan_lanes: u32,
-
-    pub gdn_scan_rows: u32,
-
-    pub moe_batch_min_per_expert: u32,
-
-    pub qmv_rows_max: u32,
-
-    pub qmv_rows_packs: u32,
-
-    pub stream_rows_per_cut: u32,
-
-    pub sdpa_split_max: u32,
-
-    pub sdpa_split_min_keys: u32,
+/// How many workgroups a decode row's keys may split across, as on Vulkan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.sdpa.decode.split",
+    default = r#"{ use = "per_core", per = 1 }"#,
+    tune = search
+)]
+pub enum DecodeSplit {
+    /// A fixed workgroup count.
+    Fixed {
+        #[constant(range(1..=65_536), default = 128)]
+        groups: u32,
+    },
+    /// `per` workgroups for each core the engine sizes work by (the count
+    /// the native driver reports, else a fallback).
+    PerCore {
+        #[constant(range(1..=64), default = 1)]
+        per: u32,
+    },
 }
 
-impl DeviceTuning {
+/// The fewest keys a split slice holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
+pub struct DecodeSplitMinKeys(pub u32);
+
+pub fn register(registry: &mut Registry) {
+    registry
+        .add::<Qmm>()
+        .add::<MoeTileRows>()
+        .add::<SdpaTileRowsPerRequest>()
+        .add::<DecodeSplit>()
+        .add::<DecodeSplitMinKeys>();
+}
+
+#[derive(Clone, Debug)]
+pub struct Tuning {
+    profile: Profile,
+    cores: u32,
+    /// Storage buffers a shader stage may bind; 0 where unknown.
+    storage_buffers: u32,
+}
+
+impl Tuning {
     #[must_use]
-    pub const fn defaults() -> Self {
-        Self {
-            qmm_min_batch: 5,
-            qmm_min_batch_moe: 8,
-            qmm_min_batch_emulated: 12,
-            qmm_bn_crossover_tg: 160,
-            moe_tile_mid_per: 32,
-            moe_tile_wide_per: 1 << 24,
-            fp16_qmm: false,
-            sdpa_tile_min_rows_per_request: 32,
-            sdpa_mma: false,
-            gdn_scan_lanes: 32,
-            gdn_scan_rows: 4,
-            moe_batch_min_per_expert: 2,
-            qmv_rows_max: 2,
-            qmv_rows_packs: 1,
-            stream_rows_per_cut: 0,
-            sdpa_split_max: 32,
-            sdpa_split_min_keys: 256,
+    pub fn new(profile: Profile, cores: u32, storage_buffers: u32) -> Tuning {
+        Tuning {
+            profile,
+            cores,
+            storage_buffers,
         }
     }
 
     #[must_use]
-    pub const fn of(info: DeviceInfo) -> Self {
-        let _ = info.subgroups;
-        Self::defaults()
+    pub fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     #[must_use]
-    pub fn with(mut self, over: &Overrides) -> Self {
-        macro_rules! lay {
-            ($($field:ident),+ $(,)?) => {
-                $(if let Some(v) = over.$field { self.$field = v; })+
-            };
-        }
-        lay!(
-            qmm_min_batch,
-            qmm_min_batch_moe,
-            qmm_min_batch_emulated,
-            qmm_bn_crossover_tg,
-            moe_tile_mid_per,
-            moe_tile_wide_per,
-            fp16_qmm,
-            sdpa_tile_min_rows_per_request,
-            sdpa_mma,
-            gdn_scan_lanes,
-            gdn_scan_rows,
-            moe_batch_min_per_expert,
-            qmv_rows_max,
-            qmv_rows_packs,
-            stream_rows_per_cut,
-            sdpa_split_max,
-            sdpa_split_min_keys,
-        );
-        self
+    pub fn storage_buffers(&self) -> u32 {
+        self.storage_buffers
     }
 
     #[must_use]
-    pub const fn qmm_min_batch(&self, routed: bool, fp16_gemm: bool) -> u32 {
-        if !fp16_gemm {
-            return self.qmm_min_batch_emulated;
-        }
-        if routed {
-            self.qmm_min_batch_moe
-        } else {
-            self.qmm_min_batch
+    pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
+        let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
+        QmmAt {
+            rows: i64::from(rows),
+            fill: i64::try_from(tiles * 8 / u64::from(self.cores.max(1))).unwrap_or(i64::MAX),
+            n: i64::from(n),
+            k: i64::from(k),
+            bits: i64::from(bits),
+            group: i64::from(group),
         }
     }
 
     #[must_use]
-    pub const fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
-        self.fp16_qmm && bits == 4 && group == 64
+    pub fn qmm(&self, at: &QmmAt) -> Vec<Qmm> {
+        self.profile
+            .ladder::<Qmm>()
+            .candidates(at)
+            .copied()
+            .collect()
     }
-}
 
-impl Default for DeviceTuning {
-    fn default() -> Self {
-        Self::defaults()
+    #[must_use]
+    pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        if experts == 0 {
+            return 1;
+        }
+        let at = MoeTileRowsAt {
+            per_expert: i64::from(pairs / experts),
+        };
+        self.profile.pick::<MoeTileRows>(&at).0
     }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Overrides {
-    pub qmm_min_batch: Option<u32>,
-    pub qmm_min_batch_moe: Option<u32>,
-    pub qmm_min_batch_emulated: Option<u32>,
-    pub qmm_bn_crossover_tg: Option<u32>,
-    pub moe_tile_mid_per: Option<u32>,
-    pub moe_tile_wide_per: Option<u32>,
-    pub fp16_qmm: Option<bool>,
-    pub sdpa_tile_min_rows_per_request: Option<u32>,
-    pub sdpa_mma: Option<bool>,
-    pub gdn_scan_lanes: Option<u32>,
-    pub gdn_scan_rows: Option<u32>,
-    pub moe_batch_min_per_expert: Option<u32>,
-    pub qmv_rows_max: Option<u32>,
-    pub qmv_rows_packs: Option<u32>,
-    pub stream_rows_per_cut: Option<u32>,
-    pub sdpa_split_max: Option<u32>,
-    pub sdpa_split_min_keys: Option<u32>,
-}
+    #[must_use]
+    pub fn sdpa_tile_rows_per_request(&self) -> u32 {
+        self.profile.get::<SdpaTileRowsPerRequest>().0
+    }
 
-static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
-static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
-static RESOLVED: OnceLock<DeviceTuning> = OnceLock::new();
+    #[must_use]
+    pub fn sdpa_split_groups(&self) -> u32 {
+        match *self.profile.get::<DecodeSplit>() {
+            DecodeSplit::Fixed { groups } => groups,
+            DecodeSplit::PerCore { per } => self.cores.saturating_mul(per).max(1),
+        }
+    }
 
-/// States the device the tuning resolves for. The tuning is read once, so
-/// `false` once it has been, or once a device was stated: the info lands
-/// nowhere.
-pub fn describe(info: DeviceInfo) -> bool {
-    RESOLVED.get().is_none() && DEVICE.set(info).is_ok()
-}
-
-/// States the overrides the tuning resolves with; `false`, as for
-/// `describe`, once it has resolved or overrides were stated.
-pub fn override_with(over: Overrides) -> bool {
-    RESOLVED.get().is_none() && OVERRIDES.set(over).is_ok()
-}
-
-#[must_use]
-pub fn device() -> DeviceInfo {
-    DEVICE.get().copied().unwrap_or_default()
-}
-
-#[must_use]
-pub fn current() -> DeviceTuning {
-    *RESOLVED.get_or_init(|| {
-        let info = DEVICE.get().copied().unwrap_or_default();
-        let over = OVERRIDES.get().copied().unwrap_or_default();
-        DeviceTuning::of(info).with(&over)
-    })
+    #[must_use]
+    pub fn sdpa_split_min_keys(&self) -> u32 {
+        self.profile.get::<DecodeSplitMinKeys>().0
+    }
 }

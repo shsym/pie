@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "cuda")]
-use runtime::engine::backend::{
-    DeviceBoot, Diagnostics, Graphs, Knobs, Recording, Transport, World, ordinal_of,
-};
+use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -117,45 +115,14 @@ fn cuda_budgets(
 #[cfg(feature = "cuda")]
 fn device_boot(
     opts: &CudaNativeEngineOptions,
+    home: &Path,
     cache_dir: &Path,
     adapter_dir: Option<&Path>,
 ) -> Result<DeviceBoot> {
-    let graphs = match opts.graphs.as_deref() {
-        None => Graphs::default(),
-        Some(word) => word
-            .parse::<Graphs>()
-            .map_err(|error| anyhow!("[engine] graphs: {error}"))?,
+    let mut knobs = Knobs {
+        profiles: Some(home.join("profiles")),
+        ..Knobs::default()
     };
-    let mut knobs = Knobs::default();
-    if let Some(word) = opts.recording.as_deref() {
-        knobs.recording = word
-            .parse::<Recording>()
-            .map_err(|error| anyhow!("[engine] recording: {error}"))?;
-    }
-    match opts.bodies {
-        Some(true) if !knobs.bodies() => knobs.recording = Recording::default(),
-        Some(false) if knobs.bodies() => knobs.recording = Recording::Shaped,
-        _ => {}
-    }
-    if let Recording::Bodies { mem_megabytes } = &mut knobs.recording {
-        if let Some(megabytes) = opts.bodies_mem {
-            *mem_megabytes = megabytes;
-        }
-    }
-    match opts.pad {
-        Some(false) => knobs.recording = Recording::Off,
-        Some(true) if !knobs.pad() => knobs.recording = Recording::Shaped,
-        _ => {}
-    }
-    if let Some(copies) = opts.fallback_copy {
-        knobs.copies = copies;
-    }
-    if let Some(grouped) = opts.grouped {
-        knobs.grouped = grouped;
-    }
-    if let Some(streams) = opts.side_streams {
-        knobs.side_streams = Some(streams);
-    }
     if let Some(words) = opts.diagnostics.as_deref() {
         knobs.diagnostics = words
             .parse::<Diagnostics>()
@@ -170,7 +137,6 @@ fn device_boot(
         ordinal: ordinal_of(&opts.device),
         world: World::default(),
         comm: None,
-        graphs,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
         adapter_dir: adapter_dir.map(Path::to_path_buf),
@@ -304,7 +270,7 @@ pub(crate) fn create_engine_backend_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
-        let boot = device_boot(opts, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -395,7 +361,7 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "cuda")]
         EngineOptions::CudaNative(opts) => {
-            let boot = device_boot(opts, cache_dir, adapter_dir)?;
+            let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
@@ -415,10 +381,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(words.to_string())
                 ));
             }
-            if !opts.tuning.is_empty() {
-                boot_doc.push_str("\n[metal.tuning]\n");
-                boot_doc.push_str(&opts.tuning.to_string());
-            }
+            boot_doc.push_str(&format!(
+                "profiles = {}\n",
+                toml::Value::String(home.join("profiles").display().to_string())
+            ));
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
                     "\n[model]\nadapter_dir = {}\n",
@@ -465,8 +431,9 @@ pub(crate) fn create_engine_backend(
                 .clone()
                 .unwrap_or_else(|| cache_dir.join("vulkan-pipelines.bin"));
             boot_doc.push_str(&format!(
-                "pipeline_cache = {}\n",
-                toml::Value::String(cache.display().to_string())
+                "pipeline_cache = {}\nprofiles = {}\n",
+                toml::Value::String(cache.display().to_string()),
+                toml::Value::String(home.join("profiles").display().to_string())
             ));
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),
@@ -510,6 +477,10 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(cache.display().to_string())
                 ));
             }
+            boot_doc.push_str(&format!(
+                "profiles = {}\n",
+                toml::Value::String(home.join("profiles").display().to_string())
+            ));
             if let Some(memory) = opts.device_memory {
                 boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
             }
@@ -538,7 +509,12 @@ pub(crate) fn create_engine_backend(
         }
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
-            let mut boot_doc = format!("[xla]\ndevice = {}\n", opts.device_index,);
+            let mut boot_doc = format!(
+                "[xla]\ndevice = {}\nprewarm = {}\nprofiles = {}\n",
+                opts.device_index,
+                opts.prewarm,
+                toml::Value::String(home.join("profiles").display().to_string()),
+            );
             if let Some(plugin) = &opts.plugin {
                 boot_doc.push_str(&format!(
                     "plugin = {}\n",

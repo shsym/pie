@@ -20,7 +20,7 @@ use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
 use engine::frame::{Demand, Supply};
 use kernels_xla::Tensor;
-use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile, FireRows, compile_axes};
+use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
 use poem_exec::fire::{Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use poem_ir::{Dtype, Trace, ValueId};
 
@@ -32,7 +32,7 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::store::{Pools, SpaceSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
-use crate::window::{At, Copies, Cursor, Windows};
+use crate::window::{At, Cursor, Windows};
 
 pub use crate::dit::{Clips, Pixels, PortCell, SelfCond};
 
@@ -238,6 +238,9 @@ pub struct FireCost {
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    tuning: kernels_xla::tuning::Tuning,
+    pad: crate::chip::Pad,
+    tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
     compiled: CompiledModel,
@@ -349,30 +352,17 @@ fn classes_running(
     set
 }
 
-const DEVICE_HEADROOM: u64 = 2 << 30;
-
 /// The most pages a pool takes on a device that states no memory limit (a
 /// dry one, or a plugin that reports none) with no `[model]
-/// device_kv_budget` stated: the pages a pool defaulted to before it was
-/// sized in bytes.
+/// device_kv_budget` stated.
 const FILL_PAGES: u64 = 65536;
 
-/// Rows past the fire limit a prefill fire may pad into (see `fire_inner`).
-const PAD_ROOM: u32 = 128;
-
-/// The least lane rung of the prefill class in a fire that decodes too, so
-/// such fires vary by their decode rung and row rung alone.
-const MIXED_HOST_RUNG: u32 = 16;
-
-/// The least page bound a fire's tables are laid out to.
-const PAGE_FLOOR: u32 = 16;
-
-/// A lane count's rung: the power of two at or above it.
-fn lane_rung(n: u32) -> u32 {
-    n.max(1).next_power_of_two()
-}
-
 impl Shell {
+    #[must_use]
+    pub fn tpu(&self) -> crate::chip::Tpu {
+        self.tpu
+    }
+
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
     /// defaults); [`Shell::load_with`] names one.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
@@ -405,8 +395,26 @@ impl Shell {
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
     ) -> Result<Shell> {
+        let (chip, chip_report) =
+            crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
+        if !device.kind().is_empty() {
+            crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
+        }
+        let tpu = crate::chip::Tpu::of(device.kind());
+        if !tpu.known() {
+            tracing::warn!(
+                "TPU kind {:?} is not one pie knows: running untuned, sized as a v6e",
+                device.kind()
+            );
+        }
+        let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
+        let engine = crate::chip::Engine::of(&chip);
+        let pad = engine.pad;
         let boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(&chip),
+            ),
             ..boot
         };
         // The row ladder every fire is padded up to (powers of two to
@@ -414,22 +422,19 @@ impl Shell {
         // for the padding lanes that fill a decode up to its rung.
         let mut budget = boot.budget.clone();
         if budget.buckets.is_empty() {
-            budget.buckets = std::iter::successors(Some(1u32), |rung| rung.checked_mul(2))
-                .take_while(|rung| *rung < budget.max_tokens)
-                .chain(std::iter::once(budget.max_tokens))
-                .collect();
+            budget.buckets = pad.ladder(budget.max_tokens);
             // One rung past the fire limit, for the padding lanes that
             // bring a full prefill fire's lane counts to their rungs
             // (`fire_inner`); the runtime still sends at most `max_tokens`.
-            if budget.max_tokens >= 4 * PAD_ROOM {
-                budget.max_tokens += PAD_ROOM;
+            if pad.room > 0 && budget.max_tokens >= 4 * pad.room {
+                budget.max_tokens += pad.room;
                 budget.buckets.push(budget.max_tokens);
             }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
-        // prefill beside a decode's up to `MIXED_HOST_RUNG`.
+        // prefill beside a decode's up to the mixed fire's host rung.
         budget.max_lanes = poem_exec::fire::rung_of(&budget.buckets, budget.max_lanes)
-            .saturating_add(MIXED_HOST_RUNG);
+            .saturating_add(pad.mixed_host_rung);
         let budgets = match boot.patches.clone() {
             None => Budgets::of(budget),
             Some(ladder) => Budgets::of(budget).with_patches(ladder),
@@ -438,7 +443,7 @@ impl Shell {
             None => budgets,
             Some(ladder) => budgets.with_voxels(ladder),
         };
-        let compiled = compile_axes(&boot.trace, &budgets, &DeviceProfile::default())?;
+        let compiled = compile_axes(&boot.trace, &budgets, &crate::chip::compiler_profile(&chip))?;
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
 
@@ -460,13 +465,11 @@ impl Shell {
         });
 
         // Windowed kv rows live in their own pool, a window per sequence
-        // (engine-cuda `serve/load.rs`); `PIE_XLA_FULL_WINDOWS=1` keeps them
-        // in full pages, for an A/B against the windowed pool.
-        let full_windows = std::env::var("PIE_XLA_FULL_WINDOWS").is_ok_and(|v| v == "1");
-        let window = if full_windows {
-            None
-        } else {
+        // (engine-cuda `serve/load.rs`).
+        let window = if boot.device.window_pool {
             crate::store::window_of(&boot.trace)?
+        } else {
+            None
         };
         let paging_at = |pages: u64| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, boot.slots, pages)?
@@ -486,7 +489,7 @@ impl Shell {
         let room = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(weight_floor)
-                .saturating_sub(DEVICE_HEADROOM)
+                .saturating_sub(tpu.headroom())
         });
         let least = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
         // A plane's cells are addressed by a 32-bit word, and a device with
@@ -517,12 +520,18 @@ impl Shell {
         let device_cap = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(demand(fit))
-                .saturating_sub(DEVICE_HEADROOM)
+                .saturating_sub(tpu.headroom())
         });
         let weights = if device.is_dry() {
-            // A device of the target's size (32 GiB) would pre-scale an
-            // mxfp4 bank when the weights leave room for it.
-            Weights::dry(&handles, &boot.trace, weight_floor < 20 << 30)?
+            // A device of the target's size would pre-scale an mxfp4 bank
+            // when the weights leave room for it: under 5/8 of its HBM (20 of
+            // a v6e's 32 GiB).
+            Weights::dry(
+                &handles,
+                &boot.trace,
+                weight_floor < tpu.hbm_bytes() / 8 * 5,
+                &engine,
+            )?
         } else {
             Weights::resident(
                 &device,
@@ -531,6 +540,7 @@ impl Shell {
                 boot.contract,
                 boot.checkpoint,
                 device_cap,
+                &engine,
             )?
         };
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
@@ -683,6 +693,9 @@ impl Shell {
             crate::rows::readout_probe(&boot.trace),
         );
         Ok(Shell {
+            tuning,
+            pad,
+            tpu,
             device,
             handles,
             trace: boot.trace,
@@ -1054,9 +1067,6 @@ impl Shell {
     /// present reads more than tokens (a mask, an adapter, scores, media),
     /// or the padding does not fit the rows or the lanes.
     fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
-        if std::env::var("PIE_XLA_CANONICAL").is_ok_and(|v| v == "0") {
-            return None;
-        }
         let classes = &self.compiled.classes;
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();
@@ -1094,15 +1104,16 @@ impl Shell {
         }
         // The class that takes the rest of the rows: the one with the most.
         let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
+        let pad = self.pad;
         let buckets = &self.budgets.tokens.buckets;
         // A fire that decodes beside its prefill: the prefill's lanes at
-        // `MIXED_HOST_RUNG` at least, and always a rest lane.
+        // the mixed host rung at least, and always a rest lane.
         let mixed = by.len() > 1;
         // Every count at its rung already fills a rung of rows: no rest lane.
         let ones: Vec<(u32, u64)> = by
             .iter()
             .flat_map(|&(_, word, n, _)| {
-                std::iter::repeat_n((1u32, word), (lane_rung(n) - n) as usize)
+                std::iter::repeat_n((1u32, word), (pad.rung(n) - n) as usize)
             })
             .collect();
         let exact = real_rows + ones.len() as u32;
@@ -1115,11 +1126,11 @@ impl Shell {
         let mut pads: Vec<(u32, u64)> = Vec::new();
         for (at, &(_, word, n, _)) in by.iter().enumerate() {
             let want = if at != host {
-                lane_rung(n)
+                pad.rung(n)
             } else if mixed {
-                lane_rung(n + 1).max(MIXED_HOST_RUNG) - 1
+                pad.rung(n + 1).max(pad.mixed_host_rung) - 1
             } else {
-                lane_rung(n + 1) - 1
+                pad.rung(n + 1) - 1
             };
             pads.extend(std::iter::repeat_n((1u32, word), (want - n) as usize));
         }
@@ -1472,8 +1483,11 @@ impl Shell {
         }
 
         // The page bound every gathered table is laid out to: the most pages
-        // any lane holds, rounded up to a power of two, and at least
-        // `PAGE_FLOOR` (short lanes share one program as they grow).
+        // any lane holds, rounded up to a rung (a power of two by default),
+        // and at least the profile's page floor (short lanes share one
+        // program as they grow).
+        let pad = self.pad;
+        let cap = pad.rung(paging.pages_per_slot.max(1));
         let max_pages = geometries
             .first()
             .map_or(1, |g| {
@@ -1483,25 +1497,18 @@ impl Shell {
                     .max()
                     .unwrap_or(1)
             })
-            .max(PAGE_FLOOR)
-            .next_power_of_two()
-            .min(paging.pages_per_slot.max(1).next_power_of_two());
+            .max(pad.page_floor);
+        let max_pages = pad.rung(max_pages).min(cap);
         // A canonical prefill fire lays every table at the page cap, so its
         // program does not vary with how long its lanes are.
-        let max_pages = if canonical {
-            paging.pages_per_slot.max(1).next_power_of_two()
-        } else {
-            max_pages
-        };
+        let max_pages = if canonical { cap } else { max_pages };
 
         let mut windows = Windows::of(
-            &self.trace,
             &self.compiled,
             composition.classes(),
             composition.patch_classes(),
             composition.voxel_classes(),
             &indptr_host,
-            Copies::off(),
             &[],
             &[],
         )?;
@@ -2070,7 +2077,9 @@ impl Shell {
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
-        let tracer = Tracer::new(&self.handles).with_pack(pack_len);
+        let tracer = Tracer::new(&self.handles)
+            .with_pack(pack_len)
+            .with_tuning(self.tuning);
         let place = At::new();
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
         let probed = {

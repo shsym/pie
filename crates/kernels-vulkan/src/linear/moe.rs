@@ -9,8 +9,6 @@ use crate::tensor::{Bank, Tensor};
 
 const MOE_TILE_ROWS: [u32; 3] = [16, 32, 64];
 
-const MOE_TILE_COLS: [u32; 3] = [32, 64, 128];
-
 const ROUTER_MAX_EXPERTS: u32 = 1024;
 
 const ROUTER_MAX_TOP_K: u32 = 16;
@@ -28,28 +26,17 @@ const ROUTE_GROUP: [u32; 3] = [256, 1, 1];
 const QMV_GROUP: [u32; 3] = [32, 8, 1];
 
 #[must_use]
-pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
-    experts > 0 && u64::from(pairs) >= u64::from(experts) * u64::from(min_per_expert)
+pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
+    let tile = tuning.moe_tile_rows(pairs, experts);
+    debug_assert!(
+        tile == 1 || MOE_TILE_ROWS.contains(&tile),
+        "`kernel.moe.tile_rows` declares the tiles this crate stamps"
+    );
+    tile
 }
 
 #[must_use]
-pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
-    if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) {
-        return 1;
-    }
-    let per = pairs / experts;
-    if per >= tuning.moe_tile_wide_per {
-        return MOE_TILE_ROWS[2];
-    }
-    if per >= tuning.moe_tile_mid_per {
-        MOE_TILE_ROWS[1]
-    } else {
-        MOE_TILE_ROWS[0]
-    }
-}
-
-#[must_use]
-pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
+pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::Tuning) -> u32 {
     let tile = tile_rows(pairs, experts, tuning);
     if tile <= 1 {
         return pairs;
@@ -57,15 +44,6 @@ pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u3
     let touched = pairs.min(experts);
     let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
     bound.div_ceil(tile) * tile
-}
-
-#[must_use]
-pub fn tile_cols(out_width: u32) -> Option<u32> {
-    MOE_TILE_COLS
-        .iter()
-        .rev()
-        .copied()
-        .find(|tile| out_width.is_multiple_of(*tile))
 }
 
 fn router_grid(op: &'static str, rows: u32) -> Result<Grid, Error> {
@@ -725,7 +703,7 @@ pub fn matmul_select_batched(
     experts: u32,
     scratch: RoutedScratch,
     y: Tensor,
-    tuning: &crate::DeviceTuning,
+    tuning: &crate::Tuning,
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
@@ -735,7 +713,7 @@ pub fn matmul_select_batched(
     if tile <= 1 || !x.width.is_multiple_of(32) || experts > 1024 {
         return Ok(false);
     }
-    let coopmat = crate::tuning::device().coopmat;
+    let coopmat = tuning.moe_coopmat();
     let family = match (bank.affine(), bank.group, bank.bits) {
         (false, 32, 4) => "mxfp4",
         (true, 64, 4) | (true, 64, 2) | (true, 32, 2) | (true, 128, 2) => "affine",
@@ -769,7 +747,15 @@ pub fn matmul_select_batched(
         return Ok(false);
     };
     ctx.fire(
-        Fire::at(SORT_FILE, "route_sort").apply(Grid::of([1024, 1, 1], [1024, 1, 1])),
+        {
+            let lanes = tuning.sort_lanes();
+            let entry = if lanes == 1024 {
+                "route_sort"
+            } else {
+                "route_sort_256"
+            };
+            Fire::at(SORT_FILE, entry).apply(Grid::of([lanes, 1, 1], [lanes, 1, 1]))
+        },
         &[
             routes.arg(),
             scratch.perm.arg_mut(),

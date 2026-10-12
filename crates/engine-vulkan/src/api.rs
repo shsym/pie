@@ -31,6 +31,9 @@ pub struct DeviceBoot {
     pub validation: bool,
 
     pub pipeline_cache: Option<PathBuf>,
+
+    /// `$PIE_HOME/profiles`, where a user's device profiles live.
+    pub profiles: Option<PathBuf>,
 }
 
 struct PendingStep {

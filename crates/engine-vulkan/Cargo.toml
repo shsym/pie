@@ -24,6 +24,7 @@ engine = { path = "../engine" }
 
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
+profile = { package = "pie-profile", path = "../profile" }
 
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 
@@ -31,6 +32,8 @@ eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
+poem = { package = "pie-poem", path = "../poem" }
+ztensor-compat = { workspace = true }
 
 libc = "0.2"
 
@@ -47,4 +50,4 @@ ash = { version = "0.38", default-features = false, features = [
 
 [features]
 default = []
-vulkan = ["dep:ash", "dep:naga", "kernels-vulkan/native"]
+vulkan = ["dep:ash", "dep:naga", "kernels-vulkan/native", "kernels-vulkan/probe"]

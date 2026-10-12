@@ -134,6 +134,7 @@ fn every_probe_is_dumped() {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");

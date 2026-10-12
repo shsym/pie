@@ -43,11 +43,29 @@ pub trait Env {
 pub struct Cx<'a> {
     f: &'a mut Func,
     env: &'a mut dyn Env,
+    tuning: crate::tuning::Tuning,
 }
 
 impl<'a> Cx<'a> {
     pub fn new(f: &'a mut Func, env: &'a mut dyn Env) -> Self {
-        Self { f, env }
+        Self {
+            f,
+            env,
+            tuning: crate::tuning::Tuning::DEFAULT,
+        }
+    }
+
+    /// The kernel decisions of the sink's load; a nested view takes its
+    /// parent's.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: crate::tuning::Tuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    #[must_use]
+    pub fn tuning(&self) -> crate::tuning::Tuning {
+        self.tuning
     }
 
     /// `t`'s current value, `[rows, width]`.

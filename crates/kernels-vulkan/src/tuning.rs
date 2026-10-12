@@ -1,270 +1,345 @@
-use std::sync::OnceLock;
+//! The hardware-dependent decisions the Vulkan kernels read, and [`Tuning`],
+//! the values one load runs under.
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Vendor {
-    Nvidia,
-    Amd,
-    Intel,
-    Apple,
-    Qualcomm,
-    Imagination,
-    #[default]
-    Other,
+use profile::{Decision, Domain, Profile, Registry, Var};
+
+pub const FACTS: &[Var] = &[
+    Var::fixed("vendor", Domain::Enum(profile::vendor::NAMES)),
+    // The narrowest subgroup a pipeline runs at.
+    Var::fixed("subgroup", Domain::COUNT),
+    // Multiprocessors or compute units; absent where no extension says.
+    Var::fixed("cores", Domain::COUNT),
+    Var::fixed("coopmat", Domain::Bool),
+];
+
+pub const AXES: &[&str] = &["rows"];
+
+/// The kernel a dense affine-quantised matmul runs: the first rung whose
+/// shape it fits that can run. `fill` is how full the device is: eighths of
+/// a wave of 32x64 output tiles over its cores, so a rung can say "fills the
+/// device" in a way that holds on GPUs of any size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.qmm",
+    shape(rows, fill: derived; n, k, bits, group),
+    default = r#"[
+        { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+        { use = "qmv", vecs = 4 },
+    ]"#,
+    fits = Qmm::fits_shape,
+    tune = search
+)]
+pub enum Qmm {
+    /// The cooperative-matrix kernel: 64x64 output tiles on tensor cores.
+    #[requires("coopmat")]
+    #[partial]
+    Coopmat,
+    /// The register-tiled kernel: a 4x4 output block an invocation, which
+    /// suits GPUs whose workgroup memory is slow next to their ALUs
+    /// (Adreno, PowerVR).
+    #[partial]
+    RegisterTiled {
+        /// Rows a workgroup covers.
+        #[constant(set(32, 64), default = 32)]
+        bm: u32,
+        /// A 16-wide contraction block: 2.5x faster on PowerVR, faster on Adreno.
+        #[constant(default = true)]
+        k16: bool,
+    },
+    /// The tiled kernel, through workgroup memory.
+    #[partial]
+    Tiled {
+        /// Workgroups a tiling must fill before a 32-wide column tile pays.
+        #[constant(range(1..=1_000_000), default = 160)]
+        crossover_tg: u32,
+    },
+    /// One row (decode), 128-bit loads folded with subgroup shuffles.
+    #[requires("subgroup >= 32")]
+    #[partial]
+    OneRow {
+        /// Lanes that walk one output row.
+        #[constant(set(8, 16, 32), default = 32)]
+        lanes: u32,
+        /// Output rows one lane carries, sharing the activations it loads.
+        #[constant(set(1, 2), default = 1)]
+        rows: u32,
+    },
+    /// The vector kernel, `vecs` activation rows a workgroup.
+    Qmv {
+        #[constant(set(1, 2, 4, 8), default = 4)]
+        vecs: u32,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeviceInfo {
-    pub vendor: Vendor,
-
-    pub subgroup_size: u32,
-
-    pub max_workgroup_invocations: u32,
-
-    pub max_shared_bytes: u32,
-
-    pub coopmat: bool,
-
-    pub multiprocessors: u32,
-}
-
-impl DeviceInfo {
-    #[must_use]
-    pub const fn vendor_of(vendor_id: u32) -> Vendor {
-        match vendor_id {
-            0x10de => Vendor::Nvidia,
-            0x1002 | 0x1022 => Vendor::Amd,
-            0x8086 => Vendor::Intel,
-            0x106b => Vendor::Apple,
-            0x5143 => Vendor::Qualcomm,
-            0x1010 => Vendor::Imagination,
-            _ => Vendor::Other,
+impl Qmm {
+    fn fits_shape(&self, at: &QmmAt) -> bool {
+        use crate::linear::quant::{QMM_BK, qmm_stamped, qmv1_fits};
+        let stamped = qmm_stamped(at.group, at.bits);
+        let whole = at.k % i64::from(QMM_BK) == 0;
+        match self {
+            Qmm::Coopmat | Qmm::RegisterTiled { .. } => stamped && whole,
+            Qmm::Tiled { .. } => stamped && whole && at.n % 16 == 0,
+            Qmm::OneRow { .. } => {
+                at.rows == 1
+                    && stamped
+                    && qmv1_fits(at.group, at.bits)
+                    && (at.k * at.bits) % 128 == 0
+                    && at.k % 8 == 0
+            }
+            Qmm::Qmv { .. } => true,
         }
     }
 }
 
+/// How unquantised matmuls read prompt rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.path", default = "tiled", tune = search)]
+pub enum GemmPath {
+    Tiled,
+    #[requires("coopmat")]
+    Coopmat,
+}
+
+/// How routed (mixture-of-experts) matmuls read their sorted rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.path", default = "tiled", tune = search)]
+pub enum MoePath {
+    Tiled,
+    #[requires("coopmat")]
+    Coopmat,
+}
+
+/// The row tile a routed matmul sorts its pairs into, by pairs per expert;
+/// 1 leaves the pairs unsorted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.moe.tile_rows",
+    shape(per_expert: derived),
+    constant(set(1, 16, 32, 64)),
+    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#,
+    tune = search
+)]
+pub struct MoeTileRows(pub u32);
+
+/// The fewest rows per request that take the tiled attention kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
+pub struct SdpaTileRowsPerRequest(pub u32);
+
+/// How many workgroups a decode row's keys may split across.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.sdpa.decode.split",
+    default = r#"{ use = "fixed", groups = 128 }"#,
+    tune = search
+)]
+pub enum DecodeSplit {
+    /// A fixed workgroup count.
+    Fixed {
+        #[constant(range(1..=65_536), default = 128)]
+        groups: u32,
+    },
+    /// `per` workgroups for each core the device reports.
+    #[requires("cores > 0")]
+    PerCore {
+        #[constant(range(1..=64), default = 1)]
+        per: u32,
+    },
+}
+
+/// The fewest keys a split slice holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
+pub struct DecodeSplitMinKeys(pub u32);
+
+/// Invocations a decode attention workgroup walks a row's keys with: more
+/// walk more keys at once and merge more partial sums. The device's
+/// workgroup memory caps it whatever the profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.threads", constant(set(128, 256)), default = 256, tune = search)]
+pub struct DecodeThreads(pub u32);
+
+/// Query rows a tiled attention workgroup holds, 32 lanes each: fewer rows
+/// mean more workgroups and less reuse of each key. The device's invocation
+/// limit caps it whatever the profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.tile_rows", constant(set(8, 16, 32)), default = 32, tune = search)]
+pub struct SdpaTileRows(pub u32);
+
+pub fn register(registry: &mut Registry) {
+    registry
+        .add::<Qmm>()
+        .add::<GemmPath>()
+        .add::<MoePath>()
+        .add::<MoeTileRows>()
+        .add::<SdpaTileRowsPerRequest>()
+        .add::<DecodeSplit>()
+        .add::<DecodeSplitMinKeys>()
+        .add::<DecodeThreads>()
+        .add::<SdpaTileRows>();
+}
+
+/// The point a dense matmul is chosen at on a device with `cores` cores.
+#[must_use]
+pub fn qmm_at(rows: u32, n: u32, k: u32, bits: u32, group: u32, cores: u32) -> QmmAt {
+    let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
+    QmmAt {
+        rows: i64::from(rows),
+        fill: i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX),
+        n: i64::from(n),
+        k: i64::from(k),
+        bits: i64::from(bits),
+        group: i64::from(group),
+    }
+}
+
+/// What a device allows a kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceTuning {
-    pub qmm_min_batch: u32,
-
-    pub qmm_min_batch_moe: u32,
-
-    pub qmm_min_batch_emulated: u32,
-
-    pub qmm_bn_crossover_tg: u32,
-
-    pub moe_tile_mid_per: u32,
-
-    pub moe_tile_wide_per: u32,
-
-    pub fp16_qmm: bool,
-
-    pub sdpa_tile_min_rows_per_request: u32,
-
-    pub sdpa_mma: bool,
-
-    pub gdn_scan_lanes: u32,
-
-    pub gdn_scan_rows: u32,
-
-    pub moe_batch_min_per_expert: u32,
-
-    pub qmv_rows_max: u32,
-
-    pub qmv_rows_packs: u32,
-
-    pub stream_rows_per_cut: u32,
-
-    pub sdpa_split_groups: u32,
-
-    pub sdpa_split_min_keys: u32,
-
-    /// Batched quantized projections on the register-tiled point (a 4x4
-    /// block per invocation) rather than the plain tiled one.
-    pub qmm_register_tiles: bool,
-    /// A 16-wide K block on the register-tiled point; faster on PowerVR (2.5x) and Adreno.
-    pub qmm_rt_k16: bool,
-
-    /// A one-row quantized projection (decode) on the 128-bit-load point
-    /// that folds with subgroup shuffles; needs subgroups of 32 or more.
-    pub qmv_one_row: bool,
-
-    /// Lanes of the one-row point that walk one output row: 32, 16 or 8.
-    /// Fewer give each lane more loads in flight.
-    pub qmv_one_row_lanes: u32,
-
-    /// Output rows one lane of the one-row point carries, sharing the
-    /// activations it loads: 1 or 2.
-    pub qmv_one_row_rows: u32,
+pub struct Limits {
+    pub cores: u32,
+    /// The narrowest subgroup a pipeline runs at.
+    pub lanes: u32,
+    /// `maxComputeSharedMemorySize`.
+    pub shared_bytes: u32,
+    /// `maxComputeWorkGroupInvocations`.
+    pub invocations: u32,
 }
 
-impl Default for DeviceTuning {
-    fn default() -> Self {
-        Self {
-            qmm_min_batch: 5,
-            qmm_min_batch_moe: 8,
-            qmm_min_batch_emulated: 12,
-            qmm_bn_crossover_tg: 160,
-            moe_tile_mid_per: 32,
-            moe_tile_wide_per: 1 << 24,
-            fp16_qmm: false,
-            sdpa_tile_min_rows_per_request: 32,
-            sdpa_mma: false,
-            gdn_scan_lanes: 32,
-            gdn_scan_rows: 4,
-            moe_batch_min_per_expert: 2,
-            qmv_rows_max: 2,
-            qmv_rows_packs: 1,
-            stream_rows_per_cut: 0,
-            sdpa_split_groups: 128,
-            sdpa_split_min_keys: 256,
-            qmm_register_tiles: false,
-            qmm_rt_k16: true,
-            qmv_one_row: false,
-            qmv_one_row_lanes: 32,
-            qmv_one_row_rows: 1,
-        }
-    }
+impl Limits {
+    /// What a test assumes of a device it does not open.
+    pub const ASSUMED: Limits = Limits {
+        cores: 16,
+        lanes: 32,
+        shared_bytes: 32 << 10,
+        invocations: 1024,
+    };
 }
 
-impl DeviceTuning {
-    #[must_use]
-    pub fn of(info: DeviceInfo) -> Self {
-        let mut t = Self::default();
-        if info.subgroup_size != 0 {
-            t.gdn_scan_lanes = info.subgroup_size;
-        }
+#[derive(Clone, Debug)]
+pub struct Tuning {
+    profile: Profile,
+    limits: Limits,
+}
 
-        if info.multiprocessors != 0 {
-            t.sdpa_split_groups = info.multiprocessors;
-        }
-        // Adreno's workgroup memory is slow next to its ALUs: the plain tiled
-        // point runs a 64x1024x7168 projection at ~27 GFLOPS there.
-        if info.vendor == Vendor::Qualcomm {
-            t.qmm_register_tiles = true;
-            t.qmv_one_row = info.subgroup_size >= 32;
-            // A decode row's keys split across 128 workgroups, 128 keys or
-            // more apiece: 3k keys of Qwen3.5-0.8B attend in 1.9 ms a token
-            // over six layers, against 11.7 split two ways.
-            t.sdpa_split_groups = 128;
-            t.sdpa_split_min_keys = 128;
-        }
-        // PowerVR (Pixel 11 Pro, Tensor G6) decodes Qwen3.5-0.8B at 11 tok/s
-        // on `qmv`, 27 on the one-row point, and 33 with 8 lanes a row
-        // carrying two rows each.
-        if info.vendor == Vendor::Imagination {
-            t.qmm_register_tiles = true;
-            t.qmv_one_row = info.subgroup_size >= 32;
-            t.qmv_one_row_lanes = 8;
-            t.qmv_one_row_rows = 2;
-        }
-        t
+impl Tuning {
+    #[must_use]
+    pub fn new(profile: Profile, limits: Limits) -> Tuning {
+        Tuning { profile, limits }
     }
 
     #[must_use]
-    pub fn with(mut self, over: &Overrides) -> Self {
-        macro_rules! lay {
-            ($($field:ident),+ $(,)?) => {
-                $(if let Some(v) = over.$field { self.$field = v; })+
-            };
-        }
-        lay!(
-            qmm_min_batch,
-            qmm_min_batch_moe,
-            qmm_min_batch_emulated,
-            qmm_bn_crossover_tg,
-            moe_tile_mid_per,
-            moe_tile_wide_per,
-            fp16_qmm,
-            sdpa_tile_min_rows_per_request,
-            sdpa_mma,
-            gdn_scan_lanes,
-            gdn_scan_rows,
-            moe_batch_min_per_expert,
-            qmv_rows_max,
-            qmv_rows_packs,
-            stream_rows_per_cut,
-            sdpa_split_groups,
-            sdpa_split_min_keys,
-            qmm_register_tiles,
-            qmm_rt_k16,
-            qmv_one_row,
-            qmv_one_row_lanes,
-            qmv_one_row_rows,
-        );
-        self
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     #[must_use]
-    pub const fn qmm_min_batch(&self, routed: bool, fp16_gemm: bool) -> u32 {
-        if !fp16_gemm {
-            return self.qmm_min_batch_emulated;
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    #[must_use]
+    pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
+        qmm_at(rows, n, k, bits, group, self.limits.cores)
+    }
+
+    #[must_use]
+    pub fn qmm(&self, at: &QmmAt) -> Vec<Qmm> {
+        self.profile
+            .ladder::<Qmm>()
+            .candidates(at)
+            .copied()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn gemm_coopmat(&self) -> bool {
+        *self.profile.get::<GemmPath>() == GemmPath::Coopmat
+    }
+
+    #[must_use]
+    pub fn moe_coopmat(&self) -> bool {
+        *self.profile.get::<MoePath>() == MoePath::Coopmat
+    }
+
+    #[must_use]
+    pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        if experts == 0 {
+            return 1;
         }
-        if routed {
-            self.qmm_min_batch_moe
+        let at = MoeTileRowsAt {
+            per_expert: i64::from(pairs / experts),
+        };
+        self.profile.pick::<MoeTileRows>(&at).0
+    }
+
+    #[must_use]
+    pub fn sdpa_tile_rows_per_request(&self) -> u32 {
+        self.profile.get::<SdpaTileRowsPerRequest>().0
+    }
+
+    /// The profile's, halved until 32 lanes a row fit the invocation limit.
+    #[must_use]
+    pub fn sdpa_tile_rows(&self) -> u32 {
+        let fits = (self.limits.invocations / 32).max(8);
+        let mut rows = self.profile.get::<SdpaTileRows>().0;
+        while rows > fits && rows > 8 {
+            rows /= 2;
+        }
+        rows
+    }
+
+    /// The profile's, or 128 where 256 would pass the workgroup memory (one
+    /// partial row a 32-lane subgroup) or the invocation limit.
+    #[must_use]
+    pub fn sdpa_decode_threads(&self, head_dim: u32) -> u32 {
+        let want = self.profile.get::<DecodeThreads>().0;
+        let need = |threads: u32| (threads / 32) * (head_dim * 4 + 8);
+        if want > 128 && (need(want) > self.limits.shared_bytes || want > self.limits.invocations) {
+            128
         } else {
-            self.qmm_min_batch
+            want
         }
     }
 
     #[must_use]
-    pub const fn fp16_gemm_format(&self, bits: u32, group: u32) -> bool {
-        self.fp16_qmm && bits == 4 && group == 64
+    pub fn sdpa_split_groups(&self) -> u32 {
+        match *self.profile.get::<DecodeSplit>() {
+            DecodeSplit::Fixed { groups } => groups,
+            DecodeSplit::PerCore { per } => self.limits.cores.saturating_mul(per).max(1),
+        }
+    }
+
+    #[must_use]
+    pub fn sdpa_split_min_keys(&self) -> u32 {
+        self.profile.get::<DecodeSplitMinKeys>().0
+    }
+
+    #[must_use]
+    pub fn sort_lanes(&self) -> u32 {
+        if self.limits.invocations >= 1024 {
+            1024
+        } else {
+            256
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Overrides {
-    pub qmm_min_batch: Option<u32>,
-    pub qmm_min_batch_moe: Option<u32>,
-    pub qmm_min_batch_emulated: Option<u32>,
-    pub qmm_bn_crossover_tg: Option<u32>,
-    pub moe_tile_mid_per: Option<u32>,
-    pub moe_tile_wide_per: Option<u32>,
-    pub fp16_qmm: Option<bool>,
-    pub sdpa_tile_min_rows_per_request: Option<u32>,
-    pub sdpa_mma: Option<bool>,
-    pub gdn_scan_lanes: Option<u32>,
-    pub gdn_scan_rows: Option<u32>,
-    pub moe_batch_min_per_expert: Option<u32>,
-    pub qmv_rows_max: Option<u32>,
-    pub qmv_rows_packs: Option<u32>,
-    pub stream_rows_per_cut: Option<u32>,
-    pub sdpa_split_groups: Option<u32>,
-    pub sdpa_split_min_keys: Option<u32>,
-    pub qmm_register_tiles: Option<bool>,
-    pub qmm_rt_k16: Option<bool>,
-    pub qmv_one_row: Option<bool>,
-    pub qmv_one_row_lanes: Option<u32>,
-    pub qmv_one_row_rows: Option<u32>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();
-static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
-static RESOLVED: OnceLock<DeviceTuning> = OnceLock::new();
-
-/// States the device the tuning resolves for. The tuning is read once, so
-/// `false` once it has been, or once a device was stated: the info lands
-/// nowhere.
-pub fn describe(info: DeviceInfo) -> bool {
-    RESOLVED.get().is_none() && DEVICE.set(info).is_ok()
-}
-
-#[must_use]
-pub fn device() -> DeviceInfo {
-    DEVICE.get().copied().unwrap_or_default()
-}
-
-/// States the overrides the tuning resolves with; `false`, as for
-/// `describe`, once it has resolved or overrides were stated.
-pub fn override_with(over: Overrides) -> bool {
-    RESOLVED.get().is_none() && OVERRIDES.set(over).is_ok()
-}
-
-#[must_use]
-pub fn current() -> DeviceTuning {
-    *RESOLVED.get_or_init(|| {
-        let info = DEVICE.get().copied().unwrap_or_default();
-        let over = OVERRIDES.get().copied().unwrap_or_default();
-        DeviceTuning::of(info).with(&over)
-    })
+    #[test]
+    fn the_default_ladder_tiles_from_twelve_rows_and_folds_below() {
+        let mut r = Registry::new("vulkan-test", FACTS, AXES);
+        register(&mut r);
+        let t = Tuning::new(r.defaults(), Limits::ASSUMED);
+        let at = |rows| t.qmm_at(rows, 4096, 4096, 4, 64);
+        assert_eq!(t.qmm(&at(12))[0], Qmm::Tiled { crossover_tg: 160 });
+        assert_eq!(t.qmm(&at(11))[0], Qmm::Qmv { vecs: 4 });
+        // An odd contraction leaves the tiled rung for the vector kernel.
+        assert_eq!(
+            t.qmm(&t.qmm_at(64, 4096, 4100, 4, 64))[0],
+            Qmm::Qmv { vecs: 4 }
+        );
+    }
 }

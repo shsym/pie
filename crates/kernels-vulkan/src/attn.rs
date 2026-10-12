@@ -8,7 +8,7 @@ use crate::encode::{
 };
 use crate::error::Error;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
-use crate::tuning::DeviceTuning;
+use crate::tuning::Tuning;
 
 pub mod arbiter;
 pub mod dense;
@@ -156,11 +156,25 @@ pub fn plan_prefill(
 
 const FILE: &str = "attn/sdpa_paged.slang";
 
-pub(crate) const SDPA_TILE: u32 = 32;
+/// The `_r16` / `_r8` variant of a 32-row tiled entry.
+fn tiled_entry(base: &'static str, rows: u32) -> &'static str {
+    if rows == 32 {
+        base
+    } else {
+        crate::encode::symbol(&format!("{base}_r{rows}"))
+    }
+}
 
 const SDPA_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
-pub const DECODE_THREADS: u32 = 256;
+/// The `_t128` variant of a 256-invocation decode entry.
+fn decode_entry(base: &'static str, threads: u32) -> &'static str {
+    if threads >= 256 {
+        base
+    } else {
+        crate::encode::symbol(&format!("{base}_t128"))
+    }
+}
 
 const SDPA_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_64",
@@ -400,16 +414,16 @@ pub fn splits_for(
     ceiling: u32,
     window: Option<u32>,
     keys: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> u32 {
     let groups = q_heads.saturating_mul(rows).max(1);
-    if ceiling <= 1 || groups >= tuning.sdpa_split_groups {
+    if ceiling <= 1 || groups >= tuning.sdpa_split_groups() {
         return 1;
     }
-    let min_keys = tuning.sdpa_split_min_keys.max(1);
+    let min_keys = tuning.sdpa_split_min_keys().max(1);
     let bound = window.map_or(keys, |w| w.min(keys));
     tuning
-        .sdpa_split_groups
+        .sdpa_split_groups()
         .div_ceil(groups)
         .min(bound.div_ceil(min_keys))
         .clamp(1, ceiling.max(1))
@@ -429,7 +443,7 @@ pub(crate) fn vector_split(
     lse: Option<Tensor>,
     split: Split,
     splits: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     let shape = Paged::of(op, q, pool, window, head_dim)?;
@@ -460,11 +474,12 @@ pub(crate) fn vector_split(
     };
     args.push(stated(op, slices)?.arg());
     args.push(stated(op, shape.rows)?.arg());
-    args.push(stated(op, tuning.sdpa_split_min_keys.max(1))?.arg());
+    args.push(stated(op, tuning.sdpa_split_min_keys().max(1))?.arg());
+    let threads = tuning.sdpa_decode_threads(head_dim);
     ctx.fire(
-        Fire::at(FILE, walker)
+        Fire::at(FILE, decode_entry(walker, threads))
             .groups([shape.q_heads, shape.rows, slices])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )?;
 
@@ -525,6 +540,7 @@ fn split_capacity(
 
 pub(crate) fn vector(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -563,10 +579,11 @@ pub(crate) fn vector(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    let threads = tuning.sdpa_decode_threads(SDPA_WIDTHS[shape.at]);
     ctx.fire(
-        Fire::at(FILE, entry)
+        Fire::at(FILE, decode_entry(entry, threads))
             .groups([shape.q_heads, shape.rows, 1])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )
 }
@@ -574,6 +591,7 @@ pub(crate) fn vector(
 #[allow(clippy::too_many_arguments)]
 fn selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -634,10 +652,11 @@ fn selected(
     args.push(selection.arg());
     args.push(stated(op, top_k)?.arg());
     args.push(stated(op, ratio)?.arg());
+    let threads = tuning.sdpa_decode_threads(SDPA_WIDTHS[shape.at]);
     ctx.fire(
-        Fire::at(FILE, SDPA_SELECTED[shape.at])
+        Fire::at(FILE, decode_entry(SDPA_SELECTED[shape.at], threads))
             .groups([shape.q_heads, shape.rows, 1])
-            .group([DECODE_THREADS, 1, 1]),
+            .group([threads, 1, 1]),
         &args,
     )
 }
@@ -645,6 +664,7 @@ fn selected(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     selection: Tensor,
@@ -657,6 +677,7 @@ pub fn decode_selected(
 ) -> Result<(), Error> {
     selected(
         ctx,
+        tuning,
         "attention.decode_selected",
         q,
         pool,
@@ -677,6 +698,7 @@ pub fn decode_selected(
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_selected(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: RaggedTensor,
     plan: &PrefillPlan,
     selection: Tensor,
@@ -692,6 +714,7 @@ pub fn prefill_selected(
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     selected(
         ctx,
+        tuning,
         OP,
         q.data,
         pool,
@@ -709,8 +732,10 @@ pub fn prefill_selected(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tiled(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     pool: &KvPool,
@@ -728,10 +753,12 @@ pub(crate) fn tiled(
         "the attention lands one output row per query row"
     );
     let shape = Paged::of(op, q, pool, window, head_dim)?;
-    let entry = match lse {
+    let tile = tuning.sdpa_tile_rows();
+    let base = match lse {
         None => SDPA_TILED[shape.at],
         Some(_) => SDPA_TILED_LSE[shape.at],
     };
+    let entry = tiled_entry(base, tile);
     let mut args = sdpa_args(
         ctx,
         op,
@@ -753,8 +780,8 @@ pub(crate) fn tiled(
     }
     ctx.fire(
         Fire::at(FILE, entry)
-            .groups([shape.q_heads, shape.rows.div_ceil(SDPA_TILE), 1])
-            .group([32, SDPA_TILE, 1]),
+            .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
+            .group([32, tile, 1]),
         &args,
     )
 }
@@ -762,6 +789,7 @@ pub(crate) fn tiled(
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -773,6 +801,7 @@ pub fn decode(
 ) -> Result<(), Error> {
     decode_arm(
         ctx,
+        tuning,
         "attention.decode",
         q,
         plan,
@@ -789,6 +818,7 @@ pub fn decode(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_lse(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     q: Tensor,
     plan: &DecodePlan,
     pool: &KvPool,
@@ -801,6 +831,7 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     decode_arm(
         ctx,
+        tuning,
         "attention.decode_lse",
         q,
         plan,
@@ -817,6 +848,7 @@ pub fn decode_lse(
 #[allow(clippy::too_many_arguments)]
 fn decode_arm(
     ctx: &Ctx<'_>,
+    tuning: &Tuning,
     op: &'static str,
     q: Tensor,
     plan: &DecodePlan,
@@ -829,7 +861,6 @@ fn decode_arm(
     split: Option<Split>,
 ) -> Result<(), Error> {
     if let Some(planes) = split {
-        let tuning = crate::tuning::current();
         let heads = q.width.checked_div(head_dim).unwrap_or(0);
         let ceiling = split_ceiling(&planes, q.rows, heads, head_dim);
 
@@ -840,86 +871,15 @@ fn decode_arm(
             .rows
             .saturating_mul(pool.page_indices.width)
             .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
-        let slices = splits_for(heads, q.rows, ceiling, window, keys, &tuning);
+        let slices = splits_for(heads, q.rows, ceiling, window, keys, tuning);
         if slices > 1 {
             return vector_split(
-                ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse, planes, slices, &tuning,
+                ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse, planes, slices, tuning,
             );
         }
     }
-    vector(ctx, op, q, pool, plan, window, head_dim, sm_scale, o, lse)
-}
-
-pub fn prefill(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx, OP, q.data, pool, plan, plan.mask, window, head_dim, sm_scale, o, None,
-    )
-}
-
-pub fn prefill_lse(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    kv_heads: u32,
-    sm_scale: f32,
-    o: Tensor,
-    lse: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
-    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
-    tiled(
-        ctx,
-        OP,
-        q.data,
-        pool,
-        plan,
-        plan.mask,
-        window,
-        head_dim,
-        sm_scale,
-        o,
-        Some(lse),
-    )
-}
-
-pub fn masked(
-    ctx: &Ctx<'_>,
-    q: RaggedTensor,
-    plan: &PrefillPlan,
-    mask: Tensor,
-    pool: &KvPool,
-    window: Option<u32>,
-    head_dim: u32,
-    sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
-    if mask.dtype != Dtype::U8 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
-                mask.dtype
-            ),
-        ));
-    }
-    tiled(
-        ctx, OP, q.data, pool, plan, mask, window, head_dim, sm_scale, o, None,
+    vector(
+        ctx, tuning, op, q, pool, plan, window, head_dim, sm_scale, o, lse,
     )
 }
 

@@ -93,6 +93,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the block drafter's shell loads");

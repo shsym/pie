@@ -34,18 +34,12 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 }
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
-    if !crate::in_own_process(
-        "the_q8_kv_roundtrip::stored_q8_and_all_attention_routes_match_fp64",
-        &[("PIE_METAL_KV_Q8", "1")],
-    ) {
-        return;
-    }
-    assert!(kernels_metal::tuning::override_with(
-        kernels_metal::tuning::Overrides {
-            sdpa_mpp: Some(std::env::var("PIE_TEST_MPP").as_deref() == Ok("1")),
-            ..Default::default()
-        }
-    ));
+    // `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
+    let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
+        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
+    } else {
+        engine_metal::chip::tuning("", false)
+    };
     let dev = Context::bind().unwrap();
     let handles = Handles::new();
     let pipes = Pipelines::new();
@@ -117,6 +111,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
             page_size: page as i32,
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
+            q8: true,
         };
         let frame = dev.frame().unwrap();
         attn::kv_append(
@@ -245,8 +240,9 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                     }
                 }
             }
-            let per = attn::split::workspace_words(attn::split::split_count(m as u32), qh as u32)
-                .unwrap();
+            let per =
+                attn::split::workspace_words(attn::split::split_count(m as u32, 32), qh as u32)
+                    .unwrap();
             let words = m.div_ceil(8) as u32 * per;
             let workspace = upload(&vec![0xa5; words as usize * 4 + 64]);
             for route in 0..5 {
@@ -279,17 +275,19 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                                 1,
                                 width as usize,
                                 Dtype::F32
-                            ))
+                            )),
+                            32,
                         )
                         .unwrap()
                     );
                 } else if route == 0 {
-                    attn::decode(&sink, qt, &plan, &pool, window, d as u32, scale, yt).unwrap();
+                    attn::decode(
+                        &sink, &tuning, qt, &plan, &pool, window, d as u32, scale, yt,
+                    )
+                    .unwrap();
                 } else if route == 1 {
-                    let tuning = kernels_metal::DeviceTuning {
-                        sdpa_mpp: true,
-                        ..Default::default()
-                    };
+                    let tuning =
+                        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
                     attn::arbiter::masked(
                         &sink,
                         RaggedTensor {
@@ -311,6 +309,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 } else if route == 3 {
                     attn::prefill(
                         &sink,
+                        &tuning,
                         RaggedTensor {
                             data: qt,
                             indptr: tensor(&qp, 2, 1, Dtype::I32),
@@ -327,6 +326,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 } else {
                     attn::decode_lse(
                         &sink,
+                        &tuning,
                         qt,
                         &plan,
                         &pool,

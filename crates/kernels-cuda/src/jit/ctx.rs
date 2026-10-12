@@ -177,6 +177,8 @@ pub struct Ctx {
     stage: core::cell::Cell<u64>,
     region: core::cell::Cell<u32>,
     lane: core::cell::Cell<u32>,
+
+    tuning: crate::tuning::Tuning,
 }
 
 impl Ctx {
@@ -196,6 +198,7 @@ impl Ctx {
             stage: core::cell::Cell::new(0),
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
+            tuning: crate::tuning::Tuning::DEFAULT,
         }
     }
 
@@ -206,6 +209,21 @@ impl Ctx {
     pub const fn in_order_of(mut self, owner: *mut c_void) -> Self {
         self.owner = owner;
         self
+    }
+
+    #[must_use]
+    pub const fn with_tuning(mut self, tuning: crate::tuning::Tuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    pub fn set_tuning(&mut self, tuning: crate::tuning::Tuning) {
+        self.tuning = tuning;
+    }
+
+    #[must_use]
+    pub const fn tuning(&self) -> crate::tuning::Tuning {
+        self.tuning
     }
 
     #[must_use]
@@ -390,19 +408,6 @@ impl Ctx {
         i32::try_from(self.pad.get().extent(stated))
             .unwrap_or(rows)
             .max(rows)
-    }
-
-    #[allow(clippy::unused_self)]
-    #[must_use]
-    pub fn compute_capability_major(&self) -> Option<u32> {
-        #[cfg(feature = "cuda")]
-        {
-            crate::jit::device::compute_capability_major()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            None
-        }
     }
 
     #[allow(clippy::unused_self)]

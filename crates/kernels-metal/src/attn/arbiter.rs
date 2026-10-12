@@ -1,13 +1,11 @@
 use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
-use crate::tuning::DeviceTuning;
+use crate::tuning::Tuning;
 
 use super::{DecodePlan, Paged, PrefillPlan, SDPA_TILE, kv_heads_agree, lse_plane, tiled, vector};
 
 const MMA_HEAD_DIM: u32 = 64;
-
-const MMA_LSE_HEAD_DIM: u32 = 64;
 
 const MMA_THREADS: u32 = 128;
 
@@ -18,14 +16,14 @@ const MMA_LSE_ENTRY: &str = "sdpa_paged_mma_lse_bfloat16_d_64";
 const MMA_FILE: &str = "attn/sdpa_paged_mma.metal";
 
 #[must_use]
-pub fn should_tile(rows: u32, requests: u32, tuning: &DeviceTuning) -> bool {
-    rows / requests.max(1) >= tuning.sdpa_tile_min_rows_per_request
+pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
+    rows / requests.max(1) >= tuning.sdpa_tile_rows_per_request()
 }
 
 #[must_use]
-pub fn should_mma(head_dim: u32, lse: bool, tuning: &DeviceTuning) -> bool {
-    let stamped = if lse { MMA_LSE_HEAD_DIM } else { MMA_HEAD_DIM };
-    tuning.sdpa_mma && head_dim == stamped
+pub fn should_mma(head_dim: u32, tuning: &Tuning) -> bool {
+    // The plain and the lse kernels are both stamped at one head width.
+    tuning.sdpa_mma() && head_dim == MMA_HEAD_DIM
 }
 
 fn as_decode(plan: &PrefillPlan, mask: Tensor) -> DecodePlan {
@@ -114,7 +112,7 @@ fn arbitrate(
     o: Tensor,
     lse: Option<Tensor>,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     if super::q8::enabled(pool, head_dim) {
         return super::q8::attention(
@@ -129,7 +127,8 @@ fn arbitrate(
             sm_scale,
             o,
             lse,
-            tuning.sdpa_mpp && should_tile(q.rows, requests, tuning),
+            tuning.sdpa_mpp() && should_tile(q.rows, requests, tuning),
+            tuning.sdpa_mpp_rows(),
         );
     }
     if !should_tile(q.rows, requests, tuning) {
@@ -145,9 +144,19 @@ fn arbitrate(
             sm_scale,
             o,
             lse,
+            tuning,
         );
     }
-    if tuning.sdpa_mpp && super::q8::mpp_fits(q, pool, head_dim, causal, lse.is_some()) {
+    if tuning.sdpa_mpp()
+        && super::q8::mpp_fits(
+            q,
+            pool,
+            head_dim,
+            causal,
+            lse.is_some(),
+            tuning.sdpa_mpp_rows(),
+        )
+    {
         return super::q8::attention(
             ctx,
             op,
@@ -161,15 +170,16 @@ fn arbitrate(
             o,
             lse,
             true,
+            tuning.sdpa_mpp_rows(),
         );
     }
-    if causal && should_mma(head_dim, lse.is_some(), tuning) {
+    if causal && should_mma(head_dim, tuning) {
         return mma(
             ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
         );
     }
     tiled(
-        ctx, op, q, pool, plan, mask, window, causal, head_dim, sm_scale, o, lse,
+        ctx, op, q, pool, plan, mask, window, causal, head_dim, sm_scale, o, lse, tuning,
     )
 }
 
@@ -185,7 +195,7 @@ pub fn prefill(
     sm_scale: f32,
     o: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
@@ -208,7 +218,7 @@ pub fn prefill_lse(
     o: Tensor,
     lse: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill_lse";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
@@ -243,7 +253,7 @@ pub fn masked(
     sm_scale: f32,
     o: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     const OP: &str = "attention.masked";
     if mask.dtype != dtype::Dtype::U8 {
@@ -275,7 +285,7 @@ pub fn masked_lse(
     o: Tensor,
     lse: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
 ) -> Result<(), Error> {
     const OP: &str = "attention.masked_lse";
     if mask.dtype != dtype::Dtype::U8 {
@@ -317,13 +327,24 @@ pub fn prefill_with_scratch(
     sm_scale: f32,
     o: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp
+    if tuning.sdpa_mpp()
         && super::split::try_paged(
-            ctx, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, requests,
+            ctx,
+            q.data,
+            pool,
+            plan,
+            plan.mask,
+            window,
+            true,
+            head_dim,
+            sm_scale,
+            o,
+            requests,
             partials,
+            tuning.sdpa_split(),
         )?
     {
         return Ok(());
@@ -347,13 +368,24 @@ pub fn masked_with_scratch(
     sm_scale: f32,
     o: Tensor,
     requests: u32,
-    tuning: &DeviceTuning,
+    tuning: &Tuning,
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
-    if tuning.sdpa_mpp
+    if tuning.sdpa_mpp()
         && super::split::try_paged(
-            ctx, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, requests,
+            ctx,
+            q.data,
+            pool,
+            plan,
+            mask,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            requests,
             partials,
+            tuning.sdpa_split(),
         )?
     {
         return Ok(());

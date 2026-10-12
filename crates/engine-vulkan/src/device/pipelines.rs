@@ -71,13 +71,15 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(entrypoint) {
             return Ok(Arc::clone(pipeline));
         }
-        let code = kernels_vulkan::sources::module(entrypoint).ok_or(Fault::Shader {
-            file: fire.file,
-            entrypoint,
-            why: "the kernel table holds no compiled module by that name (built without \
+        let code = kernels_vulkan::sources::module_for(entrypoint, device.lanes()).ok_or(
+            Fault::Shader {
+                file: fire.file,
+                entrypoint,
+                why: "the kernel table holds no compiled module by that name (built without \
                   `kernels-vulkan/native`, or the variant is not instantiated)"
-                .to_string(),
-        })?;
+                    .to_string(),
+            },
+        )?;
         let cache = device.pipeline_cache();
         let pipeline = Arc::new(build(device.core(), cache.handle(), fire, code)?);
         cache.built();
@@ -140,10 +142,15 @@ fn build(core: &Arc<Core>, cache: vk::PipelineCache, fire: Fire, code: &[u8]) ->
                 return Err(core.fault("vkCreateShaderModule", e));
             }
         };
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(core.pinned.unwrap_or(0));
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(c"main");
+        if core.pinned.is_some() {
+            stage = stage.push_next(&mut required);
+        }
         let made = d.create_compute_pipelines(
             cache,
             &[vk::ComputePipelineCreateInfo::default()

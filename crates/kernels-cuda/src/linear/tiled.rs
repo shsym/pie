@@ -49,15 +49,11 @@ pub const SHORT: Tuple = Tuple {
     stages: 4,
 };
 
-pub const LONG_PREFILL_ROWS: u32 = 512;
-
+/// The tile `rows` rows take: the long one from `long_rows`
+/// (`kernel.qmm.long_rows`), else the short one.
 #[must_use]
-pub const fn tuple_for(rows: u32) -> Tuple {
-    if rows >= LONG_PREFILL_ROWS {
-        LONG
-    } else {
-        SHORT
-    }
+pub const fn tuple_for(rows: u32, long_rows: u32) -> Tuple {
+    if rows >= long_rows { LONG } else { SHORT }
 }
 
 #[derive(Clone, Copy)]
@@ -143,7 +139,7 @@ pub fn matmul(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
     tiled_launch(
         ctx,
         "linear.matmul",
@@ -166,7 +162,7 @@ pub fn lm_head(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
     tiled_launch(
         ctx,
         "linear.lm_head",
@@ -299,29 +295,28 @@ impl Carve {
     }
 }
 
-pub const TARGET_WARPS: u32 = 8 * 1024;
-
 pub const MIN_SPLIT: u32 = 8;
-
-pub const THIN_SPLIT: u32 = 32;
-
-pub const WIDE_SPLIT: u32 = 16;
 
 pub const THIN_ROWS: u32 = 8;
 
-#[must_use]
-pub const fn carve_for(n: u32, rows: u32) -> Carve {
+/// Split-K depth for `rows` x `n`: aims for `kernel.qmm.split_warps_per_sm`
+/// warps on every SM, capped by the thin (8 rows or fewer) or wide maximum.
+fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
+    let tuning = ctx.tuning();
+    // A context that cannot say its SM count aims as an L40S would.
+    let sms = ctx.multiprocessors().unwrap_or(142);
+    let warps = sms.saturating_mul(tuning.qmm_split_warps_per_sm).max(1);
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
-        THIN_SPLIT
+        tuning.qmm_split_thin_max
     } else {
-        WIDE_SPLIT
+        tuning.qmm_split_wide_max
     };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
         deepest
     } else {
-        (TARGET_WARPS / bands).next_power_of_two()
+        (warps / bands).next_power_of_two()
     };
     let split = if want < MIN_SPLIT {
         MIN_SPLIT
@@ -365,7 +360,7 @@ pub fn matmul_gemv(
         biases,
         y,
         seat,
-        carve_for(y.width, y.rows),
+        carve_for(y.width, y.rows, ctx),
     )
 }
 
@@ -387,7 +382,7 @@ pub fn lm_head_gemv(
         biases,
         y,
         seat,
-        carve_for(y.width, y.rows),
+        carve_for(y.width, y.rows, ctx),
     )
 }
 

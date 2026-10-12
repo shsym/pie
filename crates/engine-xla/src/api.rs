@@ -43,7 +43,7 @@ use crate::serve::{Boot, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceBoot {
     /// The PJRT plugin; `None` finds one (`PIE_XLA_PLUGIN`,
     /// `TPU_LIBRARY_PATH`, then `libtpu.so`).
@@ -51,6 +51,28 @@ pub struct DeviceBoot {
 
     /// Which addressable device of the plugin's client.
     pub ordinal: u32,
+
+    /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
+    pub profiles: Option<PathBuf>,
+
+    /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
+    pub prewarm: bool,
+
+    /// Windowed kv rows live in their own pool; `false` keeps them in full
+    /// pages, for a test that compares the two.
+    pub window_pool: bool,
+}
+
+impl Default for DeviceBoot {
+    fn default() -> DeviceBoot {
+        DeviceBoot {
+            plugin: None,
+            ordinal: 0,
+            profiles: None,
+            prewarm: false,
+            window_pool: true,
+        }
+    }
 }
 
 /// Fields drop in order: the pending frame's kept readouts and the program
@@ -375,7 +397,7 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
-        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1") {
+        if boot.prewarm {
             shell.prewarm().map_err(fault)?;
         }
         let trace_name = shell.trace().name.clone();
@@ -389,7 +411,7 @@ impl Engine for Xla {
                 domain: MemoryDomain::XlaDevice(boot.ordinal),
                 sms: 1,
                 unified_memory: false,
-                fp8_native: false,
+                fp8_native: shell.tpu().fp8_native(),
                 native_mxfp4_moe: false,
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,

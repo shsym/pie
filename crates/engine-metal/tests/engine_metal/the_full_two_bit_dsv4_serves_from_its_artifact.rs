@@ -274,6 +274,7 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        profiles: None,
         residency,
     });
     let mut shell = match shell {

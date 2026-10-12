@@ -70,11 +70,6 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// A step of at least this many rows is submitted a layer at a time: in one
-/// submit, a long prefill on a slow GPU outlasts the driver's watchdog (about
-/// 2 s on Adreno, which a 64-row prefill reaches) and loses the device.
-const SPLIT_ROWS: u32 = 32;
-
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -289,6 +284,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
+    tuning: kernels_vulkan::Tuning,
     device: Context,
 
     pipelines: Pipelines,
@@ -388,18 +384,24 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        let device = Context::bind(boot.device, boot.residency.device_memory_share)?;
+        let measured = device.chip();
+        let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &report);
+        let tuning = kernels_vulkan::Tuning::new(chip, device.limits());
+        let chip = tuning.profile();
         let boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(chip),
+            ),
             ..boot
         };
-        let device = Context::bind(boot.device, boot.residency.device_memory_share)?;
         let kv_budget = boot.residency.device_kv_budget;
 
-        let profile = boot.profile.unwrap_or(DeviceProfile {
-            sms: device.cores(),
-            side_streams: 0,
-            ..DeviceProfile::default()
-        });
+        let profile = boot
+            .profile
+            .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
 
         let budgets = {
             let base = match boot.patches.clone() {
@@ -500,14 +502,8 @@ impl Shell {
 
         handles.seal();
 
-        let mut scratch = Scratch::reserve(
-            &device,
-            &boot.trace,
-            weights.table(),
-            &compiled,
-            &budgets,
-            least,
-        )?;
+        let mut scratch =
+            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         let spaces = boot
             .trace
             .caches
@@ -1000,14 +996,7 @@ impl Shell {
             > crate::scratch::pool_bytes(&boot.trace, least)
         {
             drop(scratch);
-            scratch = Scratch::reserve(
-                &device,
-                &boot.trace,
-                weights.table(),
-                &compiled,
-                &budgets,
-                paging,
-            )?;
+            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let rs_buffers = match &rs_layout {
@@ -1024,6 +1013,7 @@ impl Shell {
             || weights.pump().is_some();
 
         Ok(Shell {
+            tuning,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -1174,6 +1164,11 @@ impl Shell {
     #[must_use]
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    #[must_use]
+    pub fn tuning(&self) -> &kernels_vulkan::Tuning {
+        &self.tuning
     }
 
     #[must_use]
@@ -2811,6 +2806,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
                 self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),
@@ -3096,8 +3092,14 @@ impl engine::frame::Shell for Shell {
         }
 
         // A split step is not recorded: a recording replays as one submit.
+        let split_rows = self
+            .tuning
+            .profile()
+            .get::<crate::chip::SubmitSplitRows>()
+            .0;
         // Whole, a 512x512 VAE decode outlasts one Adreno submission and loses the device.
-        let split = prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= SPLIT_ROWS
+        let split = (split_rows > 0
+            && prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= split_rows)
             || prepared.bindings.voxels.is_some();
         let keep = key.filter(|_| !split && self.recorder.has_room());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;

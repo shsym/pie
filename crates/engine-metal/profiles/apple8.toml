@@ -1,0 +1,14 @@
+api = 1
+
+[target]
+assumes = { family = 8 }
+
+[kernel]
+qmm = [
+  { when = "(rows >= 5 and bits == 2) or (rows >= 8 and format == fp16)", use = "tiled", crossover_tg = 160 },
+  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { use = "qmv", rows_max = 8, packs = 1, crossover_tg = 160 },
+]
+sdpa.prefill    = "mpp"
+ane.mlp         = [{ when = "ane", use = "share", percent = 47 }, "gpu"]
+ane.projections = [{ when = "ane", use = "share", percent = 47 }, "gpu"]

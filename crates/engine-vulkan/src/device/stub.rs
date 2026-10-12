@@ -68,6 +68,16 @@ impl Context {
     }
 
     #[must_use]
+    pub fn lanes(&self) -> u32 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> kernels_vulkan::tuning::Limits {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn api_version(&self) -> u32 {
         match self.never {}
     }
@@ -88,7 +98,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn info(&self) -> kernels_vulkan::DeviceInfo {
+    pub fn chip(&self) -> crate::chip::Device {
         match self.never {}
     }
 

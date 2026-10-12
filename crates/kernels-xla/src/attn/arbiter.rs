@@ -1,7 +1,7 @@
 //! The prefill entries engine dispatches call (kernels-wgpu `attn::arbiter`),
-//! with Metal's `causal` flag on the masked forms. `requests` picks the walk:
-//! at most two rows per request gather per row, more walk row blocks. The GPU
-//! tuning argument is dropped.
+//! with Metal's `causal` flag on the masked forms. The paged driver picks
+//! the walk (`Walk::Auto`); `requests` and the GPU tuning argument are
+//! dropped.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -13,14 +13,6 @@ use crate::cx::Ctx;
 use crate::error::{Error, refuse};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-fn walk(rows: u32, requests: u32) -> Walk {
-    if rows <= 2 * requests.max(1) {
-        Walk::PerRow
-    } else {
-        Walk::Blocked
-    }
-}
-
 fn call(
     op: &'static str,
     q: RaggedTensor,
@@ -31,7 +23,6 @@ fn call(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
-    requests: u32,
 ) -> Paged {
     Paged {
         op,
@@ -44,7 +35,7 @@ fn call(
         sm_scale,
         o,
         lse,
-        walk: walk(q.data.rows, requests),
+        walk: Walk::Auto,
         selection: None,
         rel: None,
     }
@@ -73,7 +64,7 @@ pub fn prefill(
     kv_heads: u32,
     sm_scale: f32,
     o: Tensor,
-    requests: u32,
+    _requests: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
@@ -87,7 +78,6 @@ pub fn prefill(
         sm_scale,
         o,
         None,
-        requests,
     );
     attend(ctx, c, pool)
 }
@@ -103,7 +93,7 @@ pub fn prefill_lse(
     sm_scale: f32,
     o: Tensor,
     lse: Tensor,
-    requests: u32,
+    _requests: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill_lse";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
@@ -117,7 +107,6 @@ pub fn prefill_lse(
         sm_scale,
         o,
         Some(lse),
-        requests,
     );
     attend(ctx, c, pool)
 }
@@ -137,14 +126,12 @@ pub fn masked(
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
-    requests: u32,
+    _requests: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attention.masked";
     u8_mask(OP, mask)?;
     let tables = Tables::prefill(plan).with_mask(mask);
-    let c = call(
-        OP, q, tables, window, causal, head_dim, sm_scale, o, None, requests,
-    );
+    let c = call(OP, q, tables, window, causal, head_dim, sm_scale, o, None);
     attend(ctx, c, pool)
 }
 
@@ -160,7 +147,7 @@ pub fn masked_lse(
     sm_scale: f32,
     o: Tensor,
     lse: Tensor,
-    requests: u32,
+    _requests: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attention.masked_lse";
     u8_mask(OP, mask)?;
@@ -175,7 +162,6 @@ pub fn masked_lse(
         sm_scale,
         o,
         Some(lse),
-        requests,
     );
     attend(ctx, c, pool)
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use poem_compiler::{Budget, DeviceProfile};
+use poem_compiler::Budget;
 use poem_ir::Trace;
 
 use super::diag::Diagnostics;
@@ -23,22 +23,6 @@ impl Graphs {
     #[must_use]
     pub fn records(self) -> bool {
         matches!(self, Graphs::On)
-    }
-}
-
-impl std::str::FromStr for Graphs {
-    type Err = String;
-
-    fn from_str(word: &str) -> std::result::Result<Graphs, String> {
-        match word {
-            "off" | "eager" => Ok(Graphs::Off),
-            "shaped" => Ok(Graphs::Shaped),
-            "on" | "graph" => Ok(Graphs::On),
-            other => Err(format!(
-                "`{other}` does not name a graph mode; the spellings are \
-                 `on` (or `graph`), `shaped`, and `off` (or `eager`)"
-            )),
-        }
     }
 }
 
@@ -77,60 +61,14 @@ impl Recording {
     }
 }
 
-impl std::str::FromStr for Recording {
-    type Err = String;
-
-    fn from_str(word: &str) -> std::result::Result<Recording, String> {
-        match word {
-            "off" => Ok(Recording::Off),
-            "shaped" => Ok(Recording::Shaped),
-            "bodies" => Ok(Recording::default()),
-            other => Err(format!(
-                "`{other}` does not name a recording mode; the spellings are \
-                 `off`, `shaped`, and `bodies`"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Knobs {
-    pub recording: Recording,
-    pub copies: bool,
-    pub grouped: bool,
-    pub side_streams: Option<u32>,
     pub diagnostics: Diagnostics,
     pub nccl_transport: crate::comm::Transport,
-}
-
-impl Knobs {
-    #[must_use]
-    pub fn pad(&self) -> bool {
-        self.recording.pad()
-    }
-
-    #[must_use]
-    pub fn bodies(&self) -> bool {
-        self.recording.bodies()
-    }
-
-    #[must_use]
-    pub fn bodies_mem(&self) -> u32 {
-        self.recording.bodies_mem()
-    }
-}
-
-impl Default for Knobs {
-    fn default() -> Knobs {
-        Knobs {
-            recording: Recording::default(),
-            copies: true,
-            grouped: true,
-            side_streams: None,
-            diagnostics: Diagnostics::default(),
-            nccl_transport: crate::comm::Transport::default(),
-        }
-    }
+    /// The user's profile directory; `None` reads only the checked-in ones.
+    pub profiles: Option<std::path::PathBuf>,
+    /// A profile used as is instead of resolving one (`chip::pinned`).
+    pub chip: Option<profile::Profile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,7 +88,6 @@ pub struct Boot<'a> {
     pub budget: Budget,
     pub patches: Option<poem_compiler::PatchLadder>,
     pub voxels: Option<poem_compiler::VoxelLadder>,
-    pub profile: Option<DeviceProfile>,
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
@@ -161,7 +98,6 @@ pub struct Boot<'a> {
     /// hold, less what was in use when it began.
     pub memory_share: f64,
     pub ordinal: i32,
-    pub graphs: Graphs,
     pub knobs: Knobs,
     pub cache_dir: Option<&'a Path>,
     pub runahead: engine::runahead::Runahead,

@@ -48,7 +48,7 @@ fn family(device: &ProtocolObject<dyn MTLDevice>) -> u32 {
             return number;
         }
     }
-    kernels_metal::DeviceInfo::of_name(&device.name().to_string()).apple_family
+    0
 }
 
 #[cfg(target_vendor = "apple")]
@@ -61,6 +61,35 @@ type Queue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 #[cfg(not(target_vendor = "apple"))]
 type Queue = ();
 
+/// Where a GPU core count came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoresFrom {
+    /// The IORegistry's `gpu-core-count`: macOS.
+    Registry,
+    /// The checked-in model table, by this model identifier.
+    Model(&'static str),
+}
+
+impl CoresFrom {
+    /// Its value of the `cores_from` fact.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            CoresFrom::Registry => "registry",
+            CoresFrom::Model(_) => "model",
+        }
+    }
+}
+
+impl std::fmt::Display for CoresFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoresFrom::Registry => write!(f, "from the IORegistry"),
+            CoresFrom::Model(id) => write!(f, "from the model table, as {id}"),
+        }
+    }
+}
+
 pub struct Context {
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     device: Device,
@@ -69,7 +98,10 @@ pub struct Context {
     name: String,
     working_set: u64,
     max_buffer: u64,
-    cores: u32,
+    /// The GPU's cores, where the IORegistry or the model table says.
+    cores: Option<(u32, CoresFrom)>,
+    /// The newest `MTLGPUFamily::AppleN` the device supports.
+    family: u32,
     /// The Metal 4 mapping side, opened on first use: most loads never map a
     /// tile, and a second command queue is a scheduler context in the
     /// driver. `None` inside once opened means the device is not Metal 4.
@@ -113,10 +145,21 @@ impl Context {
                 why: "the device would not open a command queue".to_string(),
             })?;
             let name = device.name().to_string();
-            kernels_metal::tuning::describe(kernels_metal::DeviceInfo {
-                apple_family: family(&device),
-                gpu_core_count: 0,
-                metal4: device.supportsFamily(MTLGPUFamily::Metal4),
+            if !device.supportsFamily(MTLGPUFamily::Metal4) {
+                return Err(Fault::Device {
+                    call: "supportsFamily(Metal4)",
+                    why: format!(
+                        "`{name}` does not run Metal 4, and pie's Metal engine needs it: \
+                         Apple Silicon on macOS 26 or newer"
+                    ),
+                });
+            }
+            let family = family(&device);
+            let cores = super::iokit::gpu_cores().map(|n| (n, CoresFrom::Registry));
+            #[cfg(target_os = "ios")]
+            let cores = cores.or_else(|| {
+                let (n, id) = super::models::gpu_cores(&super::models::machine()?, family)?;
+                Some((n, CoresFrom::Model(id)))
             });
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
@@ -126,7 +169,8 @@ impl Context {
                 name,
                 working_set,
                 max_buffer,
-                cores: 32,
+                cores,
+                family,
                 sparse: std::cell::OnceCell::new(),
             })
         }
@@ -190,8 +234,18 @@ impl Context {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
-        self.cores
+    pub fn cores(&self) -> Option<u32> {
+        self.cores.map(|(n, _)| n)
+    }
+
+    #[must_use]
+    pub fn cores_from(&self) -> Option<CoresFrom> {
+        self.cores.map(|(_, from)| from)
+    }
+
+    #[must_use]
+    pub fn family(&self) -> u32 {
+        self.family
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -825,5 +879,20 @@ fn available_memory() -> Option<u64> {
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn the_core_count_is_the_registrys_not_a_guess() {
+        let ctx = super::Context::bind().expect("a Metal 4 device");
+        let cores = super::super::iokit::gpu_cores().expect("the registry says");
+        assert_eq!(ctx.cores(), Some(cores));
+        assert_eq!(ctx.cores_from(), Some(super::CoresFrom::Registry));
+        assert!(
+            cores >= 7,
+            "no Apple Silicon GPU has fewer than 7 cores: {cores}"
+        );
     }
 }

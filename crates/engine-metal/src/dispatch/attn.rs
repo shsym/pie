@@ -102,10 +102,6 @@ impl Run<'_> {
             } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
-                    StructKind::AttnPrefillPlanSm90 => panic!(
-                        "an sm90 plan kind on a metal trace is a trace bug: this plane \
-                         builds only the fa2-shaped `AttnPrefillPlan`"
-                    ),
                     other => panic!(
                         "`attention.plan_prefill` defines a {other:?}, which is no \
                          prefill plan kind"
@@ -136,6 +132,7 @@ impl Run<'_> {
                 o,
             } => attn::decode(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -164,7 +161,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_metal::tuning::current(),
+                self.tuning(),
                 &|rows, width| self.partials(rows, width),
             ),
             Attention::DecodeSelected {
@@ -254,7 +251,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_metal::tuning::current(),
+                self.tuning(),
                 &|rows, width| self.partials(rows, width),
             ),
             Attention::MaskedLse {
@@ -282,7 +279,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
                 self.requests(),
-                &kernels_metal::tuning::current(),
+                self.tuning(),
             ),
             Attention::DecodeLse {
                 q,
@@ -295,6 +292,7 @@ impl Run<'_> {
                 lse,
             } => attn::decode_lse(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -327,7 +325,7 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.tensor(*lse),
                     self.requests(),
-                    &kernels_metal::tuning::current(),
+                    self.tuning(),
                 )?;
                 self.capture_scores(
                     *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
@@ -757,6 +755,7 @@ impl Run<'_> {
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 attn::ssm::gated_delta_committed(
                     self.ctx(),
+                    self.tuning(),
                     ext_qkv,
                     self.qo_indptr(),
                     &self.rs_committed(&seat),
@@ -974,6 +973,7 @@ impl Run<'_> {
                 y,
             } => attn::ssm::gated_delta(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),
@@ -996,6 +996,7 @@ impl Run<'_> {
                 y,
             } => attn::ssm::gated_delta_chunked(
                 self.ctx(),
+                self.tuning(),
                 self.ragged(*qkv),
                 self.tensor(*z),
                 self.tensor(*gates),

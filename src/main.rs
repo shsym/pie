@@ -54,6 +54,14 @@ enum Command {
         cmd: ops::language::LanguageCmd,
     },
 
+    Profile {
+        #[command(subcommand)]
+        cmd: ops::profile::ProfileCmd,
+    },
+
+    /// Measure this machine's device and write its profile.
+    Tune(ops::tune::TuneArgs),
+
     Doctor,
 }
 
@@ -123,6 +131,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Language { cmd } => {
             tokio::task::spawn_blocking(move || ops::language::run(cmd)).await??
         }
+        Command::Profile { cmd } => {
+            tokio::task::spawn_blocking(move || ops::profile::run(cmd)).await??
+        }
+        Command::Tune(args) => tokio::task::spawn_blocking(move || ops::tune::run(args)).await??,
     };
 
     let code = answer.code();

@@ -1837,6 +1837,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "serde_json",
  "tempfile",
  "tokenizer",
@@ -1867,6 +1868,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "serde_json",
  "tokenizer",
  "toml",
@@ -1888,11 +1890,14 @@ dependencies = [
  "memmap2",
  "naga",
  "pie-eta-ir",
+ "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "toml",
  "tracing",
+ "ztensor-compat",
 ]
 
 [[package]]
@@ -1904,6 +1909,7 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
+ "kernels-vulkan",
  "kernels-wgpu",
  "libc",
  "memmap2",
@@ -1912,6 +1918,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "toml",
  "tracing",
  "web-std",
@@ -1937,6 +1944,7 @@ dependencies = [
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "prost",
  "serde_json",
  "tokenizer",
@@ -3070,6 +3078,7 @@ version = "0.5.4"
 dependencies = [
  "cudarc",
  "pie-dtype",
+ "pie-profile",
  "tracing",
 ]
 
@@ -3082,13 +3091,16 @@ dependencies = [
  "objc2",
  "objc2-metal",
  "pie-dtype",
+ "pie-profile",
 ]
 
 [[package]]
 name = "kernels-vulkan"
 version = "0.5.4"
 dependencies = [
+ "ash",
  "pie-dtype",
+ "pie-profile",
 ]
 
 [[package]]
@@ -3096,6 +3108,7 @@ name = "kernels-wgpu"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-profile",
  "serde_json",
 ]
 
@@ -3104,6 +3117,7 @@ name = "kernels-xla"
 version = "0.5.4"
 dependencies = [
  "pie-dtype",
+ "pie-profile",
 ]
 
 [[package]]
@@ -4143,6 +4157,7 @@ dependencies = [
  "libc",
  "pie-client",
  "pie-poem",
+ "pie-profile",
  "reqwest",
  "runtime",
  "rustls",
@@ -4287,6 +4302,7 @@ dependencies = [
  "checkpoint",
  "pie-poem",
  "pie-poem-ir",
+ "pie-profile",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -4310,6 +4326,23 @@ version = "0.5.4"
 dependencies = [
  "pie-dtype",
  "serde",
+]
+
+[[package]]
+name = "pie-profile"
+version = "0.5.4"
+dependencies = [
+ "pie-profile-macros",
+ "toml",
+]
+
+[[package]]
+name = "pie-profile-macros"
+version = "0.5.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5106,6 +5139,7 @@ dependencies = [
  "pie-poem",
  "pie-poem-compiler",
  "pie-poem-ir",
+ "pie-profile",
  "rand 0.10.3",
  "rustc-hash 2.1.3",
  "serde",

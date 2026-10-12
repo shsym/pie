@@ -1,0 +1,5 @@
+api = 1
+
+[target]
+tier    = "sm_86"
+assumes = { cc = 86 }

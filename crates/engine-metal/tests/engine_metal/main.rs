@@ -10,7 +10,7 @@ mod a_fenced_frame_lands_both_sides;
 mod a_forked_page_is_one_run_and_not_one_move_per_token;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
-mod an_apple10_gpu_reads_a_prompt_through_mpp;
+mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
 mod mpp_attention_over_a_bf16_pool_matches_fp64;
 mod the_block_drafter_loads_and_leaves_the_trunk_alone;
@@ -51,25 +51,4 @@ fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -
     let paging = engine_metal::store::kv::Paging::of(page_size, context, slots, pages)
         .expect("a test's paging");
     Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
-}
-
-/// Whether this process runs `test` itself: the first call re-runs the
-/// binary on `test` alone, with `env` set, and asserts it passed, so a test
-/// that states process-wide kernel tuning is not answered by a tuning an
-/// earlier test already resolved. `true` in that child, `false` in the
-/// parent.
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-fn in_own_process(test: &str, env: &[(&str, &str)]) -> bool {
-    const CHILD: &str = "PIE_TEST_OWN_PROCESS";
-    if std::env::var(CHILD).as_deref() == Ok(test) {
-        return true;
-    }
-    let status = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .env(CHILD, test)
-        .envs(env.iter().copied())
-        .status()
-        .expect("the test re-runs");
-    assert!(status.success(), "{test}, run in its own process, failed");
-    false
 }

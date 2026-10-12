@@ -247,6 +247,7 @@ struct LandedSeat {
 }
 
 pub struct Shell {
+    tuning: kernels_wgpu::Tuning,
     device: Context,
 
     pipelines: Pipelines,
@@ -346,22 +347,29 @@ pub struct Shell {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        let mut boot = Boot {
-            trace: poem_compiler::fuse::fuse(boot.trace, &crate::FUSED),
-            ..boot
-        };
+        let mut boot = boot;
         let share = boot.residency.device_memory_share;
         let kv_budget = boot.residency.device_kv_budget;
         let device = match boot.handed.take() {
             Some(handed) => Context::adopt(boot.device, share, handed)?,
             None => Context::bind(boot.device, share)?,
         };
+        let measured = device.chip();
+        let (chip, report) = crate::chip::resolve(&measured, boot.device.profiles.as_deref());
+        crate::chip::SHELF.tell_untuned(&measured.name, &report);
+        let tuning = kernels_wgpu::Tuning::new(chip, device.cores(), device.storage_buffers());
+        let chip = tuning.profile();
+        let boot = Boot {
+            trace: poem_compiler::fuse::fuse(
+                boot.trace,
+                &poem_compiler::fuse::flags::kernels(chip),
+            ),
+            ..boot
+        };
 
-        let profile = boot.profile.unwrap_or(DeviceProfile {
-            sms: device.cores(),
-            side_streams: 0,
-            ..DeviceProfile::default()
-        });
+        let profile = boot
+            .profile
+            .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
 
         let budgets = match boot.patches.clone() {
             None => Budgets::of(boot.budget.clone()),
@@ -462,14 +470,8 @@ impl Shell {
 
         handles.seal();
 
-        let mut scratch = Scratch::reserve(
-            &device,
-            &boot.trace,
-            weights.table(),
-            &compiled,
-            &budgets,
-            least,
-        )?;
+        let mut scratch =
+            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         let spaces = boot
             .trace
             .caches
@@ -792,14 +794,7 @@ impl Shell {
             > crate::scratch::pool_bytes(&boot.trace, least)
         {
             drop(scratch);
-            scratch = Scratch::reserve(
-                &device,
-                &boot.trace,
-                weights.table(),
-                &compiled,
-                &budgets,
-                paging,
-            )?;
+            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
         }
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let rs_buffers = match &rs_layout {
@@ -811,6 +806,7 @@ impl Shell {
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
         Ok(Shell {
+            tuning,
             device,
             pipelines: Pipelines::new(),
             handles,
@@ -2026,6 +2022,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
+                &self.tuning,
                 self.weights.seats(),
                 self.weights.gathered(),
                 self.weights.host(),

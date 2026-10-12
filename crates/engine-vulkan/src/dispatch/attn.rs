@@ -105,10 +105,6 @@ impl Run<'_> {
             } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
-                    StructKind::AttnPrefillPlanSm90 => panic!(
-                        "an sm90 plan kind on a vulkan trace is a trace bug: this plane \
-                         builds only the fa2-shaped `AttnPrefillPlan`"
-                    ),
                     other => panic!(
                         "`attention.plan_prefill` defines a {other:?}, which is no \
                          prefill plan kind"
@@ -140,6 +136,7 @@ impl Run<'_> {
                 o,
             } => attn::decode(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -170,7 +167,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_vulkan::tuning::current(),
+                self.tuning(),
             ),
 
             Attention::DecodeSelected {
@@ -185,6 +182,7 @@ impl Run<'_> {
                 o,
             } => attn::decode_selected(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.tensor(*selection),
@@ -208,6 +206,7 @@ impl Run<'_> {
                 o,
             } => attn::prefill_selected(
                 self.ctx(),
+                self.tuning(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
                 self.tensor(*selection),
@@ -303,7 +302,7 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
                 self.requests(),
-                &kernels_vulkan::tuning::current(),
+                self.tuning(),
             ),
             Attention::MaskedLse {
                 q,
@@ -329,7 +328,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.tensor(*lse),
                 self.requests(),
-                &kernels_vulkan::tuning::current(),
+                self.tuning(),
             ),
             Attention::DecodeLse {
                 q,
@@ -342,6 +341,7 @@ impl Run<'_> {
                 lse,
             } => attn::decode_lse(
                 self.ctx(),
+                self.tuning(),
                 self.tensor(*q),
                 self.decode_plan(*plan),
                 self.pool(*cache),
@@ -375,7 +375,7 @@ impl Run<'_> {
                     self.tensor(*o),
                     self.tensor(*lse),
                     self.requests(),
-                    &kernels_vulkan::tuning::current(),
+                    self.tuning(),
                 )?;
 
                 self.capture_scores(
